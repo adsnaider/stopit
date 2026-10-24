@@ -257,14 +257,16 @@ mod tests {
     fn empty_sandbox_section_is_default() {
         let want = SandboxGrants::default();
         assert!(want.share.is_empty() && want.allow_syscalls.is_empty());
-        assert_eq!(Manifest::default().sandbox, want);
-        assert_eq!(toml_ok("").sandbox, want);
-        assert_eq!(toml_ok("[sandbox]").sandbox, want);
-        assert_eq!(jv_ok("").sandbox, want);
-        assert_eq!(jv_ok(r#""sandbox": {}"#).sandbox, want);
+        assert_eq!(Manifest::default().grants.sandbox, want);
+        assert_eq!(toml_ok("").grants.sandbox, want);
+        assert_eq!(toml_ok("[sandbox]").grants.sandbox, want);
+        assert_eq!(jv_ok("").grants.sandbox, want);
+        assert_eq!(jv_ok(r#""sandbox": {}"#).grants.sandbox, want);
         // §3.6 spells out empty lists.
         assert_eq!(
-            jv_ok(r#""sandbox": { "share": [], "allow_syscalls": [] }"#).sandbox,
+            jv_ok(r#""sandbox": { "share": [], "allow_syscalls": [] }"#)
+                .grants
+                .sandbox,
             want
         );
     }
@@ -277,17 +279,21 @@ mod tests {
             assert_eq!(ns.as_str(), name);
             assert_eq!(ShareableNamespace::try_from(name.to_owned()).unwrap(), *ns);
             let m = toml_ok(&format!("sandbox.share = [{name:?}]"));
-            assert_eq!(m.sandbox.share, vec![*ns]);
+            assert_eq!(m.grants.sandbox.share, vec![*ns]);
             let j = jv_ok(&format!(r#""sandbox": {{"share": [{name:?}]}}"#));
-            assert_eq!(j.sandbox.share, vec![*ns]);
+            assert_eq!(j.grants.sandbox.share, vec![*ns]);
         }
         let all = r#"["net", "pid", "ipc", "uts", "cgroup"]"#;
         assert_eq!(
-            toml_ok(&format!("sandbox.share = {all}")).sandbox.share,
+            toml_ok(&format!("sandbox.share = {all}"))
+                .grants
+                .sandbox
+                .share,
             NAMESPACES.to_vec()
         );
         assert_eq!(
             jv_ok(&format!(r#""sandbox": {{"share": {all}}}"#))
+                .grants
                 .sandbox
                 .share,
             NAMESPACES.to_vec()
@@ -340,13 +346,13 @@ mod tests {
             assert_eq!(sc.as_str(), name);
             assert_eq!(OptInSyscall::try_from(name.to_owned()).unwrap(), *sc);
             let m = toml_ok(&format!("sandbox.allow_syscalls = [{name:?}]"));
-            assert_eq!(m.sandbox.allow_syscalls, vec![*sc]);
+            assert_eq!(m.grants.sandbox.allow_syscalls, vec![*sc]);
             let j = jv_ok(&format!(r#""sandbox": {{"allow_syscalls": [{name:?}]}}"#));
-            assert_eq!(j.sandbox.allow_syscalls, vec![*sc]);
+            assert_eq!(j.grants.sandbox.allow_syscalls, vec![*sc]);
         }
         let m = toml_ok("sandbox.allow_syscalls = [\"ptrace\", \"bpf\"]");
         assert_eq!(
-            m.sandbox.allow_syscalls,
+            m.grants.sandbox.allow_syscalls,
             vec![OptInSyscall::Ptrace, OptInSyscall::Bpf]
         );
     }

@@ -281,11 +281,11 @@ mod tests {
         let want = EnvGrants::default();
         assert!(want.pass.is_empty() && want.deny.is_empty());
         assert!(want.set.is_empty() && want.path_prepend.is_empty());
-        assert_eq!(Manifest::default().env, want);
-        assert_eq!(toml_ok("").env, want);
-        assert_eq!(toml_ok("[env]").env, want);
-        assert_eq!(jv_ok("").env, want);
-        assert_eq!(jv_ok(r#""env": {}"#).env, want);
+        assert_eq!(Manifest::default().grants.env, want);
+        assert_eq!(toml_ok("").grants.env, want);
+        assert_eq!(toml_ok("[env]").grants.env, want);
+        assert_eq!(jv_ok("").grants.env, want);
+        assert_eq!(jv_ok(r#""env": {}"#).grants.env, want);
     }
 
     #[test]
@@ -310,12 +310,12 @@ mod tests {
             pass = ["TERM", "LANG", "COLORTERM"]
             deny = ["*_TOKEN", "*_KEY", "*_SECRET", "*_PASSWORD", "AWS_*", "GITHUB_*", "SSH_AUTH_SOCK", "NIX_CONFIG"]
         "#;
-        assert_eq!(toml_ok(toml).env, want);
+        assert_eq!(toml_ok(toml).grants.env, want);
         let json = r#""env": {
             "pass": ["TERM", "LANG", "COLORTERM"],
             "deny": ["*_TOKEN", "*_KEY", "*_SECRET", "*_PASSWORD", "AWS_*", "GITHUB_*", "SSH_AUTH_SOCK", "NIX_CONFIG"]
         }"#;
-        assert_eq!(jv_ok(json).env, want);
+        assert_eq!(jv_ok(json).grants.env, want);
     }
 
     #[test]
@@ -349,14 +349,14 @@ mod tests {
             set  = { EDITOR = "nvim" }
             path_prepend = ["/nix/store/abc-tools/bin"]
         "#;
-        assert_eq!(toml_ok(toml).env, want);
+        assert_eq!(toml_ok(toml).grants.env, want);
         let json = r#""env": {
             "pass": ["TERM", "LANG", "COLORTERM", "RUST_*", "CARGO_*", "PKG_CONFIG_*"],
             "deny": ["*_TOKEN", "*_KEY", "*_SECRET", "*_PASSWORD", "AWS_*", "GITHUB_*", "SSH_AUTH_SOCK", "NIX_CONFIG"],
             "set": { "EDITOR": "nvim" },
             "path_prepend": ["/nix/store/abc-tools/bin"]
         }"#;
-        assert_eq!(jv_ok(json).env, want);
+        assert_eq!(jv_ok(json).grants.env, want);
     }
 
     #[test]
@@ -365,10 +365,10 @@ mod tests {
             r#""env": { "pass": ["TERM"], "deny": ["*_TOKEN"], "set": { "LANG": "C.UTF-8" }, "path_prepend": ["/nix/store/x/bin"] }"#,
         );
         assert_eq!(m.version, ManifestVersion::V1);
-        assert_eq!(m.env.pass, pats(&["TERM"]));
-        assert_eq!(m.env.deny, pats(&["*_TOKEN"]));
-        assert_eq!(m.env.set, set(&[("LANG", "C.UTF-8")]));
-        assert_eq!(m.env.path_prepend, vec![sp("/nix/store/x/bin")]);
+        assert_eq!(m.grants.env.pass, pats(&["TERM"]));
+        assert_eq!(m.grants.env.deny, pats(&["*_TOKEN"]));
+        assert_eq!(m.grants.env.set, set(&[("LANG", "C.UTF-8")]));
+        assert_eq!(m.grants.env.path_prepend, vec![sp("/nix/store/x/bin")]);
     }
 
     #[test]
@@ -546,19 +546,19 @@ mod tests {
         assert!(msg.contains("path_prepend"), "{msg}");
         // Only the exact name `PATH` is special; `pass`/`deny` may mention it.
         let m = toml_ok("env.set = { PATH_INFO = \"x\", path = \"y\" }");
-        assert_eq!(m.env.set, set(&[("PATH_INFO", "x"), ("path", "y")]));
+        assert_eq!(m.grants.env.set, set(&[("PATH_INFO", "x"), ("path", "y")]));
         let m = toml_ok("env.pass = [\"PATH\"]\nenv.deny = [\"PATH\"]");
-        assert_eq!(m.env.pass, pats(&["PATH"]));
+        assert_eq!(m.grants.env.pass, pats(&["PATH"]));
     }
 
     #[test]
     fn set_map_keys_deserialize_in_both_formats() {
         let m = jv_ok(r#""env": {"set": {"B": "2", "A": "1", "_C": ""}}"#);
-        let keys: Vec<_> = m.env.set.keys().map(EnvName::as_str).collect();
+        let keys: Vec<_> = m.grants.env.set.keys().map(EnvName::as_str).collect();
         assert_eq!(keys, ["A", "B", "_C"]);
-        assert_eq!(m.env.set[&name("_C")].as_str(), "");
+        assert_eq!(m.grants.env.set[&name("_C")].as_str(), "");
         let m = toml_ok("[env.set]\nB = \"2\"\nA = \"1\"");
-        assert_eq!(m.env.set, set(&[("A", "1"), ("B", "2")]));
+        assert_eq!(m.grants.env.set, set(&[("A", "1"), ("B", "2")]));
     }
 
     #[test]

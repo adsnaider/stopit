@@ -176,11 +176,11 @@ mod tests {
         assert_eq!(want.dev, None);
         assert!(want.etc.is_empty());
         assert_eq!(want.home, None);
-        assert_eq!(Manifest::default().system, want);
-        assert_eq!(toml_ok("").system, want);
-        assert_eq!(toml_ok("[system]").system, want);
-        assert_eq!(jv_ok("").system, want);
-        assert_eq!(jv_ok(r#""system": {}"#).system, want);
+        assert_eq!(Manifest::default().grants.system, want);
+        assert_eq!(toml_ok("").grants.system, want);
+        assert_eq!(toml_ok("[system]").grants.system, want);
+        assert_eq!(jv_ok("").grants.system, want);
+        assert_eq!(jv_ok(r#""system": {}"#).grants.system, want);
     }
 
     #[test]
@@ -194,23 +194,26 @@ mod tests {
         let toml = r#"
             system = { proc = true, dev = "minimal", etc = ["passwd", "group", "hosts", "nsswitch.conf"], home = "/home/user" }
         "#;
-        assert_eq!(toml_ok(toml).system, want);
+        assert_eq!(toml_ok(toml).grants.system, want);
         let json = r#""system": { "proc": true, "dev": "minimal", "etc": ["passwd", "group", "hosts", "nsswitch.conf"], "home": "/home/user" }"#;
-        assert_eq!(jv_ok(json).system, want);
+        assert_eq!(jv_ok(json).grants.system, want);
         // As a standalone table too.
         let toml = "[system]\nproc = true\ndev = \"minimal\"\netc = [\"passwd\", \"group\", \"hosts\", \"nsswitch.conf\"]\nhome = \"/home/user\"";
-        assert_eq!(toml_ok(toml).system, want);
+        assert_eq!(toml_ok(toml).grants.system, want);
     }
 
     #[test]
     fn proc_is_tri_state() {
-        assert_eq!(toml_ok("system.proc = true").system.proc, Some(true));
-        assert_eq!(toml_ok("system.proc = false").system.proc, Some(false));
+        assert_eq!(toml_ok("system.proc = true").grants.system.proc, Some(true));
         assert_eq!(
-            jv_ok(r#""system": {"proc": false}"#).system.proc,
+            toml_ok("system.proc = false").grants.system.proc,
             Some(false)
         );
-        assert_eq!(jv_ok(r#""system": {}"#).system.proc, None);
+        assert_eq!(
+            jv_ok(r#""system": {"proc": false}"#).grants.system.proc,
+            Some(false)
+        );
+        assert_eq!(jv_ok(r#""system": {}"#).grants.system.proc, None);
         toml_err("system.proc = \"yes\"");
         jv_err(r#""system": {"proc": 1}"#);
     }
@@ -218,11 +221,11 @@ mod tests {
     #[test]
     fn dev_mode_parses_and_displays() {
         assert_eq!(
-            toml_ok("system.dev = \"minimal\"").system.dev,
+            toml_ok("system.dev = \"minimal\"").grants.system.dev,
             Some(DevMode::Minimal)
         );
         assert_eq!(
-            jv_ok(r#""system": {"dev": "minimal"}"#).system.dev,
+            jv_ok(r#""system": {"dev": "minimal"}"#).grants.system.dev,
             Some(DevMode::Minimal)
         );
         assert_eq!(DevMode::Minimal.to_string(), "minimal");
@@ -243,9 +246,9 @@ mod tests {
             assert_eq!(file.to_string(), name);
             assert_eq!(file.as_str(), name);
             let m = toml_ok(&format!("system.etc = [{name:?}]"));
-            assert_eq!(m.system.etc, vec![file]);
+            assert_eq!(m.grants.system.etc, vec![file]);
             let j = jv_ok(&format!(r#""system": {{"etc": [{name:?}]}}"#));
-            assert_eq!(j.system.etc, vec![file]);
+            assert_eq!(j.grants.system.etc, vec![file]);
         }
     }
 
@@ -282,11 +285,15 @@ mod tests {
             assert_eq!(h.to_string(), good);
             assert_eq!(SandboxHome::try_from(good.to_owned()).unwrap(), h);
             assert_eq!(
-                toml_ok(&format!("system.home = {good:?}")).system.home,
+                toml_ok(&format!("system.home = {good:?}"))
+                    .grants
+                    .system
+                    .home,
                 Some(h.clone())
             );
             assert_eq!(
                 jv_ok(&format!(r#""system": {{"home": {good:?}}}"#))
+                    .grants
                     .system
                     .home,
                 Some(h)

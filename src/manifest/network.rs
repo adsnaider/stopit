@@ -166,11 +166,11 @@ mod tests {
         let want = NetworkGrants::default();
         assert_eq!(want.mode, None);
         assert!(want.allow_domains.is_empty());
-        assert_eq!(Manifest::default().network, want);
-        assert_eq!(toml_ok("").network, want);
-        assert_eq!(toml_ok("[network]").network, want);
-        assert_eq!(jv_ok("").network, want);
-        assert_eq!(jv_ok(r#""network": {}"#).network, want);
+        assert_eq!(Manifest::default().grants.network, want);
+        assert_eq!(toml_ok("").grants.network, want);
+        assert_eq!(toml_ok("[network]").grants.network, want);
+        assert_eq!(jv_ok("").grants.network, want);
+        assert_eq!(jv_ok(r#""network": {}"#).grants.network, want);
     }
 
     #[test]
@@ -179,11 +179,19 @@ mod tests {
             mode: Some(NetworkMode::Loopback),
             allow_domains: vec![],
         };
-        assert_eq!(toml_ok("network = { mode = \"loopback\" }").network, want);
-        assert_eq!(jv_ok(r#""network": { "mode": "loopback" }"#).network, want);
+        assert_eq!(
+            toml_ok("network = { mode = \"loopback\" }").grants.network,
+            want
+        );
+        assert_eq!(
+            jv_ok(r#""network": { "mode": "loopback" }"#).grants.network,
+            want
+        );
         // §3.6 spells out the empty domain list.
         assert_eq!(
-            jv_ok(r#""network": { "mode": "loopback", "allow_domains": [] }"#).network,
+            jv_ok(r#""network": { "mode": "loopback", "allow_domains": [] }"#)
+                .grants
+                .network,
             want
         );
     }
@@ -203,21 +211,21 @@ mod tests {
             mode = "proxy"
             allow_domains = ["cache.nixos.org", "index.crates.io", "static.crates.io"]
         "#;
-        assert_eq!(toml_ok(toml).network, want);
+        assert_eq!(toml_ok(toml).grants.network, want);
         let json = r#""network": {"mode": "proxy", "allow_domains": ["cache.nixos.org", "index.crates.io", "static.crates.io"]}"#;
-        assert_eq!(jv_ok(json).network, want);
+        assert_eq!(jv_ok(json).grants.network, want);
         // The inline form from §3.1.
         let toml = "network = { mode = \"proxy\", allow_domains = [\"cache.nixos.org\", \"index.crates.io\", \"static.crates.io\"] }";
-        assert_eq!(toml_ok(toml).network, want);
+        assert_eq!(toml_ok(toml).grants.network, want);
     }
 
     #[test]
     fn every_mode_parses() {
         for mode in ["none", "loopback", "proxy", "full"] {
             let m = toml_ok(&format!("network.mode = {mode:?}"));
-            assert_eq!(m.network.mode.unwrap().to_string(), mode);
+            assert_eq!(m.grants.network.mode.unwrap().to_string(), mode);
             let j = jv_ok(&format!(r#""network": {{"mode": {mode:?}}}"#));
-            assert_eq!(j.network.mode, m.network.mode);
+            assert_eq!(j.grants.network.mode, m.grants.network.mode);
         }
         for bad in ["host", "Proxy", "NONE", ""] {
             toml_err(&format!("network.mode = {bad:?}"));
@@ -253,9 +261,9 @@ mod tests {
             assert_eq!(d.to_string(), good);
             assert_eq!(Domain::try_from(good.to_owned()).unwrap(), d);
             let m = toml_ok(&format!("network.allow_domains = [{good:?}]"));
-            assert_eq!(m.network.allow_domains, vec![d.clone()]);
+            assert_eq!(m.grants.network.allow_domains, vec![d.clone()]);
             let j = jv_ok(&format!(r#""network": {{"allow_domains": [{good:?}]}}"#));
-            assert_eq!(j.network.allow_domains, vec![d]);
+            assert_eq!(j.grants.network.allow_domains, vec![d]);
         }
     }
 

@@ -2,9 +2,9 @@
 //! (DESIGN.md §3.6).
 //!
 //! The same schema is written inline as `[provider.sandbox]` in TOML and
-//! printed as JSON by script providers. `version` and the `fs`, `system`,
-//! `env`, `network` and `sandbox` sections exist so far; the remaining
-//! sections are rejected as unknown keys until they are implemented.
+//! printed as JSON by script providers. `version`, the grant sections `fs`,
+//! `system`, `env`, `network`, `sandbox` and `shims`, and contributed
+//! `profiles` exist; any other key is rejected as unknown.
 //!
 //! Path values are validated *syntactically* here. Expanding `{workspace}`
 //! and `~`, expanding globs and mapping to sandbox paths happens later.
@@ -16,10 +16,12 @@
 mod env;
 mod network;
 mod sandbox;
+mod shim;
 mod system;
 #[cfg(test)]
 mod test_util;
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -28,6 +30,7 @@ use serde::de::Error as _;
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::config::{Inherit, ProfileName};
 use crate::error::ValueError;
 use crate::policy::PathMode;
 use crate::serde_util::MapOnly;
@@ -35,6 +38,7 @@ use crate::serde_util::MapOnly;
 pub use env::{EnvGrants, EnvName, EnvPattern, EnvValue, SearchPathEntry};
 pub use network::{Domain, NetworkGrants};
 pub use sandbox::{OptInSyscall, SandboxGrants, ShareableNamespace};
+pub use shim::{BinaryName, Flag, ShimAction, ShimName, ShimRule, ShimSpec, SubcommandPattern};
 pub use system::{DevMode, EtcFile, SandboxHome, SystemGrants};
 
 /// Error produced while loading a manifest document from JSON.
@@ -47,18 +51,15 @@ pub enum ManifestError {
     Json(#[from] serde_json::Error),
 }
 
-/// A manifest (DESIGN.md §3.6). Every section is optional.
+/// The grant sections shared by a manifest and each profile it contributes
+/// (DESIGN.md §3.6).
 ///
-/// Deserializes from a table or object only, never from a sequence.
-///
-/// The generic `Deserialize` impl applies the inline-TOML rule: `version`
-/// may be omitted and defaults to 1. JSON callers must use
-/// [`Manifest::from_json_str`], which requires `version`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(from = "MapOnly<RawManifest>")]
-pub struct Manifest {
-    /// Schema version; only `1` exists.
-    pub version: ManifestVersion,
+/// In a document these are direct keys of the enclosing table. `Grants` has
+/// no `Deserialize` impl of its own: `#[serde(flatten)]` cannot be combined
+/// with `deny_unknown_fields`, so [`Manifest`] and [`ContributedProfile`]
+/// deserialize the sections themselves and assemble a `Grants`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Grants {
     /// Filesystem grants.
     pub fs: FsGrants,
     /// System mounts and synthesized files.
@@ -69,6 +70,33 @@ pub struct Manifest {
     pub network: NetworkGrants,
     /// Hardening opt-outs.
     pub sandbox: SandboxGrants,
+    /// Brokered commands, by the name they are installed under.
+    pub shims: BTreeMap<ShimName, ShimSpec>,
+}
+
+/// A manifest (DESIGN.md §3.6). Every section is optional.
+///
+/// Deserializes from a table or object only, never from a sequence.
+///
+/// The grant sections are top-level keys of the document and are held in
+/// [`Manifest::grants`]. `profiles` is not part of `Grants`: contributed
+/// profiles cannot themselves contribute profiles. Inside a manifest,
+/// contributed-profile keys are plain names; the provider-name prefix is
+/// applied later, when the profiles are registered.
+///
+/// The generic `Deserialize` impl applies the inline-TOML rule: `version`
+/// may be omitted and defaults to 1. JSON callers must use
+/// [`Manifest::from_json_str`], which requires `version`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(from = "MapOnly<RawManifest>")]
+pub struct Manifest {
+    /// Schema version; only `1` exists.
+    pub version: ManifestVersion,
+    /// The grants applied to the profile this manifest is attached to.
+    pub grants: Grants,
+    /// Profiles contributed by this manifest. Keys are plain names; the
+    /// provider prefix is added when the profile is registered.
+    pub profiles: BTreeMap<ProfileName, ContributedProfile>,
 }
 
 #[derive(Default, Deserialize)]
@@ -80,17 +108,68 @@ struct RawManifest {
     env: EnvGrants,
     network: NetworkGrants,
     sandbox: SandboxGrants,
+    shims: BTreeMap<ShimName, ShimSpec>,
+    profiles: BTreeMap<ProfileName, ContributedProfile>,
 }
 
 impl From<MapOnly<RawManifest>> for Manifest {
     fn from(MapOnly(raw): MapOnly<RawManifest>) -> Self {
         Manifest {
             version: raw.version.unwrap_or_default(),
-            fs: raw.fs,
-            system: raw.system,
-            env: raw.env,
-            network: raw.network,
-            sandbox: raw.sandbox,
+            grants: Grants {
+                fs: raw.fs,
+                system: raw.system,
+                env: raw.env,
+                network: raw.network,
+                sandbox: raw.sandbox,
+                shims: raw.shims,
+            },
+            profiles: raw.profiles,
+        }
+    }
+}
+
+/// A profile contributed by a manifest (DESIGN.md §3.3, §3.6): where it
+/// starts from, plus grants for it.
+///
+/// The grant sections are direct keys alongside `inherit`. There is no
+/// `profiles` or `version` key: contributed profiles do not nest. Whether
+/// `inherit` resolves is checked later.
+///
+/// Deserializes from a table or object only, never from a sequence.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(from = "MapOnly<RawContributedProfile>")]
+pub struct ContributedProfile {
+    /// Parent profile; defaults to `main`.
+    pub inherit: Inherit,
+    /// The grants for this profile.
+    pub grants: Grants,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawContributedProfile {
+    inherit: Inherit,
+    fs: FsGrants,
+    system: SystemGrants,
+    env: EnvGrants,
+    network: NetworkGrants,
+    sandbox: SandboxGrants,
+    shims: BTreeMap<ShimName, ShimSpec>,
+}
+
+impl From<MapOnly<RawContributedProfile>> for ContributedProfile {
+    fn from(MapOnly(raw): MapOnly<RawContributedProfile>) -> Self {
+        ContributedProfile {
+            inherit: raw.inherit,
+            grants: Grants {
+                fs: raw.fs,
+                system: raw.system,
+                env: raw.env,
+                network: raw.network,
+                sandbox: raw.sandbox,
+                shims: raw.shims,
+            },
         }
     }
 }
@@ -483,8 +562,8 @@ mod tests {
     fn default_manifest() -> Manifest {
         Manifest {
             version: ManifestVersion::V1,
-            fs: FsGrants::default(),
-            ..Manifest::default()
+            grants: Grants::default(),
+            profiles: BTreeMap::new(),
         }
     }
 
@@ -493,8 +572,8 @@ mod tests {
         let m = toml_ok("");
         assert_eq!(m, default_manifest());
         assert_eq!(m.version.get(), 1);
-        assert_eq!(m.fs, FsGrants::default());
-        assert_eq!(m.fs.mask_sockets, None);
+        assert_eq!(m.grants.fs, FsGrants::default());
+        assert_eq!(m.grants.fs.mask_sockets, None);
         assert_eq!(jv_ok(""), default_manifest());
         assert_eq!(Manifest::default(), default_manifest());
         assert_eq!(toml_ok("[fs]"), default_manifest());
@@ -546,8 +625,8 @@ mod tests {
         assert!(msg.contains("unsupported manifest version 2"), "{msg}");
         assert!(!msg.contains("unknown field"), "{msg}");
         // With a supported version the unknown section is the error.
-        let msg = json_err(r#"{"shims": {}, "version": 1}"#);
-        assert!(msg.contains("unknown field `shims`"), "{msg}");
+        let msg = json_err(r#"{"limits": {}, "version": 1}"#);
+        assert!(msg.contains("unknown field `limits`"), "{msg}");
         // A document that is not an object is still rejected up front.
         let msg = json_err("[2]");
         assert!(msg.contains("expected a map"), "{msg}");
@@ -591,23 +670,29 @@ mod tests {
 
     #[test]
     fn mask_sockets_is_tri_state() {
-        assert_eq!(toml_ok("").fs.mask_sockets, None);
-        assert_eq!(jv_ok("").fs.mask_sockets, None);
-        assert_eq!(jv_ok(r#""fs": {}"#).fs.mask_sockets, None);
+        assert_eq!(toml_ok("").grants.fs.mask_sockets, None);
+        assert_eq!(jv_ok("").grants.fs.mask_sockets, None);
+        assert_eq!(jv_ok(r#""fs": {}"#).grants.fs.mask_sockets, None);
         assert_eq!(
-            toml_ok("fs.mask_sockets = true").fs.mask_sockets,
+            toml_ok("fs.mask_sockets = true").grants.fs.mask_sockets,
             Some(true)
         );
         assert_eq!(
-            toml_ok("fs.mask_sockets = false").fs.mask_sockets,
+            toml_ok("fs.mask_sockets = false").grants.fs.mask_sockets,
             Some(false)
         );
         assert_eq!(
-            jv_ok(r#""fs": {"mask_sockets": true}"#).fs.mask_sockets,
+            jv_ok(r#""fs": {"mask_sockets": true}"#)
+                .grants
+                .fs
+                .mask_sockets,
             Some(true)
         );
         assert_eq!(
-            jv_ok(r#""fs": {"mask_sockets": false}"#).fs.mask_sockets,
+            jv_ok(r#""fs": {"mask_sockets": false}"#)
+                .grants
+                .fs
+                .mask_sockets,
             Some(false)
         );
         toml_err("fs.mask_sockets = \"yes\"");
@@ -634,7 +719,7 @@ mod tests {
     fn appendix_a_fs_table_parses() {
         let m = toml_ok(APPENDIX_FS_TOML);
         assert_eq!(
-            m.fs,
+            m.grants.fs,
             FsGrants {
                 rw: pps(&["{workspace}"]),
                 ro: vec![],
@@ -666,20 +751,23 @@ mod tests {
     fn section_3_6_expected() -> Manifest {
         Manifest {
             version: ManifestVersion::V1,
-            fs: FsGrants {
-                rw: pps(&["{workspace}"]),
-                ro: vec![],
-                masked: vec![],
-                protected: vec![],
-                ephemeral: pps(&["/tmp", "~"]),
-                bind: vec![Bind {
-                    host: pp("/etc/ssl/certs"),
-                    sandbox: "/etc/ssl/certs".parse().unwrap(),
-                    mode: BindMode::Ro,
-                }],
-                mask_sockets: Some(true),
+            grants: Grants {
+                fs: FsGrants {
+                    rw: pps(&["{workspace}"]),
+                    ro: vec![],
+                    masked: vec![],
+                    protected: vec![],
+                    ephemeral: pps(&["/tmp", "~"]),
+                    bind: vec![Bind {
+                        host: pp("/etc/ssl/certs"),
+                        sandbox: "/etc/ssl/certs".parse().unwrap(),
+                        mode: BindMode::Ro,
+                    }],
+                    mask_sockets: Some(true),
+                },
+                ..Grants::default()
             },
-            ..Manifest::default()
+            profiles: BTreeMap::new(),
         }
     }
 
@@ -850,7 +938,7 @@ mod tests {
             "#,
         );
         assert_eq!(
-            m.fs.bind,
+            m.grants.fs.bind,
             vec![
                 Bind {
                     host: pp("~/.cache/tool"),
@@ -865,8 +953,8 @@ mod tests {
             ]
         );
         let m = jv_ok(r#""fs": {"bind": [{"host": "/a", "sandbox": "~", "mode": "ro"}]}"#);
-        assert_eq!(m.fs.bind[0].sandbox.as_str(), "~");
-        assert_eq!(m.fs.bind[0].mode, BindMode::Ro);
+        assert_eq!(m.grants.fs.bind[0].sandbox.as_str(), "~");
+        assert_eq!(m.grants.fs.bind[0].mode, BindMode::Ro);
     }
 
     fn bind_json(host: &str, sandbox: &str, mode: &str) -> String {
@@ -883,7 +971,7 @@ mod tests {
             ("protected", BindMode::Protected, PathMode::Protected),
         ] {
             let m = Manifest::from_json_str(&bind_json("/a", "/a", s)).unwrap();
-            assert_eq!(m.fs.bind[0].mode, b);
+            assert_eq!(m.grants.fs.bind[0].mode, b);
             assert_eq!(b.to_string(), s);
             assert_eq!(b.as_str(), s);
             assert_eq!(PathMode::from(b), p);
@@ -975,8 +1063,7 @@ mod tests {
     fn unknown_keys_are_rejected() {
         for (src, key) in [
             ("verson = 1", "verson"),
-            ("[shims]", "shims"),
-            ("[profiles.x]", "profiles"),
+            ("[limits]", "limits"),
             ("[fs]\nrww = []", "rww"),
             ("[fs]\nmask_socket = true", "mask_socket"),
             (
@@ -989,8 +1076,7 @@ mod tests {
         }
         for (src, key) in [
             (r#""verson": 1"#, "verson"),
-            (r#""shims": {}"#, "shims"),
-            (r#""profiles": {}"#, "profiles"),
+            (r#""limits": {}"#, "limits"),
             (r#""fs": {"rww": []}"#, "rww"),
             (r#""fs": {"mask_socket": true}"#, "mask_socket"),
             (
@@ -1001,6 +1087,242 @@ mod tests {
             let msg = jv_err(src);
             assert!(msg.contains(key), "{src}: {msg}");
         }
+    }
+
+    fn pname(s: &str) -> ProfileName {
+        s.parse().unwrap()
+    }
+
+    fn inherit_ref(s: &str) -> Inherit {
+        Inherit::Profile(s.parse().unwrap())
+    }
+
+    #[test]
+    fn no_profiles_is_empty() {
+        assert!(toml_ok("").profiles.is_empty());
+        assert!(toml_ok("[profiles]").profiles.is_empty());
+        assert!(jv_ok("").profiles.is_empty());
+        assert!(jv_ok(r#""profiles": {}"#).profiles.is_empty());
+    }
+
+    #[test]
+    fn empty_contributed_profile_inherits_main() {
+        let m = toml_ok("[profiles.ro]");
+        assert_eq!(m.profiles.len(), 1);
+        assert_eq!(m.profiles[&pname("ro")], ContributedProfile::default());
+        assert_eq!(m.profiles[&pname("ro")].inherit, inherit_ref("main"));
+        assert_eq!(jv_ok(r#""profiles": {"ro": {}}"#), m);
+    }
+
+    const APPENDIX_PROFILES_TOML: &str = r#"
+        [profiles.ro]       # inherits "main"
+        fs.ro = ["{workspace}/.git", "{workspace}/.jj", "~/.config/jj/repos/abc123"]
+
+        [profiles.local]
+        fs.rw = ["{workspace}/.git", "{workspace}/.jj"]
+        fs.ro = [
+          "{workspace}/.git/config", "{workspace}/.git/config.worktree", "{workspace}/.git/info/attributes",
+          "{workspace}/.git/modules/*/config", "{workspace}/.git/worktrees/*/config.worktree",
+          "{workspace}/.jj/repo/config.toml", "~/.config/jj/repos/abc123",
+        ]
+        fs.masked = ["{workspace}/.git/hooks", "{workspace}/.git/modules/*/hooks"]
+
+        [profiles.remote]
+        inherit = "vcs.local"
+        network.mode = "proxy"
+    "#;
+
+    #[test]
+    fn appendix_a_contributed_profiles_parse() {
+        let m = toml_ok(APPENDIX_PROFILES_TOML);
+        let keys: Vec<&str> = m.profiles.keys().map(ProfileName::as_str).collect();
+        assert_eq!(keys, ["local", "remote", "ro"]);
+
+        let ro = &m.profiles[&pname("ro")];
+        assert_eq!(ro.inherit, inherit_ref("main"));
+        assert_eq!(
+            ro.grants,
+            Grants {
+                fs: FsGrants {
+                    ro: pps(&[
+                        "{workspace}/.git",
+                        "{workspace}/.jj",
+                        "~/.config/jj/repos/abc123"
+                    ]),
+                    ..FsGrants::default()
+                },
+                ..Grants::default()
+            }
+        );
+
+        let local = &m.profiles[&pname("local")];
+        assert_eq!(local.inherit, inherit_ref("main"));
+        assert_eq!(
+            local.grants.fs.rw,
+            pps(&["{workspace}/.git", "{workspace}/.jj"])
+        );
+        assert_eq!(
+            local.grants.fs.ro,
+            pps(&[
+                "{workspace}/.git/config",
+                "{workspace}/.git/config.worktree",
+                "{workspace}/.git/info/attributes",
+                "{workspace}/.git/modules/*/config",
+                "{workspace}/.git/worktrees/*/config.worktree",
+                "{workspace}/.jj/repo/config.toml",
+                "~/.config/jj/repos/abc123",
+            ])
+        );
+        assert_eq!(
+            local.grants.fs.masked,
+            pps(&["{workspace}/.git/hooks", "{workspace}/.git/modules/*/hooks"])
+        );
+        assert_eq!(local.grants.network, NetworkGrants::default());
+
+        let remote = &m.profiles[&pname("remote")];
+        assert_eq!(remote.inherit, inherit_ref("vcs.local"));
+        assert_eq!(
+            remote.grants,
+            Grants {
+                network: NetworkGrants {
+                    mode: Some(crate::policy::NetworkMode::Proxy),
+                    allow_domains: vec![],
+                },
+                ..Grants::default()
+            }
+        );
+        // The manifest's own grants are untouched.
+        assert_eq!(m.grants, Grants::default());
+    }
+
+    #[test]
+    fn appendix_a_contributed_profiles_as_json_match_toml() {
+        let json = r#"{"version": 1, "profiles": {
+            "ro": {"fs": {"ro": ["{workspace}/.git", "{workspace}/.jj", "~/.config/jj/repos/abc123"]}},
+            "local": {
+                "fs": {
+                    "rw": ["{workspace}/.git", "{workspace}/.jj"],
+                    "ro": ["{workspace}/.git/config", "{workspace}/.git/config.worktree",
+                           "{workspace}/.git/info/attributes", "{workspace}/.git/modules/*/config",
+                           "{workspace}/.git/worktrees/*/config.worktree",
+                           "{workspace}/.jj/repo/config.toml", "~/.config/jj/repos/abc123"],
+                    "masked": ["{workspace}/.git/hooks", "{workspace}/.git/modules/*/hooks"]
+                }
+            },
+            "remote": {"inherit": "vcs.local", "network": {"mode": "proxy"}}
+        }}"#;
+        assert_eq!(
+            Manifest::from_json_str(json).unwrap(),
+            toml_ok(APPENDIX_PROFILES_TOML)
+        );
+    }
+
+    #[test]
+    fn manifest_with_grants_shims_and_profiles_together() {
+        let m = toml_ok(
+            r#"
+            fs.rw = ["{workspace}"]
+            shims.sh = { binary = "fish", default = { decision = "allow", profile = "main" } }
+            [profiles.a]
+            inherit = "none"
+            shims.sh = { binary = "bash", default = { decision = "deny" } }
+            network.mode = "loopback"
+            "#,
+        );
+        assert_eq!(m.grants.fs.rw, pps(&["{workspace}"]));
+        assert_eq!(m.grants.shims.len(), 1);
+        assert_eq!(
+            m.grants.shims[&"sh".parse().unwrap()].binary.as_str(),
+            "fish"
+        );
+        let a = &m.profiles[&pname("a")];
+        assert_eq!(a.inherit, Inherit::None);
+        assert_eq!(
+            a.grants.shims[&"sh".parse().unwrap()].binary.as_str(),
+            "bash"
+        );
+        assert_eq!(
+            a.grants.network.mode,
+            Some(crate::policy::NetworkMode::Loopback)
+        );
+    }
+
+    #[test]
+    fn contributed_profile_inherit_values() {
+        let m = toml_ok(
+            "[profiles.a]\ninherit = \"vcs.local\"\n[profiles.b]\ninherit = \"none\"\n[profiles.c]\ninherit = \"a\"",
+        );
+        assert_eq!(m.profiles[&pname("a")].inherit, inherit_ref("vcs.local"));
+        assert_eq!(m.profiles[&pname("b")].inherit, Inherit::None);
+        assert_eq!(m.profiles[&pname("c")].inherit, inherit_ref("a"));
+        let m = jv_ok(r#""profiles": {"a": {"inherit": "vcs.local"}, "b": {"inherit": "none"}}"#);
+        assert_eq!(m.profiles[&pname("a")].inherit, inherit_ref("vcs.local"));
+        assert_eq!(m.profiles[&pname("b")].inherit, Inherit::None);
+        // Unresolved references are accepted here.
+        let m = toml_ok("[profiles.a]\ninherit = \"nope.nothing\"");
+        assert_eq!(m.profiles[&pname("a")].inherit, inherit_ref("nope.nothing"));
+        for bad in ["", "Vcs", "vcs.", "a b"] {
+            let msg = toml_err(&format!("[profiles.a]\ninherit = {bad:?}"));
+            assert!(msg.contains("profile reference"), "{bad:?}: {msg}");
+        }
+        toml_err("[profiles.a]\ninherit = 5");
+    }
+
+    #[test]
+    fn invalid_contributed_profile_names() {
+        for bad in ["main", "none", "vcs.local", "Local", "1a", "", "a b"] {
+            let msg = toml_err(&format!("[profiles.\"{bad}\"]"));
+            assert!(msg.contains("profile name"), "{bad:?}: {msg}");
+            assert!(msg.contains(&format!("{bad:?}")), "{bad:?}: {msg}");
+            let msg = jv_err(&format!(r#""profiles": {{"{bad}": {{}}}}"#));
+            assert!(msg.contains("profile name"), "{bad:?}: {msg}");
+        }
+        let msg = toml_err("[profiles.main]");
+        assert!(msg.contains("reserved"), "{msg}");
+        let msg = toml_err("[profiles.none]");
+        assert!(msg.contains("reserved"), "{msg}");
+        // Unquoted, this is the nested table `profiles.vcs` with key `local`.
+        toml_err("[profiles.vcs.local]");
+    }
+
+    #[test]
+    fn contributed_profiles_do_not_nest_or_version() {
+        let msg = toml_err("[profiles.a.profiles.b]");
+        assert!(msg.contains("profiles"), "{msg}");
+        let msg = toml_err("[profiles.a]\nprofiles = {}");
+        assert!(msg.contains("unknown field `profiles`"), "{msg}");
+        let msg = toml_err("[profiles.a]\nversion = 1");
+        assert!(msg.contains("unknown field `version`"), "{msg}");
+        let msg = jv_err(r#""profiles": {"a": {"profiles": {}}}"#);
+        assert!(msg.contains("unknown field `profiles`"), "{msg}");
+        let msg = jv_err(r#""profiles": {"a": {"version": 1}}"#);
+        assert!(msg.contains("unknown field `version`"), "{msg}");
+    }
+
+    #[test]
+    fn contributed_profiles_are_map_only_and_reject_unknown_keys() {
+        for src in [
+            r#""profiles": []"#,
+            r#""profiles": {"a": []}"#,
+            r#""profiles": {"a": ["none"]}"#,
+            r#""profiles": {"a": {"fs": []}}"#,
+            r#""profiles": {"a": {"shims": []}}"#,
+        ] {
+            let msg = jv_err(src);
+            assert!(msg.contains("expected a map"), "{src}: {msg}");
+        }
+        for src in ["profiles = []", "profiles.a = []", "[profiles.a]\nfs = []"] {
+            let msg = toml_err(src);
+            assert!(msg.contains("expected a map"), "{src}: {msg}");
+        }
+        let msg = toml_err("[profiles.a]\ninheirt = \"none\"");
+        assert!(msg.contains("unknown field `inheirt`"), "{msg}");
+        let msg = toml_err("[profiles.a]\nfs.rww = []");
+        assert!(msg.contains("rww"), "{msg}");
+        let msg = jv_err(r#""profiles": {"a": {"inheirt": "none"}}"#);
+        assert!(msg.contains("unknown field `inheirt`"), "{msg}");
+        let msg = jv_err(r#""profiles": {"a": {"network": {"mod": "none"}}}"#);
+        assert!(msg.contains("mod"), "{msg}");
     }
 
     #[test]
