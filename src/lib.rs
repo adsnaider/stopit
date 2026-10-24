@@ -2,6 +2,7 @@
 //! the filesystem, network and other host resources. See `DESIGN.md` at the
 //! repository root for the full design.
 
+pub mod config;
 pub mod policy;
 
 /// The version of the `stopit` crate.
