@@ -1,12 +1,17 @@
 //! Session-wide top-level configuration settings (DESIGN.md §3.1).
 //!
 //! Only the settings that are not grants live here: `base`, `[workspace]`,
-//! `[limits]`, `[approval]` and `[terminal]`. Profiles and providers are not
-//! handled yet.
+//! `[limits]`, `[approval]` and `[terminal]`, plus the structure of
+//! `[profiles.<name>]` declarations. Providers are not handled yet.
 //!
 //! This is security configuration, so every table rejects unknown keys:
 //! a typo must fail loudly instead of silently falling back to a default.
 
+mod profile;
+
+pub use profile::{Inherit, ProfileDecl, ProfileName, ProfileRef};
+
+use std::collections::BTreeMap;
 use std::num::{IntErrorKind, NonZeroU32};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -46,6 +51,9 @@ pub struct Config {
     pub approval: Approval,
     /// Terminal settings (§5).
     pub terminal: Terminal,
+    /// User-declared profiles (§3.3). `main` is implicit and cannot be
+    /// declared.
+    pub profiles: BTreeMap<ProfileName, ProfileDecl>,
 }
 
 impl Config {
@@ -383,6 +391,7 @@ mod tests {
                 hotkey: "ctrl-]".to_owned(),
                 clipboard_write: ClipboardWrite::Block,
             },
+            profiles: BTreeMap::new(),
         }
     }
 
@@ -445,6 +454,7 @@ mod tests {
                 hotkey: "ctrl-]".to_owned(),
                 clipboard_write: ClipboardWrite::Ask,
             },
+            profiles: BTreeMap::new(),
         };
         assert_eq!(Config::from_toml_str(src).unwrap(), expected);
     }
@@ -716,7 +726,6 @@ mod tests {
             ("[unknown]\nx = 1", "unknown"),
             // Not implemented yet, so rejected rather than ignored.
             ("[[provider]]\ntype = \"config\"", "provider"),
-            ("[profiles.main]", "profiles"),
         ] {
             let msg = err(src);
             assert!(msg.contains(key), "{src:?}: {msg}");
