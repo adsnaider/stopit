@@ -181,11 +181,8 @@ pub struct PathMapping {
 /// Expands a bind: its `host` on the host side (`{workspace}`, `~` and
 /// absolute paths) and its `sandbox` on the sandbox side (`~` is the sandbox
 /// `HOME`, absolute paths map to themselves).
-///
-/// A bind's host is glob-free when deserialized; if a hand-built `Bind`
-/// contains glob characters they are treated as literal path text.
 pub fn expand_bind(bind: &Bind, ctx: &ExpansionContext) -> PathMapping {
-    let host = expand_pattern(&bind.host, ctx);
+    let host = expand_pattern(bind.host.as_pattern(), ctx);
     let (anchor, rest) = bind.sandbox.split();
     let sandbox_anchor = match anchor {
         SandboxAnchor::Home => ctx.sandbox_home.clone(),
@@ -417,7 +414,7 @@ mod tests {
 
     fn bind(host: &str, sandbox: &str) -> Bind {
         Bind {
-            host: pp(host),
+            host: host.parse().unwrap(),
             sandbox: sandbox.parse().unwrap(),
             mode: crate::manifest::BindMode::Ro,
         }

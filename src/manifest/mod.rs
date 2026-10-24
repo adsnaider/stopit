@@ -570,10 +570,10 @@ impl From<BindMode> for PathMode {
 ///
 /// Deserializes from a table or object only, never from a sequence.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "MapOnly<RawBind>")]
+#[serde(from = "MapOnly<RawBind>")]
 pub struct Bind {
-    /// The host path. Must not contain glob characters.
-    pub host: PathPattern,
+    /// The host path; see [`BindHost`]. Never contains glob characters.
+    pub host: BindHost,
     /// Where it appears in the sandbox.
     pub sandbox: SandboxPath,
     /// How it is presented.
@@ -583,26 +583,70 @@ pub struct Bind {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawBind {
-    host: PathPattern,
+    host: BindHost,
     sandbox: SandboxPath,
     mode: BindMode,
 }
 
-impl TryFrom<MapOnly<RawBind>> for Bind {
-    type Error = ValueError;
-
-    fn try_from(MapOnly(raw): MapOnly<RawBind>) -> Result<Self, ValueError> {
-        if has_glob(raw.host.as_str()) {
-            return Err(ValueError::new(format!(
-                "invalid bind host {:?}: a bind maps exactly one path, so glob characters are not allowed",
-                raw.host.as_str()
-            )));
-        }
-        Ok(Bind {
+impl From<MapOnly<RawBind>> for Bind {
+    fn from(MapOnly(raw): MapOnly<RawBind>) -> Self {
+        Bind {
             host: raw.host,
             sandbox: raw.sandbox,
             mode: raw.mode,
-        })
+        }
+    }
+}
+
+/// The host side of a bind: a [`PathPattern`] that is guaranteed to contain
+/// no glob characters, because a bind maps exactly one path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[serde(try_from = "String")]
+pub struct BindHost(PathPattern);
+
+impl BindHost {
+    /// The validated pattern text.
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// The underlying (glob-free) pattern.
+    pub fn as_pattern(&self) -> &PathPattern {
+        &self.0
+    }
+
+    /// Splits into anchor and relative remainder; see [`PathPattern::split`].
+    /// The remainder contains no glob characters.
+    pub fn split(&self) -> (PatternAnchor, &str) {
+        self.0.split()
+    }
+}
+
+impl FromStr for BindHost {
+    type Err = ValueError;
+
+    fn from_str(s: &str) -> Result<Self, ValueError> {
+        let pattern: PathPattern = s.parse()?;
+        if has_glob(s) {
+            return Err(ValueError::new(format!(
+                "invalid bind host {s:?}: a bind maps exactly one path, so glob characters are not allowed"
+            )));
+        }
+        Ok(BindHost(pattern))
+    }
+}
+
+impl TryFrom<String> for BindHost {
+    type Error = ValueError;
+
+    fn try_from(s: String) -> Result<Self, ValueError> {
+        s.parse()
+    }
+}
+
+impl fmt::Display for BindHost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 
@@ -819,7 +863,7 @@ mod tests {
                     protected: vec![],
                     ephemeral: pps(&["/tmp", "~"]),
                     bind: vec![Bind {
-                        host: pp("/etc/ssl/certs"),
+                        host: "/etc/ssl/certs".parse().unwrap(),
                         sandbox: "/etc/ssl/certs".parse().unwrap(),
                         mode: BindMode::Ro,
                     }],
@@ -1001,12 +1045,12 @@ mod tests {
             m.grants.fs.bind,
             vec![
                 Bind {
-                    host: pp("~/.cache/tool"),
+                    host: "~/.cache/tool".parse().unwrap(),
                     sandbox: "~/.cache/tool".parse().unwrap(),
                     mode: BindMode::Rw,
                 },
                 Bind {
-                    host: pp("{workspace}/vendor"),
+                    host: "{workspace}/vendor".parse().unwrap(),
                     sandbox: "/opt/vendor".parse().unwrap(),
                     mode: BindMode::Protected,
                 },
@@ -1053,11 +1097,61 @@ mod tests {
             assert!(msg.contains("bind host"), "{host:?}: {msg}");
             assert!(msg.contains(host), "{host:?}: {msg}");
         }
+        let msg = toml_err("[[fs.bind]]\nhost = \"/a/*\"\nsandbox = \"/x\"\nmode = \"ro\"");
+        assert!(msg.contains("bind host"), "{msg}");
+        assert!(msg.contains("\"/a/*\""), "{msg}");
+        assert!(msg.contains("line "), "{msg}");
         // A host that is not even a valid pattern is still reported.
         let msg = json_err(&bind_json("rel", "/x", "ro"));
         assert!(
             msg.contains("\\\"rel\\\"") || msg.contains("\"rel\""),
             "{msg}"
+        );
+    }
+
+    #[test]
+    fn bind_host_validation() {
+        for good in [
+            "/a",
+            "~",
+            "~/.cache/tool",
+            "{workspace}",
+            "{workspace}/vendor",
+            "/a..b",
+        ] {
+            let h = good.parse::<BindHost>().unwrap();
+            assert_eq!(h.as_str(), good);
+            assert_eq!(h.to_string(), good);
+            assert_eq!(h.as_pattern(), &pp(good));
+            assert_eq!(h.split(), pp(good).split());
+            assert_eq!(BindHost::try_from(good.to_owned()).unwrap(), h);
+        }
+        for bad in [
+            "/a/*",
+            "/a/?",
+            "/a/[x]",
+            "/a/x]",
+            "{workspace}/**/x",
+            "~/x/a*",
+        ] {
+            let msg = bad.parse::<BindHost>().unwrap_err().to_string();
+            assert!(msg.contains("bind host"), "{bad:?}: {msg}");
+            assert!(msg.contains(&format!("{bad:?}")), "{bad:?}: {msg}");
+            assert!(msg.contains("glob"), "{bad:?}: {msg}");
+        }
+        // Invalid patterns are reported by `PathPattern` validation.
+        for bad in ["", "rel", "/", "/a//b", "{repo}/x", "/*"] {
+            let msg = bad.parse::<BindHost>().unwrap_err().to_string();
+            assert!(msg.contains("path pattern"), "{bad:?}: {msg}");
+            assert!(msg.contains(&format!("{bad:?}")), "{bad:?}: {msg}");
+        }
+        let msg = serde_json::from_str::<BindHost>("\"/a/*\"")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("bind host"), "{msg}");
+        assert_eq!(
+            serde_json::from_str::<BindHost>("\"/a\"").unwrap().as_str(),
+            "/a"
         );
     }
 
