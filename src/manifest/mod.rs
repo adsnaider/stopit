@@ -2,12 +2,23 @@
 //! (DESIGN.md §3.6).
 //!
 //! The same schema is written inline as `[provider.sandbox]` in TOML and
-//! printed as JSON by script providers. Only `version` and the `fs` section
-//! exist so far; the remaining sections are rejected as unknown keys until
-//! they are implemented.
+//! printed as JSON by script providers. `version` and the `fs`, `system`,
+//! `env`, `network` and `sandbox` sections exist so far; the remaining
+//! sections are rejected as unknown keys until they are implemented.
 //!
 //! Path values are validated *syntactically* here. Expanding `{workspace}`
 //! and `~`, expanding globs and mapping to sandbox paths happens later.
+//!
+//! Scalar settings that merge by "most permissive" or "OR" are `Option`s, so
+//! that merging can tell "unset" from an explicit value. Merging itself is
+//! not implemented here.
+
+mod env;
+mod network;
+mod sandbox;
+mod system;
+#[cfg(test)]
+mod test_util;
 
 use std::fmt;
 use std::str::FromStr;
@@ -20,6 +31,11 @@ use thiserror::Error;
 use crate::error::ValueError;
 use crate::policy::PathMode;
 use crate::serde_util::MapOnly;
+
+pub use env::{EnvGrants, EnvName, EnvPattern, EnvValue, SearchPathEntry};
+pub use network::{Domain, NetworkGrants};
+pub use sandbox::{OptInSyscall, SandboxGrants, ShareableNamespace};
+pub use system::{DevMode, EtcFile, SandboxHome, SystemGrants};
 
 /// Error produced while loading a manifest document from JSON.
 #[derive(Debug, Error)]
@@ -45,6 +61,14 @@ pub struct Manifest {
     pub version: ManifestVersion,
     /// Filesystem grants.
     pub fs: FsGrants,
+    /// System mounts and synthesized files.
+    pub system: SystemGrants,
+    /// Environment filtering and explicit variables.
+    pub env: EnvGrants,
+    /// Network access.
+    pub network: NetworkGrants,
+    /// Hardening opt-outs.
+    pub sandbox: SandboxGrants,
 }
 
 #[derive(Default, Deserialize)]
@@ -52,6 +76,10 @@ pub struct Manifest {
 struct RawManifest {
     version: Option<ManifestVersion>,
     fs: FsGrants,
+    system: SystemGrants,
+    env: EnvGrants,
+    network: NetworkGrants,
+    sandbox: SandboxGrants,
 }
 
 impl From<MapOnly<RawManifest>> for Manifest {
@@ -59,6 +87,10 @@ impl From<MapOnly<RawManifest>> for Manifest {
         Manifest {
             version: raw.version.unwrap_or_default(),
             fs: raw.fs,
+            system: raw.system,
+            env: raw.env,
+            network: raw.network,
+            sandbox: raw.sandbox,
         }
     }
 }
@@ -333,6 +365,28 @@ impl fmt::Display for SandboxPath {
     }
 }
 
+/// Checks an absolute sandbox-side path that is used verbatim: no `~`, no
+/// placeholders, no globs, no empty or `.`/`..` components, and not the root.
+/// Shared by [`SandboxHome`] and [`SearchPathEntry`].
+fn check_plain_absolute(s: &str) -> Result<(), &'static str> {
+    if s.contains('\0') {
+        return Err("must not contain NUL bytes");
+    }
+    let Some(rest) = s.strip_prefix('/') else {
+        return Err("must be an absolute path (`~` is not allowed here)");
+    };
+    if s.contains(['{', '}']) {
+        return Err("must not contain placeholders");
+    }
+    if has_glob(s) {
+        return Err("must not contain glob characters");
+    }
+    if rest.is_empty() {
+        return Err("must not be the root `/`");
+    }
+    check_components(rest)
+}
+
 /// How a bind is presented. `masked` and `ephemeral` are not bind modes: a
 /// masked or ephemeral path has no host content to map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
@@ -415,6 +469,7 @@ impl TryFrom<MapOnly<RawBind>> for Bind {
 
 #[cfg(test)]
 mod tests {
+    use super::test_util::*;
     use super::*;
 
     fn pp(s: &str) -> PathPattern {
@@ -425,48 +480,12 @@ mod tests {
         v.iter().map(|s| pp(s)).collect()
     }
 
-    fn toml_ok(src: &str) -> Manifest {
-        toml::from_str(src).unwrap_or_else(|e| panic!("{src:?}: {e}"))
-    }
-
-    fn toml_err(src: &str) -> String {
-        match toml::from_str::<Manifest>(src) {
-            Ok(m) => panic!("expected an error for {src:?}, got {m:?}"),
-            Err(e) => e.to_string(),
-        }
-    }
-
-    fn json_err(src: &str) -> String {
-        match Manifest::from_json_str(src) {
-            Ok(m) => panic!("expected an error for {src:?}, got {m:?}"),
-            Err(e) => e.to_string(),
-        }
-    }
-
     fn default_manifest() -> Manifest {
         Manifest {
             version: ManifestVersion::V1,
             fs: FsGrants::default(),
+            ..Manifest::default()
         }
-    }
-
-    /// Wraps JSON object members in an object that declares `version: 1`,
-    /// which `from_json_str` requires.
-    fn jv(members: &str) -> String {
-        if members.is_empty() {
-            r#"{"version": 1}"#.to_owned()
-        } else {
-            format!(r#"{{"version": 1, {members}}}"#)
-        }
-    }
-
-    fn jv_ok(members: &str) -> Manifest {
-        let src = jv(members);
-        Manifest::from_json_str(&src).unwrap_or_else(|e| panic!("{src}: {e}"))
-    }
-
-    fn jv_err(members: &str) -> String {
-        json_err(&jv(members))
     }
 
     #[test]
@@ -522,13 +541,13 @@ mod tests {
 
     #[test]
     fn unsupported_version_is_reported_before_unknown_sections() {
-        let src = r#"{"network": {"mode": "none"}, "fs2": [], "version": 2}"#;
+        let src = r#"{"shims": {"x": 1}, "fs2": [], "version": 2}"#;
         let msg = json_err(src);
         assert!(msg.contains("unsupported manifest version 2"), "{msg}");
         assert!(!msg.contains("unknown field"), "{msg}");
         // With a supported version the unknown section is the error.
-        let msg = json_err(r#"{"network": {}, "version": 1}"#);
-        assert!(msg.contains("unknown field `network`"), "{msg}");
+        let msg = json_err(r#"{"shims": {}, "version": 1}"#);
+        assert!(msg.contains("unknown field `shims`"), "{msg}");
         // A document that is not an object is still rejected up front.
         let msg = json_err("[2]");
         assert!(msg.contains("expected a map"), "{msg}");
@@ -660,6 +679,7 @@ mod tests {
                 }],
                 mask_sockets: Some(true),
             },
+            ..Manifest::default()
         }
     }
 
@@ -955,10 +975,6 @@ mod tests {
     fn unknown_keys_are_rejected() {
         for (src, key) in [
             ("verson = 1", "verson"),
-            ("[system]\nproc = true", "system"),
-            ("[env]\npass = []", "env"),
-            ("[network]\nmode = \"none\"", "network"),
-            ("[sandbox]\nshare = []", "sandbox"),
             ("[shims]", "shims"),
             ("[profiles.x]", "profiles"),
             ("[fs]\nrww = []", "rww"),
@@ -973,10 +989,6 @@ mod tests {
         }
         for (src, key) in [
             (r#""verson": 1"#, "verson"),
-            (r#""system": {}"#, "system"),
-            (r#""env": {}"#, "env"),
-            (r#""network": {}"#, "network"),
-            (r#""sandbox": {}"#, "sandbox"),
             (r#""shims": {}"#, "shims"),
             (r#""profiles": {}"#, "profiles"),
             (r#""fs": {"rww": []}"#, "rww"),
