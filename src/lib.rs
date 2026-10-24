@@ -6,6 +6,7 @@ pub mod config;
 pub mod error;
 pub mod manifest;
 pub mod policy;
+pub mod provider;
 mod serde_util;
 
 /// The version of the `stopit` crate.
