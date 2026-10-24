@@ -10,6 +10,7 @@ use std::str::FromStr;
 use serde::Deserialize;
 
 use crate::error::ValueError;
+use crate::serde_util::MapOnly;
 
 /// Name of the implicit main profile.
 const MAIN: &str = "main";
@@ -201,10 +202,25 @@ impl TryFrom<String> for Inherit {
 /// A `[profiles.<name>]` declaration: structure only. Grants are attached by
 /// providers.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(from = "MapOnly<RawProfileDecl>")]
 pub struct ProfileDecl {
     /// Parent profile; defaults to `main`.
     pub inherit: Inherit,
+}
+
+/// Deserialization shape of [`ProfileDecl`]; see [`MapOnly`].
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawProfileDecl {
+    inherit: Inherit,
+}
+
+impl From<MapOnly<RawProfileDecl>> for ProfileDecl {
+    fn from(MapOnly(raw): MapOnly<RawProfileDecl>) -> Self {
+        ProfileDecl {
+            inherit: raw.inherit,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -21,6 +21,7 @@ use serde::{Deserialize, Deserializer, de::Error as _};
 use thiserror::Error;
 
 use crate::error::ValueError;
+use crate::serde_util::MapOnly;
 
 /// Error produced while loading a configuration document.
 #[derive(Debug, Error)]
@@ -36,7 +37,7 @@ pub enum ConfigError {
 /// Every field has the default given in the design, so an empty document is
 /// valid.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(from = "MapOnly<RawConfig>")]
 pub struct Config {
     /// Starting set of built-in providers (§3.2).
     pub base: Base,
@@ -51,6 +52,31 @@ pub struct Config {
     /// User-declared profiles (§3.3). `main` is implicit and cannot be
     /// declared.
     pub profiles: BTreeMap<ProfileName, ProfileDecl>,
+}
+
+/// Deserialization shape of [`Config`]; see [`MapOnly`].
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawConfig {
+    base: Base,
+    workspace: WorkspaceSettings,
+    limits: Limits,
+    approval: Approval,
+    terminal: Terminal,
+    profiles: BTreeMap<ProfileName, ProfileDecl>,
+}
+
+impl From<MapOnly<RawConfig>> for Config {
+    fn from(MapOnly(raw): MapOnly<RawConfig>) -> Self {
+        Config {
+            base: raw.base,
+            workspace: raw.workspace,
+            limits: raw.limits,
+            approval: raw.approval,
+            terminal: raw.terminal,
+            profiles: raw.profiles,
+        }
+    }
 }
 
 impl Config {
@@ -73,10 +99,23 @@ pub enum Base {
 
 /// `[workspace]` table (DESIGN.md §3.1).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(from = "MapOnly<RawWorkspaceSettings>")]
 pub struct WorkspaceSettings {
     /// Where `{workspace}` appears inside the sandbox.
     pub mount: WorkspaceMount,
+}
+
+/// Deserialization shape of [`WorkspaceSettings`]; see [`MapOnly`].
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawWorkspaceSettings {
+    mount: WorkspaceMount,
+}
+
+impl From<MapOnly<RawWorkspaceSettings>> for WorkspaceSettings {
+    fn from(MapOnly(raw): MapOnly<RawWorkspaceSettings>) -> Self {
+        WorkspaceSettings { mount: raw.mount }
+    }
 }
 
 /// Where the workspace is mounted inside the sandbox.
@@ -134,7 +173,7 @@ impl TryFrom<String> for WorkspaceMount {
 
 /// `[limits]` table (DESIGN.md §10). Every limit is off by default.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(from = "MapOnly<RawLimits>")]
 pub struct Limits {
     /// Maximum number of processes; must be greater than zero.
     pub pids: Option<NonZeroU32>,
@@ -142,6 +181,25 @@ pub struct Limits {
     pub memory: Option<MemoryLimit>,
     /// CPU limit as a percentage of one CPU, e.g. `"400%"`.
     pub cpu: Option<CpuLimit>,
+}
+
+/// Deserialization shape of [`Limits`]; see [`MapOnly`].
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawLimits {
+    pids: Option<NonZeroU32>,
+    memory: Option<MemoryLimit>,
+    cpu: Option<CpuLimit>,
+}
+
+impl From<MapOnly<RawLimits>> for Limits {
+    fn from(MapOnly(raw): MapOnly<RawLimits>) -> Self {
+        Limits {
+            pids: raw.pids,
+            memory: raw.memory,
+            cpu: raw.cpu,
+        }
+    }
 }
 
 /// Splits a leading run of ASCII digits off `s`. `expected` describes the
@@ -255,12 +313,29 @@ impl TryFrom<String> for CpuLimit {
 
 /// `[approval]` table (DESIGN.md §4.3).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(from = "MapOnly<RawApproval>")]
 pub struct Approval {
     /// How long a pending approval waits before being auto-denied.
     pub timeout: ApprovalTimeout,
     /// What to do about writes to masked files.
     pub masked_writes: MaskedWrites,
+}
+
+/// Deserialization shape of [`Approval`]; see [`MapOnly`].
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawApproval {
+    timeout: ApprovalTimeout,
+    masked_writes: MaskedWrites,
+}
+
+impl From<MapOnly<RawApproval>> for Approval {
+    fn from(MapOnly(raw): MapOnly<RawApproval>) -> Self {
+        Approval {
+            timeout: raw.timeout,
+            masked_writes: raw.masked_writes,
+        }
+    }
 }
 
 /// Approval timeout: `"off"` (default) or `<integer><s|m|h>`.
@@ -328,10 +403,9 @@ pub enum MaskedWrites {
 
 /// `[terminal]` table (DESIGN.md §5).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(from = "MapOnly<RawTerminal>")]
 pub struct Terminal {
     /// Key that opens the supervisor menu. Not parsed yet; must be non-empty.
-    #[serde(deserialize_with = "deserialize_hotkey")]
     pub hotkey: String,
     /// Policy for OSC 52 clipboard writes (§5.3).
     pub clipboard_write: ClipboardWrite,
@@ -342,6 +416,37 @@ impl Default for Terminal {
         Terminal {
             hotkey: "ctrl-]".to_owned(),
             clipboard_write: ClipboardWrite::default(),
+        }
+    }
+}
+
+/// Deserialization shape of [`Terminal`]; see [`MapOnly`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawTerminal {
+    #[serde(deserialize_with = "deserialize_hotkey")]
+    hotkey: String,
+    clipboard_write: ClipboardWrite,
+}
+
+impl Default for RawTerminal {
+    fn default() -> Self {
+        let Terminal {
+            hotkey,
+            clipboard_write,
+        } = Terminal::default();
+        RawTerminal {
+            hotkey,
+            clipboard_write,
+        }
+    }
+}
+
+impl From<MapOnly<RawTerminal>> for Terminal {
+    fn from(MapOnly(raw): MapOnly<RawTerminal>) -> Self {
+        Terminal {
+            hotkey: raw.hotkey,
+            clipboard_write: raw.clipboard_write,
         }
     }
 }
@@ -728,6 +833,30 @@ mod tests {
         ] {
             let msg = err(src);
             assert!(msg.contains(key), "{src:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn arrays_are_rejected_for_every_table() {
+        for src in [
+            "limits = []",
+            "limits = [4096]",
+            "workspace = [\"/w\"]",
+            "workspace = []",
+            "approval = []",
+            "approval = [\"5m\", \"deny\"]",
+            "terminal = []",
+            "terminal = [\"ctrl-]\", \"block\"]",
+            "profiles = []",
+            "profiles = [\"harness\"]",
+            "[profiles]\nharness = []",
+            "[profiles]\nharness = [\"main\"]",
+            "[[limits]]\npids = 1",
+            "[[workspace]]\nmount = \"/w\"",
+            "[[profiles.harness]]\ninherit = \"none\"",
+        ] {
+            let msg = err(src);
+            assert!(msg.contains("expected a map"), "{src:?}: {msg}");
         }
     }
 
