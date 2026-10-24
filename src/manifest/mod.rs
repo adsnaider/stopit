@@ -248,8 +248,9 @@ impl TryFrom<u64> for ManifestVersion {
 /// The `fs` section: filesystem grants (DESIGN.md §3.4).
 ///
 /// Deserializes from a table or object only, never from a sequence.
+/// `ephemeral` rules must be literal paths: globs are rejected there.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(from = "MapOnly<RawFsGrants>")]
+#[serde(try_from = "MapOnly<RawFsGrants>")]
 pub struct FsGrants {
     /// Real content, writes go to the host.
     pub rw: Vec<PathPattern>,
@@ -280,9 +281,20 @@ struct RawFsGrants {
     mask_sockets: Option<bool>,
 }
 
-impl From<MapOnly<RawFsGrants>> for FsGrants {
-    fn from(MapOnly(raw): MapOnly<RawFsGrants>) -> Self {
-        FsGrants {
+impl TryFrom<MapOnly<RawFsGrants>> for FsGrants {
+    type Error = ValueError;
+
+    fn try_from(MapOnly(raw): MapOnly<RawFsGrants>) -> Result<Self, ValueError> {
+        // An ephemeral rule is backed by a single session directory, so it
+        // must name exactly one path; a glob could match any number of paths,
+        // and a different set each session.
+        if let Some(p) = raw.ephemeral.iter().find(|p| has_glob(p.as_str())) {
+            return Err(ValueError::new(format!(
+                "invalid ephemeral path {:?}: ephemeral paths must be literal, glob characters are not allowed",
+                p.as_str()
+            )));
+        }
+        Ok(FsGrants {
             rw: raw.rw,
             ro: raw.ro,
             masked: raw.masked,
@@ -290,7 +302,7 @@ impl From<MapOnly<RawFsGrants>> for FsGrants {
             ephemeral: raw.ephemeral,
             bind: raw.bind,
             mask_sockets: raw.mask_sockets,
-        }
+        })
     }
 }
 
@@ -1459,6 +1471,86 @@ mod tests {
                     assert_eq!(orig.is_match(&s), new.is_match(&s), "{g} on {s:?}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn ephemeral_rejects_globs() {
+        for bad in [
+            "{workspace}/*.tmp",
+            "/tmp/a?b",
+            "~/.cache/[ab]",
+            "/tmp/a]b",
+            "{workspace}/**",
+            "/tmp/[*]",
+        ] {
+            let want = format!("invalid ephemeral path {bad:?}: ");
+            let msg = toml_err(&format!("[fs]\nrw = []\nephemeral = [\"/tmp\", \"{bad}\"]"));
+            assert!(msg.contains(&want), "{bad:?}: {msg}");
+            assert!(msg.contains("ephemeral paths must be literal"), "{msg}");
+            assert!(msg.contains("glob characters are not allowed"), "{msg}");
+            assert!(msg.contains("line "), "{bad:?}: {msg}");
+            let msg = jv_err(&format!(r#""fs": {{"ephemeral": ["/tmp", "{bad}"]}}"#));
+            assert!(msg.contains(&want), "{bad:?}: {msg}");
+            assert!(msg.contains("ephemeral paths must be literal"), "{msg}");
+            assert!(msg.contains("glob characters are not allowed"), "{msg}");
+        }
+        // A syntax error is reported before the glob rule.
+        for bad in ["/*", "~/**"] {
+            let msg = toml_err(&format!("fs.ephemeral = [\"{bad}\"]"));
+            assert!(msg.contains("first component"), "{bad:?}: {msg}");
+            assert!(!msg.contains("invalid ephemeral path"), "{bad:?}: {msg}");
+            let msg = jv_err(&format!(r#""fs": {{"ephemeral": ["{bad}"]}}"#));
+            assert!(msg.contains("first component"), "{bad:?}: {msg}");
+            assert!(!msg.contains("invalid ephemeral path"), "{bad:?}: {msg}");
+        }
+        // Inline form and contributed profiles go through the same check.
+        toml_err("fs.ephemeral = [\"{workspace}/*.tmp\"]");
+        let msg = toml_err("[profiles.p.fs]\nephemeral = [\"/tmp/*\"]");
+        assert!(msg.contains("\"/tmp/*\""), "{msg}");
+        // Each glob character on its own.
+        for c in ['*', '?', '[', ']'] {
+            toml_err(&format!("fs.ephemeral = [\"/tmp/a{c}b\"]"));
+            jv_err(&format!(r#""fs": {{"ephemeral": ["/tmp/a{c}b"]}}"#));
+        }
+    }
+
+    #[test]
+    fn ephemeral_accepts_literal_paths() {
+        let want = pps(&[
+            "/tmp",
+            "~",
+            "~/.cache/x",
+            "{workspace}/scratch",
+            "{workspace}",
+        ]);
+        let toml = "fs.ephemeral = [\"/tmp\", \"~\", \"~/.cache/x\", \"{workspace}/scratch\", \"{workspace}\"]";
+        let json = r#""fs": {"ephemeral": ["/tmp", "~", "~/.cache/x", "{workspace}/scratch", "{workspace}"]}"#;
+        assert_eq!(toml_ok(toml).grants.fs.ephemeral, want);
+        assert_eq!(jv_ok(json).grants.fs.ephemeral, want);
+        // The defaults.
+        assert_eq!(
+            toml_ok(APPENDIX_FS_TOML).grants.fs.ephemeral,
+            pps(&["/tmp", "~"])
+        );
+    }
+
+    #[test]
+    fn globs_are_still_accepted_in_other_lists() {
+        for list in ["rw", "ro", "masked", "protected"] {
+            let m = toml_ok(&format!(
+                "fs.{list} = [\"{{workspace}}/**/*.nix\", \"/a/b?\"]"
+            ));
+            let got = match list {
+                "rw" => m.grants.fs.rw,
+                "ro" => m.grants.fs.ro,
+                "masked" => m.grants.fs.masked,
+                _ => m.grants.fs.protected,
+            };
+            assert_eq!(got, pps(&["{workspace}/**/*.nix", "/a/b?"]), "{list}");
+            jv_ok(&format!(
+                r#""fs": {{"{list}": ["{{workspace}}/**/*.nix", "/a/b[0-9]"]}}"#
+            ));
         }
     }
 
