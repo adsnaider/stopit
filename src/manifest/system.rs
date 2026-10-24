@@ -72,7 +72,9 @@ impl fmt::Display for DevMode {
 }
 
 /// A synthesized file under `/etc`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+///
+/// Ordered by declaration, so that merged sets iterate deterministically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 pub enum EtcFile {
     /// `/etc/passwd`.
     #[serde(rename = "passwd")]

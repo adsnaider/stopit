@@ -26,7 +26,8 @@ pub struct EnvGrants {
     pub deny: Vec<EnvPattern>,
     /// Explicit variables. Conflicting values are a merge error.
     pub set: BTreeMap<EnvName, EnvValue>,
-    /// Directories placed in front of `PATH`, concatenated in provider order.
+    /// Directories placed in front of `PATH`; on merge, later providers'
+    /// entries come first (DESIGN.md §3.5).
     pub path_prepend: Vec<SearchPathEntry>,
 }
 

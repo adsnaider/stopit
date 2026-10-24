@@ -247,11 +247,11 @@ To loosen a restriction, configure the provider that added it (e.g. `vcs` with `
 | Section | Merge rule |
 | :--- | :--- |
 | `env.pass` / `env.deny` | Union; **`deny` always wins** over `pass` |
-| `env.set` | Conflicting values for the same variable are an **error** unless identical |
-| `env.path_prepend` | Concatenated in provider order |
+| `env.set` | Conflicting values for the same variable are an **error** unless identical; a profile's own value overrides the inherited one, per variable |
+| `env.path_prepend` | Later providers' entries first within a profile, then inherited entries; earlier entries take precedence in `PATH`; duplicates keep the first occurrence |
 | `network.mode` | Within a profile: the most permissive granted mode (`none` < `loopback` < `proxy` < `full`). A profile's own value overrides the inherited one |
 | `network.allow_domains` | Union |
-| `shims` | Union; the same shim name from two providers in one profile is an **error** |
+| `shims` | Union; the same shim name from two providers in one profile is an **error**; a profile's own shim replaces an inherited one of the same name |
 | `sandbox.share`, `sandbox.allow_syscalls` | Union |
 | `system.proc`, `system.dev` | Logical OR within a profile; a profile's own explicit value overrides the inherited one |
 | `system.etc` | Union |

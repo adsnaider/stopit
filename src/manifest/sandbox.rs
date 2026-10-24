@@ -45,7 +45,9 @@ impl From<MapOnly<RawSandboxGrants>> for SandboxGrants {
 ///
 /// The user and mount namespaces are not listed: they are always unshared
 /// (bubblewrap requires them, and invariant I2 depends on them).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+///
+/// Ordered by declaration, so that merged sets iterate deterministically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 #[serde(try_from = "String")]
 pub enum ShareableNamespace {
     /// Network namespace.
@@ -115,7 +117,9 @@ impl fmt::Display for ShareableNamespace {
 /// Only attack-surface reducers are listed. Everything the sandbox's
 /// invariants depend on (`mount`, `unshare`, `setns`, `clone3`, `pivot_root`,
 /// `kexec_load`, `open_by_handle_at`, …) can never be re-enabled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+///
+/// Ordered by declaration, so that merged sets iterate deterministically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 #[serde(try_from = "String")]
 pub enum OptInSyscall {
     /// `ptrace`.
