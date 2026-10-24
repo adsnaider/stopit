@@ -505,8 +505,9 @@ impl fmt::Display for SandboxPath {
 
 /// Checks an absolute sandbox-side path that is used verbatim: no `~`, no
 /// placeholders, no globs, no empty or `.`/`..` components, and not the root.
-/// Shared by [`SandboxHome`] and [`SearchPathEntry`].
-fn check_plain_absolute(s: &str) -> Result<(), &'static str> {
+/// Shared by [`SandboxHome`], [`SearchPathEntry`] and
+/// [`WorkspaceMount`](crate::config::WorkspaceMount).
+pub(crate) fn check_plain_absolute(s: &str) -> Result<(), &'static str> {
     if s.contains('\0') {
         return Err("must not contain NUL bytes");
     }

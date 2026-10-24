@@ -88,9 +88,7 @@ impl ExpansionContext {
         check_host_dir("host home directory", &host_home)?;
         Ok(ExpansionContext {
             workspace_host,
-            // A mount such as `/work/` is accepted by `WorkspaceMount`;
-            // normalise it so joins and comparisons are uniform.
-            workspace_sandbox: workspace_mount.as_path().components().collect(),
+            workspace_sandbox: workspace_mount.as_path().to_owned(),
             host_home,
             sandbox_home: PathBuf::from(sandbox_home.as_str()),
         })
@@ -220,7 +218,7 @@ mod tests {
     fn custom_ctx() -> ExpansionContext {
         ExpansionContext::new(
             "/data/my proj".into(),
-            "/work/tree/".parse().unwrap(),
+            "/work/tree".parse().unwrap(),
             "/root".into(),
             "/sbx/h".parse().unwrap(),
         )
@@ -568,6 +566,25 @@ mod tests {
         let e = exp(&c, "~/a");
         assert_eq!(e.host().unwrap().as_os_str().as_bytes(), b"/home/\xc3(/a");
         assert_eq!(e.sandbox(), Some(p("/home/user/a")));
+    }
+
+    #[test]
+    fn context_keeps_the_mount_exactly_as_given() {
+        let c = custom_ctx();
+        assert_eq!(
+            exp(&c, "{workspace}").sandbox_anchor(),
+            Path::new("/work/tree")
+        );
+        assert_eq!(exp(&c, "{workspace}/a").sandbox(), Some(p("/work/tree/a")));
+        let mount: WorkspaceMount = "/w".parse().unwrap();
+        let c = ExpansionContext::new(
+            "/ws".into(),
+            mount.clone(),
+            "/h".into(),
+            "/home/user".parse().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(exp(&c, "{workspace}").sandbox_anchor(), mount.as_path());
     }
 
     #[test]

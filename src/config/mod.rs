@@ -24,6 +24,7 @@ use serde::{Deserialize, Deserializer, de::Error as _};
 use thiserror::Error;
 
 use crate::error::ValueError;
+use crate::manifest::check_plain_absolute;
 use crate::serde_util::MapOnly;
 
 /// Error produced while loading a configuration document.
@@ -145,9 +146,11 @@ impl From<MapOnly<RawWorkspaceSettings>> for WorkspaceSettings {
 
 /// Where the workspace is mounted inside the sandbox.
 ///
-/// Guaranteed to be an absolute path that is not `/`, contains no NUL bytes
-/// and has no `.` or `..` components. Whether it collides with other
-/// sandbox mounts is checked later, when the sandbox is compiled.
+/// Guaranteed to be a plain absolute path, validated like the sandbox `HOME`:
+/// not `/`, no NUL bytes, no `~`, placeholders or glob characters, and no
+/// empty (so no `//` or trailing `/`), `.` or `..` components. Whether it
+/// collides with other sandbox mounts is checked later, when the sandbox is
+/// compiled.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
 pub struct WorkspaceMount(PathBuf);
@@ -169,21 +172,8 @@ impl FromStr for WorkspaceMount {
     type Err = ValueError;
 
     fn from_str(s: &str) -> Result<Self, ValueError> {
-        let bad = |why: &str| ValueError::new(format!("invalid workspace mount {s:?}: {why}"));
-        if !s.starts_with('/') {
-            return Err(bad("must be an absolute path"));
-        }
-        if s.chars().all(|c| c == '/') {
-            return Err(bad("must not be the root directory"));
-        }
-        if s.contains('\0') {
-            return Err(bad("must not contain NUL bytes"));
-        }
-        // Checked on the raw string: `Path::components` silently drops
-        // interior `.` components.
-        if s.split('/').any(|c| c == "." || c == "..") {
-            return Err(bad("must not contain `.` or `..` components"));
-        }
+        check_plain_absolute(s)
+            .map_err(|why| ValueError::new(format!("invalid workspace mount {s:?}: {why}")))?;
         Ok(WorkspaceMount(PathBuf::from(s)))
     }
 }
@@ -669,6 +659,15 @@ mod tests {
             "/..",
             "/.",
             "/a/..",
+            "/work/",
+            "/a//b",
+            "/w*",
+            "/w?",
+            "/w[x]",
+            "/{x}",
+            "/{workspace}",
+            "~",
+            "~/w",
         ] {
             let msg = err(&format!("[workspace]\nmount = \"{bad}\""));
             assert!(msg.contains("workspace mount"), "{bad:?}: {msg}");
@@ -680,7 +679,7 @@ mod tests {
 
     #[test]
     fn valid_workspace_mounts_are_accepted() {
-        for good in ["/workspace", "/a/b", "/work/", "/a..b", "/.hidden"] {
+        for good in ["/workspace", "/a/b", "/a..b", "/.hidden"] {
             let cfg = Config::from_toml_str(&format!("[workspace]\nmount = \"{good}\"")).unwrap();
             assert_eq!(cfg.workspace.mount.as_path(), Path::new(good));
         }
@@ -893,5 +892,7 @@ mod tests {
         assert!(msg.contains("line 3"), "{msg}");
         let msg = err("this is not toml");
         assert!(msg.contains("line 1"), "{msg}");
+        let msg = err("[workspace]\nmount = \"/a//b\"\n");
+        assert!(msg.contains("line 2"), "{msg}");
     }
 }
