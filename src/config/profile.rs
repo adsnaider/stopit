@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 use serde::Deserialize;
 
-use super::ValueError;
+use crate::error::ValueError;
 
 /// Name of the implicit main profile.
 const MAIN: &str = "main";
@@ -61,7 +61,7 @@ impl FromStr for ProfileName {
     type Err = ValueError;
 
     fn from_str(s: &str) -> Result<Self, ValueError> {
-        let bad = |why: &str| ValueError(format!("invalid profile name {s:?}: {why}"));
+        let bad = |why: &str| ValueError::new(format!("invalid profile name {s:?}: {why}"));
         if s == MAIN {
             return Err(bad(
                 "`main` is reserved (it is implicit and inherits from the base)",
@@ -123,7 +123,7 @@ impl FromStr for ProfileRef {
     type Err = ValueError;
 
     fn from_str(s: &str) -> Result<Self, ValueError> {
-        let bad = |why: &str| ValueError(format!("invalid profile reference {s:?}: {why}"));
+        let bad = |why: &str| ValueError::new(format!("invalid profile reference {s:?}: {why}"));
         if s == NONE {
             return Err(bad("`none` is the `inherit` keyword, not a profile"));
         }

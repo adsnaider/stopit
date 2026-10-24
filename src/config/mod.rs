@@ -20,6 +20,8 @@ use std::time::Duration;
 use serde::{Deserialize, Deserializer, de::Error as _};
 use thiserror::Error;
 
+use crate::error::ValueError;
+
 /// Error produced while loading a configuration document.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -28,11 +30,6 @@ pub enum ConfigError {
     #[error("invalid configuration: {0}")]
     Toml(#[from] toml::de::Error),
 }
-
-/// Error parsing one of the custom value types (`"8G"`, `"400%"`, `"5m"`).
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("{0}")]
-pub struct ValueError(String);
 
 /// The session-wide top-level settings (DESIGN.md §3.1).
 ///
@@ -108,7 +105,7 @@ impl FromStr for WorkspaceMount {
     type Err = ValueError;
 
     fn from_str(s: &str) -> Result<Self, ValueError> {
-        let bad = |why: &str| ValueError(format!("invalid workspace mount {s:?}: {why}"));
+        let bad = |why: &str| ValueError::new(format!("invalid workspace mount {s:?}: {why}"));
         if !s.starts_with('/') {
             return Err(bad("must be an absolute path"));
         }
@@ -155,9 +152,9 @@ fn split_digits<'a>(what: &str, expected: &str, s: &'a str) -> Result<(u64, &'a 
     let (digits, rest) = s.split_at(end);
     let n = digits.parse::<u64>().map_err(|e| match e.kind() {
         IntErrorKind::PosOverflow => {
-            ValueError(format!("invalid {what} {s:?}: number is too large"))
+            ValueError::new(format!("invalid {what} {s:?}: number is too large"))
         }
-        _ => ValueError(format!("invalid {what} {s:?}: expected {expected}")),
+        _ => ValueError::new(format!("invalid {what} {s:?}: expected {expected}")),
     })?;
     Ok((n, rest))
 }
@@ -189,19 +186,19 @@ impl FromStr for MemoryLimit {
             "G" => 30,
             "T" => 40,
             _ => {
-                return Err(ValueError(format!(
+                return Err(ValueError::new(format!(
                     "invalid memory limit {s:?}: expected <int>K|M|G|T (uppercase unit)"
                 )));
             }
         };
         if n == 0 {
-            return Err(ValueError(format!(
+            return Err(ValueError::new(format!(
                 "invalid memory limit {s:?}: must be greater than zero"
             )));
         }
         n.checked_mul(1u64 << shift)
             .map(MemoryLimit)
-            .ok_or_else(|| ValueError(format!("invalid memory limit {s:?}: value overflows")))
+            .ok_or_else(|| ValueError::new(format!("invalid memory limit {s:?}: value overflows")))
     }
 }
 
@@ -233,18 +230,18 @@ impl FromStr for CpuLimit {
     fn from_str(s: &str) -> Result<Self, ValueError> {
         let (n, rest) = split_digits("cpu limit", "<int>%", s)?;
         if rest != "%" {
-            return Err(ValueError(format!(
+            return Err(ValueError::new(format!(
                 "invalid cpu limit {s:?}: expected <int>%"
             )));
         }
         if n == 0 {
-            return Err(ValueError(format!(
+            return Err(ValueError::new(format!(
                 "invalid cpu limit {s:?}: must be greater than zero"
             )));
         }
         u32::try_from(n)
             .map(CpuLimit)
-            .map_err(|_| ValueError(format!("invalid cpu limit {s:?}: value is too large")))
+            .map_err(|_| ValueError::new(format!("invalid cpu limit {s:?}: value is too large")))
     }
 }
 
@@ -292,19 +289,21 @@ impl FromStr for ApprovalTimeout {
             "m" => 60,
             "h" => 3600,
             _ => {
-                return Err(ValueError(format!(
+                return Err(ValueError::new(format!(
                     "invalid approval timeout {s:?}: expected \"off\" or <int>s|m|h"
                 )));
             }
         };
         if n == 0 {
-            return Err(ValueError(format!(
+            return Err(ValueError::new(format!(
                 "invalid approval timeout {s:?}: must be greater than zero"
             )));
         }
         n.checked_mul(mult)
             .map(|secs| ApprovalTimeout::After(Duration::from_secs(secs)))
-            .ok_or_else(|| ValueError(format!("invalid approval timeout {s:?}: value overflows")))
+            .ok_or_else(|| {
+                ValueError::new(format!("invalid approval timeout {s:?}: value overflows"))
+            })
     }
 }
 
