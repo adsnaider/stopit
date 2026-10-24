@@ -147,7 +147,7 @@ fs.ro = ["/etc/ssl/certs"]
 network = { mode = "proxy", allow_domains = ["static.crates.io", "index.crates.io"] }
 ```
 
-**Workspace.** The workspace is the host directory the session is about: by default the directory containing `.stopit.toml` (or the current directory), overridable with `stopit run --workspace <dir>`. Its identity is session-wide because the supervisor depends on it (socket and hard-link scans, protected-file shadows, repository resolution, broker cwd checks) and every provider's `{workspace}` paths are relative to it. *Access* to it is still a grant: under `base = "none"` the workspace is defined but not mounted until a provider grants it.
+**Workspace.** The workspace is the host directory the session is about: by default the directory containing `.stopit.toml` (or the current directory), overridable with `stopit run --workspace <dir>`. Its identity is session-wide because the supervisor depends on it (socket and hard-link scans, protected-file shadows, repository resolution, broker cwd checks) and every provider's `{workspace}` paths are relative to it. *Access* to it is still a grant: under `base = "none"` the workspace is defined but not mounted until a provider grants it. The workspace mount point (like `system.home`) is subject to the reserved-path rules in §6.2.
 
 ### 3.2 Bases
 
@@ -196,7 +196,7 @@ Profiles come from two places:
   inherit = "none"         # starts from the empty sandbox, ignoring base
   ```
   Grants are then attached by providers (`config` providers take `profile = "<name>"`; §3.6).
-* **Contributed by providers** as part of their manifest. These are prefixed with the provider's name to avoid collisions: the `vcs` provider contributes `vcs.ro`, `vcs.local`, `vcs.remote`. Most users never see them.
+* **Contributed by providers** as part of their manifest. These are prefixed with the provider's name to avoid collisions: the `vcs` provider contributes `vcs.ro`, `vcs.local`, `vcs.remote`. Inside the manifest they are written as plain single-segment names (`ro`, `local`, `remote`) and the prefix is added automatically (§3.6). Most users never see them.
 
 `inherit = "<profile>"` (default `"main"`) means the profile starts from the parent's fully merged grants, then adds its own. `inherit = "none"` starts from the empty sandbox. `stopit-grant` (§7.5) creates a temporary profile: the caller's profile plus the requested delta.
 
@@ -223,6 +223,7 @@ Path syntax (in any provider):
 * `~/…` — host `$HOME/…` on the host side, sandbox `HOME` (default `/home/user`) on the sandbox side.
 * Absolute paths map to the same path inside the sandbox; `fs.bind` entries remap explicitly.
 * Built-in providers may resolve additional concrete host paths internally (e.g. `vcs` resolves git worktree and jj workspace storage, §7.3). These are not user-facing placeholders.
+* **Syntactic validation (at load time):** no `.`/`..`/empty components, no NUL, no trailing `/`; the bare `/` is rejected; a glob is not allowed as the first component directly below `/` or `~` (`/*` and `~/**` are rejected; `{workspace}/**` is fine).
 * Globs (`*`, `**`) are expanded **once at session start** into concrete paths. Files created later are not retroactively masked or protected (except via the "new files are written through" rule above).
 
 Additional checks:
@@ -251,7 +252,10 @@ To loosen a restriction, configure the provider that added it (e.g. `vcs` with `
 | `network.allow_domains` | Union |
 | `shims` | Union; the same shim name from two providers in one profile is an **error** |
 | `sandbox.share`, `sandbox.allow_syscalls` | Union |
-| `system.*` | Logical OR / union |
+| `system.proc`, `system.dev` | Logical OR within a profile; a profile's own explicit value overrides the inherited one |
+| `system.etc` | Union |
+| `system.home` | Conflicting values within a profile are an **error** (like `env.set`); a profile's own value overrides the inherited one |
+| `fs.mask_sockets` | Tri-state (unset / `true` / `false`). Within a profile, `true` wins over `false` (strictest wins). A profile's own explicit value overrides the inherited one, so a contributed or user profile can opt out of masking that `main` enables |
 
 ### 3.6 Providers
 
@@ -308,7 +312,10 @@ view = "masked"
 ```
 
 * Top-level manifest sections apply to the target profile (`profile` for `config`; `main` for other types). Entries under `profiles` are contributed profiles, prefixed with the provider's `name`.
-* **Script providers** receive on stdin a JSON object containing their `[provider.config]` and a context (`workspace` host path, `workspace_mount`, `home`, `session_dir`, target `profile`), and print a manifest on stdout. A non-zero exit or invalid manifest aborts startup.
+* **Contributed profile keys** inside a manifest are plain single-segment names (e.g. `local`); the provider's `name` prefix is added automatically (`vcs.local`). Contributed profiles cannot themselves contain `profiles` or `version`.
+* **Reference rule:** within a manifest, a plain profile reference (`inherit = "local"`, shim `profile = "ro"`) resolves first to that manifest's own contributed profile, then to a user-declared profile. `main` and other providers' profiles are referenced by their full names. A full name (e.g. `vcs.local`) always resolves globally, including to the manifest's own profiles; plain names are preferred inside a manifest because the provider `name` can change.
+* **Validation:** every manifest table accepts only maps (array forms are rejected) and unknown keys are rejected. A JSON manifest from a script **must** include `"version"`; an inline `[provider.sandbox]` may omit it (defaults to 1). Bind `mode` is one of `ro`, `rw`, `protected` only (`masked` and `ephemeral` have no host content to bind). Bind `host`/`sandbox` paths contain no globs (glob characters are `*`, `?`, `[`, `]`), and a bind's `sandbox` side additionally allows no `{workspace}` placeholder. Path rules are also validated syntactically at load time (§3.4).
+* **Script providers** receive on stdin a JSON object containing their `[provider.config]` and a context (`workspace` host path, `workspace_mount`, `home`, `session_dir`, provider `name`, target `profile`), and print a manifest on stdout. A non-zero exit or invalid manifest aborts startup.
 * **Scripts run on the host with the user's privileges.** With `protect = true` (default) the script — and its directory, if it sources other files — is `protected` so the sandbox cannot rewrite code that runs on the host next session. `protect = false` is allowed but flagged in the startup summary.
 * Manifests are cached, keyed by a hash of the provider's protected inputs and config.
 
@@ -471,7 +478,7 @@ The only implementation is **`BwrapEngine`**. The trait is kept so other engines
 
 `SandboxSpec` is compiled into bubblewrap arguments (passed over `--args FD` because closure-only binds can produce thousands of arguments):
 
-1. **Namespaces:** `--unshare-all` (user, mount, pid, net, ipc, uts, cgroup), `--disable-userns`, `--die-with-parent`. Providers may grant sharing of individual namespaces (`sandbox.share = ["net"]`).
+1. **Namespaces:** `--unshare-all` (user, mount, pid, net, ipc, uts, cgroup), `--disable-userns`, `--die-with-parent`. Providers may grant sharing of individual namespaces (`sandbox.share = ["net"]`); `sandbox.share` accepts only `net`, `pid`, `ipc`, `uts`, `cgroup` (user and mount are always unshared).
 2. **Root:** bwrap's empty `tmpfs` root; `--tmpfs` skeleton directories as needed.
 3. **System mounts** (when granted): `--proc /proc` with `/proc/sys`, `/proc/bus`, `/proc/fs`, `/proc/irq`, `/proc/kcore`, `/proc/keys`, `/proc/timer_list` masked; `--dev /dev` (minimal: `null`, `zero`, `full`, `random`, `urandom`, `tty`, new `devpts` instance).
 4. **Synthesized files:** `/etc/passwd`, `/etc/group`, `/etc/hosts`, `/etc/nsswitch.conf`, sandbox-`HOME` stubs (e.g. `.gitconfig` with `user.name`/`user.email`) via `--ro-bind-data`.
@@ -479,6 +486,8 @@ The only implementation is **`BwrapEngine`**. The trait is kept so other engines
 6. **Runtime directory:** `/run/stopit` (shims RO, broker socket, proxy socket if granted).
 7. **Environment:** `--clearenv` plus the filtered/explicit variables (§9).
 8. **Command:** `stopit __init -- <cmd…>`.
+
+**Reserved paths.** The workspace mount (`[workspace] mount`) and `system.home` must not be equal to or an ancestor of any of `/proc`, `/dev`, `/etc`, `/tmp`, `/run/stopit`, or each other, and must not be inside `/proc`, `/dev`, `/etc` or `/run/stopit`. A workspace mount *inside* `system.home` or `/tmp` is allowed (it is mounted over the ephemeral directory). This is checked when the `SandboxSpec` is built.
 
 **Mount locking.** bubblewrap drops all capabilities before executing the init helper, so the sandbox cannot `umount` or `mount -o remount,rw` anything (no `CAP_SYS_ADMIN`). `--disable-userns` plus seccomp prevent creating a new user namespace to regain capabilities; even if one were created, the kernel marks all inherited mounts `MNT_LOCKED` and locks their `ro`/`nosuid`/`nodev` flags, so they could not be detached or remounted read-write individually.
 
@@ -496,6 +505,7 @@ Runs as the first program inside the sandbox (bwrap remains PID 1 and reaps zomb
    * Attack surface: `io_uring_*`, `bpf`, `perf_event_open`, `userfaultfd`, `keyctl`, `add_key`, `request_key`, `kexec_*`, `open_by_handle_at`, `ioctl(TIOCSTI | TIOCLINUX)` → `EPERM`.
    * `ptrace` → `EPERM` by default; opt-in via `allow_syscalls = ["ptrace"]` (debuggers are common tools; with a PID namespace it only reaches sandboxed processes).
    * `socket()` family allowlist: `AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK` (route only); notably **`AF_VSOCK` is denied** (not isolated by network namespaces).
+   * **`allow_syscalls` accepts only:** `ptrace`, `perf_event_open`, `io_uring` (`io_uring_setup`/`enter`/`register`), `userfaultfd`, `bpf`, `keyctl` (`keyctl`/`add_key`/`request_key`). Namespace creation, mount APIs, `setns`, `clone3`, `kexec_*` and `open_by_handle_at` can never be re-enabled.
    * `rename`, `renameat`, `renameat2` → `SECCOMP_RET_USER_NOTIF` (§4.1); the listener FD is sent to the supervisor over the broker socket before `execve`.
 5. `prctl(PR_SET_NO_NEW_PRIVS)` (bwrap sets it too) and `execve(<cmd…>)`.
 
@@ -512,7 +522,7 @@ Runs as the first program inside the sandbox (bwrap remains PID 1 and reaps zomb
 * **Lifecycle:** the broker relays signals (Ctrl+C, harness timeouts killing the shim) to the tool sandbox, kills the tool sandbox if the shim's connection closes, and returns the exit status to the shim.
 * **Environment:** the broker discards the shim's environment and builds a clean one from the target profile.
 * **Binary resolution:** a shim's `binary` is resolved in the target profile's `PATH`.
-* Unlisted subcommands fall back to the shim's `default`, which is **Ask** unless stated otherwise.
+* Unlisted subcommands use the shim's `default` (required; conventionally `ask`).
 
 **Shim declaration** (in any manifest):
 
@@ -525,6 +535,11 @@ rules      = [
   { subcommand = ["publish"], decision = "ask", profile = "publish" },
 ]
 ```
+
+* `binary` and `default` are **required**. `binary` is never inferred from the shim name, and `default` has no implicit value because `ask`/`allow` need a target profile.
+* A rule or default with `decision = "deny"` must not name a `profile`; `allow` and `ask` must.
+* Shim names `stopit` and `stopit-grant` are reserved.
+* Each entry in a rule's `subcommand` list is one or more tokens separated by single spaces (`[a-z0-9][a-z0-9_-]*`); the last token may be `*` (e.g. `bookmark *`). A lone `*` is rejected (use `default`), and flags are not subcommands.
 
 ### 7.2 Global-Flag Parsing
 
@@ -688,7 +703,8 @@ allow_domains = ["cache.nixos.org", "index.crates.io", "static.crates.io"]
 
 Proxy details:
 * The CONNECT host and the TLS SNI must both match the allowlist **and each other**. Domain fronting through CDNs that permit it cannot be detected without TLS interception (§11).
-* DNS is resolved by the proxy; the sandbox has no resolver access.
+* **`allow_domains` entries** are lowercase DNS hostnames only: at least two labels, and the final label starts with a letter. This rejects IP literals (including short and hex forms), wildcards, ports, schemes and a trailing dot.
+* DNS is resolved by the proxy; the sandbox has no resolver access. The proxy refuses connections whose resolved address is host-local (e.g. `foo.localhost`): 127.0.0.0/8, ::1, 0.0.0.0, ::, 169.254.0.0/16, fe80::/10, and IPv4-mapped IPv6 forms of these, even when the name is allowlisted.
 * **Exfiltration tagging:** domains that accept uploads (`github.com`, `gist.github.com`, `pastebin.com`, model API endpoints such as `api.anthropic.com`/`api.openai.com`) are tagged **exfiltration-capable** in prompts and the startup summary, distinguishing them from read-only package registries.
 
 Abstract unix sockets are isolated by the network namespace; path-based sockets are handled by masking (§3.4).
@@ -709,7 +725,7 @@ path_prepend = ["/nix/store/…/bin"]
 
 * Host variables are passed **only** if they match a `pass` pattern. **`deny` always wins** over `pass` (e.g. `CARGO_REGISTRY_TOKEN` matches both and is denied).
 * `NIX_CONFIG` is denied by the default base (it commonly carries `access-tokens`).
-* `set` values are explicit and not subject to the host filter; conflicting `set` values across providers are an error (§3.5).
+* `set` values are explicit and not subject to the host filter; conflicting `set` values across providers are an error (§3.5). `set` must not contain `PATH`: `PATH` is built from `path_prepend`, whose entries are absolute sandbox paths and must not contain `:`.
 * Under `base = "none"` the environment is empty.
 
 ---
@@ -750,7 +766,7 @@ Session-wide, so not a provider setting. Off unless configured. Applied by launc
 ## 12. Phased Implementation Plan & Verification
 
 ### Phase 1: Scaffold, Configuration, Providers, `BwrapEngine`
-* Cargo workspace + `flake.nix` dev environment (Rust toolchain, bubblewrap, jujutsu, git).
+* Cargo package (a library plus the `stopit` binary) + `flake.nix` dev environment (Rust toolchain, bubblewrap, jujutsu, git).
 * Config parser: top-level settings, bases, profiles (`inherit`), `[[provider]]` with `config` and `script` types, manifest v1, merging and precedence (§3.5).
 * Path modes `masked`/`ro`/`rw`/`ephemeral`; env; network `none`/`loopback`.
 * `SandboxSpec` → `BwrapEngine`; `stopit __init` (controlling terminal, FD hygiene, Landlock, seccomp).
@@ -850,16 +866,16 @@ signing = false
 # Plus at least one user provider granting tools (required).
 ```
 
-For reference, the `vcs` provider's manifest is ordinary manifest data plus Rust handlers. For a **plain colocated repository** (all metadata inside `{workspace}`), its grants are equivalent to the following. For worktrees, jj secondary workspaces and subdirectory workspaces, the provider adds the resolved backing-storage and checkout-root paths (§7.3.1) as concrete absolute paths in the same sections.
+For reference, the `vcs` provider's manifest is ordinary manifest data plus Rust handlers. For a **plain colocated repository** (all metadata inside `{workspace}`), its grants are equivalent to the following. For worktrees, jj secondary workspaces and subdirectory workspaces, the provider adds the resolved backing-storage and checkout-root paths (§7.3.1) as concrete absolute paths in the same sections. Inside a manifest, contributed profiles use plain names and references (§3.6); from outside they appear as `vcs.ro`, `vcs.local`, `vcs.remote`.
 
 ```toml
 [provider.sandbox.fs]                      # applied to "main"
 masked = ["{workspace}/.git", "{workspace}/.jj"]
 
-[provider.sandbox.profiles."vcs.ro"]       # inherits "main"
+[provider.sandbox.profiles.ro]             # appears as "vcs.ro"; inherits "main"
 fs.ro = ["{workspace}/.git", "{workspace}/.jj", "~/.config/jj/repos/<repo-id>"]
 
-[provider.sandbox.profiles."vcs.local"]
+[provider.sandbox.profiles.local]          # appears as "vcs.local"
 fs.rw = ["{workspace}/.git", "{workspace}/.jj"]
 fs.ro = [
   "{workspace}/.git/config", "{workspace}/.git/config.worktree", "{workspace}/.git/info/attributes",
@@ -868,27 +884,29 @@ fs.ro = [
 ]
 fs.masked = ["{workspace}/.git/hooks", "{workspace}/.git/modules/*/hooks"]
 
-[provider.sandbox.profiles."vcs.remote"]
-inherit = "vcs.local"
+[provider.sandbox.profiles.remote]         # appears as "vcs.remote"
+inherit = "local"
 network.mode = "proxy"                     # domains derived from the resolved remote at approval time
 
 [provider.sandbox.shims.jj]
+binary = "jj"
 deny_flags = ["--config", "--config-file", "--config-toml"]
-default = { decision = "ask", profile = "vcs.local" }
+default = { decision = "ask", profile = "local" }
 rules = [
-  { subcommand = ["status", "diff", "log", "show", "evolog", "op log"], decision = "allow", profile = "vcs.ro" },
-  { subcommand = ["new", "commit", "describe"], decision = "allow", profile = "vcs.local", deny_flags = ["-A", "--insert-after", "-B", "--insert-before"] },
-  { subcommand = ["git fetch", "git clone"], decision = "ask", profile = "vcs.remote" },   # from `fetch`
-  { subcommand = ["git push"], decision = "ask", profile = "vcs.remote" },                 # from `push`
+  { subcommand = ["status", "diff", "log", "show", "evolog", "op log"], decision = "allow", profile = "ro" },
+  { subcommand = ["new", "commit", "describe"], decision = "allow", profile = "local", deny_flags = ["-A", "--insert-after", "-B", "--insert-before"] },
+  { subcommand = ["git fetch", "git clone"], decision = "ask", profile = "remote" },   # from `fetch`
+  { subcommand = ["git push"], decision = "ask", profile = "remote" },                 # from `push`
 ]
 
 [provider.sandbox.shims.git]
+binary = "git"
 deny_flags = ["-c", "--config-env", "--exec-path", "--upload-pack", "--receive-pack"]
-default = { decision = "ask", profile = "vcs.local" }
+default = { decision = "ask", profile = "local" }
 rules = [
-  { subcommand = ["status", "diff", "log", "show", "add", "commit"], decision = "allow", profile = "vcs.local" },
-  { subcommand = ["fetch", "pull", "ls-remote", "remote update", "clone"], decision = "ask", profile = "vcs.remote" },  # from `fetch`
-  { subcommand = ["push"], decision = "ask", profile = "vcs.remote" },                                                 # from `push`
+  { subcommand = ["status", "diff", "log", "show", "add", "commit"], decision = "allow", profile = "local" },
+  { subcommand = ["fetch", "pull", "ls-remote", "remote update", "clone"], decision = "ask", profile = "remote" },  # from `fetch`
+  { subcommand = ["push"], decision = "ask", profile = "remote" },                                                 # from `push`
 ]
 ```
 
@@ -906,7 +924,8 @@ The declarative form above reproduces the `vcs` provider's *grants*; its runtime
 * Terminal output filtering (escape-sequence allowlist), VT emulation for overlay restore, prompt safeguards.
 * Dropped `NativeLinuxEngine`; bubblewrap plus the `stopit __init` helper. Corrected the mount-locking rationale.
 * Seccomp additions: `clone3` → `ENOSYS`, new mount API, `setns`, socket-family allowlist (`AF_VSOCK` denied), configurable `ptrace`.
-* Broker fixes: per-sandbox sockets under `$XDG_RUNTIME_DIR`, cwd verification without `fchdir` into the caller's mount, signal/exit relay, global-flag parsing, Ask by default.
+* Broker fixes: per-sandbox sockets under `$XDG_RUNTIME_DIR`, cwd verification without `fchdir` into the caller's mount, signal/exit relay, global-flag parsing, explicit shim default.
 * Network `none` mode; CONNECT/SNI matching; model APIs tagged exfiltration-capable.
 * Env `deny` wins; `NIX_CONFIG` denied.
 * Optional resource limits; unix-socket masking; hard-link warning; no harness-specific features (§7.6 example instead).
+* **Implementation-driven clarifications:** syntactic path and manifest validation rules (§3.4, §3.6), the in-manifest profile reference rule, required shim `binary`/`default`, per-key `system.*` and `fs.mask_sockets` merge rules, reserved paths for the workspace mount and `system.home`, the proxy's refusal of host-local addresses, and the exact values accepted by `sandbox.share`, `sandbox.allow_syscalls`, `allow_domains`, `env.set` and `path_prepend`.
