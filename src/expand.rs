@@ -26,6 +26,9 @@ use crate::manifest::{Bind, PathPattern, PatternAnchor, SandboxAnchor, SandboxHo
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ExpandError {
     /// A glob in a path rule does not compile (e.g. an unclosed `[`).
+    ///
+    /// Unreachable for a validated `PathPattern`, which is checked with the
+    /// same glob builder when it is loaded; kept as a defensive error.
     #[error("invalid glob {pattern:?}: {error}")]
     InvalidGlob {
         /// The pattern with its anchor expanded on the host side.
@@ -370,7 +373,7 @@ mod tests {
         for s in [
             "{workspace}/*",
             "{workspace}/a?",
-            "{workspace}/a[b",
+            "{workspace}/a[b]",
             "{workspace}/a]b",
             "{workspace}/[ab]",
             "/a/b*",

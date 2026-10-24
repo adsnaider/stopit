@@ -337,11 +337,238 @@ fn check_components(rest: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Compiles the glob part of a path pattern (the components from the first
+/// one containing a glob character on).
+///
+/// This is the single place that decides how pattern globs are read, used
+/// both to validate patterns when they are loaded and to match them when
+/// they are resolved, so the two can never disagree. `*` and `?` never match
+/// `/`, and `\` is an ordinary filename byte: the path syntax has no escape
+/// character.
+///
+/// `literal_separator` only constrains `*` and `?`: globset compiles a class
+/// to a plain regex class, so `[!a]` would match `/` and, under `**`, reach
+/// paths the pattern never named. Every negated class is therefore rewritten
+/// to also exclude `/` (`[!abc]` becomes `[!abc/]`). Validation
+/// ([`check_glob`]) forbids a `/` or a `/`-spanning range in what the user
+/// wrote, so no class can match `/`.
+pub(crate) fn compile_glob(rest: &str) -> Result<globset::GlobMatcher, globset::Error> {
+    Ok(globset::GlobBuilder::new(&exclude_slash_from_negated(rest))
+        .literal_separator(true)
+        .backslash_escape(false)
+        .build()?
+        .compile_matcher())
+}
+
+/// A closed `[...]` character class found in a glob.
+#[derive(Debug)]
+struct Class {
+    /// Byte offsets of the whole class, `[` through `]`.
+    start: usize,
+    end: usize,
+    negated: bool,
+    /// Inclusive `(lo, hi)` ranges; a single character is `(c, c)`.
+    ranges: Vec<(char, char)>,
+    inverted: bool,
+}
+
+impl Class {
+    /// Whether `c` is one of the members (before negation).
+    #[cfg(test)]
+    fn contains(&self, c: char) -> bool {
+        self.ranges.iter().any(|&(lo, hi)| lo <= c && c <= hi)
+    }
+
+    /// Whether the class has an inverted range, which globset rejects. This
+    /// includes an inverted step of a chain: globset fails `[e-a-z]` at
+    /// `e-a`, even though the chain ends up as the valid range `e..z`.
+    fn inverted(&self) -> bool {
+        self.inverted
+    }
+}
+
+/// Sets the end of the last range, as globset does for `lo-hi` and for each
+/// further `-x` of a chain, noting if that leaves the range inverted.
+fn extend_last(ranges: &mut [(char, char)], hi: char, inverted: &mut bool) {
+    let r = ranges.last_mut().expect("in_range implies a member");
+    r.1 = hi;
+    *inverted |= r.1 < r.0;
+}
+
+/// Finds the closed character classes of `s`, reading them exactly as
+/// globset's `parse_class` does (0.4.x): an optional `!` or `^` negates; a
+/// `]` or `-` that is first is a literal member; a `-` after a member starts
+/// a range with the next character, and a `-` after a completed range makes
+/// the next character *extend that range* (`a-c-e` is `a..e`); a `-` right
+/// before the closing `]` is a literal member. An unclosed class ends the
+/// scan; globset reports it. Shared by validation and compilation.
+fn classes(s: &str) -> Vec<Class> {
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].1 != '[' {
+            i += 1;
+            continue;
+        }
+        let start = chars[i].0;
+        i += 1;
+        let negated = matches!(chars.get(i), Some((_, '!' | '^')));
+        if negated {
+            i += 1;
+        }
+        let mut ranges: Vec<(char, char)> = Vec::new();
+        let mut first = true;
+        let mut in_range = false;
+        let mut inverted = false;
+        let mut end = None;
+        while let Some(&(at, c)) = chars.get(i) {
+            i += 1;
+            match c {
+                ']' if !first => {
+                    end = Some(at + 1);
+                    break;
+                }
+                ']' => ranges.push((']', ']')),
+                '-' if first => ranges.push(('-', '-')),
+                '-' if in_range => {
+                    extend_last(&mut ranges, '-', &mut inverted);
+                    in_range = false;
+                }
+                '-' => in_range = true,
+                c if in_range => {
+                    extend_last(&mut ranges, c, &mut inverted);
+                    in_range = false;
+                }
+                c => ranges.push((c, c)),
+            }
+            first = false;
+        }
+        let Some(end) = end else { break };
+        if in_range {
+            ranges.push(('-', '-'));
+        }
+        out.push(Class {
+            start,
+            end,
+            negated,
+            ranges,
+            inverted,
+        });
+    }
+    out
+}
+
+/// Rewrites every negated class of `glob` to also exclude `/`. The class is
+/// rebuilt from its parsed ranges in a form with no ambiguity: a literal `]`
+/// goes first, a literal `-` goes last (after the added `/`), and a range
+/// that starts or ends with one of them is split around it, so no member
+/// changes meaning. A class with an inverted range is left alone for globset
+/// to reject.
+fn exclude_slash_from_negated(glob: &str) -> String {
+    let mut out = String::with_capacity(glob.len() + 2);
+    let mut pos = 0;
+    for class in classes(glob).iter().filter(|c| c.negated) {
+        out.push_str(&glob[pos..class.start]);
+        pos = class.end;
+        if class.inverted() {
+            out.push_str(&glob[class.start..class.end]);
+            continue;
+        }
+        let (mut bracket, mut dash) = (false, false);
+        let mut body = String::new();
+        for &(mut lo, mut hi) in &class.ranges {
+            if lo == ']' {
+                bracket = true;
+                if hi == ']' {
+                    continue;
+                }
+                lo = '^'; // the character after `]`
+            } else if lo == '-' {
+                dash = true;
+                if hi == '-' {
+                    continue;
+                }
+                lo = '.'; // the character after `-`
+            }
+            if hi == ']' {
+                bracket = true;
+                hi = '\\'; // the character before `]`
+            }
+            body.push(lo);
+            if lo != hi {
+                body.push('-');
+                body.push(hi);
+            }
+        }
+        out.push_str("[!");
+        if bracket {
+            out.push(']');
+        }
+        out.push_str(&body);
+        out.push('/');
+        if dash {
+            out.push('-');
+        }
+        out.push(']');
+    }
+    out.push_str(&glob[pos..]);
+    out
+}
+
+/// Checks the glob syntax of the components after the anchor, if there are
+/// any glob characters.
+///
+/// Beyond what [`compile_glob`] accepts: a character class must stay within
+/// one component, so it must not contain a `/` or a range spanning `/`
+/// (`[.-0]`), and `**` must be an entire component (globset would read `a**b`
+/// as two ordinary stars, which is never what was meant). A lone `]` is an
+/// ordinary character, as in globset. There is no escape character: to match
+/// a glob character literally, put it in a class (`[*]`, `[?]`, `[[]`).
+fn check_glob(rest: &str) -> Result<(), String> {
+    if !has_glob(rest) {
+        return Ok(());
+    }
+    // Classes first, so that `[**]` is not reported as a misplaced `**`.
+    for class in classes(rest) {
+        for &(lo, hi) in &class.ranges {
+            if lo == '/' && hi == '/' {
+                return Err("a `[...]` character class must not contain `/`".to_owned());
+            }
+            if lo <= '/' && '/' <= hi {
+                return Err(format!(
+                    "the range `{lo}-{hi}` in a `[...]` character class must not include `/`"
+                ));
+            }
+        }
+    }
+    for c in rest.split('/') {
+        if c.contains("**") && c != "**" {
+            let hint = if c.contains('[') {
+                " (inside a class, write `[*]`)"
+            } else {
+                ""
+            };
+            return Err(format!(
+                "`**` must be an entire path component, but found {c:?}{hint}"
+            ));
+        }
+    }
+    compile_glob(rest).map_err(|e| format!("invalid glob: {}", e.kind()))?;
+    Ok(())
+}
+
 /// A syntactically valid path rule.
 ///
 /// One of: an absolute path, `~` or `~/…`, `{workspace}` or `{workspace}/…`.
 /// Components after the leading anchor may contain the glob characters `*`,
-/// `?`, `[` and `]`; glob syntax itself is not validated here. Below a `/` or
+/// `?`, `[` and `]`, and any glob must be valid: `**` only as an entire
+/// component, no `/` or `/`-spanning range inside a `[...]` class (see
+/// `check_glob`), and the glob must compile (so
+/// no unclosed `[`). A lone `]` is an ordinary character. Matching is on
+/// bytes: `?` and `[...]` match a single byte, so they do not match a
+/// non-ASCII character as a whole (`?.env` does not match `é.env`; use `*`).
+/// Below a `/` or
 /// `~` anchor the first component must not be a glob (so `/*`, `/**` and
 /// `~/*` are rejected, while `/nix/store/*-foo` is fine). This is only a
 /// syntactic guard against glob accidents: broad grants such as
@@ -417,7 +644,17 @@ impl FromStr for PathPattern {
                 "the first component below `/` or `~` must not be a glob",
             ));
         }
+        check_glob(rest).map_err(|why| bad(&why))?;
         Ok(PathPattern(s.to_owned()))
+    }
+}
+
+#[cfg(test)]
+impl PathPattern {
+    /// Builds a pattern without validating it, to test code that must cope
+    /// with patterns that validation would have rejected.
+    pub(crate) fn new_unchecked(s: &str) -> PathPattern {
+        PathPattern(s.to_owned())
     }
 }
 
@@ -1025,6 +1262,255 @@ mod tests {
         toml_err("[fs]\nrw = \"/a\"");
         toml_err("[fs]\nrw = [5]");
         jv_err(r#""fs": {"rw": "/a"}"#);
+    }
+
+    const BAD_GLOBS: &[(&str, &str)] = &[
+        ("{workspace}/[.-0]", "must not include `/`"),
+        ("{workspace}/[!.-0]", "must not include `/`"),
+        ("{workspace}/[--0]", "must not include `/`"),
+        ("{workspace}/[z-a]", "invalid range"),
+        ("{workspace}/[e-a-z]", "invalid range"),
+        ("{workspace}/[!e-a-z]", "invalid range"),
+        ("{workspace}/[**]", "write `[*]`"),
+        ("{workspace}/**.nix", "entire path component"),
+        ("{workspace}/a**b", "entire path component"),
+        ("/x/a**", "entire path component"),
+        ("{workspace}/x/***", "entire path component"),
+        ("{workspace}/x/**a/y", "entire path component"),
+        ("/x/a[/]b", "must not contain `/`"),
+        ("/x/a[!/]b", "must not contain `/`"),
+        ("{workspace}/[a.nix", "invalid glob"),
+        ("~/.config/[]", "invalid glob"),
+    ];
+
+    #[test]
+    fn invalid_globs_are_rejected() {
+        for &(bad, why) in BAD_GLOBS {
+            let msg = bad.parse::<PathPattern>().unwrap_err().to_string();
+            assert!(msg.contains("path pattern"), "{bad:?}: {msg}");
+            assert!(msg.contains(&format!("{bad:?}")), "{bad:?}: {msg}");
+            assert!(msg.contains(why), "{bad:?}: {msg}");
+            assert!(PathPattern::try_from(bad.to_owned()).is_err(), "{bad:?}");
+        }
+        // The globset message is included for patterns it rejects.
+        let msg = "{workspace}/[a.nix"
+            .parse::<PathPattern>()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.ends_with("invalid glob: unclosed character class; missing ']'"),
+            "{msg}"
+        );
+        // The pattern is quoted once, not again by globset.
+        assert_eq!(msg.matches("[a.nix").count(), 1, "{msg}");
+    }
+
+    #[test]
+    fn has_glob_sees_every_glob_character() {
+        for s in ["a*", "a?", "a[b", "a]b", "[a]"] {
+            assert!(has_glob(s), "{s}");
+        }
+        assert!(!has_glob("a.b-c"));
+    }
+
+    #[test]
+    fn glob_characters_can_be_matched_literally_in_a_class() {
+        // There is no `\` escape; a class is the way to name `*` or `?`.
+        let m = compile_glob("[*]").unwrap();
+        assert!(m.is_match("*"));
+        assert!(!m.is_match("a"));
+        let m = compile_glob("[?]x").unwrap();
+        assert!(m.is_match("?x"));
+        assert!(!m.is_match("ax"));
+        for ok in ["{workspace}/[*]", "{workspace}/[?]", "{workspace}/x/**/**"] {
+            ok.parse::<PathPattern>()
+                .unwrap_or_else(|e| panic!("{ok:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn class_scanner_agrees_with_globset() {
+        let probes: Vec<char> = (0u8..128)
+            .map(char::from)
+            .chain(['é', 'α', 'ω', '\u{10FFFF}'])
+            .collect();
+        let bodies = [
+            "a", "ab", "a-c", "]", "]a", "]-a", "-", "-a", "a-", "-a-", "---", "--", "--.", "a-b-",
+            "a-c-e", "a-c-e-g", "e-a-z", "+-.-0", ".-0", "é", "α-ω", "]a-c-", "*?", "[", "[a",
+        ];
+        for body in bodies {
+            for neg in ["", "!", "^"] {
+                let class = format!("[{neg}{body}]");
+                let found = classes(&class);
+                assert_eq!(found.len(), 1, "{class}");
+                let c = &found[0];
+                assert_eq!(
+                    (c.start, c.end, c.negated),
+                    (0, class.len(), !neg.is_empty())
+                );
+                let Ok(glob) = globset::GlobBuilder::new(&class)
+                    .literal_separator(false)
+                    .backslash_escape(false)
+                    .build()
+                else {
+                    assert!(
+                        c.inverted(),
+                        "{class}: globset rejects but scanner does not"
+                    );
+                    continue;
+                };
+                assert!(!c.inverted(), "{class}");
+                let m = glob.compile_matcher();
+                for &p in &probes {
+                    // globset matches bytes, so a class compares single bytes
+                    // and never matches a whole multi-byte character (even
+                    // `[é]` does not match `é`): only ASCII is comparable.
+                    // That does not affect `/`, which is ASCII, and ranges
+                    // are still judged by code point (`[+-é]` spans `/`).
+                    if !p.is_ascii() {
+                        continue;
+                    }
+                    assert_eq!(
+                        m.is_match(p.to_string()),
+                        c.contains(p) != c.negated,
+                        "{class} on {p:?}"
+                    );
+                }
+            }
+        }
+        // Inverted ranges are errors in globset, and the scanner knows.
+        assert!(classes("[z-a]")[0].inverted());
+        assert!(classes("[c-e-a]")[0].inverted());
+        assert!(!classes("[a-c-b]")[0].inverted());
+        assert!(classes("[α-ω]")[0].contains('β'));
+        assert!(!classes("[α-ω]")[0].contains('a'));
+    }
+
+    #[test]
+    fn chained_ranges_spanning_slash_are_rejected() {
+        // `+-.-0` is the range `+..0`, which includes `/`.
+        for bad in [
+            "{workspace}/**/x[+-.-0]y",
+            "{workspace}/x[!+-.-0]y",
+            "{workspace}/x[+-é]y",
+        ] {
+            let msg = bad.parse::<PathPattern>().unwrap_err().to_string();
+            assert!(msg.contains("must not include `/`"), "{bad}: {msg}");
+        }
+        "{workspace}/[a-c-e]".parse::<PathPattern>().unwrap();
+    }
+
+    #[test]
+    fn classes_never_match_slash() {
+        let m = compile_glob("**/x[!a]y").unwrap();
+        assert!(!m.is_match("x/y"));
+        assert!(m.is_match("q/xby"));
+        assert!(!m.is_match("xay"));
+        // A leading `-` is a literal, not the start of a range, so `[!-0]`
+        // is an ordinary negated class.
+        "{workspace}/[!-0]".parse::<PathPattern>().unwrap();
+        assert!(!compile_glob("x[!-0]y").unwrap().is_match("x/y"));
+        assert!(compile_glob("x[!-0]y").unwrap().is_match("x.y"));
+        for g in [
+            "x[^a]y", "x[!a-c]y", "x[!]]y", "x[!a-]y", "x[!-a]y", "x[!]a-]y",
+        ] {
+            assert!(!compile_glob(g).unwrap().is_match("x/y"), "{g}");
+        }
+    }
+
+    #[test]
+    fn negated_class_rewrite_keeps_every_other_character_semantics() {
+        // The rewritten glob must agree with the original on all ASCII
+        // characters except `/`.
+        for g in [
+            "[!a]",
+            "[^a]",
+            "[!ab]",
+            "[!a-c]",
+            "[!]]",
+            "[!]a]",
+            "[!a-]",
+            "[!-a]",
+            "[!-]",
+            "[!a-cx-z]",
+            "[!-0]",
+            "[]-a]",
+            "[!a-c-e]",
+            "[!a-c-e-g]",
+            "[!---]",
+            "[!+-.-0]",
+            "[!a-]-]",
+            "[!]a-c-]",
+            "[!*?]",
+            "[!.-.]",
+        ] {
+            let orig = globset::GlobBuilder::new(g)
+                .literal_separator(true)
+                .backslash_escape(false)
+                .build()
+                .unwrap()
+                .compile_matcher();
+            let new = compile_glob(g).unwrap();
+            for b in 1u8..128 {
+                let s = (b as char).to_string();
+                if s == "/" {
+                    assert!(!new.is_match(&s), "{g}");
+                } else {
+                    assert_eq!(orig.is_match(&s), new.is_match(&s), "{g} on {s:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_globs_are_rejected_in_documents_with_position() {
+        for &(bad, why) in BAD_GLOBS {
+            let msg = toml_err(&format!("[fs]\nrw = []\nmasked = [\"{bad}\"]"));
+            assert!(msg.contains(&format!("{bad:?}")), "{bad:?}: {msg}");
+            assert!(msg.contains(why), "{bad:?}: {msg}");
+            assert!(msg.contains("line 3"), "{bad:?}: {msg}");
+            let msg = jv_err(&format!(r#""fs": {{"protected": ["{bad}"]}}"#));
+            assert!(msg.contains(why), "{bad:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn valid_globs_are_accepted() {
+        for good in [
+            "{workspace}/**/*.nix",
+            "{workspace}/**/x",
+            "{workspace}/.env.*",
+            "{workspace}/[ab]?/c",
+            "{workspace}/[!ab]/c",
+            "{workspace}/[^ab]/c",
+            "{workspace}/[]a]/c",
+            "{workspace}/[a-z]*.nix",
+            "/nix/store/*-foo",
+            "~/.config/*/settings",
+            "~/.cache/**",
+            "{workspace}/**",
+            "{workspace}/**/**/x",
+            // A lone `]` is an ordinary character, as in globset.
+            "{workspace}/a]",
+            "{workspace}/]",
+        ] {
+            good.parse::<PathPattern>()
+                .unwrap_or_else(|e| panic!("{good:?}: {e}"));
+            toml_ok(&format!("[fs]\nro = [\"{good}\"]"));
+        }
+    }
+
+    #[test]
+    fn compile_glob_options() {
+        // `*` and `?` stop at `/`; `\` is an ordinary byte.
+        let m = compile_glob("*.nix").unwrap();
+        assert!(m.is_match("a.nix"));
+        assert!(!m.is_match("d/a.nix"));
+        assert!(compile_glob("a?b").unwrap().is_match("axb"));
+        assert!(!compile_glob("a?b").unwrap().is_match("a/b"));
+        assert!(compile_glob("a\\*").unwrap().is_match("a\\b"));
+        assert!(compile_glob("**/x").unwrap().is_match("a/b/x"));
+        assert!(compile_glob("[a").is_err());
     }
 
     #[test]

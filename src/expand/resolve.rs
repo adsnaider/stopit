@@ -19,12 +19,11 @@ use std::io;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
-use globset::GlobBuilder;
 use thiserror::Error;
 use walkdir::WalkDir;
 
 use super::{ExpandError, ExpandedPattern, join};
-use crate::manifest::{PatternAnchor, has_glob};
+use crate::manifest::{PatternAnchor, compile_glob, has_glob};
 
 /// What kind of filesystem entry a resolved path is, as reported by
 /// `symlink_metadata` (the final symlink is never followed).
@@ -269,6 +268,8 @@ fn resolve_beneath(
 /// reported as written.
 ///
 /// The only error is a glob that does not compile (e.g. an unclosed `[`).
+/// A validated [`PathPattern`](crate::manifest::PathPattern) never has one,
+/// so this is defensive.
 pub fn resolve(pattern: &ExpandedPattern) -> Result<Resolution, ExpandError> {
     let res = if pattern.has_glob() {
         resolve_glob(pattern)?
@@ -332,17 +333,11 @@ fn resolve_glob(pattern: &ExpandedPattern) -> Result<Resolution, ExpandError> {
     let prefix = PathBuf::from(components[..split].join("/"));
     let remainder = components[split..].join("/");
 
-    let matcher = GlobBuilder::new(&remainder)
-        .literal_separator(true)
-        // The path syntax has no escape character: `\` is an ordinary
-        // filename byte.
-        .backslash_escape(false)
-        .build()
-        .map_err(|error| ExpandError::InvalidGlob {
-            pattern: join(pattern.host_anchor(), pattern.rest()),
-            error,
-        })?
-        .compile_matcher();
+    // Validated patterns always compile; the error is purely defensive.
+    let matcher = compile_glob(&remainder).map_err(|error| ExpandError::InvalidGlob {
+        pattern: join(pattern.host_anchor(), pattern.rest()),
+        error,
+    })?;
 
     let mut res = Resolution::default();
     // The walk root is reached through the symlinks in the prefix, following
@@ -1222,10 +1217,58 @@ mod tests {
     #[test]
     fn invalid_glob_is_an_error_naming_the_pattern() {
         let f = Fixture::new();
-        let pattern: PathPattern = "{workspace}/nix/[a.nix".parse().unwrap();
+        // Validation rejects this pattern, so it must be built unchecked.
+        assert!("{workspace}/nix/[a.nix".parse::<PathPattern>().is_err());
+        let pattern = PathPattern::new_unchecked("{workspace}/nix/[a.nix");
         let err = resolve(&expand_pattern(&pattern, &f.ctx)).unwrap_err();
         assert!(matches!(err, ExpandError::InvalidGlob { .. }), "{err:?}");
         let msg = err.to_string();
         assert!(msg.contains("nix/[a.nix"), "{msg}");
+    }
+
+    #[test]
+    fn negated_class_does_not_match_across_components() {
+        let f = Fixture::new();
+        f.file("x/y");
+        f.file("q/xby");
+        f.file("xay");
+        assert_eq!(f.rels("{workspace}/**/x[!a]y"), ["q/xby"]);
+        assert_eq!(f.rels("{workspace}/**/x[^a]y"), ["q/xby"]);
+    }
+
+    #[test]
+    fn classes_match_glob_characters_literally() {
+        let f = Fixture::new();
+        for name in ["*", "?", "a"] {
+            f.file(name);
+        }
+        assert_eq!(f.rels("{workspace}/[*]"), ["*"]);
+        assert_eq!(f.rels("{workspace}/[?]"), ["?"]);
+    }
+
+    #[test]
+    fn patterns_accepted_at_load_always_compile_in_resolve() {
+        // Validation and resolution share `compile_glob`, so nothing a
+        // `PathPattern` accepts can hit `InvalidGlob` here.
+        let f = Fixture::new();
+        f.file("a.nix");
+        f.file("ab/c");
+        f.file("a]");
+        for pattern in [
+            "{workspace}/**/*.nix",
+            "{workspace}/.env.*",
+            "{workspace}/[ab]?/c",
+            "{workspace}/a]",
+            "{workspace}/[]]*",
+            "{workspace}/[!a]*",
+            "{workspace}/**",
+            "~/.config/*/settings",
+            "/nix/store/*-foo",
+        ] {
+            let parsed: PathPattern = pattern.parse().unwrap();
+            resolve(&expand_pattern(&parsed, &f.ctx)).unwrap_or_else(|e| panic!("{pattern}: {e}"));
+        }
+        assert_eq!(f.rels("{workspace}/a]"), ["a]"]);
+        assert_eq!(f.rels("{workspace}/[ab]?/c"), ["ab/c"]);
     }
 }
