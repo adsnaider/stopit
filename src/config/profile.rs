@@ -13,13 +13,13 @@ use crate::error::ValueError;
 use crate::serde_util::MapOnly;
 
 /// Name of the implicit main profile.
-const MAIN: &str = "main";
+pub(super) const MAIN: &str = "main";
 /// The `inherit` keyword that starts from the empty sandbox.
-const NONE: &str = "none";
+pub(super) const NONE: &str = "none";
 
 /// Checks one name segment: non-empty, ASCII lowercase letters, digits, `-`
 /// and `_`, starting with a letter.
-fn check_segment(seg: &str) -> Result<(), &'static str> {
+pub(super) fn check_segment(seg: &str) -> Result<(), &'static str> {
     let mut chars = seg.chars();
     match chars.next() {
         None => return Err("must not be empty"),

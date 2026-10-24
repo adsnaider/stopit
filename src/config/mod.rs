@@ -2,16 +2,19 @@
 //!
 //! Only the settings that are not grants live here: `base`, `[workspace]`,
 //! `[limits]`, `[approval]` and `[terminal]`, plus the structure of
-//! `[profiles.<name>]` declarations. Providers are not handled yet.
+//! `[profiles.<name>]` declarations and the syntax of `[[provider]]` entries.
+//! Providers are only parsed and validated here, never run or merged.
 //!
 //! This is security configuration, so every table rejects unknown keys:
 //! a typo must fail loudly instead of silently falling back to a default.
 
 mod profile;
+mod provider;
 
 pub use profile::{Inherit, ProfileDecl, ProfileName, ProfileRef};
+pub use provider::{ProviderEntry, ProviderKind, ProviderName, ScriptSource, VcsTool, VcsView};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::num::{IntErrorKind, NonZeroU32};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -36,8 +39,11 @@ pub enum ConfigError {
 ///
 /// Every field has the default given in the design, so an empty document is
 /// valid.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(from = "MapOnly<RawConfig>")]
+///
+/// Not `Eq`: script providers carry free-form TOML values, which may be
+/// floats.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(try_from = "MapOnly<RawConfig>")]
 pub struct Config {
     /// Starting set of built-in providers (§3.2).
     pub base: Base,
@@ -52,6 +58,8 @@ pub struct Config {
     /// User-declared profiles (§3.3). `main` is implicit and cannot be
     /// declared.
     pub profiles: BTreeMap<ProfileName, ProfileDecl>,
+    /// `[[provider]]` entries in file order. Effective names are unique.
+    pub providers: Vec<ProviderEntry>,
 }
 
 /// Deserialization shape of [`Config`]; see [`MapOnly`].
@@ -64,18 +72,35 @@ struct RawConfig {
     approval: Approval,
     terminal: Terminal,
     profiles: BTreeMap<ProfileName, ProfileDecl>,
+    provider: Vec<ProviderEntry>,
 }
 
-impl From<MapOnly<RawConfig>> for Config {
-    fn from(MapOnly(raw): MapOnly<RawConfig>) -> Self {
-        Config {
+impl TryFrom<MapOnly<RawConfig>> for Config {
+    type Error = ValueError;
+
+    fn try_from(MapOnly(raw): MapOnly<RawConfig>) -> Result<Self, ValueError> {
+        let mut seen = HashMap::new();
+        for (i, p) in raw.provider.iter().enumerate() {
+            if let Some(first) = seen.insert(p.name.as_str(), i) {
+                return Err(ValueError::new(format!(
+                    "duplicate provider name {:?} ([[provider]] entries {} and {}): \
+                     provider names must be unique (the default name is the type); \
+                     set `name` on each entry",
+                    p.name.as_str(),
+                    first + 1,
+                    i + 1
+                )));
+            }
+        }
+        Ok(Config {
             base: raw.base,
             workspace: raw.workspace,
             limits: raw.limits,
             approval: raw.approval,
             terminal: raw.terminal,
             profiles: raw.profiles,
-        }
+            providers: raw.provider,
+        })
     }
 }
 
@@ -496,6 +521,7 @@ mod tests {
                 clipboard_write: ClipboardWrite::Block,
             },
             profiles: BTreeMap::new(),
+            providers: Vec::new(),
         }
     }
 
@@ -559,6 +585,7 @@ mod tests {
                 clipboard_write: ClipboardWrite::Ask,
             },
             profiles: BTreeMap::new(),
+            providers: Vec::new(),
         };
         assert_eq!(Config::from_toml_str(src).unwrap(), expected);
     }
@@ -828,8 +855,7 @@ mod tests {
             ("[approval]\ntimout = \"5m\"", "timout"),
             ("[terminal]\nhotkeys = \"x\"", "hotkeys"),
             ("[unknown]\nx = 1", "unknown"),
-            // Not implemented yet, so rejected rather than ignored.
-            ("[[provider]]\ntype = \"config\"", "provider"),
+            ("[[providers]]\ntype = \"config\"", "providers"),
         ] {
             let msg = err(src);
             assert!(msg.contains(key), "{src:?}: {msg}");
@@ -854,6 +880,7 @@ mod tests {
             "[[limits]]\npids = 1",
             "[[workspace]]\nmount = \"/w\"",
             "[[profiles.harness]]\ninherit = \"none\"",
+            "provider = [[\"config\"]]",
         ] {
             let msg = err(src);
             assert!(msg.contains("expected a map"), "{src:?}: {msg}");
