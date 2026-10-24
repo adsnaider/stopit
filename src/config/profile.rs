@@ -9,6 +9,7 @@ use std::str::FromStr;
 
 use serde::Deserialize;
 
+use super::ProviderName;
 use crate::error::ValueError;
 use crate::serde_util::MapOnly;
 
@@ -112,6 +113,12 @@ impl ProfileRef {
     /// A reference to the implicit `main` profile.
     pub fn main() -> Self {
         ProfileRef(MAIN.to_owned())
+    }
+
+    /// The full name `<provider>.<profile>` of a profile contributed by a
+    /// provider. Always valid: both parts are valid segments.
+    pub fn contributed(provider: &ProviderName, profile: &ProfileName) -> Self {
+        ProfileRef(format!("{provider}.{profile}"))
     }
 
     /// The reference as a string.
@@ -433,5 +440,13 @@ mod tests {
     fn profile_name_converts_to_ref() {
         let r: ProfileRef = name("harness").into();
         assert_eq!(r.as_str(), "harness");
+    }
+
+    #[test]
+    fn contributed_ref_is_prefixed_and_valid() {
+        let provider: ProviderName = "my-vcs".parse().unwrap();
+        let r = ProfileRef::contributed(&provider, &name("local"));
+        assert_eq!(r.as_str(), "my-vcs.local");
+        assert_eq!(r, "my-vcs.local".parse().unwrap());
     }
 }

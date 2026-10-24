@@ -8,6 +8,7 @@ pub mod expand;
 pub mod manifest;
 pub mod policy;
 pub mod provider;
+pub mod resolve;
 mod serde_util;
 
 /// The version of the `stopit` crate.
