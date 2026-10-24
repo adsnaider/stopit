@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod error;
+pub mod expand;
 pub mod manifest;
 pub mod policy;
 pub mod provider;

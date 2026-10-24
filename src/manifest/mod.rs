@@ -297,8 +297,28 @@ impl From<MapOnly<RawFsGrants>> for FsGrants {
 /// Characters that make a path component a glob.
 const GLOB_CHARS: [char; 4] = ['*', '?', '[', ']'];
 
-fn has_glob(s: &str) -> bool {
+pub(crate) fn has_glob(s: &str) -> bool {
     s.contains(GLOB_CHARS)
+}
+
+/// The leading part of a [`PathPattern`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PatternAnchor {
+    /// `{workspace}` or `{workspace}/…`.
+    Workspace,
+    /// `~` or `~/…`.
+    Home,
+    /// An absolute path, anchored at `/`.
+    Root,
+}
+
+/// The leading part of a [`SandboxPath`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SandboxAnchor {
+    /// `~` or `~/…`: the sandbox `HOME`.
+    Home,
+    /// An absolute path, anchored at `/`.
+    Root,
 }
 
 /// Checks the components after the leading anchor: no empty components (so
@@ -336,6 +356,29 @@ impl PathPattern {
     /// The validated pattern text.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Splits the pattern into its anchor and the remaining relative path.
+    ///
+    /// The remainder never starts or ends with `/` and is empty when the
+    /// pattern is just the anchor (`~`, `{workspace}`). For an absolute path
+    /// the anchor is `/` and the remainder is everything after it.
+    pub fn split(&self) -> (PatternAnchor, &str) {
+        let s = self.0.as_str();
+        if s == "{workspace}" {
+            (PatternAnchor::Workspace, "")
+        } else if s == "~" {
+            (PatternAnchor::Home, "")
+        } else if let Some(rest) = s.strip_prefix("{workspace}/") {
+            (PatternAnchor::Workspace, rest)
+        } else if let Some(rest) = s.strip_prefix("~/") {
+            (PatternAnchor::Home, rest)
+        } else {
+            (
+                PatternAnchor::Root,
+                s.strip_prefix('/').expect("validated: absolute"),
+            )
+        }
     }
 }
 
@@ -402,6 +445,22 @@ impl SandboxPath {
     /// The validated path text.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Splits the path into its anchor and the remaining relative path, with
+    /// the same conventions as [`PathPattern::split`].
+    pub fn split(&self) -> (SandboxAnchor, &str) {
+        let s = self.0.as_str();
+        if s == "~" {
+            (SandboxAnchor::Home, "")
+        } else if let Some(rest) = s.strip_prefix("~/") {
+            (SandboxAnchor::Home, rest)
+        } else {
+            (
+                SandboxAnchor::Root,
+                s.strip_prefix('/').expect("validated: absolute"),
+            )
+        }
     }
 }
 
