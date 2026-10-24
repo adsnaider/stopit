@@ -227,6 +227,7 @@ Path syntax (in any provider):
 * Globs (`*`, `**`) are expanded **once at session start** into concrete paths. Files created later are not retroactively masked or protected (except via the "new files are written through" rule above).
 
 Additional checks:
+* **Symlinks.** The workspace is writable by the sandbox, so a symlink in it may have been planted to reach host files. For `{workspace}` rules, symlinks in the path (a literal path, or a glob's literal prefix) are followed only while the result stays beneath the workspace; a path that escapes skips the rule with a warning. The final component of a matched path is never followed, and globs never descend into symlinked directories. `~` and absolute rules follow symlinks (home-manager and `/etc/static` rely on it); see §11. A matched symlink inside the workspace is never bound: a bind mount would follow it.
 * **Unix sockets.** Network namespaces isolate abstract sockets, but a socket *file* created by a host process inside an RW directory is reachable through the bind mount (e.g. `.devenv/state/postgres/.s.PGSQL.5432`). With `fs.mask_sockets = true` (default base), sockets found in RW grants at startup are masked (connecting yields `ECONNREFUSED`).
 * **Hard links.** A protected file with `nlink > 1` is writable through its other name. The sandbox cannot create such links (`link` across mounts fails with `EXDEV`), but pre-existing ones trigger a startup warning.
 
@@ -753,6 +754,8 @@ Session-wide, so not a provider setting. Off unless configured. Applied by launc
 * **HTTPS remote credentials** in `.git/config` are readable when `vcs` uses `view = "ro"`.
 * **Domain fronting** cannot be detected by the proxy.
 * **Masked/protected globs** are evaluated once at startup.
+* **Path resolution is path-based.** Rule paths are resolved to concrete host paths at startup and mounted by path, so another session on the same workspace can swap a component (e.g. replace a directory with a symlink) between resolution and mounting. Planned hardening: resolve to `O_PATH` file descriptors with the same algorithm (`openat(O_PATH|O_NOFOLLOW)` and `readlinkat` per component) and mount them with bwrap `--bind-fd`/`--ro-bind-fd`.
+* **Symlink confinement is keyed on the `{workspace}` anchor.** A `~` or absolute rule that points into the workspace or another RW grant (e.g. `~/.cache/tool/x/**` with `~/.cache/tool` granted `rw`) still follows symlinks the sandbox planted there.
 
 **Future:**
 * **`WorkspaceBackend` abstraction** with `BindBackend` (v1) and `FuseBackend`: full-workspace FUSE using FUSE passthrough (Linux 6.9+), likely built on `fuse-backend-rs`. Gains: renames handled natively (no seccomp hook), nested-`.git` control, live policy changes, a write log. Costs: the daemon becomes a security boundary (requires `O_PATH`-per-inode, `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` discipline), and every lookup/stat still goes through the supervisor. Benchmark on a cargo build and an `npm install` before adopting; keep kernel bind mounts for `.git` stubs and masks on top, and allow large low-risk directories (`target/`, `node_modules/`) to bypass FUSE.

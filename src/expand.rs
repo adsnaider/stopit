@@ -8,7 +8,11 @@
 //!
 //! Everything here is pure: the filesystem is never consulted. Globs are
 //! carried through unexpanded in [`ExpandedPattern::rest`]; expanding them
-//! against the host filesystem is a separate step.
+//! against the host filesystem is a separate step, [`resolve`].
+
+mod resolve;
+
+pub use resolve::{EntryKind, Resolution, ResolveWarning, ResolvedPath, resolve};
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -18,9 +22,18 @@ use thiserror::Error;
 use crate::config::WorkspaceMount;
 use crate::manifest::{Bind, PathPattern, PatternAnchor, SandboxAnchor, SandboxHome, has_glob};
 
-/// Error building an [`ExpansionContext`].
+/// Error building an [`ExpansionContext`] or resolving a pattern.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ExpandError {
+    /// A glob in a path rule does not compile (e.g. an unclosed `[`).
+    #[error("invalid glob {pattern:?}: {error}")]
+    InvalidGlob {
+        /// The pattern with its anchor expanded on the host side.
+        pattern: PathBuf,
+        /// The glob parser's error.
+        #[source]
+        error: globset::Error,
+    },
     /// A host path supplied by the environment is not absolute and normalised.
     #[error("invalid {what} {path:?}: {why}")]
     InvalidHostPath {
@@ -78,6 +91,13 @@ impl ExpansionContext {
     /// silently produce wrong mappings, so both must be absolute and
     /// normalised (no `.`, `..` or empty components, no trailing `/`, not
     /// `/`).
+    ///
+    /// Both must also be canonical, i.e. contain no symlinks; this is not
+    /// checked here, since it needs the filesystem, so the caller
+    /// canonicalises them at session start. Otherwise `{workspace}` itself
+    /// could resolve as a symlink, and absolute symlinks pointing back into
+    /// the workspace would not be recognised as staying beneath it (see
+    /// [`resolve`]).
     pub fn new(
         workspace_host: PathBuf,
         workspace_mount: WorkspaceMount,
@@ -115,12 +135,18 @@ fn join(anchor: &Path, rest: &Path) -> PathBuf {
 /// path, which `Path::join` would treat as discarding the anchor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpandedPattern {
+    anchor: PatternAnchor,
     host_anchor: PathBuf,
     sandbox_anchor: PathBuf,
     rest: PathBuf,
 }
 
 impl ExpandedPattern {
+    /// Which leading part the pattern had.
+    pub fn anchor(&self) -> PatternAnchor {
+        self.anchor
+    }
+
     /// What the leading part expanded to on the host.
     pub fn host_anchor(&self) -> &Path {
         &self.host_anchor
@@ -163,6 +189,7 @@ pub fn expand_pattern(pattern: &PathPattern, ctx: &ExpansionContext) -> Expanded
         PatternAnchor::Root => (PathBuf::from("/"), PathBuf::from("/")),
     };
     ExpandedPattern {
+        anchor,
         host_anchor,
         sandbox_anchor,
         rest: PathBuf::from(rest),
