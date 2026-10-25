@@ -98,9 +98,8 @@ impl ExpansionContext {
     /// Both must also be canonical, i.e. contain no symlinks; this is not
     /// checked here, since it needs the filesystem, so the caller
     /// canonicalises them at session start. Otherwise `{workspace}` itself
-    /// could resolve as a symlink, and absolute symlinks pointing back into
-    /// the workspace would not be recognised as staying beneath it (see
-    /// [`resolve`]).
+    /// would resolve as a symlink, and globs below it would not be walked
+    /// (see [`resolve`]).
     pub fn new(
         workspace_host: PathBuf,
         workspace_mount: WorkspaceMount,
