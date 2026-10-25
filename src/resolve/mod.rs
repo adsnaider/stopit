@@ -5,10 +5,12 @@
 //! from, and which grants each provider contributes to each of them
 //! ([`build_profile_graph`]). Then every grant section except the path
 //! rules is merged into each profile's effective grants
-//! ([`merge_profiles`]); path precedence is applied later.
+//! ([`merge_profiles`]). Finally path precedence turns a profile's path
+//! rules into a mount plan ([`plan_mounts`]).
 
 mod graph;
 mod merge;
+mod paths;
 
 pub use graph::{
     Contribution, ProfileError, ProfileGraph, ProfileNode, ShimField, build_profile_graph,
@@ -16,4 +18,8 @@ pub use graph::{
 pub use merge::{
     EffectiveEnv, EffectiveGrants, EffectiveNetwork, EffectiveSandbox, EffectiveSystem,
     EnvSetConflict, FsRule, FsRuleKind, MergeError, MergedProfiles, merge_profiles,
+};
+pub use paths::{
+    MountConflict, MountPlan, MountSource, PathPlanError, PlanWarning, PlanWarningKind,
+    PlannedMount, plan_mounts,
 };

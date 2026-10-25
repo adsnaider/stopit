@@ -13,6 +13,7 @@
 mod resolve;
 
 pub use resolve::{EntryKind, Resolution, ResolveWarning, ResolvedPath, resolve};
+pub(crate) use resolve::{NoSymlinksError, check_no_symlinks};
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -114,6 +115,16 @@ impl ExpansionContext {
             host_home,
             sandbox_home: PathBuf::from(sandbox_home.as_str()),
         })
+    }
+
+    /// The host workspace directory.
+    pub fn workspace_host(&self) -> &Path {
+        &self.workspace_host
+    }
+
+    /// Where the workspace is mounted inside the sandbox.
+    pub fn workspace_sandbox(&self) -> &Path {
+        &self.workspace_sandbox
     }
 }
 

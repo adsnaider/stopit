@@ -40,7 +40,8 @@ pub enum EntryKind {
 }
 
 impl EntryKind {
-    fn from_file_type(ft: FileType) -> Self {
+    /// The kind of an entry of file type `ft`.
+    pub(crate) fn from_file_type(ft: FileType) -> Self {
         if ft.is_symlink() {
             EntryKind::Symlink
         } else if ft.is_dir() {
@@ -69,8 +70,8 @@ pub struct ResolvedPath {
 /// A non-fatal problem found while resolving a pattern.
 #[derive(Debug, Error)]
 pub enum ResolveWarning {
-    /// A literal path, or the walk root of a glob, does not exist. The rule
-    /// is skipped.
+    /// A literal path, or the walk root of a glob, does not exist, or an
+    /// entry vanished during a glob walk. The path is skipped.
     #[error("{path:?} does not exist")]
     Missing {
         /// The missing host path.
@@ -127,6 +128,15 @@ impl Resolution {
                 error,
             },
         });
+    }
+
+    /// Records an error from the glob walk below `root`, classified like
+    /// [`warn_io`](Self::warn_io): an entry that vanished during the walk
+    /// (or whose directory was replaced by a non-directory) is `Missing`,
+    /// anything else (e.g. an unreadable directory) is `Io`.
+    fn warn_walk(&mut self, root: &Path, err: walkdir::Error) {
+        let path = err.path().unwrap_or(root).to_owned();
+        self.warn_io(path.clone(), path, err.into());
     }
 
     fn warn_no_symlinks(&mut self, original: PathBuf, error: NoSymlinksError) {
@@ -328,11 +338,7 @@ fn resolve_glob(pattern: &ExpandedPattern) -> Result<Resolution, ExpandError> {
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
-                let path = err.path().unwrap_or(&root).to_owned();
-                res.warnings.push(ResolveWarning::Io {
-                    path,
-                    error: err.into(),
-                });
+                res.warn_walk(&root, err);
                 continue;
             }
         };
@@ -984,6 +990,53 @@ mod tests {
         }
         let msg = res.warnings[0].to_string();
         assert!(msg.contains("locked"), "{msg}");
+    }
+
+    #[test]
+    fn walk_errors_are_classified_like_other_io_errors() {
+        // A walk error for an entry that vanished mid-walk cannot be raced
+        // reliably, so produce the same walkdir errors directly: a missing
+        // entry, one below a non-directory, and an unreadable directory.
+        let f = Fixture::new();
+        f.file("file");
+        f.mkdir("locked");
+        let walk_err = |path: PathBuf| {
+            WalkDir::new(path)
+                .min_depth(1)
+                .into_iter()
+                .find_map(Result::err)
+                .expect("the walk fails")
+        };
+        let mut res = Resolution::default();
+        res.warn_walk(&f.ws(), walk_err(f.ws().join("gone")));
+        res.warn_walk(&f.ws(), walk_err(f.ws().join("file/x")));
+        let locked = f.ws().join("locked");
+        let is_root = rustix::process::geteuid().is_root();
+        if !is_root {
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            let err = walk_err(locked.clone());
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            res.warn_walk(&f.ws(), err);
+        }
+        match res.warnings.as_slice() {
+            [
+                ResolveWarning::Missing { path: gone },
+                ResolveWarning::Missing { path: below_file },
+                rest @ ..,
+            ] => {
+                assert_eq!(gone, &f.ws().join("gone"));
+                assert_eq!(below_file, &f.ws().join("file/x"));
+                match rest {
+                    [] => assert!(is_root),
+                    [ResolveWarning::Io { path, error }] => {
+                        assert_eq!(path, &locked);
+                        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                    }
+                    other => panic!("expected one Io warning, got {other:?}"),
+                }
+            }
+            other => panic!("expected two Missing warnings first, got {other:?}"),
+        }
     }
 
     #[test]
