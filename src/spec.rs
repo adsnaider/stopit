@@ -13,13 +13,14 @@
 //! profile; [`compile_profile`] compiles a single profile's merged grants.
 //!
 //! Each profile's workspace mount point and sandbox `HOME` are checked
-//! against the reserved-path rules (§6.2) before any mounts are planned.
-//!
-//! Not yet checked here (a separate step): grants whose host source
-//! overlaps the host workspace (§11).
+//! against the reserved-path rules (§6.2) before any mounts are planned;
+//! the planned mounts' destinations are checked against them afterwards,
+//! and their host sources against the host workspace (§6.2, "Workspace
+//! exposure").
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -29,11 +30,11 @@ use crate::expand::ExpansionContext;
 use crate::manifest::{
     DevMode, Domain, EtcFile, OptInSyscall, SandboxHome, ShareableNamespace, ShimName, ShimSpec,
 };
-use crate::policy::NetworkMode;
+use crate::policy::{NetworkMode, PathMode};
 use crate::provider::ProviderOutput;
 use crate::resolve::{
-    EffectiveEnv, EffectiveGrants, EffectiveNetwork, MergeError, PathPlanError, PlanWarning,
-    PlannedMount, ProfileError, build_profile_graph, merge_profiles, plan_mounts,
+    EffectiveEnv, EffectiveGrants, EffectiveNetwork, MergeError, MountSource, PathPlanError,
+    PlanWarning, PlannedMount, ProfileError, build_profile_graph, merge_profiles, plan_mounts,
 };
 
 /// One profile's sandbox, independent of the engine that builds it.
@@ -201,6 +202,84 @@ pub enum SpecError {
         /// What it collides with.
         reason: ReservedReason,
     },
+    /// A mount's host source contains the host workspace, or lies inside it
+    /// but is mounted away from the workspace mount, so it would show
+    /// workspace files where their masks and protections do not apply
+    /// (§6.2, "Workspace exposure").
+    #[error(
+        "provider {:?}: {mode} mount of {host:?}{} at {sandbox:?} exposes the host workspace \
+         {workspace:?} outside the workspace mount, where its masks and protected files do not \
+         apply; grant narrower paths that leave the workspace out, mask this one, or reach these \
+         files through the workspace mount",
+        .provider.as_str(),
+        resolved_note(.host, .resolved)
+    )]
+    WorkspaceExposed {
+        /// The provider whose rule produced the mount.
+        provider: ProviderName,
+        /// The mount's mode.
+        mode: PathMode,
+        /// The mount's host source, as planned.
+        host: PathBuf,
+        /// `host` with every symlink resolved.
+        resolved: PathBuf,
+        /// The mount's sandbox destination.
+        sandbox: PathBuf,
+        /// The host workspace.
+        workspace: PathBuf,
+    },
+    /// A `~` or absolute rule's host source is written inside the host
+    /// workspace but runs through a symlink there, which the sandbox may
+    /// have planted to redirect the grant to any host path (§6.2,
+    /// "Workspace exposure").
+    #[error(
+        "provider {:?}: {mode} mount of {host:?} at {sandbox:?} runs through a symlink inside the \
+         host workspace {workspace:?} (resolving to {resolved:?}); links inside the workspace are \
+         never followed, whatever the rule's anchor",
+        .provider.as_str()
+    )]
+    WorkspaceLinkFollowed {
+        /// The provider whose rule produced the mount.
+        provider: ProviderName,
+        /// The mount's mode.
+        mode: PathMode,
+        /// The mount's host source, as planned.
+        host: PathBuf,
+        /// `host` with every symlink resolved.
+        resolved: PathBuf,
+        /// The mount's sandbox destination.
+        sandbox: PathBuf,
+        /// The host workspace.
+        workspace: PathBuf,
+    },
+    /// A mount's host source could not be resolved to a canonical path, so
+    /// whether it exposes the host workspace cannot be checked.
+    #[error(
+        "provider {:?}: cannot resolve the host source {host:?} of the {mode} mount at \
+         {sandbox:?} ({kind}) to check that it does not expose the host workspace",
+        .provider.as_str()
+    )]
+    HostSourceUnresolved {
+        /// The provider whose rule produced the mount.
+        provider: ProviderName,
+        /// The mount's mode.
+        mode: PathMode,
+        /// The mount's host source, as planned.
+        host: PathBuf,
+        /// The mount's sandbox destination.
+        sandbox: PathBuf,
+        /// What went wrong resolving it.
+        kind: io::ErrorKind,
+    },
+}
+
+/// `" (resolving to …)"` when a host source is not its own canonical path.
+fn resolved_note(host: &Path, resolved: &Path) -> String {
+    if host == resolved {
+        String::new()
+    } else {
+        format!(" (resolving to {resolved:?})")
+    }
 }
 
 /// The path a [`SpecError::ReservedPath`] is about.
@@ -310,6 +389,89 @@ fn check_mount_destinations(mounts: &[PlannedMount]) -> Result<(), SpecError> {
     Ok(())
 }
 
+/// Checks that no planned mount exposes the host workspace at a second
+/// sandbox path (DESIGN.md §6.2, "Workspace exposure"): masks and protected
+/// files apply to sandbox paths inside the workspace mount, not to host
+/// content, so the same files shown elsewhere would escape them.
+///
+/// Every mount with a host source except a `masked` one (which shows
+/// nothing of it) is checked. Its source, resolved to a canonical path,
+/// must not be the host workspace or an ancestor of it, unless it is the
+/// workspace itself mounted at the workspace mount; and if it lies inside
+/// the host workspace, the mount must be at the aligned path, i.e. the
+/// workspace mount joined with the source's path relative to the host
+/// workspace.
+///
+/// The planner keeps host sources as written: `~` and absolute rules follow
+/// symlinks on the way and binds follow a final symlink, as bwrap does when
+/// mounting. Hence the canonicalisation, so a link outside the workspace
+/// pointing into it is caught; a source that cannot be resolved fails
+/// closed. `{workspace}` sources contain no symlinks below the workspace
+/// (the planner refuses them), so aligned ones resolve to themselves.
+///
+/// A source written inside the host workspace must also resolve to itself:
+/// the sandbox can plant links there, so a `~` or absolute rule such as
+/// `~/proj/x` with `x -> ../.ssh` would otherwise mount `~/.ssh`, which
+/// neither contains nor lies inside the workspace. This extends the
+/// `{workspace}` anchor's no-symlink rule to every rule written into the
+/// workspace. (When such a mount's destination is inside the workspace
+/// mount, the planner's destination check already refuses the link.)
+/// `ctx`'s host workspace is canonical by contract. Paths are compared by
+/// component.
+fn check_workspace_exposure(
+    mounts: &[PlannedMount],
+    ctx: &ExpansionContext,
+) -> Result<(), SpecError> {
+    let ws_host = ctx.workspace_host();
+    let ws_sandbox = ctx.workspace_sandbox();
+    for m in mounts {
+        let MountSource::Host { path: host, .. } = &m.source else {
+            continue;
+        };
+        if m.mode == PathMode::Masked {
+            continue;
+        }
+        let resolved = host
+            .canonicalize()
+            .map_err(|error| SpecError::HostSourceUnresolved {
+                provider: m.provider.clone(),
+                mode: m.mode,
+                host: host.clone(),
+                sandbox: m.sandbox.clone(),
+                kind: error.kind(),
+            })?;
+        if host.starts_with(ws_host) && resolved != *host {
+            return Err(SpecError::WorkspaceLinkFollowed {
+                provider: m.provider.clone(),
+                mode: m.mode,
+                host: host.clone(),
+                resolved,
+                sandbox: m.sandbox.clone(),
+                workspace: ws_host.to_owned(),
+            });
+        }
+        let exposed = match resolved.strip_prefix(ws_host) {
+            // Inside the workspace (or the workspace itself): only the
+            // aligned mapping is allowed.
+            Ok(rel) if rel.as_os_str().is_empty() => m.sandbox != ws_sandbox,
+            Ok(rel) => m.sandbox != ws_sandbox.join(rel),
+            // Elsewhere: it must not contain the workspace.
+            Err(_) => ws_host.starts_with(&resolved),
+        };
+        if exposed {
+            return Err(SpecError::WorkspaceExposed {
+                provider: m.provider.clone(),
+                mode: m.mode,
+                host: host.clone(),
+                resolved,
+                sandbox: m.sandbox.clone(),
+                workspace: ws_host.to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Checks the workspace mount point and sandbox `HOME` against the
 /// reserved-path rules of DESIGN.md §6.2.
 ///
@@ -366,6 +528,7 @@ pub fn compile_profile(
     check_reserved_paths(ctx.workspace_sandbox(), Path::new(home.as_str()))?;
     let plan = plan_mounts(&grants.fs, &ctx.with_sandbox_home(&home))?;
     check_mount_destinations(&plan.mounts)?;
+    check_workspace_exposure(&plan.mounts, ctx)?;
     let mut warnings: Vec<SpecWarning> = plan.warnings.into_iter().map(Into::into).collect();
     let inherited_domains = parent.map(|p| &p.network.allow_domains);
     let network = network_spec(&grants.network, inherited_domains, &mut warnings);
@@ -530,22 +693,33 @@ mod tests {
     use crate::resolve::{MountSource, PlanWarningKind};
 
     /// A temporary workspace and host home, with an expansion context
-    /// mapping them to `/workspace` and `/home/user`.
+    /// mapping them to the workspace mount (`/workspace` by default) and
+    /// `/home/user`.
     struct Fixture {
         _dir: TempDir,
         root: PathBuf,
+        /// The workspace, relative to `root`.
+        ws_rel: &'static str,
+        /// The workspace mount.
+        ws_mount: &'static str,
         ctx: ExpansionContext,
     }
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_workspace("ws", "/workspace")
+        }
+
+        /// A fixture whose workspace is `ws_rel` below the temp root (e.g.
+        /// below `home`), mounted at `ws_mount`.
+        fn with_workspace(ws_rel: &'static str, ws_mount: &'static str) -> Self {
             let dir = TempDir::new().unwrap();
             let root = dir.path().canonicalize().unwrap();
-            fs::create_dir(root.join("ws")).unwrap();
-            fs::create_dir(root.join("home")).unwrap();
+            fs::create_dir_all(root.join(ws_rel)).unwrap();
+            fs::create_dir_all(root.join("home")).unwrap();
             let ctx = ExpansionContext::new(
-                root.join("ws"),
-                "/workspace".parse().unwrap(),
+                root.join(ws_rel),
+                ws_mount.parse().unwrap(),
                 root.join("home"),
                 "/home/user".parse().unwrap(),
             )
@@ -553,12 +727,14 @@ mod tests {
             Fixture {
                 _dir: dir,
                 root,
+                ws_rel,
+                ws_mount,
                 ctx,
             }
         }
 
         fn ws(&self) -> PathBuf {
-            self.root.join("ws")
+            self.root.join(self.ws_rel)
         }
 
         /// Creates a file (and its parents) at `rel` below the temp root.
@@ -577,7 +753,7 @@ mod tests {
         fn outputs(&self, cfg: &Config) -> Vec<(ProviderName, ProviderOutput)> {
             let pctx = ProviderContext {
                 workspace: self.ws(),
-                workspace_mount: "/workspace".parse().unwrap(),
+                workspace_mount: self.ws_mount.parse().unwrap(),
                 home: self.root.join("home"),
                 session_dir: self.root.join("session"),
             };
@@ -1504,6 +1680,344 @@ mod tests {
             if let Err(e) = compile_with_rule(&f, &bind_at(dest)) {
                 panic!("{dest}: {e}");
             }
+        }
+    }
+
+    /// Compiles a `base = "none"` session whose only provider, `p`, targets
+    /// `main` with `body` as its sandbox grants.
+    fn compile_body(f: &Fixture, body: &str) -> Result<CompiledSession, CompileError> {
+        f.try_compile(&format!("base = \"none\"\n{}", prov("p", "main", body)))
+    }
+
+    /// The `(mode, host, resolved, sandbox)` of a `WorkspaceExposed` error,
+    /// checking its provider and workspace.
+    fn exposure(f: &Fixture, e: CompileError) -> (PathMode, PathBuf, PathBuf, PathBuf) {
+        let CompileError::Profile { error, .. } = e else {
+            panic!("expected a profile error, got {e:?}");
+        };
+        match *error {
+            SpecError::WorkspaceExposed {
+                provider,
+                mode,
+                host,
+                resolved,
+                sandbox,
+                workspace,
+            } => {
+                assert_eq!(provider.as_str(), "p");
+                assert_eq!(workspace, f.ws());
+                (mode, host, resolved, sandbox)
+            }
+            other => panic!("expected a WorkspaceExposed error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn grants_containing_the_host_workspace_are_rejected() {
+        let f = Fixture::with_workspace("home/Projects/stopit", "/workspace");
+        let projects = f.root.join("home/Projects");
+        for (body, mode) in [
+            ("fs.ro = [\"~/Projects\"]", Ro),
+            ("fs.rw = [\"~/Projects\"]", Rw),
+            ("fs.protected = [\"~/Projects\"]", Protected),
+        ] {
+            let e = compile_body(&f, body).unwrap_err();
+            assert_eq!(
+                exposure(&f, e),
+                (
+                    mode,
+                    projects.clone(),
+                    projects.clone(),
+                    PathBuf::from("/home/user/Projects")
+                ),
+                "{body}"
+            );
+        }
+        // A mask over the workspace inside the grant does not excuse it.
+        let body = "fs.ro = [\"~/Projects\"]\nfs.masked = [\"~/Projects/stopit\"]";
+        let e = compile_body(&f, body).unwrap_err();
+        assert_eq!(exposure(&f, e).1, projects);
+        // A glob matching the workspace is caught too.
+        let e = compile_body(&f, "fs.ro = [\"~/Projects/stop*\"]").unwrap_err();
+        assert_eq!(exposure(&f, e).1, f.ws());
+    }
+
+    #[test]
+    fn the_host_workspace_mounted_elsewhere_is_rejected() {
+        let f = Fixture::with_workspace("home/Projects/stopit", "/workspace");
+        let ws = f.ws();
+        let e = compile_body(&f, &format!("fs.ro = [{:?}]", ws.to_str().unwrap())).unwrap_err();
+        assert_eq!(
+            exposure(&f, e),
+            (Ro, ws.clone(), ws.clone(), ws.clone()),
+            "an absolute rule naming the host workspace"
+        );
+        let bind = "fs.bind = [{ host = \"{workspace}\", sandbox = \"/opt/ws\", mode = \"rw\" }]";
+        let e = compile_body(&f, bind).unwrap_err();
+        assert_eq!(
+            exposure(&f, e),
+            (Rw, ws.clone(), ws, PathBuf::from("/opt/ws"))
+        );
+    }
+
+    #[test]
+    fn workspace_descendants_mounted_elsewhere_are_rejected() {
+        let f = Fixture::with_workspace("home/Projects/stopit", "/workspace");
+        f.mkdir("home/Projects/stopit/sub");
+        let sub = f.ws().join("sub");
+        let bind =
+            "fs.bind = [{ host = \"{workspace}/sub\", sandbox = \"/opt/sub\", mode = \"ro\" }]";
+        let e = compile_body(&f, bind).unwrap_err();
+        assert_eq!(
+            exposure(&f, e),
+            (Ro, sub.clone(), sub.clone(), PathBuf::from("/opt/sub"))
+        );
+        // An absolute rule maps the host path to itself, not to the
+        // workspace mount.
+        let e = compile_body(&f, &format!("fs.rw = [{:?}]", sub.to_str().unwrap())).unwrap_err();
+        assert_eq!(exposure(&f, e), (Rw, sub.clone(), sub.clone(), sub.clone()));
+        // So does a `~` rule, when the workspace is not mounted under HOME.
+        let e = compile_body(&f, "fs.ro = [\"~/Projects/stopit/sub\"]").unwrap_err();
+        assert_eq!(
+            exposure(&f, e),
+            (
+                Ro,
+                sub.clone(),
+                sub,
+                PathBuf::from("/home/user/Projects/stopit/sub")
+            )
+        );
+    }
+
+    #[test]
+    fn links_into_the_workspace_are_resolved_before_the_check() {
+        let f = Fixture::with_workspace("home/Projects/stopit", "/workspace");
+        f.mkdir("home/Projects/stopit/sub");
+        symlink(f.ws(), f.root.join("home/ws-link")).unwrap();
+        symlink(f.ws().join("sub"), f.root.join("home/sub-link")).unwrap();
+        // A link to the workspace itself, and to a directory inside it.
+        for (link, target) in [("ws-link", f.ws()), ("sub-link", f.ws().join("sub"))] {
+            let e = compile_body(&f, &format!("fs.ro = [\"~/{link}\"]")).unwrap_err();
+            assert_eq!(
+                exposure(&f, e),
+                (
+                    Ro,
+                    f.root.join("home").join(link),
+                    target,
+                    PathBuf::from("/home/user").join(link)
+                )
+            );
+        }
+        // A link on the way is followed too.
+        let e = compile_body(&f, "fs.ro = [\"~/ws-link/sub\"]").unwrap_err();
+        assert_eq!(exposure(&f, e).2, f.ws().join("sub"));
+        // A bind's host side follows a final link.
+        let bind = "fs.bind = [{ host = \"~/ws-link\", sandbox = \"/opt/ws\", mode = \"ro\" }]";
+        let e = compile_body(&f, bind).unwrap_err();
+        assert_eq!(exposure(&f, e).2, f.ws());
+    }
+
+    #[test]
+    fn links_inside_the_workspace_never_redirect_home_or_absolute_rules() {
+        // The workspace is `~/proj`, mounted at `/workspace`; the sandbox has
+        // planted `x -> ../.ssh` (and `d -> ../.ssh` on the way to a path).
+        let f = Fixture::with_workspace("home/proj", "/workspace");
+        f.file("home/.ssh/id_ed25519");
+        symlink("../.ssh", f.ws().join("x")).unwrap();
+        symlink("../.ssh", f.ws().join("d")).unwrap();
+        let ssh = f.root.join("home/.ssh");
+        let followed = |body: &str| {
+            let e = compile_body(&f, body).unwrap_err();
+            let CompileError::Profile { error, .. } = e else {
+                panic!("{body}: expected a profile error, got {e:?}");
+            };
+            match *error {
+                SpecError::WorkspaceLinkFollowed {
+                    provider,
+                    mode,
+                    host,
+                    resolved,
+                    sandbox,
+                    workspace,
+                } => {
+                    assert_eq!(provider.as_str(), "p", "{body}");
+                    assert_eq!(workspace, f.ws(), "{body}");
+                    (mode, host, resolved, sandbox)
+                }
+                other => panic!("{body}: expected WorkspaceLinkFollowed, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            followed("fs.ro = [\"~/proj/x\"]"),
+            (
+                Ro,
+                f.ws().join("x"),
+                ssh.clone(),
+                PathBuf::from("/home/user/proj/x")
+            )
+        );
+        assert_eq!(
+            followed("fs.rw = [\"~/proj/d/id_ed25519\"]"),
+            (
+                Rw,
+                f.ws().join("d/id_ed25519"),
+                ssh.join("id_ed25519"),
+                PathBuf::from("/home/user/proj/d/id_ed25519")
+            )
+        );
+        let abs = f.ws().join("x");
+        let (_, host, resolved, sandbox) =
+            followed(&format!("fs.protected = [{:?}]", abs.to_str().unwrap()));
+        assert_eq!((host, resolved, sandbox), (abs.clone(), ssh.clone(), abs));
+        let bind = "fs.bind = [{ host = \"~/proj/x\", sandbox = \"/opt/x\", mode = \"ro\" }]";
+        assert_eq!(followed(bind).2, ssh);
+        // Masked, it shows nothing of the target.
+        if let Err(e) = compile_body(&f, "fs.masked = [\"~/proj/x\"]") {
+            panic!("masked: {e}");
+        }
+        let e = compile_body(&f, "fs.ro = [\"~/proj/x\"]").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "cannot compile profile \"main\": provider \"p\": ro mount of {:?} at \
+                 \"/home/user/proj/x\" runs through a symlink inside the host workspace {:?} \
+                 (resolving to {ssh:?}); links inside the workspace are never followed, whatever \
+                 the rule's anchor",
+                f.ws().join("x"),
+                f.ws()
+            )
+        );
+    }
+
+    #[test]
+    fn aligned_rules_through_workspace_links_are_refused_by_the_planner() {
+        // With the workspace mounted at its `~` path the destination is
+        // inside the workspace mount, so the planner's destination check
+        // refuses the link first (a restrictive rule) or drops it (`rw`).
+        let f = Fixture::with_workspace("home/proj", "/home/user/proj");
+        f.mkdir("home/.ssh");
+        symlink("../.ssh", f.ws().join("x")).unwrap();
+        let e = compile_body(&f, "fs.ro = [\"~/proj/x\"]").unwrap_err();
+        assert!(
+            matches!(
+                e,
+                CompileError::Profile { ref error, .. }
+                    if matches!(**error, SpecError::Mounts(PathPlanError::WorkspaceSymlink { .. }))
+            ),
+            "{e:?}"
+        );
+        let s = compile_body(&f, "fs.rw = [\"~/proj/x\"]").unwrap();
+        assert!(spec(&s, "main").mounts.is_empty());
+    }
+
+    #[test]
+    fn exposure_error_message_names_everything_and_hints() {
+        let f = Fixture::with_workspace("home/Projects/stopit", "/workspace");
+        symlink(f.ws(), f.root.join("home/ws-link")).unwrap();
+        let home = f.root.join("home");
+        let e = compile_body(&f, "fs.ro = [\"~/Projects\"]").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "cannot compile profile \"main\": provider \"p\": ro mount of {:?} at \
+                 \"/home/user/Projects\" exposes the host workspace {:?} outside the workspace \
+                 mount, where its masks and protected files do not apply; grant narrower paths \
+                 that leave the workspace out, mask this one, or reach these files through the \
+                 workspace mount",
+                home.join("Projects"),
+                f.ws()
+            )
+        );
+        let e = compile_body(&f, "fs.ro = [\"~/ws-link\"]").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "cannot compile profile \"main\": provider \"p\": ro mount of {:?} (resolving to \
+                 {:?}) at \"/home/user/ws-link\" exposes the host workspace {:?} outside the \
+                 workspace mount, where its masks and protected files do not apply; grant \
+                 narrower paths that leave the workspace out, mask this one, or reach these files \
+                 through the workspace mount",
+                home.join("ws-link"),
+                f.ws(),
+                f.ws()
+            )
+        );
+    }
+
+    #[test]
+    fn aligned_masked_ephemeral_and_unrelated_grants_are_accepted() {
+        let f = Fixture::with_workspace("home/Projects/stopit", "/workspace");
+        f.mkdir("home/Projects/stopit/sub");
+        f.mkdir("home/Projects/other");
+        f.mkdir("home/Projects/stopit2");
+        f.file("home/Projects/stopit/.env");
+        for body in [
+            // The workspace and paths inside it at their aligned paths.
+            "fs.rw = [\"{workspace}\"]",
+            "fs.ro = [\"{workspace}/sub\"]",
+            "fs.protected = [\"{workspace}/**/.env\"]",
+            "fs.bind = [{ host = \"{workspace}/sub\", sandbox = \"/workspace/sub\", mode = \"ro\" }]",
+            // Masking or replacing an ancestor shows nothing of it.
+            "fs.masked = [\"~/Projects\"]",
+            "fs.ephemeral = [\"~/Projects\"]",
+            // Siblings, including one sharing the workspace's name prefix.
+            "fs.ro = [\"~/Projects/other\"]",
+            "fs.rw = [\"~/Projects/stopit2\"]",
+            "fs.ro = [\"~/Projects/stopit2\", \"~/Projects/other\"]",
+        ] {
+            if let Err(e) = compile_body(&f, body) {
+                panic!("{body}: {e}");
+            }
+        }
+        // The default base, which grants the workspace and masks and
+        // protects files inside it.
+        if let Err(e) = f.try_compile("") {
+            panic!("base default: {e}");
+        }
+    }
+
+    #[test]
+    fn home_rules_resolving_to_the_aligned_path_are_accepted() {
+        // The workspace is `~/proj`, mounted at the matching path under HOME,
+        // so `~/proj/...` rules land exactly where the workspace mount shows
+        // the same files.
+        let f = Fixture::with_workspace("home/proj", "/home/user/proj");
+        f.mkdir("home/proj/x");
+        for body in [
+            "fs.ro = [\"~/proj/x\"]",
+            "fs.protected = [\"~/proj\"]",
+            "fs.rw = [\"{workspace}\"]\nfs.ro = [\"~/proj/x\"]",
+        ] {
+            if let Err(e) = compile_body(&f, body) {
+                panic!("{body}: {e}");
+            }
+        }
+        // But not `~` itself, which contains the workspace.
+        let e = compile_body(&f, "fs.ro = [\"~\"]").unwrap_err();
+        assert_eq!(exposure(&f, e).3, PathBuf::from("/home/user"));
+    }
+
+    #[test]
+    fn unresolvable_host_sources_fail_closed() {
+        let f = Fixture::new();
+        symlink(f.root.join("missing"), f.root.join("home/dangling")).unwrap();
+        let e = compile_body(&f, "fs.ro = [\"~/dangling\"]").unwrap_err();
+        let CompileError::Profile { error, .. } = &e else {
+            panic!("expected a profile error, got {e:?}");
+        };
+        assert_eq!(
+            **error,
+            SpecError::HostSourceUnresolved {
+                provider: "p".parse().unwrap(),
+                mode: Ro,
+                host: f.root.join("home/dangling"),
+                sandbox: PathBuf::from("/home/user/dangling"),
+                kind: std::io::ErrorKind::NotFound,
+            }
+        );
+        // A masked one is not resolved, so the planner's handling stands.
+        if let Err(e) = compile_body(&f, "fs.masked = [\"~/dangling\"]") {
+            panic!("masked: {e}");
         }
     }
 
