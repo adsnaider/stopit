@@ -3,7 +3,7 @@
 # manifest parser as a user's `[provider.sandbox]` table, so the default base
 # is expressible as configuration by construction.
 
-system = { proc = true, dev = "minimal", etc = ["passwd", "group", "hosts", "nsswitch.conf"], home = "/home/user" }
+system = { proc = true, dev = "minimal", etc = ["passwd", "group", "hosts", "nsswitch.conf"] }
 network = { mode = "loopback" }
 
 [fs]

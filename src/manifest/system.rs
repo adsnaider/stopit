@@ -199,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn appendix_a_system_parses_from_toml_and_json() {
+    fn full_system_table_parses_from_toml_and_json() {
         let want = SystemGrants {
             proc: Some(true),
             dev: Some(DevMode::Minimal),

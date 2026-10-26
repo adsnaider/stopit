@@ -220,7 +220,7 @@ Semantics:
 
 Path syntax (in any provider):
 * `{workspace}` — the host workspace directory, mounted at `workspace.mount` (default `/workspace`).
-* `~/…` — host `$HOME/…` on the host side, sandbox `HOME` (default `/home/user`) on the sandbox side.
+* `~/…` — host `$HOME/…` on the host side, sandbox `HOME` on the sandbox side (`/home/user` unless a provider sets `system.home`; the default base leaves it unset).
 * Absolute paths map to the same path inside the sandbox; `fs.bind` entries remap explicitly.
 * Built-in providers may resolve additional concrete host paths internally (e.g. `vcs` resolves git worktree and jj workspace storage, §7.3). These are not user-facing placeholders.
 * **Syntactic validation (at load time):** no `.`/`..`/empty components, no NUL, no trailing `/`; the bare `/` is rejected; a glob is not allowed as the first component directly below `/` or `~` (`/*` and `~/**` are rejected; `{workspace}/**` is fine). Globs are validated too: `**` only as an entire component, no `/` (or range spanning `/`) in a `[...]` class, and the glob must compile. `?` and `[...]` match a single byte, so they do not match a non-ASCII character as a whole (e.g. a `masked` rule `?.env` does not match `é.env`; use `*`). `fs.ephemeral` entries must be literal paths, without glob characters (each rule is backed by one session directory).
@@ -843,7 +843,7 @@ type = "config"
 name = "base"
 profile = "main"
 [provider.sandbox]
-system = { proc = true, dev = "minimal", etc = ["passwd", "group", "hosts", "nsswitch.conf"], home = "/home/user" }
+system = { proc = true, dev = "minimal", etc = ["passwd", "group", "hosts", "nsswitch.conf"] }
 network = { mode = "loopback" }
 [provider.sandbox.fs]
 rw = ["{workspace}"]

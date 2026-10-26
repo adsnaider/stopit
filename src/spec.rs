@@ -585,6 +585,28 @@ mod tests {
     }
 
     #[test]
+    fn default_base_leaves_home_settable_by_user_providers() {
+        let f = Fixture::new();
+        // The default base does not set `system.home`; the spec defaults it.
+        let s = f.compile("");
+        assert_eq!(spec(&s, "main").system.home.as_str(), "/home/user");
+
+        // So a user provider can move `main`'s HOME without a conflict, and
+        // the base's ephemeral `~` follows it.
+        let s = f.compile(&prov("u", "main", "system.home = \"/home/agent\""));
+        let main = spec(&s, "main");
+        assert_eq!(main.system.home.as_str(), "/home/agent");
+        assert_eq!(
+            mounts(main),
+            [
+                row("/tmp", Ephemeral, "base"),
+                row("/workspace", Rw, "base"),
+                row("/home/agent", Ephemeral, "base"),
+            ]
+        );
+    }
+
+    #[test]
     fn base_default_masks_and_protects_matching_workspace_files() {
         let f = Fixture::new();
         for file in [

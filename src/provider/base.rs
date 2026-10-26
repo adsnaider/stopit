@@ -106,7 +106,9 @@ mod tests {
         assert_eq!(g.network.mode, Some(NetworkMode::Loopback));
         assert_eq!(g.system.proc, Some(true));
         assert_eq!(g.system.dev, Some(DevMode::Minimal));
-        assert_eq!(g.system.home.as_ref().unwrap().as_str(), "/home/user");
+        // HOME's location is not a grant: the spec defaults it, so users can
+        // set `system.home` without a merge conflict.
+        assert_eq!(g.system.home, None);
         assert_eq!(
             strs(&g.system.etc, |e| e.as_str()),
             ["passwd", "group", "hosts", "nsswitch.conf"]

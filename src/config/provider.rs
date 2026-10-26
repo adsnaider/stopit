@@ -351,7 +351,7 @@ type = "config"
 name = "base"
 profile = "main"
 [provider.sandbox]
-system = { proc = true, dev = "minimal", etc = ["passwd", "group", "hosts", "nsswitch.conf"], home = "/home/user" }
+system = { proc = true, dev = "minimal", etc = ["passwd", "group", "hosts", "nsswitch.conf"] }
 network = { mode = "loopback" }
 [provider.sandbox.fs]
 rw = ["{workspace}"]
