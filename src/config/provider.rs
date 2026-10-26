@@ -472,7 +472,7 @@ mod tests {
 
             [[provider]]
             type = "config"
-            name = "default"
+            name = "base"
             profile = "main"
             [provider.sandbox]
             system = { proc = true, dev = "minimal", etc = ["passwd", "group", "hosts", "nsswitch.conf"], home = "/home/user" }
@@ -504,11 +504,13 @@ mod tests {
             "#,
         );
         assert_eq!(p.len(), 2);
-        assert_eq!(p[0].name, name("default"));
+        assert_eq!(p[0].name, name("base"));
         let ProviderKind::Config { profile, sandbox } = &p[0].kind else {
             panic!("{:?}", p[0].kind);
         };
         assert_eq!(profile, &ProfileRef::main());
+        // The embedded default base is exactly Appendix A's config provider.
+        assert_eq!(**sandbox, crate::provider::default_base_manifest().unwrap());
         let g = &sandbox.grants;
         assert_eq!(g.fs.rw.len(), 1);
         assert_eq!(g.fs.masked.len(), 6);

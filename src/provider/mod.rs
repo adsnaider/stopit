@@ -3,6 +3,7 @@
 //! A provider turns its configuration entry into a [`ProviderOutput`] at
 //! session start. Merging the outputs of all providers happens elsewhere.
 
+mod base;
 mod config;
 mod script;
 
@@ -16,6 +17,7 @@ use thiserror::Error;
 use crate::config::{ProfileRef, ProviderEntry, ProviderKind, ProviderName, WorkspaceMount};
 use crate::manifest::{Manifest, ManifestError};
 
+pub use base::{BASE_PROVIDER_NAME, default_base_manifest, session_providers};
 pub use config::ConfigProvider;
 pub use script::{STDERR_LIMIT, STDOUT_LIMIT, ScriptProvider};
 
@@ -55,6 +57,23 @@ pub enum ProviderError {
         /// The `type` of the entry.
         kind: &'static str,
     },
+
+    /// A user provider is named like the built-in provider of the default
+    /// base.
+    #[error(
+        "provider name {:?} is reserved by the built-in provider of `base = \"default\"`: \
+         choose a different name, or set `base = \"none\"`",
+        .name.as_str()
+    )]
+    ReservedName {
+        /// The offending name.
+        name: ProviderName,
+    },
+
+    /// The built-in provider of the default base is invalid (its name or
+    /// embedded manifest). A bug in `stopit`, prevented by a unit test.
+    #[error("internal error: the built-in default base is invalid: {0}")]
+    BuiltinBase(String),
 
     /// A script provider's path could not be canonicalized (e.g. it does not
     /// exist).

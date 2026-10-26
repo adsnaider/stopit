@@ -158,7 +158,7 @@ base = "default"   # "default" (the default) | "none"
 The design rule is: **restrictions default on, grants default off.** A base is a set of built-in providers placed **before** the user's providers.
 
 * `base = "none"` — no built-in providers. The sandbox is empty: nothing mounted (no `/proc`, no `/dev`), empty environment, no network at all (not even `lo`), full hardening, no shims. `stopit run /bin/sh` fails because `/bin/sh` does not exist. That is intended.
-* `base = "default"` — a built-in `config` provider with the defaults below, plus the `vcs` provider (§7.3).
+* `base = "default"` — a built-in `config` provider named `base` with the defaults below (the name is reserved: a user provider cannot use it under this base), plus the `vcs` provider (§7.3).
 
 | Aspect | `base = "none"` | `base = "default"` |
 | :--- | :--- | :--- |
@@ -840,7 +840,7 @@ clipboard_write = "block"
 # --- What the built-in default `config` provider grants ---
 [[provider]]
 type = "config"
-name = "default"
+name = "base"
 profile = "main"
 [provider.sandbox]
 system = { proc = true, dev = "minimal", etc = ["passwd", "group", "hosts", "nsswitch.conf"], home = "/home/user" }

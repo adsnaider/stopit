@@ -1,0 +1,25 @@
+# The sandbox manifest of the built-in `base` config provider under
+# `base = "default"` (DESIGN.md §3.2, Appendix A). It is parsed by the same
+# manifest parser as a user's `[provider.sandbox]` table, so the default base
+# is expressible as configuration by construction.
+
+system = { proc = true, dev = "minimal", etc = ["passwd", "group", "hosts", "nsswitch.conf"], home = "/home/user" }
+network = { mode = "loopback" }
+
+[fs]
+rw = ["{workspace}"]
+masked = [
+  "{workspace}/**/.env", "{workspace}/**/.env.*", "{workspace}/**/*.pem",
+  "{workspace}/**/*.key", "{workspace}/**/.npmrc", "{workspace}/**/.pypirc",
+]
+mask_sockets = true
+protected = [
+  "{workspace}/**/*.nix", "{workspace}/flake.lock", "{workspace}/.envrc",
+  "{workspace}/.stopit.toml", "{workspace}/.vscode", "{workspace}/.idea",
+  "{workspace}/.github/workflows",
+]
+ephemeral = ["/tmp", "~"]
+
+[env]
+pass = ["TERM", "LANG", "COLORTERM"]
+deny = ["*_TOKEN", "*_KEY", "*_SECRET", "*_PASSWORD", "AWS_*", "GITHUB_*", "SSH_AUTH_SOCK", "NIX_CONFIG"]
