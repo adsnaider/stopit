@@ -14,6 +14,9 @@ mod provider;
 pub use profile::{Inherit, ProfileDecl, ProfileName, ProfileRef};
 pub use provider::{ProviderEntry, ProviderKind, ProviderName, ScriptSource, VcsTool, VcsView};
 
+#[cfg(test)]
+pub(crate) use provider::APPENDIX_A_WITHOUT_VCS;
+
 use std::collections::{BTreeMap, HashMap};
 use std::num::{IntErrorKind, NonZeroU32};
 use std::path::{Path, PathBuf};

@@ -123,6 +123,14 @@ impl SandboxHome {
     }
 }
 
+impl Default for SandboxHome {
+    /// `/home/user`, the sandbox `HOME` when no provider sets one (DESIGN.md
+    /// §3.4).
+    fn default() -> Self {
+        SandboxHome("/home/user".to_owned())
+    }
+}
+
 impl FromStr for SandboxHome {
     type Err = ValueError;
 
@@ -169,6 +177,11 @@ mod tests {
 
     fn home(s: &str) -> SandboxHome {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn default_sandbox_home_is_home_user() {
+        assert_eq!(SandboxHome::default(), home("/home/user"));
     }
 
     #[test]

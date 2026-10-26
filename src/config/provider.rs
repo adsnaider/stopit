@@ -327,6 +327,50 @@ impl TryFrom<MapOnly<RawProviderEntry>> for ProviderEntry {
     }
 }
 
+/// DESIGN.md Appendix A (`base = "default"` written out under
+/// `base = "none"`) up to, not including, its `vcs` provider, verbatim.
+/// Shared by the tests parsing it and the expressiveness golden test.
+#[cfg(test)]
+pub(crate) const APPENDIX_A_WITHOUT_VCS: &str = r#"
+base = "none"
+
+[workspace]
+mount = "/workspace"
+
+[approval]
+timeout = "off"
+masked_writes = "deny"
+
+[terminal]
+hotkey = "ctrl-]"
+clipboard_write = "block"
+
+# --- What the built-in default `config` provider grants ---
+[[provider]]
+type = "config"
+name = "base"
+profile = "main"
+[provider.sandbox]
+system = { proc = true, dev = "minimal", etc = ["passwd", "group", "hosts", "nsswitch.conf"], home = "/home/user" }
+network = { mode = "loopback" }
+[provider.sandbox.fs]
+rw = ["{workspace}"]
+masked = [
+  "{workspace}/**/.env", "{workspace}/**/.env.*", "{workspace}/**/*.pem",
+  "{workspace}/**/*.key", "{workspace}/**/.npmrc", "{workspace}/**/.pypirc",
+]
+mask_sockets = true
+protected = [
+  "{workspace}/**/*.nix", "{workspace}/flake.lock", "{workspace}/.envrc",
+  "{workspace}/.stopit.toml", "{workspace}/.vscode", "{workspace}/.idea",
+  "{workspace}/.github/workflows",
+]
+ephemeral = ["/tmp", "~"]
+[provider.sandbox.env]
+pass = ["TERM", "LANG", "COLORTERM"]
+deny = ["*_TOKEN", "*_KEY", "*_SECRET", "*_PASSWORD", "AWS_*", "GITHUB_*", "SSH_AUTH_SOCK", "NIX_CONFIG"]
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,34 +510,9 @@ mod tests {
 
     #[test]
     fn appendix_a_providers() {
-        let p = providers(
-            r#"
-            base = "none"
-
-            [[provider]]
-            type = "config"
-            name = "base"
-            profile = "main"
-            [provider.sandbox]
-            system = { proc = true, dev = "minimal", etc = ["passwd", "group", "hosts", "nsswitch.conf"], home = "/home/user" }
-            network = { mode = "loopback" }
-            [provider.sandbox.fs]
-            rw = ["{workspace}"]
-            masked = [
-              "{workspace}/**/.env", "{workspace}/**/.env.*", "{workspace}/**/*.pem",
-              "{workspace}/**/*.key", "{workspace}/**/.npmrc", "{workspace}/**/.pypirc",
-            ]
-            mask_sockets = true
-            protected = [
-              "{workspace}/**/*.nix", "{workspace}/flake.lock", "{workspace}/.envrc",
-              "{workspace}/.stopit.toml", "{workspace}/.vscode", "{workspace}/.idea",
-              "{workspace}/.github/workflows",
-            ]
-            ephemeral = ["/tmp", "~"]
-            [provider.sandbox.env]
-            pass = ["TERM", "LANG", "COLORTERM"]
-            deny = ["*_TOKEN", "*_KEY", "*_SECRET", "*_PASSWORD", "AWS_*", "GITHUB_*", "SSH_AUTH_SOCK", "NIX_CONFIG"]
-
+        let p = providers(&format!(
+            r#"{APPENDIX_A_WITHOUT_VCS}
+            # --- The built-in `vcs` provider with its default options ---
             [[provider]]
             type    = "vcs"
             view    = "masked"
@@ -502,7 +521,7 @@ mod tests {
             push    = "ask"
             signing = false
             "#,
-        );
+        ));
         assert_eq!(p.len(), 2);
         assert_eq!(p[0].name, name("base"));
         let ProviderKind::Config { profile, sandbox } = &p[0].kind else {

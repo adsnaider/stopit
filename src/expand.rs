@@ -126,6 +126,20 @@ impl ExpansionContext {
     pub fn workspace_sandbox(&self) -> &Path {
         &self.workspace_sandbox
     }
+
+    /// The sandbox `HOME`, which `~` expands to on the sandbox side.
+    pub fn sandbox_home(&self) -> &Path {
+        &self.sandbox_home
+    }
+
+    /// This context with `~` expanding to `sandbox_home` on the sandbox
+    /// side, for a profile whose `system.home` differs from the session's.
+    pub fn with_sandbox_home(&self, sandbox_home: &SandboxHome) -> Self {
+        ExpansionContext {
+            sandbox_home: PathBuf::from(sandbox_home.as_str()),
+            ..self.clone()
+        }
+    }
 }
 
 /// Joins `rest` onto `anchor`, without adding a trailing `/` for an empty
@@ -297,6 +311,25 @@ mod tests {
         );
         let e = exp(&c, "{workspace}/.git");
         assert_eq!(e.rest, p(".git"));
+    }
+
+    #[test]
+    fn with_sandbox_home_changes_only_the_sandbox_side_of_home() {
+        let c = ctx();
+        let d = c.with_sandbox_home(&"/home/agent".parse().unwrap());
+        assert_eq!(c.sandbox_home(), Path::new("/home/user"));
+        assert_eq!(d.sandbox_home(), Path::new("/home/agent"));
+        assert_eq!(
+            anchors(&exp(&d, "~/x")),
+            (
+                Path::new("/home/alice"),
+                Path::new("/home/agent"),
+                Path::new("x")
+            )
+        );
+        assert_eq!(d.workspace_host(), c.workspace_host());
+        assert_eq!(d.workspace_sandbox(), c.workspace_sandbox());
+        assert_eq!(c.with_sandbox_home(&"/home/user".parse().unwrap()), c);
     }
 
     #[test]
