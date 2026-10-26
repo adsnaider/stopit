@@ -10,13 +10,14 @@
 //!
 //! [`compile_session`] runs the whole pipeline for a session, from the
 //! configuration and the providers' outputs to one compiled spec per
-//! profile; [`compile_profile`] compiles a single profile's merged grants.
+//! profile.
 //!
 //! Each profile's workspace mount point and sandbox `HOME` are checked
 //! against the reserved-path rules (§6.2) before any mounts are planned;
 //! the planned mounts' destinations are checked against them afterwards,
-//! and their host sources against the host workspace (§6.2, "Workspace
-//! exposure").
+//! and their host sources against the session's untrusted roots (§3.4,
+//! Symlinks; §6.2, "Untrusted links") and the host workspace (§6.2,
+//! "Workspace exposure").
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -37,8 +38,9 @@ use crate::manifest::{
 use crate::policy::{NetworkMode, PathMode};
 use crate::provider::ProviderOutput;
 use crate::resolve::{
-    EffectiveEnv, EffectiveGrants, EffectiveNetwork, MergeError, MountSource, PathPlanError,
-    PlanWarning, PlannedMount, ProfileError, build_profile_graph, merge_profiles, plan_mounts,
+    EffectiveEnv, EffectiveGrants, EffectiveNetwork, MergeError, MountPlan, MountSource,
+    PathPlanError, PlanWarning, PlannedMount, ProfileError, build_profile_graph, merge_profiles,
+    plan_mounts,
 };
 
 /// One profile's sandbox, independent of the engine that builds it.
@@ -232,16 +234,19 @@ pub enum SpecError {
         /// The host workspace.
         workspace: PathBuf,
     },
-    /// A mount's host source runs through a symlink inside the host
-    /// workspace (§6.2, "Workspace exposure"). Boxed to keep `SpecError`
+    /// A mount's host source runs through a symlink inside an untrusted
+    /// root, a host directory some sandbox of the session can write (§3.4,
+    /// Symlinks; §6.2, "Untrusted links"). Boxed to keep `SpecError`
     /// small.
     #[error(transparent)]
-    WorkspaceLinkFollowed(Box<LinkFollowed>),
+    UntrustedLinkFollowed(Box<LinkFollowed>),
     /// A mount's host source could not be resolved to a canonical path, so
-    /// whether it exposes the host workspace cannot be checked.
+    /// whether it exposes the host workspace or follows a link the sandbox
+    /// may have planted cannot be checked.
     #[error(
         "provider {:?}: cannot resolve the host source {host:?} of the {mode} mount at \
-         {sandbox:?} ({kind}) to check that it does not expose the host workspace",
+         {sandbox:?} ({kind}) to check that it neither exposes the host workspace nor follows a \
+         symlink a sandbox can write",
         .provider.as_str()
     )]
     HostSourceUnresolved {
@@ -258,17 +263,19 @@ pub enum SpecError {
     },
 }
 
-/// A mount's host source runs through a symlink inside the host workspace,
-/// which the sandbox may have planted to redirect the grant to any host
-/// path (§6.2, "Workspace exposure"). This holds however the source
-/// reaches the workspace: written inside it, or through symlinks outside
-/// it that lead there.
+/// A mount's host source runs through a symlink inside an untrusted root, a
+/// host directory some sandbox of the session can write, where the link may
+/// have been planted to redirect the grant to any host path (§3.4,
+/// Symlinks). This holds however the source reaches the root: written
+/// inside it, or through symlinks outside it that lead there. For a
+/// `masked` mount the link would decide the mask's shape (an empty file or
+/// an empty directory), which a planted link must not either.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error(
     "provider {:?}: {mode} mount of {host:?} at {sandbox:?} runs through the symlink {link:?} \
-     inside the host workspace {workspace:?} (resolving to {resolved:?}); links inside the \
-     workspace are never followed, whatever the rule's anchor or the links leading there: \
-     remove the link or change the rule",
+     inside {root} (resolving to {resolved:?}); a sandbox can write there, so links inside it \
+     are never followed, whatever the rule's anchor or the links leading there: remove the \
+     link or change the rule",
     .provider.as_str()
 )]
 pub struct LinkFollowed {
@@ -278,15 +285,148 @@ pub struct LinkFollowed {
     pub mode: PathMode,
     /// The mount's host source, as planned.
     pub host: PathBuf,
-    /// The first symlink inside the host workspace that resolving `host`
+    /// The first symlink inside an untrusted root that resolving `host`
     /// follows, named below its canonical parent directory.
     pub link: PathBuf,
     /// `host` with every symlink resolved.
     pub resolved: PathBuf,
     /// The mount's sandbox destination.
     pub sandbox: PathBuf,
-    /// The host workspace.
-    pub workspace: PathBuf,
+    /// The untrusted root `link` lies in (the innermost one, see
+    /// [`UntrustedRoot`]).
+    pub root: UntrustedRoot,
+}
+
+/// A host directory that a sandbox of the session can write, so that any
+/// symlink inside it may have been planted (DESIGN.md §3.4, Symlinks).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UntrustedRoot {
+    /// The directory's canonical host path.
+    pub path: PathBuf,
+    /// What makes it writable by a sandbox.
+    pub kind: UntrustedKind,
+}
+
+/// Why an [`UntrustedRoot`] is untrusted.
+///
+/// Ephemeral directories are writable too, but their session backing
+/// directories do not exist yet; they become a variant here once the
+/// session runtime directory does (DESIGN.md §2.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UntrustedKind {
+    /// The host workspace. Always untrusted, even when no profile of this
+    /// session grants it `rw`: another session or an earlier one may have.
+    Workspace,
+    /// The host source of an `rw` mount (a path rule or a bind) of some
+    /// profile of the session.
+    RwGrant {
+        /// The provider whose rule produced the mount.
+        provider: ProviderName,
+        /// The profile whose plan has the mount; `None` when a profile is
+        /// compiled on its own (`compile_profile`, tests only), where it is that
+        /// profile.
+        profile: Option<ProfileRef>,
+        /// The mount's host source, as planned (before resolving links).
+        host: PathBuf,
+    },
+}
+
+impl fmt::Display for UntrustedRoot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.kind {
+            UntrustedKind::Workspace => write!(f, "the host workspace {:?}", self.path),
+            UntrustedKind::RwGrant {
+                provider,
+                profile,
+                host,
+            } => {
+                write!(f, "{:?}, granted rw as {host:?}", self.path)?;
+                write!(f, " by provider {:?}", provider.as_str())?;
+                if let Some(p) = profile {
+                    write!(f, " in profile {:?}", p.as_str())?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The untrusted roots of a session (DESIGN.md §3.4, Symlinks): the host
+/// workspace and the canonical host source of every `rw` mount of every
+/// profile. A sandbox in one profile can plant links that a rule of
+/// another follows, so the roots are collected session-wide.
+///
+/// Roots may nest (`rw` grants of `~/.cache` and `~/.cache/tool`): a path
+/// is attributed to the innermost root containing it, the narrowest
+/// directory known to be writable there. Two sources with the same
+/// canonical path are one root, credited to the first one added: the
+/// workspace, then mounts in the order given (profiles in graph order).
+#[derive(Debug, Clone)]
+struct UntrustedRoots {
+    roots: Vec<UntrustedRoot>,
+}
+
+impl UntrustedRoots {
+    /// Just the host workspace (canonical).
+    fn new(workspace: &Path) -> Self {
+        UntrustedRoots {
+            roots: vec![UntrustedRoot {
+                path: workspace.to_owned(),
+                kind: UntrustedKind::Workspace,
+            }],
+        }
+    }
+
+    /// No roots at all: resolving against them is plain canonicalisation.
+    fn none() -> Self {
+        UntrustedRoots { roots: Vec::new() }
+    }
+
+    /// Adds the host source of every `rw` mount of `mounts`, a plan of
+    /// `profile`.
+    ///
+    /// Each source is canonicalised (it may be written through host links,
+    /// such as `~/cachelink/tool` with `~/cachelink -> .cache`, and the
+    /// sandbox writes the directory they lead to), following every link: a
+    /// source that itself runs through a link inside a root is rejected by
+    /// the host-source check of its own profile, so the root it adds here
+    /// never matters. A source that cannot be resolved is not a root: bwrap
+    /// could not mount it either, and the same check rejects it
+    /// ([`SpecError::HostSourceUnresolved`]), so the session never starts.
+    fn add_rw_mounts(&mut self, profile: Option<&ProfileRef>, mounts: &[PlannedMount]) {
+        let none = UntrustedRoots::none();
+        for m in mounts {
+            let MountSource::Host { path: host, .. } = &m.source else {
+                continue;
+            };
+            if m.mode != PathMode::Rw {
+                continue;
+            }
+            let Ok(resolved) = resolve_host_source(host, &none) else {
+                continue;
+            };
+            if self.roots.iter().any(|r| r.path == resolved.path) {
+                continue;
+            }
+            self.roots.push(UntrustedRoot {
+                path: resolved.path,
+                kind: UntrustedKind::RwGrant {
+                    provider: m.provider.clone(),
+                    profile: profile.cloned(),
+                    host: host.clone(),
+                },
+            });
+        }
+    }
+
+    /// The innermost root containing the canonical path `path` (or equal to
+    /// it), compared by component.
+    fn containing(&self, path: &Path) -> Option<&UntrustedRoot> {
+        self.roots
+            .iter()
+            .filter(|r| path.starts_with(&r.path))
+            .max_by_key(|r| r.path.components().count())
+    }
 }
 
 /// `" (resolving to …)"` when a host source is not its own canonical path.
@@ -405,48 +545,56 @@ fn check_mount_destinations(mounts: &[PlannedMount]) -> Result<(), SpecError> {
     Ok(())
 }
 
-/// Checks that no planned mount exposes the host workspace at a second
-/// sandbox path (DESIGN.md §6.2, "Workspace exposure"): masks and protected
-/// files apply to sandbox paths inside the workspace mount, not to host
-/// content, so the same files shown elsewhere would escape them.
-///
-/// Every mount with a host source except a `masked` one (which shows
-/// nothing of it) is checked. Its source, resolved to a canonical path,
-/// must not be the host workspace or an ancestor of it, unless it is the
-/// workspace itself mounted at the workspace mount; and if it lies inside
-/// the host workspace, the mount must be at the aligned path, i.e. the
-/// workspace mount joined with the source's path relative to the host
-/// workspace.
+/// Checks every planned mount's host source against the untrusted `roots`
+/// (DESIGN.md §3.4, Symlinks; §6.2, "Untrusted links") and the host
+/// workspace (§6.2, "Workspace exposure").
 ///
 /// The planner keeps host sources as written: `~` and absolute rules follow
 /// symlinks on the way and binds follow a final symlink, as bwrap does when
 /// mounting. Hence each source is resolved first (see
-/// [`resolve_host_source`]), so a link outside the workspace pointing into
-/// it is caught; a source that cannot be resolved fails closed.
-/// `{workspace}` sources contain no symlinks below the workspace (the
-/// planner refuses them), so aligned ones resolve to themselves.
+/// [`resolve_host_source`]); a source that cannot be resolved fails closed.
 ///
-/// No source may run through a symlink inside the host workspace: the
-/// sandbox can plant links there, so a `~` or absolute rule such as
-/// `~/proj/x` with `x -> ../.ssh` would otherwise mount `~/.ssh`, which
-/// neither contains nor lies inside the workspace. This holds however the
-/// source reaches the workspace: written inside it, or through a link
-/// outside it (`~/current/x` with `~/current -> proj`, or `~/.bashrc ->
-/// proj/bashrc` replaced by a link in the workspace), where the planted
-/// link would turn a rule that shows nothing or is rejected into a mount
-/// of any host path. This extends the `{workspace}` anchor's no-symlink
-/// rule to every rule. (When such a mount's destination is inside the
-/// workspace mount, the planner's destination check already refuses a link
-/// written there.) Only links count: a literal `..` may leave the
-/// workspace again, since the sandbox cannot change what it means. Rule
-/// paths cannot contain `..`, but the target of a link outside the
-/// workspace can (`~/via -> proj/../.ssh` resolves to `~/.ssh` like any
-/// other path), and only the user can write that.
-/// `ctx`'s host workspace is canonical by contract. Paths are compared by
-/// component.
-fn check_workspace_exposure(
+/// **Untrusted links.** No source may run through a symlink inside an
+/// untrusted root, a host directory some sandbox of the session can write:
+/// the workspace, or the source of any profile's `rw` mount. The sandbox can
+/// plant links there, so a `~` or absolute rule such as `~/proj/x` with
+/// `x -> ../.ssh` would otherwise mount `~/.ssh`. This holds however the
+/// source reaches the root: written inside it, or through a link outside it
+/// (`~/current/x` with `~/current -> proj`, or `~/.bashrc -> proj/bashrc`
+/// replaced by a link in the workspace), where the planted link would turn
+/// a rule that shows nothing or is rejected into a mount of any host path.
+/// Links the host controls, outside every root, are followed. This extends
+/// the `{workspace}` anchor's no-symlink rule to every rule and root.
+/// (When such a mount's destination is inside the workspace mount, the
+/// planner's destination check already refuses a link written there.) Only
+/// links count: a literal `..` may leave a root again, since the sandbox
+/// cannot change what it means. Rule paths cannot contain `..`, but the
+/// target of a link outside the roots can (`~/via -> proj/../.ssh` resolves
+/// to `~/.ssh` like any other path), and only the user can write that.
+///
+/// `masked` mounts show nothing of their source, but the planner takes a
+/// masked `~` or absolute symlink's kind (an empty file or an empty
+/// directory) from its target, and any path's kind from the entry the
+/// lookup ends at, so they are checked for untrusted links too: a planted
+/// link must not decide a mask's shape.
+///
+/// **Workspace exposure.** Masks and protected files apply to sandbox paths
+/// inside the workspace mount, not to host content, so the same files
+/// shown elsewhere would escape them. Every source except a `masked` one
+/// must, resolved, not be the host workspace or an ancestor of it, unless
+/// it is the workspace itself mounted at the workspace mount; and if it
+/// lies inside the host workspace, the mount must be at the aligned path,
+/// i.e. the workspace mount joined with the source's path relative to the
+/// host workspace. `{workspace}` sources contain no symlinks below the
+/// workspace (the planner refuses them), so aligned ones resolve to
+/// themselves.
+///
+/// `ctx`'s host workspace is canonical by contract, and is one of `roots`.
+/// Paths are compared by component.
+fn check_host_sources(
     mounts: &[PlannedMount],
     ctx: &ExpansionContext,
+    roots: &UntrustedRoots,
 ) -> Result<(), SpecError> {
     let ws_host = ctx.workspace_host();
     let ws_sandbox = ctx.workspace_sandbox();
@@ -454,28 +602,28 @@ fn check_workspace_exposure(
         let MountSource::Host { path: host, .. } = &m.source else {
             continue;
         };
-        if m.mode == PathMode::Masked {
-            continue;
-        }
-        let (resolved, ws_link) = resolve_host_source(host, ws_host).map_err(|error| {
-            SpecError::HostSourceUnresolved {
+        let source =
+            resolve_host_source(host, roots).map_err(|error| SpecError::HostSourceUnresolved {
                 provider: m.provider.clone(),
                 mode: m.mode,
                 host: host.clone(),
                 sandbox: m.sandbox.clone(),
                 kind: error.kind(),
-            }
-        })?;
-        if let Some(link) = ws_link {
-            return Err(SpecError::WorkspaceLinkFollowed(Box::new(LinkFollowed {
+            })?;
+        let resolved = source.path;
+        if let Some(followed) = source.untrusted.into_iter().next() {
+            return Err(SpecError::UntrustedLinkFollowed(Box::new(LinkFollowed {
                 provider: m.provider.clone(),
                 mode: m.mode,
                 host: host.clone(),
-                link,
+                link: followed.link,
                 resolved,
                 sandbox: m.sandbox.clone(),
-                workspace: ws_host.to_owned(),
+                root: followed.root.clone(),
             })));
+        }
+        if m.mode == PathMode::Masked {
+            continue;
         }
         let exposed = match resolved.strip_prefix(ws_host) {
             // Inside the workspace (or the workspace itself): only the
@@ -503,15 +651,39 @@ fn check_workspace_exposure(
 /// (`MAXSYMLINKS`).
 const MAX_SYMLINKS: usize = 40;
 
+/// A host source resolved by [`resolve_host_source`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedSource<'r> {
+    /// The canonical path.
+    path: PathBuf,
+    /// Every symlink followed that lies inside an untrusted root, in the
+    /// order the lookup followed them.
+    untrusted: Vec<UntrustedLink<'r>>,
+}
+
+/// A symlink inside an untrusted root that a lookup followed.
+///
+/// Every such link is reported with its root, not just the first, so that
+/// a per-rule opt-in can later accept links whose targets stay inside
+/// their own root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UntrustedLink<'r> {
+    /// The link, named below its canonical parent directory.
+    link: PathBuf,
+    /// The innermost root containing it.
+    root: &'r UntrustedRoot,
+}
+
 /// Resolves the absolute host path `path` as the kernel would, one
 /// component at a time, following every symlink (the final one included).
-/// Returns the canonical path and the first symlink followed that lies
-/// inside `workspace` (canonical), if any, named below its canonical parent.
+/// Returns the canonical path and every symlink followed that lies inside
+/// one of `roots` (each link is attributed to the innermost root containing
+/// its canonical parent directory).
 ///
 /// Walking by hand rather than canonicalising sees every link the lookup
-/// passes, including ones a link outside the workspace leads through (a
-/// link to a path inside the workspace that has itself been replaced by a
-/// link): checking prefixes of the path as written would miss those. It
+/// passes, including ones a link outside the roots leads through (a link to
+/// a path inside the workspace that has itself been replaced by a link):
+/// checking prefixes of the path as written would miss those. It
 /// costs one `lstat` per component and one `readlink` per link, the
 /// components of link targets included. Errors are those of the lookup
 /// (`ENOTDIR` for a component below a non-directory or a trailing `/` or
@@ -521,7 +693,10 @@ const MAX_SYMLINKS: usize = 40;
 /// (`/proc/<pid>/root`, `/proc/self/fd/N`), which the kernel follows to the
 /// object they refer to rather than to the path `readlink` shows, resolve
 /// differently here than when mounted (DESIGN.md §11).
-fn resolve_host_source(path: &Path, workspace: &Path) -> io::Result<(PathBuf, Option<PathBuf>)> {
+fn resolve_host_source<'r>(
+    path: &Path,
+    roots: &'r UntrustedRoots,
+) -> io::Result<ResolvedSource<'r>> {
     /// Pushes `path`'s components onto `pending` so they pop in order.
     /// `Path::components` drops a trailing `/` or `/.`, which requires a
     /// directory, so it is kept as a final `.`.
@@ -540,7 +715,7 @@ fn resolve_host_source(path: &Path, workspace: &Path) -> io::Result<(PathBuf, Op
     let mut pending = Vec::new();
     push(&mut pending, path);
     let mut links = 0;
-    let mut ws_link = None;
+    let mut untrusted = Vec::new();
     while let Some(name) = pending.pop() {
         if name == "/" {
             (resolved, is_dir) = (PathBuf::from("/"), true);
@@ -568,12 +743,15 @@ fn resolve_host_source(path: &Path, workspace: &Path) -> io::Result<(PathBuf, Op
             return Err(Errno::LOOP.into());
         }
         let target = fs::read_link(&next)?;
-        if ws_link.is_none() && resolved.starts_with(workspace) {
-            ws_link = Some(next);
+        if let Some(root) = roots.containing(&resolved) {
+            untrusted.push(UntrustedLink { link: next, root });
         }
         push(&mut pending, &target);
     }
-    Ok((resolved, ws_link))
+    Ok(ResolvedSource {
+        path: resolved,
+        untrusted,
+    })
 }
 
 /// Checks the workspace mount point and sandbox `HOME` against the
@@ -623,16 +801,56 @@ fn check_reserved_paths(workspace: &Path, home: &Path) -> Result<(), SpecError> 
 /// grants. Domains inherited from `parent` are dropped silently: a child
 /// may validly narrow a proxy parent's network (say to `"none"`), and the
 /// union of domains is not something it can opt out of.
-pub fn compile_profile(
+///
+/// Host sources are checked against the untrusted roots of this profile
+/// alone: the host workspace and the profile's own `rw` mounts. A session
+/// must be compiled with [`compile_session`], which checks every profile
+/// against the `rw` mounts of all of them. Only tests use this, to pin the
+/// difference.
+#[cfg(test)]
+fn compile_profile(
     grants: &EffectiveGrants,
     parent: Option<&EffectiveGrants>,
     ctx: &ExpansionContext,
 ) -> Result<CompiledProfile, SpecError> {
+    let planned = plan_profile(grants, ctx)?;
+    let mut roots = UntrustedRoots::new(ctx.workspace_host());
+    roots.add_rw_mounts(None, &planned.plan.mounts);
+    finish_profile(planned, grants, parent, ctx, &roots)
+}
+
+/// A profile whose mounts are planned but whose host sources are not yet
+/// checked.
+struct PlannedProfile {
+    home: SandboxHome,
+    plan: MountPlan,
+}
+
+/// The first stage of compiling a profile: checks the workspace mount and
+/// `HOME` against the reserved paths, plans the mounts and checks their
+/// destinations.
+fn plan_profile(
+    grants: &EffectiveGrants,
+    ctx: &ExpansionContext,
+) -> Result<PlannedProfile, SpecError> {
     let home = grants.system.home.clone().unwrap_or_default();
     check_reserved_paths(ctx.workspace_sandbox(), Path::new(home.as_str()))?;
     let plan = plan_mounts(&grants.fs, &ctx.with_sandbox_home(&home))?;
     check_mount_destinations(&plan.mounts)?;
-    check_workspace_exposure(&plan.mounts, ctx)?;
+    Ok(PlannedProfile { home, plan })
+}
+
+/// The second stage of compiling a profile: checks the planned host sources
+/// against `roots` and assembles the spec.
+fn finish_profile(
+    planned: PlannedProfile,
+    grants: &EffectiveGrants,
+    parent: Option<&EffectiveGrants>,
+    ctx: &ExpansionContext,
+    roots: &UntrustedRoots,
+) -> Result<CompiledProfile, SpecError> {
+    let PlannedProfile { home, plan } = planned;
+    check_host_sources(&plan.mounts, ctx, roots)?;
     let mut warnings: Vec<SpecWarning> = plan.warnings.into_iter().map(Into::into).collect();
     let inherited_domains = parent.map(|p| &p.network.allow_domains);
     let network = network_spec(&grants.network, inherited_domains, &mut warnings);
@@ -752,10 +970,15 @@ pub enum CompileError {
 /// Runs the whole pipeline for a session: builds the profile graph from
 /// `config` and the providers' `outputs` (in merge order, each with its
 /// provider's effective name; see [`build_profile_graph`]), merges every
-/// profile's grants, and compiles each profile with [`compile_profile`].
+/// profile's grants, and compiles each profile as `compile_profile` does,
+/// except that host sources are checked against the untrusted roots of the
+/// whole session: the host workspace and the `rw` mounts of every profile,
+/// since a sandbox of one profile can plant links that a rule of another
+/// follows (DESIGN.md §3.4, Symlinks). So every profile's mounts are
+/// planned first, then every profile's host sources are checked.
 ///
-/// Stops at the first failing stage, and among the profiles at the first
-/// failing one in graph order.
+/// Stops at the first failing stage, and within each of the two profile
+/// stages at the first failing profile in graph order.
 pub fn compile_session(
     config: &Config,
     outputs: Vec<(ProviderName, ProviderOutput)>,
@@ -763,17 +986,27 @@ pub fn compile_session(
 ) -> Result<CompiledSession, CompileError> {
     let graph = build_profile_graph(config, outputs)?;
     let merged = merge_profiles(&graph)?;
-    let mut profiles = BTreeMap::new();
+    let fail = |profile: &ProfileRef| {
+        let profile = profile.clone();
+        move |error| CompileError::Profile {
+            profile,
+            error: Box::new(error),
+        }
+    };
+    let mut planned = Vec::with_capacity(merged.order().len());
+    let mut roots = UntrustedRoots::new(ctx.workspace_host());
     for (profile, grants) in merged.iter() {
+        let p = plan_profile(grants, ctx).map_err(fail(profile))?;
+        roots.add_rw_mounts(Some(profile), &p.plan.mounts);
+        planned.push(p);
+    }
+    let mut profiles = BTreeMap::new();
+    for ((profile, grants), p) in merged.iter().zip(planned) {
         let parent = graph
             .get(profile)
             .and_then(|node| node.parent.as_ref())
             .map(|p| merged.get(p).expect("every parent is a merged profile"));
-        let compiled =
-            compile_profile(grants, parent, ctx).map_err(|error| CompileError::Profile {
-                profile: profile.clone(),
-                error: Box::new(error),
-            })?;
+        let compiled = finish_profile(p, grants, parent, ctx, &roots).map_err(fail(profile))?;
         profiles.insert(profile.clone(), compiled);
     }
     Ok(CompiledSession {
@@ -1921,31 +2154,43 @@ mod tests {
         assert_eq!(exposure(&f, e).2, f.ws());
     }
 
+    /// The `UntrustedLinkFollowed` payload of `e`, checking that it is for
+    /// profile `profile`.
+    fn untrusted_link(e: CompileError, profile: &str) -> LinkFollowed {
+        let CompileError::Profile { profile: p, error } = e else {
+            panic!("expected a profile error, got {e:?}");
+        };
+        assert_eq!(p, pr(profile));
+        match *error {
+            SpecError::UntrustedLinkFollowed(lf) => *lf,
+            other => panic!("expected UntrustedLinkFollowed, got {other:?}"),
+        }
+    }
+
     /// The `(mode, host, link, resolved, sandbox)` of the
-    /// `WorkspaceLinkFollowed` error compiling `body` gives, checking its
-    /// provider and workspace.
+    /// `UntrustedLinkFollowed` error compiling `body` gives, checking its
+    /// provider and that the link is attributed to the workspace.
     fn link_followed(f: &Fixture, body: &str) -> (PathMode, PathBuf, PathBuf, PathBuf, PathBuf) {
         let e = compile_body(f, body).unwrap_err();
-        let CompileError::Profile { error, .. } = e else {
-            panic!("{body}: expected a profile error, got {e:?}");
-        };
-        match *error {
-            SpecError::WorkspaceLinkFollowed(lf) => {
-                let LinkFollowed {
-                    provider,
-                    mode,
-                    host,
-                    link,
-                    resolved,
-                    sandbox,
-                    workspace,
-                } = *lf;
-                assert_eq!(provider.as_str(), "p", "{body}");
-                assert_eq!(workspace, f.ws(), "{body}");
-                (mode, host, link, resolved, sandbox)
-            }
-            other => panic!("{body}: expected WorkspaceLinkFollowed, got {other:?}"),
-        }
+        let LinkFollowed {
+            provider,
+            mode,
+            host,
+            link,
+            resolved,
+            sandbox,
+            root,
+        } = untrusted_link(e, "main");
+        assert_eq!(provider.as_str(), "p", "{body}");
+        assert_eq!(
+            root,
+            UntrustedRoot {
+                path: f.ws(),
+                kind: UntrustedKind::Workspace
+            },
+            "{body}"
+        );
+        (mode, host, link, resolved, sandbox)
     }
 
     #[test]
@@ -1987,19 +2232,19 @@ mod tests {
         let bind = "fs.bind = [{ host = \"~/proj/x\", sandbox = \"/opt/x\", mode = \"ro\" }]";
         let (_, _, link, resolved, _) = link_followed(&f, bind);
         assert_eq!((link, resolved), (x.clone(), ssh.clone()));
-        // Masked, it shows nothing of the target.
-        if let Err(e) = compile_body(&f, "fs.masked = [\"~/proj/x\"]") {
-            panic!("masked: {e}");
-        }
+        // Masked, it shows nothing of the target, but the planted link would
+        // decide the mask's shape.
+        let (mode, _, link, _, _) = link_followed(&f, "fs.masked = [\"~/proj/x\"]");
+        assert_eq!((mode, link), (Masked, x.clone()));
         let e = compile_body(&f, "fs.ro = [\"~/proj/x\"]").unwrap_err();
         assert_eq!(
             e.to_string(),
             format!(
                 "cannot compile profile \"main\": provider \"p\": ro mount of {x:?} at \
                  \"/home/user/proj/x\" runs through the symlink {x:?} inside the host workspace \
-                 {:?} (resolving to {ssh:?}); links inside the workspace are never followed, \
-                 whatever the rule's anchor or the links leading there: remove the link or change \
-                 the rule",
+                 {:?} (resolving to {ssh:?}); a sandbox can write there, so links inside it are \
+                 never followed, whatever the rule's anchor or the links leading there: remove \
+                 the link or change the rule",
                 f.ws()
             )
         );
@@ -2078,11 +2323,10 @@ mod tests {
         let abs = home.join("current/config");
         let (_, _, link, _, sandbox) =
             link_followed(&f, &format!("fs.protected = [{:?}]", abs.to_str().unwrap()));
-        assert_eq!((link, sandbox), (config, abs));
-        // Masked, it shows nothing of the target.
-        if let Err(e) = compile_body(&f, "fs.masked = [\"~/current/config\"]") {
-            panic!("masked: {e}");
-        }
+        assert_eq!((link, sandbox), (config.clone(), abs));
+        // Masked, the planted link would decide the mask's shape.
+        let (mode, _, link, _, _) = link_followed(&f, "fs.masked = [\"~/current/config\"]");
+        assert_eq!((mode, link), (Masked, config));
     }
 
     #[test]
@@ -2142,6 +2386,14 @@ mod tests {
         );
     }
 
+    /// Resolves `path` with the workspace `ws` as the only untrusted root:
+    /// the canonical path and the first link followed inside `ws`.
+    fn resolve_in(path: &Path, ws: &Path) -> io::Result<(PathBuf, Option<PathBuf>)> {
+        let roots = UntrustedRoots::new(ws);
+        resolve_host_source(path, &roots)
+            .map(|s| (s.path, s.untrusted.first().map(|l| l.link.clone())))
+    }
+
     #[test]
     fn resolve_host_source_matches_canonicalize_and_reports_loops() {
         let dir = TempDir::new().unwrap();
@@ -2180,7 +2432,7 @@ mod tests {
             (root.join("ws/a/../up"), Some(ws.join("up"))),
         ] {
             assert_eq!(
-                resolve_host_source(&path, &ws).unwrap(),
+                resolve_in(&path, &ws).unwrap(),
                 (path.canonicalize().unwrap(), link),
                 "{path:?}"
             );
@@ -2202,7 +2454,7 @@ mod tests {
             (root.join("slash-target"), Errno::NOTDIR),
         ] {
             assert_eq!(
-                resolve_host_source(&path, &ws).unwrap_err().raw_os_error(),
+                resolve_in(&path, &ws).unwrap_err().raw_os_error(),
                 Some(errno.raw_os_error()),
                 "{path:?}"
             );
@@ -2214,10 +2466,52 @@ mod tests {
         }
         symlink("nowhere", ws.join("dangling")).unwrap();
         assert_eq!(
-            resolve_host_source(&ws.join("dangling"), &ws)
-                .unwrap_err()
-                .kind(),
+            resolve_in(&ws.join("dangling"), &ws).unwrap_err().kind(),
             io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn resolve_host_source_reports_every_untrusted_link_with_its_root() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ws = root.join("ws");
+        let rw = root.join("rw");
+        fs::create_dir_all(ws.join("a")).unwrap();
+        fs::create_dir_all(rw.join("b")).unwrap();
+        // `ws/l1 -> l2 -> ../host -> rw/l3 -> b`, where `host` is outside
+        // every root.
+        symlink("l2", ws.join("l1")).unwrap();
+        symlink("../host", ws.join("l2")).unwrap();
+        symlink("rw/l3", root.join("host")).unwrap();
+        symlink("b", rw.join("l3")).unwrap();
+        let mut roots = UntrustedRoots::new(&ws);
+        roots.add_rw_mounts(
+            None,
+            &[PlannedMount {
+                sandbox: "/rw".into(),
+                source: MountSource::Host {
+                    path: rw.clone(),
+                    kind: EntryKind::Dir,
+                },
+                mode: Rw,
+                provider: "p".parse().unwrap(),
+            }],
+        );
+        let got = resolve_host_source(&ws.join("l1"), &roots).unwrap();
+        assert_eq!(got.path, rw.join("b"));
+        let links: Vec<(PathBuf, PathBuf)> = got
+            .untrusted
+            .iter()
+            .map(|l| (l.link.clone(), l.root.path.clone()))
+            .collect();
+        assert_eq!(
+            links,
+            [
+                (ws.join("l1"), ws.clone()),
+                (ws.join("l2"), ws.clone()),
+                (rw.join("l3"), rw.clone()),
+            ]
         );
     }
 
@@ -2235,17 +2529,12 @@ mod tests {
             symlink(format!("l{}", i - 1), root.join(format!("l{i}"))).unwrap();
         }
         let last_ok = root.join(format!("l{}", MAX_SYMLINKS - 1));
-        assert_eq!(
-            resolve_host_source(&last_ok, &ws).unwrap(),
-            (root.join("out"), None)
-        );
+        assert_eq!(resolve_in(&last_ok, &ws).unwrap(), (root.join("out"), None));
         assert!(fs::metadata(&last_ok).unwrap().is_dir());
         let too_many = root.join(format!("l{MAX_SYMLINKS}"));
         let loop_errno = Some(Errno::LOOP.raw_os_error());
         assert_eq!(
-            resolve_host_source(&too_many, &ws)
-                .unwrap_err()
-                .raw_os_error(),
+            resolve_in(&too_many, &ws).unwrap_err().raw_os_error(),
             loop_errno
         );
         assert_eq!(
@@ -2270,7 +2559,7 @@ mod tests {
         symlink("locked/d", root.join("via")).unwrap();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
         let results = [locked.join("d"), root.join("via")]
-            .map(|path| resolve_host_source(&path, &ws).map_err(|e| e.raw_os_error()));
+            .map(|path| resolve_in(&path, &ws).map_err(|e| e.raw_os_error()));
         // Restore permissions before asserting, so the tempdir can be
         // removed even if an assertion fails.
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
@@ -2405,10 +2694,348 @@ mod tests {
                 kind: std::io::ErrorKind::NotFound,
             }
         );
-        // A masked one is not resolved, so the planner's handling stands.
+        // A masked dangling link is dropped by the planner (with a warning)
+        // before it is ever resolved here.
         if let Err(e) = compile_body(&f, "fs.masked = [\"~/dangling\"]") {
             panic!("masked: {e}");
         }
+    }
+
+    /// The untrusted root of an `rw` grant of `host` by `provider` in
+    /// `profile`, at the canonical `path`.
+    fn rw_root(
+        path: PathBuf,
+        provider: &str,
+        profile: Option<&str>,
+        host: PathBuf,
+    ) -> UntrustedRoot {
+        UntrustedRoot {
+            path,
+            kind: UntrustedKind::RwGrant {
+                provider: provider.parse().unwrap(),
+                profile: profile.map(pr),
+                host,
+            },
+        }
+    }
+
+    /// A fixture with `~/.cache/tool` (to be granted `rw`), `~/.ssh` and a
+    /// link `~/.cache/tool/cfg -> ../../.ssh`, as a sandbox with the grant
+    /// could plant.
+    fn planted_cache_link() -> Fixture {
+        let f = Fixture::new();
+        f.file("home/.ssh/id_ed25519");
+        f.mkdir("home/.cache/tool");
+        symlink("../../.ssh", f.root.join("home/.cache/tool/cfg")).unwrap();
+        f
+    }
+
+    #[test]
+    fn links_planted_in_an_rw_grant_are_refused() {
+        let f = planted_cache_link();
+        let home = f.root.join("home");
+        let tool = home.join(".cache/tool");
+        let e = compile_body(
+            &f,
+            "fs.rw = [\"~/.cache/tool\"]\nfs.ro = [\"~/.cache/tool/cfg\"]",
+        )
+        .unwrap_err();
+        assert_eq!(
+            untrusted_link(e, "main"),
+            LinkFollowed {
+                provider: "p".parse().unwrap(),
+                mode: Ro,
+                host: tool.join("cfg"),
+                link: tool.join("cfg"),
+                resolved: home.join(".ssh"),
+                sandbox: PathBuf::from("/home/user/.cache/tool/cfg"),
+                root: rw_root(tool.clone(), "p", Some("main"), tool.clone()),
+            }
+        );
+        // A bind, an absolute rule and a link on the way alike.
+        for body in [
+            "fs.bind = [{ host = \"~/.cache/tool/cfg\", sandbox = \"/opt/c\", mode = \"ro\" }]",
+            &format!("fs.ro = [{:?}]", tool.join("cfg").to_str().unwrap()),
+            "fs.protected = [\"~/.cache/tool/cfg/id_ed25519\"]",
+        ] {
+            let e = compile_body(&f, &format!("fs.rw = [\"~/.cache/tool\"]\n{body}")).unwrap_err();
+            let lf = untrusted_link(e, "main");
+            assert_eq!(
+                (&lf.link, &lf.root.path),
+                (&tool.join("cfg"), &tool),
+                "{body}"
+            );
+        }
+        // Without the grant, the link is the host's own and is followed.
+        let s = compile_body(&f, "fs.ro = [\"~/.cache/tool/cfg\"]").unwrap();
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [row("/home/user/.cache/tool/cfg", Ro, "p")]
+        );
+    }
+
+    #[test]
+    fn links_planted_in_an_rw_bind_are_refused() {
+        let f = planted_cache_link();
+        let home = f.root.join("home");
+        let tool = home.join(".cache/tool");
+        let e = compile_body(
+            &f,
+            "fs.bind = [{ host = \"~/.cache/tool\", sandbox = \"/opt/t\", mode = \"rw\" }]\n\
+             fs.ro = [\"~/.cache/tool/cfg\"]",
+        )
+        .unwrap_err();
+        let lf = untrusted_link(e, "main");
+        assert_eq!(lf.link, tool.join("cfg"));
+        assert_eq!(lf.resolved, home.join(".ssh"));
+        assert_eq!(lf.root, rw_root(tool.clone(), "p", Some("main"), tool));
+    }
+
+    #[test]
+    fn links_planted_in_another_profiles_rw_grant_are_refused() {
+        let f = planted_cache_link();
+        let tool = f.root.join("home/.cache/tool");
+        // The grant in a child profile, the rule in `main`, which is planned
+        // and checked without the grant but in the same session.
+        let e = f
+            .try_compile(&format!(
+                "base = \"none\"\n[profiles.agent]\n{}{}",
+                prov("w", "agent", "fs.rw = [\"~/.cache/tool\"]"),
+                prov("r", "main", "fs.ro = [\"~/.cache/tool/cfg\"]"),
+            ))
+            .unwrap_err();
+        let lf = untrusted_link(e, "main");
+        assert_eq!(lf.link, tool.join("cfg"));
+        assert_eq!(
+            lf.root,
+            rw_root(tool.clone(), "w", Some("agent"), tool.clone())
+        );
+        // The grant in `main`, the rule in an unrelated profile.
+        let src = format!(
+            "base = \"none\"\n[profiles.bare]\ninherit = \"none\"\n{}{}",
+            prov("w", "main", "fs.rw = [\"~/.cache/tool\"]"),
+            prov("r", "bare", "fs.ro = [\"~/.cache/tool/cfg\"]"),
+        );
+        let e = f.try_compile(&src).unwrap_err();
+        let lf = untrusted_link(e, "bare");
+        assert_eq!(
+            lf.root,
+            rw_root(tool.clone(), "w", Some("main"), tool.clone())
+        );
+        assert_eq!(
+            lf.to_string(),
+            format!(
+                "provider \"r\": ro mount of {:?} at \"/home/user/.cache/tool/cfg\" runs through \
+                 the symlink {:?} inside {tool:?}, granted rw as {tool:?} by provider \"w\" in \
+                 profile \"main\" (resolving to {:?}); a sandbox can write there, so links inside \
+                 it are never followed, whatever the rule's anchor or the links leading there: \
+                 remove the link or change the rule",
+                tool.join("cfg"),
+                tool.join("cfg"),
+                f.root.join("home/.ssh")
+            )
+        );
+
+        // Compiled on its own, a profile knows only its own grants: `bare`
+        // passes, and `main`'s own grant is credited to no profile.
+        let cfg = Config::from_toml_str(&src).unwrap();
+        let graph = build_profile_graph(&cfg, f.outputs(&cfg)).unwrap();
+        let merged = merge_profiles(&graph).unwrap();
+        compile_profile(merged.get(&pr("bare")).unwrap(), None, &f.ctx).unwrap();
+        let mut main = merged.get(&pr("main")).unwrap().clone();
+        main.fs
+            .extend(merged.get(&pr("bare")).unwrap().fs.iter().cloned());
+        let e = compile_profile(&main, None, &f.ctx).unwrap_err();
+        let SpecError::UntrustedLinkFollowed(lf) = e else {
+            panic!("expected UntrustedLinkFollowed, got {e:?}");
+        };
+        assert_eq!(lf.root, rw_root(tool.clone(), "w", None, tool));
+    }
+
+    #[test]
+    fn rw_grants_without_planted_links_and_host_links_are_accepted() {
+        let f = Fixture::new();
+        f.mkdir("home/.cache/tool/cfg");
+        // A host-controlled link outside every root (home-manager style).
+        f.file("store/foo/config");
+        f.mkdir("home/.config");
+        symlink(f.root.join("store/foo"), f.root.join("home/.config/foo")).unwrap();
+        for src in [
+            format!(
+                "base = \"none\"\n{}",
+                prov(
+                    "p",
+                    "main",
+                    "fs.rw = [\"~/.cache/tool\"]\nfs.ro = [\"~/.cache/tool/cfg\", \"~/.config/foo\"]"
+                )
+            ),
+            format!(
+                "base = \"none\"\n[profiles.agent]\n{}{}",
+                prov("w", "agent", "fs.rw = [\"~/.cache/tool\"]"),
+                prov(
+                    "r",
+                    "main",
+                    "fs.ro = [\"~/.cache/tool/cfg\", \"~/.config/foo/config\"]\n\
+                     fs.masked = [\"~/.config/foo\"]"
+                ),
+            ),
+            // The default base grants the workspace `rw` too.
+            prov(
+                "r",
+                "main",
+                "fs.rw = [\"~/.cache/tool\"]\nfs.ro = [\"~/.config/foo\"]",
+            ),
+        ] {
+            if let Err(e) = f.try_compile(&src) {
+                panic!("{src}: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn rw_sources_written_through_host_links_make_their_target_a_root() {
+        let f = planted_cache_link();
+        let home = f.root.join("home");
+        let tool = home.join(".cache/tool");
+        symlink(".cache", home.join("cachelink")).unwrap();
+        let e = compile_body(
+            &f,
+            "fs.rw = [\"~/cachelink/tool\"]\nfs.ro = [\"~/.cache/tool/cfg\"]",
+        )
+        .unwrap_err();
+        let lf = untrusted_link(e, "main");
+        assert_eq!(lf.link, tool.join("cfg"));
+        assert_eq!(
+            lf.root,
+            rw_root(tool, "p", Some("main"), home.join("cachelink/tool"))
+        );
+    }
+
+    #[test]
+    fn nested_roots_attribute_links_to_the_innermost() {
+        let f = Fixture::with_workspace("home/proj", "/workspace");
+        let home = f.root.join("home");
+        let cache = home.join(".cache");
+        let tool = cache.join("tool");
+        f.file("home/.ssh/id_ed25519");
+        f.mkdir("home/.cache/tool");
+        symlink("../../.ssh", tool.join("x")).unwrap();
+        symlink("../.ssh", cache.join("y")).unwrap();
+        symlink("../.ssh", f.ws().join("z")).unwrap();
+        let grants = "fs.rw = [\"~/.cache\", \"~/.cache/tool\", \"{workspace}\"]\n";
+        let cache_root = rw_root(cache.clone(), "p", Some("main"), cache.clone());
+        let tool_root = rw_root(tool.clone(), "p", Some("main"), tool.clone());
+        // An `rw` grant of the workspace is the same root as the workspace,
+        // credited to the workspace.
+        let ws_root = UntrustedRoot {
+            path: f.ws(),
+            kind: UntrustedKind::Workspace,
+        };
+        for (rule, link, root) in [
+            ("~/.cache/tool/x", tool.join("x"), &tool_root),
+            ("~/.cache/y", cache.join("y"), &cache_root),
+            ("~/proj/z", f.ws().join("z"), &ws_root),
+        ] {
+            let e = compile_body(&f, &format!("{grants}fs.ro = [\"{rule}\"]")).unwrap_err();
+            let lf = untrusted_link(e, "main");
+            assert_eq!((&lf.link, &lf.root), (&link, root), "{rule}");
+        }
+        // An inner grant replaced by a link through the outer one is refused
+        // itself.
+        fs::remove_dir_all(&tool).unwrap();
+        symlink("../.ssh", &tool).unwrap();
+        let e = compile_body(&f, grants).unwrap_err();
+        let lf = untrusted_link(e, "main");
+        assert_eq!((lf.mode, &lf.link, &lf.root.path), (Rw, &tool, &cache));
+    }
+
+    #[test]
+    fn masks_shaped_by_planted_links_are_refused() {
+        let f = planted_cache_link();
+        let tool = f.root.join("home/.cache/tool");
+        let e = compile_body(
+            &f,
+            "fs.rw = [\"~/.cache/tool\"]\nfs.masked = [\"~/.cache/tool/cfg\"]",
+        )
+        .unwrap_err();
+        let lf = untrusted_link(e, "main");
+        assert_eq!(
+            (lf.mode, &lf.link, &lf.root.path),
+            (Masked, &tool.join("cfg"), &tool)
+        );
+        // A link on the way decides the shape just as well.
+        let e = compile_body(
+            &f,
+            "fs.rw = [\"~/.cache/tool\"]\nfs.masked = [\"~/.cache/tool/cfg/id_ed25519\"]",
+        )
+        .unwrap_err();
+        assert_eq!(untrusted_link(e, "main").link, tool.join("cfg"));
+        // Without the grant the link is the host's, and the mask takes the
+        // target's kind.
+        let s = compile_body(&f, "fs.masked = [\"~/.cache/tool/cfg\"]").unwrap();
+        assert_eq!(
+            spec(&s, "main").mounts[0].source,
+            MountSource::Host {
+                path: tool.join("cfg"),
+                kind: EntryKind::Dir
+            }
+        );
+    }
+
+    #[test]
+    fn untrusted_roots_skip_unresolvable_and_duplicate_rw_sources() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ws = root.join("ws");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir(&ws).unwrap();
+        symlink("missing", root.join("dangling")).unwrap();
+        symlink("a", root.join("alias")).unwrap();
+        let mount = |host: PathBuf, mode, provider: &str| PlannedMount {
+            sandbox: host.clone(),
+            source: MountSource::Host {
+                path: host,
+                kind: EntryKind::Dir,
+            },
+            mode,
+            provider: provider.parse().unwrap(),
+        };
+        let mut roots = UntrustedRoots::new(&ws);
+        roots.add_rw_mounts(
+            Some(&pr("main")),
+            &[
+                mount(root.join("dangling"), Rw, "d"),
+                mount(root.join("a/b"), Ro, "ro"),
+                mount(root.join("alias"), Rw, "first"),
+                mount(root.join("a"), Rw, "second"),
+                mount(ws.clone(), Rw, "ws"),
+                mount(root.join("a/b"), Rw, "inner"),
+                PlannedMount {
+                    sandbox: "/tmp".into(),
+                    source: MountSource::Ephemeral,
+                    mode: Rw,
+                    provider: "e".parse().unwrap(),
+                },
+            ],
+        );
+        assert_eq!(
+            roots.roots,
+            [
+                UntrustedRoot {
+                    path: ws.clone(),
+                    kind: UntrustedKind::Workspace
+                },
+                rw_root(root.join("a"), "first", Some("main"), root.join("alias")),
+                rw_root(root.join("a/b"), "inner", Some("main"), root.join("a/b")),
+            ]
+        );
+        let at = |p: &Path| roots.containing(p).map(|r| r.path.clone());
+        assert_eq!(at(&root.join("a/b/c")), Some(root.join("a/b")));
+        assert_eq!(at(&root.join("a/b")), Some(root.join("a/b")));
+        assert_eq!(at(&root.join("a/bc")), Some(root.join("a")));
+        assert_eq!(at(&ws.join("x")), Some(ws.clone()));
+        assert_eq!(at(&root.join("ab")), None);
+        assert_eq!(at(&root), None);
     }
 
     #[test]
