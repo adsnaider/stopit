@@ -14,18 +14,22 @@
 //! sandbox paths are separate mounts, and the plan is ordered so that
 //! children are mounted after, and therefore on top of, their parents.
 //!
-//! Symlinks below the workspace are never followed (DESIGN.md §3.4,
-//! Symlinks), neither on the way to a `{workspace}` rule's host path nor on
-//! the way to a mount destination inside the workspace mount. A rule whose
-//! literal part (a literal path, or a glob's literal prefix) or mount
-//! destination runs into one is a startup error if it restricts access
-//! (every mode but `rw`), since a planted link (e.g. a renamed directory
-//! replaced by a link to it) would redirect the rule away from the real
-//! file, and is skipped with a warning otherwise (an `rw` rule, or a bind's
-//! host side), since dropping a grant only removes access. A link matched
-//! by a glob is skipped with a warning whatever the mode: the walk never
-//! follows links and visits the real files directly, so the rule still
-//! reaches them under their real names.
+//! Symlinks below the workspace are never followed on the way to a
+//! `{workspace}` rule's host path (DESIGN.md §3.4, Symlinks). A rule whose
+//! literal part (a literal path, or a glob's literal prefix) runs into one
+//! is a startup error if it restricts access (every mode but `rw`), since a
+//! planted link (e.g. a renamed directory replaced by a link to it) would
+//! redirect the rule away from the real file, and is skipped with a warning
+//! otherwise (an `rw` rule, or a bind's host side), since dropping a grant
+//! only removes access. A link matched by a glob is skipped with a warning
+//! whatever the mode: the walk never follows links and visits the real
+//! files directly, so the rule still reaches them under their real names.
+//!
+//! Mount destinations are not checked here: whether a link on the way to a
+//! destination may have been planted depends on the mount underneath it and
+//! on the untrusted roots of the whole session, so the spec compiler checks
+//! them once every profile is planned (`crate::spec`; DESIGN.md §6.2,
+//! "Untrusted links").
 //!
 //! Likewise, a restrictive rule that cannot be resolved because a path
 //! cannot be inspected or a directory cannot be read (anything but a
@@ -47,8 +51,8 @@ use thiserror::Error;
 use super::merge::{FsRule, FsRuleKind};
 use crate::config::ProviderName;
 use crate::expand::{
-    EntryKind, ExpandError, ExpandedPattern, ExpansionContext, NoSymlinksError, ResolveWarning,
-    ResolvedPath, check_no_symlinks, expand_bind, expand_pattern, resolve,
+    EntryKind, ExpandError, ExpandedPattern, ExpansionContext, ResolveWarning, ResolvedPath,
+    expand_bind, expand_pattern, resolve,
 };
 use crate::manifest::{PathPattern, PatternAnchor};
 use crate::policy::PathMode;
@@ -99,8 +103,7 @@ pub struct MountPlan {
     /// the sandbox path and then lexicographically, so that every mount
     /// comes after the mounts of its ancestors.
     pub mounts: Vec<PlannedMount>,
-    /// Non-fatal problems: those found resolving the rules, in rule order,
-    /// then those found checking mount destinations, in sandbox path order.
+    /// Non-fatal problems found resolving the rules, in rule order.
     pub warnings: Vec<PlanWarning>,
 }
 
@@ -119,15 +122,14 @@ pub struct PlanWarning {
 /// What a [`PlanWarning`] is about.
 #[derive(Debug, Error)]
 pub enum PlanWarningKind {
-    /// Resolving the rule against the host filesystem, or checking its
-    /// mount destination, found a problem: a missing path, or for an `rw`
-    /// rule or a bind's host side, one that cannot be inspected.
+    /// Resolving the rule against the host filesystem found a problem: a
+    /// missing path, or for an `rw` rule or a bind's host side, one that
+    /// cannot be inspected.
     #[error(transparent)]
     Resolve(#[from] ResolveWarning),
-    /// An `rw` rule's path or mount destination, a bind's host path, or a
-    /// path matched by a `{workspace}` glob of any mode, is or runs through
-    /// a symlink below the workspace, which is never followed (DESIGN.md
-    /// §3.4, Symlinks).
+    /// An `rw` rule's path, a bind's host path, or a path matched by a
+    /// `{workspace}` glob of any mode, is or runs through a symlink below
+    /// the workspace, which is never followed (DESIGN.md §3.4, Symlinks).
     #[error(
         "{path:?} is or runs through the symlink {link:?} in the workspace, which is never \
          followed; write a rule for the link's target if it needs one"
@@ -158,10 +160,10 @@ pub enum PathPlanError {
     /// sandbox path. Boxed to keep `PathPlanError` small.
     #[error(transparent)]
     Conflict(Box<MountConflict>),
-    /// A restrictive rule's literal path, glob literal prefix or mount
-    /// destination is or runs through a symlink below the workspace. Such a
-    /// rule is never skipped: a planted link (e.g. a renamed directory
-    /// replaced by a link to it) must not switch a restriction off.
+    /// A restrictive rule's literal path or glob literal prefix is or runs
+    /// through a symlink below the workspace. Such a rule is never skipped:
+    /// a planted link (e.g. a renamed directory replaced by a link to it)
+    /// must not switch a restriction off.
     #[error(
         "provider {:?}, rule {:?}: {path:?} is or runs through the symlink {link:?} in the \
          workspace, which is never followed, and a {mode} rule is never skipped",
@@ -179,27 +181,6 @@ pub enum PathPlanError {
         path: PathBuf,
         /// The first symlink on the way to it (possibly `path` itself).
         link: PathBuf,
-    },
-    /// A restrictive rule's mount destination inside the workspace could not
-    /// be checked for symlinks (e.g. a directory on the way is unreadable),
-    /// so the rule can neither be applied safely nor skipped.
-    #[error(
-        "provider {:?}, rule {:?}: cannot check {path:?} for symlinks ({kind}), and a {mode} \
-         rule is never skipped",
-        .provider.as_str(),
-        .pattern
-    )]
-    DestinationUnchecked {
-        /// The provider that granted the rule.
-        provider: ProviderName,
-        /// The rule's pattern as written; for a bind, its host path.
-        pattern: String,
-        /// The rule's mode.
-        mode: PathMode,
-        /// The host path that could not be inspected.
-        path: PathBuf,
-        /// What went wrong inspecting it.
-        kind: io::ErrorKind,
     },
     /// Resolving a restrictive rule failed on a path that exists but cannot
     /// be inspected, or a directory that cannot be read during a glob walk
@@ -323,17 +304,20 @@ impl Candidate<'_> {
 /// source and always produce a candidate.
 ///
 /// Symlinks: the literal part of a `{workspace}` rule (a literal path, or a
-/// glob's literal prefix), and the host path under every winning mount
-/// destination inside the workspace mount (including its final component),
-/// must contain no symlink below the workspace. Otherwise a restrictive
-/// rule is an error and an `rw` rule is dropped with a warning; a bind
-/// whose host is or runs through such a symlink is always dropped with a
-/// warning. A symlink matched by a `{workspace}` glob is dropped with a
-/// warning whatever the mode, before the winner at its sandbox path is
-/// picked. A missing destination is fine. A `masked` `~` or absolute rule
-/// matching a symlink takes the kind of the link's target; it is dropped
-/// with a warning if the target is missing, and is an error if the target
-/// cannot be inspected otherwise.
+/// glob's literal prefix) must contain no symlink below the workspace
+/// (its final component is left to the later checks, see below).
+/// Otherwise a restrictive rule is an error and an `rw` rule is dropped
+/// with a warning; a bind whose host is or runs through such a symlink is
+/// always dropped with a warning. A symlink matched by a `{workspace}` glob
+/// is dropped with a warning whatever the mode, before the winner at its
+/// sandbox path is picked. A `masked` `~` or absolute rule matching a
+/// symlink takes the kind of the link's target; it is dropped with a
+/// warning if the target is missing, and is an error if the target cannot
+/// be inspected otherwise.
+///
+/// Mount destinations, and host sources running through links a sandbox
+/// may have planted, are checked by the spec compiler once every profile
+/// of the session is planned (DESIGN.md §6.2, "Untrusted links").
 ///
 /// Fails if two candidates of equal precedence map different sources to the
 /// same sandbox path; identical candidates collapse into one mount, credited
@@ -348,10 +332,7 @@ pub fn plan_mounts(fs: &[FsRule], ctx: &ExpansionContext) -> Result<MountPlan, P
     }
     let mut mounts = Vec::with_capacity(by_path.len());
     for candidates in by_path.into_values() {
-        let winner = pick(candidates)?;
-        if destination_is_safe(&winner, ctx, &mut warnings)? {
-            mounts.push(winner.into_mount());
-        }
+        mounts.push(pick(candidates)?.into_mount());
     }
     mounts.sort_by(|a, b| {
         depth(&a.sandbox)
@@ -463,17 +444,19 @@ fn rule_candidates<'a>(
             let paths = resolve_host(rule, pattern, &expanded, refused, warnings)?;
             let mut out = Vec::with_capacity(paths.len());
             for p in paths {
-                // A literal path's final link is left as it is: its sandbox
-                // path is inside the workspace mount, so the destination
-                // check refuses it. A link matched by the glob is dropped
-                // whatever the mode: the walk never follows links and
-                // reaches the real files under their real names, so a
-                // planted link cannot make the rule miss them. Dropping it
-                // before the winner is picked never lets a weaker candidate
-                // win: every `{workspace}` glob matching this sandbox path
-                // matched the same link and is dropped alike, any literal
-                // candidate outranks globs anyway, and any other glob
-                // candidate left is refused by the destination check.
+                // A literal path's final link is left as it is: the spec
+                // compiler refuses it, by its destination check when the
+                // workspace (or a mount of something inside it) is mounted
+                // underneath, and by its host-source check otherwise (the
+                // workspace is always an untrusted root). A link matched by
+                // the glob is dropped whatever the mode: the walk never
+                // follows links and reaches the real files under their real
+                // names, so a planted link cannot make the rule miss them.
+                // Dropping it before the winner is picked never lets a
+                // weaker candidate win: every `{workspace}` glob matching
+                // this sandbox path matched the same link and is dropped
+                // alike, any literal candidate outranks globs anyway, and
+                // any other glob candidate left is refused by those checks.
                 if in_workspace && !literal && p.kind == EntryKind::Symlink {
                     workspace_symlink(rule, None, p.host.clone(), p.host, warnings)?;
                     continue;
@@ -591,60 +574,6 @@ fn resolve_host(
         }
     }
     Ok(res.paths)
-}
-
-/// Checks the host path under the winning mount destination, if it is
-/// inside the workspace mount, for symlinks below the workspace, including
-/// its final component: bwrap would follow one when mounting, so a planted
-/// link could move the mount elsewhere (e.g. a mask onto a decoy). Returns
-/// whether the mount is kept; see [`workspace_symlink`] for a link found.
-///
-/// Links matched by a `{workspace}` glob were dropped before the winner was
-/// picked, so a link found here comes from a literal rule, a bind or an
-/// ephemeral destination, from a `~` or absolute glob whose sandbox path
-/// lies inside the workspace mount, or from a link planted since the rule
-/// was resolved; it is an error for every restrictive winner.
-///
-/// A missing destination (or one below a non-directory) has nothing to
-/// follow and is fine. One that cannot be inspected is an error for a
-/// restrictive mount and skips an `rw` one with a warning.
-fn destination_is_safe(
-    winner: &Candidate<'_>,
-    ctx: &ExpansionContext,
-    warnings: &mut Vec<PlanWarning>,
-) -> Result<bool, PathPlanError> {
-    // Known limitation (DESIGN.md §11): this inspects the workspace host
-    // tree even when an ancestor sandbox path is itself a bind or ephemeral
-    // mount, whose real host directory is then a different one.
-    let Ok(rel) = winner.sandbox.strip_prefix(ctx.workspace_sandbox()) else {
-        return Ok(true);
-    };
-    let refused = unskippable(winner.mode);
-    match check_no_symlinks(ctx.workspace_host(), rel, true) {
-        Ok(()) => Ok(true),
-        Err(NoSymlinksError::Io { error, .. }) if is_missing(error.kind()) => Ok(true),
-        Err(NoSymlinksError::Symlink { link }) => {
-            let path = ctx.workspace_host().join(rel);
-            workspace_symlink(winner.rule, refused, path, link, warnings)?;
-            Ok(false)
-        }
-        Err(NoSymlinksError::Io { path, error }) => match refused {
-            Some(mode) => Err(PathPlanError::DestinationUnchecked {
-                provider: winner.rule.provider.clone(),
-                pattern: rule_pattern(winner.rule),
-                mode,
-                path,
-                kind: error.kind(),
-            }),
-            None => {
-                warnings.push(plan_warning(
-                    winner.rule,
-                    ResolveWarning::Io { path, error }.into(),
-                ));
-                Ok(false)
-            }
-        },
-    }
 }
 
 /// Picks the winner among the candidates for one sandbox path (non-empty,
@@ -1336,11 +1265,21 @@ mod tests {
             rule(Ro, "~/link", "e", 0),
             bind("~/link", "/opt/h", BindMode::Ro, "f", 0),
         ]);
+        // A literal rule's final link is left to the spec compiler, whose
+        // destination check drops `{workspace}/link` (DESIGN.md §6.2,
+        // Untrusted links).
         assert_eq!(
             plan.mounts,
             vec![
                 host("/workspace", f.ws(), EntryKind::Dir, Rw, "base"),
                 host("/opt/h", f.home().join("link"), EntryKind::Symlink, Ro, "f"),
+                host(
+                    "/workspace/link",
+                    f.ws().join("link"),
+                    EntryKind::Symlink,
+                    Rw,
+                    "a"
+                ),
                 host(
                     "/home/user/link",
                     f.home().join("link"),
@@ -1350,18 +1289,17 @@ mod tests {
                 ),
             ]
         );
-        // Resolution warnings in rule order (including the glob-matched
-        // link), then destination warnings in sandbox path order.
+        // Resolution warnings in rule order, including the glob-matched
+        // link.
         assert_eq!(
             f.symlink_warnings(&plan),
             [
                 ("b".into(), p("link/x"), p("link")),
                 ("c".into(), p(".env"), p(".env")),
                 ("d".into(), p("link"), p("link")),
-                ("a".into(), p("link"), p("link")),
             ]
         );
-        let msg = plan.warnings[3].to_string();
+        let msg = plan.warnings[2].to_string();
         assert!(msg.contains("symlink"), "{msg}");
         assert!(msg.contains("in the workspace"), "{msg}");
         assert!(msg.contains("never followed"), "{msg}");
@@ -1374,12 +1312,26 @@ mod tests {
         f.file("ws/real/.env");
         f.symlink("real", "ws/link");
         f.symlink("nowhere", "ws/.env");
-        for mode in [Masked, Protected, Ro, Ephemeral] {
-            // The final component (left to the destination check) and a
-            // parent component (found by resolution, or for ephemeral by the
-            // destination check).
+        for mode in [Masked, Protected, Ro] {
+            // A parent component, found by resolution. The final component,
+            // and every component of an ephemeral rule (which resolves
+            // nothing), are left to the spec compiler's checks, so they plan
+            // fine here.
+            let plan = f.plan(&[
+                rule(Rw, "{workspace}", "base", 0),
+                rule(mode, "{workspace}/link", "p", 0),
+                rule(Ephemeral, "{workspace}/link/x", "e", 0),
+            ]);
+            assert_eq!(
+                summary(&plan.mounts),
+                [
+                    row("/workspace", Rw, "base"),
+                    row("/workspace/link", mode, "p"),
+                    row("/workspace/link/x", Ephemeral, "e"),
+                ],
+                "{mode}"
+            );
             for (pattern, path, link) in [
-                ("{workspace}/link", "link", "link"),
                 ("{workspace}/link/x", "link/x", "link"),
                 (
                     "{workspace}/link/target/deeper",
@@ -1535,28 +1487,28 @@ mod tests {
                 ("own".into(), p("link.env"), p("link.env")),
             ]
         );
-        // A literal rule at the link still outranks the glob, and its
-        // destination check still refuses the link.
-        let got = f.symlink_err(&[
-            rule(Rw, "{workspace}/*.env", "a", 0),
-            rule(Ro, "{workspace}/link.env", "b", 1),
-        ]);
-        assert_eq!(got, (Ro, p("link.env"), p("link.env")));
-        let plan = f.plan(&[
-            rule(Masked, "{workspace}/*.env", "a", 0),
-            rule(Rw, "{workspace}/link.env", "b", 0),
-        ]);
-        assert_eq!(
-            summary(&plan.mounts),
-            [row("/workspace/real.env", Masked, "a")]
-        );
-        assert_eq!(
-            f.symlink_warnings(&plan),
-            [
-                ("a".into(), p("link.env"), p("link.env")),
-                ("b".into(), p("link.env"), p("link.env")),
-            ]
-        );
+        // A literal rule at the link still outranks the glob; its final link
+        // is left to the spec compiler, which refuses it (an error, or for
+        // `rw` a dropped mount).
+        for (mode, depth) in [(Ro, 1), (Rw, 0)] {
+            let plan = f.plan(&[
+                rule(Masked, "{workspace}/*.env", "a", 0),
+                rule(mode, "{workspace}/link.env", "b", depth),
+            ]);
+            assert_eq!(
+                summary(&plan.mounts),
+                [
+                    row("/workspace/link.env", mode, "b"),
+                    row("/workspace/real.env", Masked, "a"),
+                ],
+                "{mode}"
+            );
+            assert_eq!(
+                f.symlink_warnings(&plan),
+                [("a".into(), p("link.env"), p("link.env"))],
+                "{mode}"
+            );
+        }
     }
 
     /// Runs `body` with the directories `rels` (below the temp root) made
@@ -1702,175 +1654,6 @@ mod tests {
                 plan.warnings
             );
         }
-    }
-
-    #[test]
-    fn ephemeral_over_a_planted_link_is_an_error() {
-        let f = Fixture::new();
-        f.mkdir("ws/target2");
-        f.symlink("target2", "ws/target");
-        let got = f.symlink_err(&[rule(Ephemeral, "{workspace}/target", "rust", 0)]);
-        assert_eq!(got, (Ephemeral, p("target"), p("target")));
-        f.mkdir("ws/real");
-        f.symlink("real", "ws/sub");
-        let got = f.symlink_err(&[rule(Ephemeral, "{workspace}/sub/target", "rust", 0)]);
-        assert_eq!(got, (Ephemeral, p("sub/target"), p("sub")));
-        // An absolute ephemeral path inside the workspace mount is checked
-        // too.
-        let got = f.symlink_err(&[rule(Ephemeral, "/workspace/sub/x", "p", 0)]);
-        assert_eq!(got, (Ephemeral, p("sub/x"), p("sub")));
-    }
-
-    #[test]
-    fn bind_destination_through_a_workspace_link() {
-        let f = Fixture::new();
-        f.file("home/cfg");
-        f.mkdir("ws/decoy");
-        f.symlink("decoy", "ws/cfg");
-        f.symlink("decoy", "ws/dir");
-        for (dest, path, link) in [
-            ("/workspace/cfg", "cfg", "cfg"),
-            ("/workspace/dir/cfg", "dir/cfg", "dir"),
-        ] {
-            for mode in [BindMode::Ro, BindMode::Protected] {
-                let got = f.symlink_err(&[bind("~/cfg", dest, mode, "p", 0)]);
-                assert_eq!(got, (mode.into(), p(path), p(link)), "{dest} {mode}");
-            }
-            let plan = f.plan(&[bind("~/cfg", dest, BindMode::Rw, "p", 0)]);
-            assert!(plan.mounts.is_empty(), "{:?}", plan.mounts);
-            assert_eq!(
-                f.symlink_warnings(&plan),
-                [("p".into(), p(path), p(link))],
-                "{dest}"
-            );
-        }
-        // A missing destination is fine, and one outside the workspace
-        // mount is not checked.
-        let mounts = f.clean(&[
-            bind("~/cfg", "/workspace/new/cfg", BindMode::Ro, "p", 0),
-            bind("~/cfg", "/workspacex/cfg", BindMode::Ro, "p", 0),
-        ]);
-        assert_eq!(
-            summary(&mounts),
-            [
-                row("/workspacex/cfg", Ro, "p"),
-                row("/workspace/new/cfg", Ro, "p"),
-            ]
-        );
-    }
-
-    #[test]
-    fn home_rule_inside_a_workspace_mounted_under_home_is_checked() {
-        let f = Fixture::with_mount("/home/user/proj");
-        f.file("home/proj/cfg");
-        f.file("home/proj/new");
-        f.file("home/proj/real");
-        f.file("ws/real");
-        f.mkdir("ws/decoy");
-        f.symlink("decoy", "ws/cfg");
-        // `~/proj/cfg` mounts over `/home/user/proj/cfg`, which bwrap reaches
-        // through the workspace mount, i.e. through the link `ws/cfg`.
-        for mode in [Masked, Protected, Ro] {
-            let got = f.symlink_err(&[
-                rule(Rw, "{workspace}", "base", 0),
-                rule(mode, "~/proj/cfg", "p", 0),
-            ]);
-            assert_eq!(got, (mode, p("cfg"), p("cfg")), "{mode}");
-        }
-        let plan = f.plan(&[rule(Rw, "~/proj/cfg", "p", 0)]);
-        assert!(plan.mounts.is_empty(), "{:?}", plan.mounts);
-        assert_eq!(
-            f.symlink_warnings(&plan),
-            [("p".into(), p("cfg"), p("cfg"))]
-        );
-        // A destination missing from the workspace, or a real file there,
-        // is fine; `~` itself lies outside the workspace mount.
-        let mounts = f.clean(&[
-            rule(Ro, "~", "p", 0),
-            rule(Rw, "{workspace}", "p", 0),
-            rule(Masked, "~/proj/new", "p", 0),
-            rule(Masked, "~/proj/real", "p", 0),
-        ]);
-        assert_eq!(
-            summary(&mounts),
-            [
-                row("/home/user", Ro, "p"),
-                row("/home/user/proj", Rw, "p"),
-                row("/home/user/proj/new", Masked, "p"),
-                row("/home/user/proj/real", Masked, "p"),
-            ]
-        );
-    }
-
-    #[test]
-    fn destination_symlink_is_decided_by_the_winning_mode() {
-        let f = Fixture::new();
-        f.file("home/cfg");
-        f.symlink("nowhere", "ws/cfg");
-        // The masked rule wins over the ro bind, so the link is an error.
-        let got = f.symlink_err(&[
-            rule(Masked, "{workspace}/cfg", "a", 0),
-            bind("~/cfg", "/workspace/cfg", BindMode::Ro, "b", 0),
-        ]);
-        assert_eq!(got, (Masked, p("cfg"), p("cfg")));
-        // An own rw rule beats the inherited mask: the winner is dropped
-        // with a warning, and nothing is mounted there.
-        let plan = f.plan(&[
-            rule(Masked, "{workspace}/cfg", "a", 1),
-            rule(Rw, "{workspace}/cfg", "b", 0),
-        ]);
-        assert!(plan.mounts.is_empty(), "{:?}", plan.mounts);
-        assert_eq!(
-            f.symlink_warnings(&plan),
-            [("b".into(), p("cfg"), p("cfg"))]
-        );
-    }
-
-    #[test]
-    fn destination_that_cannot_be_inspected() {
-        use std::os::unix::fs::PermissionsExt;
-        if rustix::process::geteuid().is_root() {
-            eprintln!("skipping: permission checks do not apply to root");
-            return;
-        }
-        let f = Fixture::new();
-        f.file("home/x");
-        f.mkdir("ws/locked/sub");
-        let locked = f.ws().join("locked");
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-        let err = plan_mounts(&[rule(Ephemeral, "{workspace}/locked/sub", "p", 0)], &f.ctx);
-        let warned = plan_mounts(
-            &[bind("~/x", "/workspace/locked/sub/x", BindMode::Rw, "q", 0)],
-            &f.ctx,
-        );
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
-        let e = err.unwrap_err();
-        assert_eq!(
-            e,
-            PathPlanError::DestinationUnchecked {
-                provider: pn("p"),
-                pattern: "{workspace}/locked/sub".into(),
-                mode: Ephemeral,
-                path: f.ws().join("locked/sub"),
-                kind: io::ErrorKind::PermissionDenied,
-            }
-        );
-        let msg = e.to_string();
-        assert!(msg.contains("cannot check"), "{msg}");
-        assert!(msg.contains("ephemeral rule is never skipped"), "{msg}");
-        let plan = warned.unwrap();
-        assert!(plan.mounts.is_empty(), "{:?}", plan.mounts);
-        assert!(
-            matches!(
-                plan.warnings.as_slice(),
-                [PlanWarning {
-                    kind: PlanWarningKind::Resolve(ResolveWarning::Io { error, .. }),
-                    ..
-                }] if error.kind() == io::ErrorKind::PermissionDenied
-            ),
-            "{:?}",
-            plan.warnings
-        );
     }
 
     #[test]
