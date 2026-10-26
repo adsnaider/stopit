@@ -19,10 +19,14 @@
 //! exposure").
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fmt;
+use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
+use rustix::io::Errno;
 use thiserror::Error;
 
 use crate::config::{Config, ProfileRef, ProviderName};
@@ -228,30 +232,11 @@ pub enum SpecError {
         /// The host workspace.
         workspace: PathBuf,
     },
-    /// A `~` or absolute rule's host source is written inside the host
-    /// workspace but runs through a symlink there, which the sandbox may
-    /// have planted to redirect the grant to any host path (§6.2,
-    /// "Workspace exposure").
-    #[error(
-        "provider {:?}: {mode} mount of {host:?} at {sandbox:?} runs through a symlink inside the \
-         host workspace {workspace:?} (resolving to {resolved:?}); links inside the workspace are \
-         never followed, whatever the rule's anchor",
-        .provider.as_str()
-    )]
-    WorkspaceLinkFollowed {
-        /// The provider whose rule produced the mount.
-        provider: ProviderName,
-        /// The mount's mode.
-        mode: PathMode,
-        /// The mount's host source, as planned.
-        host: PathBuf,
-        /// `host` with every symlink resolved.
-        resolved: PathBuf,
-        /// The mount's sandbox destination.
-        sandbox: PathBuf,
-        /// The host workspace.
-        workspace: PathBuf,
-    },
+    /// A mount's host source runs through a symlink inside the host
+    /// workspace (§6.2, "Workspace exposure"). Boxed to keep `SpecError`
+    /// small.
+    #[error(transparent)]
+    WorkspaceLinkFollowed(Box<LinkFollowed>),
     /// A mount's host source could not be resolved to a canonical path, so
     /// whether it exposes the host workspace cannot be checked.
     #[error(
@@ -271,6 +256,37 @@ pub enum SpecError {
         /// What went wrong resolving it.
         kind: io::ErrorKind,
     },
+}
+
+/// A mount's host source runs through a symlink inside the host workspace,
+/// which the sandbox may have planted to redirect the grant to any host
+/// path (§6.2, "Workspace exposure"). This holds however the source
+/// reaches the workspace: written inside it, or through symlinks outside
+/// it that lead there.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "provider {:?}: {mode} mount of {host:?} at {sandbox:?} runs through the symlink {link:?} \
+     inside the host workspace {workspace:?} (resolving to {resolved:?}); links inside the \
+     workspace are never followed, whatever the rule's anchor or the links leading there: \
+     remove the link or change the rule",
+    .provider.as_str()
+)]
+pub struct LinkFollowed {
+    /// The provider whose rule produced the mount.
+    pub provider: ProviderName,
+    /// The mount's mode.
+    pub mode: PathMode,
+    /// The mount's host source, as planned.
+    pub host: PathBuf,
+    /// The first symlink inside the host workspace that resolving `host`
+    /// follows, named below its canonical parent directory.
+    pub link: PathBuf,
+    /// `host` with every symlink resolved.
+    pub resolved: PathBuf,
+    /// The mount's sandbox destination.
+    pub sandbox: PathBuf,
+    /// The host workspace.
+    pub workspace: PathBuf,
 }
 
 /// `" (resolving to …)"` when a host source is not its own canonical path.
@@ -404,18 +420,28 @@ fn check_mount_destinations(mounts: &[PlannedMount]) -> Result<(), SpecError> {
 ///
 /// The planner keeps host sources as written: `~` and absolute rules follow
 /// symlinks on the way and binds follow a final symlink, as bwrap does when
-/// mounting. Hence the canonicalisation, so a link outside the workspace
-/// pointing into it is caught; a source that cannot be resolved fails
-/// closed. `{workspace}` sources contain no symlinks below the workspace
-/// (the planner refuses them), so aligned ones resolve to themselves.
+/// mounting. Hence each source is resolved first (see
+/// [`resolve_host_source`]), so a link outside the workspace pointing into
+/// it is caught; a source that cannot be resolved fails closed.
+/// `{workspace}` sources contain no symlinks below the workspace (the
+/// planner refuses them), so aligned ones resolve to themselves.
 ///
-/// A source written inside the host workspace must also resolve to itself:
-/// the sandbox can plant links there, so a `~` or absolute rule such as
+/// No source may run through a symlink inside the host workspace: the
+/// sandbox can plant links there, so a `~` or absolute rule such as
 /// `~/proj/x` with `x -> ../.ssh` would otherwise mount `~/.ssh`, which
-/// neither contains nor lies inside the workspace. This extends the
-/// `{workspace}` anchor's no-symlink rule to every rule written into the
-/// workspace. (When such a mount's destination is inside the workspace
-/// mount, the planner's destination check already refuses the link.)
+/// neither contains nor lies inside the workspace. This holds however the
+/// source reaches the workspace: written inside it, or through a link
+/// outside it (`~/current/x` with `~/current -> proj`, or `~/.bashrc ->
+/// proj/bashrc` replaced by a link in the workspace), where the planted
+/// link would turn a rule that shows nothing or is rejected into a mount
+/// of any host path. This extends the `{workspace}` anchor's no-symlink
+/// rule to every rule. (When such a mount's destination is inside the
+/// workspace mount, the planner's destination check already refuses a link
+/// written there.) Only links count: a literal `..` may leave the
+/// workspace again, since the sandbox cannot change what it means. Rule
+/// paths cannot contain `..`, but the target of a link outside the
+/// workspace can (`~/via -> proj/../.ssh` resolves to `~/.ssh` like any
+/// other path), and only the user can write that.
 /// `ctx`'s host workspace is canonical by contract. Paths are compared by
 /// component.
 fn check_workspace_exposure(
@@ -431,24 +457,25 @@ fn check_workspace_exposure(
         if m.mode == PathMode::Masked {
             continue;
         }
-        let resolved = host
-            .canonicalize()
-            .map_err(|error| SpecError::HostSourceUnresolved {
+        let (resolved, ws_link) = resolve_host_source(host, ws_host).map_err(|error| {
+            SpecError::HostSourceUnresolved {
                 provider: m.provider.clone(),
                 mode: m.mode,
                 host: host.clone(),
                 sandbox: m.sandbox.clone(),
                 kind: error.kind(),
-            })?;
-        if host.starts_with(ws_host) && resolved != *host {
-            return Err(SpecError::WorkspaceLinkFollowed {
+            }
+        })?;
+        if let Some(link) = ws_link {
+            return Err(SpecError::WorkspaceLinkFollowed(Box::new(LinkFollowed {
                 provider: m.provider.clone(),
                 mode: m.mode,
                 host: host.clone(),
+                link,
                 resolved,
                 sandbox: m.sandbox.clone(),
                 workspace: ws_host.to_owned(),
-            });
+            })));
         }
         let exposed = match resolved.strip_prefix(ws_host) {
             // Inside the workspace (or the workspace itself): only the
@@ -470,6 +497,83 @@ fn check_workspace_exposure(
         }
     }
     Ok(())
+}
+
+/// The kernel's limit on symlinks followed in one path lookup
+/// (`MAXSYMLINKS`).
+const MAX_SYMLINKS: usize = 40;
+
+/// Resolves the absolute host path `path` as the kernel would, one
+/// component at a time, following every symlink (the final one included).
+/// Returns the canonical path and the first symlink followed that lies
+/// inside `workspace` (canonical), if any, named below its canonical parent.
+///
+/// Walking by hand rather than canonicalising sees every link the lookup
+/// passes, including ones a link outside the workspace leads through (a
+/// link to a path inside the workspace that has itself been replaced by a
+/// link): checking prefixes of the path as written would miss those. It
+/// costs one `lstat` per component and one `readlink` per link, the
+/// components of link targets included. Errors are those of the lookup
+/// (`ENOTDIR` for a component below a non-directory or a trailing `/` or
+/// `/.` after one, `ELOOP` past [`MAX_SYMLINKS`] links).
+///
+/// Links are followed by their text, so `/proc` magic links
+/// (`/proc/<pid>/root`, `/proc/self/fd/N`), which the kernel follows to the
+/// object they refer to rather than to the path `readlink` shows, resolve
+/// differently here than when mounted (DESIGN.md §11).
+fn resolve_host_source(path: &Path, workspace: &Path) -> io::Result<(PathBuf, Option<PathBuf>)> {
+    /// Pushes `path`'s components onto `pending` so they pop in order.
+    /// `Path::components` drops a trailing `/` or `/.`, which requires a
+    /// directory, so it is kept as a final `.`.
+    fn push(pending: &mut Vec<OsString>, path: &Path) {
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.len() > 1 && (bytes.ends_with(b"/") || bytes.ends_with(b"/.")) {
+            pending.push(".".into());
+        }
+        pending.extend(path.components().rev().map(|c| c.as_os_str().to_owned()));
+    }
+    debug_assert!(path.is_absolute(), "{path:?} is not absolute");
+    let mut resolved = PathBuf::from("/");
+    // Whether `resolved` is a directory, which any component after it
+    // requires.
+    let mut is_dir = true;
+    let mut pending = Vec::new();
+    push(&mut pending, path);
+    let mut links = 0;
+    let mut ws_link = None;
+    while let Some(name) = pending.pop() {
+        if name == "/" {
+            (resolved, is_dir) = (PathBuf::from("/"), true);
+            continue;
+        }
+        if !is_dir {
+            return Err(Errno::NOTDIR.into());
+        }
+        // `resolved` is canonical, so `..` is its lexical parent. A `Normal`
+        // component is never `/`, `.` or `..`.
+        if name == "." {
+            continue;
+        } else if name == ".." {
+            resolved.pop();
+            continue;
+        }
+        let next = resolved.join(&name);
+        let meta = next.symlink_metadata()?;
+        if !meta.is_symlink() {
+            (resolved, is_dir) = (next, meta.is_dir());
+            continue;
+        }
+        links += 1;
+        if links > MAX_SYMLINKS {
+            return Err(Errno::LOOP.into());
+        }
+        let target = fs::read_link(&next)?;
+        if ws_link.is_none() && resolved.starts_with(workspace) {
+            ws_link = Some(next);
+        }
+        push(&mut pending, &target);
+    }
+    Ok((resolved, ws_link))
 }
 
 /// Checks the workspace mount point and sandbox `HOME` against the
@@ -1817,6 +1921,33 @@ mod tests {
         assert_eq!(exposure(&f, e).2, f.ws());
     }
 
+    /// The `(mode, host, link, resolved, sandbox)` of the
+    /// `WorkspaceLinkFollowed` error compiling `body` gives, checking its
+    /// provider and workspace.
+    fn link_followed(f: &Fixture, body: &str) -> (PathMode, PathBuf, PathBuf, PathBuf, PathBuf) {
+        let e = compile_body(f, body).unwrap_err();
+        let CompileError::Profile { error, .. } = e else {
+            panic!("{body}: expected a profile error, got {e:?}");
+        };
+        match *error {
+            SpecError::WorkspaceLinkFollowed(lf) => {
+                let LinkFollowed {
+                    provider,
+                    mode,
+                    host,
+                    link,
+                    resolved,
+                    sandbox,
+                    workspace,
+                } = *lf;
+                assert_eq!(provider.as_str(), "p", "{body}");
+                assert_eq!(workspace, f.ws(), "{body}");
+                (mode, host, link, resolved, sandbox)
+            }
+            other => panic!("{body}: expected WorkspaceLinkFollowed, got {other:?}"),
+        }
+    }
+
     #[test]
     fn links_inside_the_workspace_never_redirect_home_or_absolute_rules() {
         // The workspace is `~/proj`, mounted at `/workspace`; the sandbox has
@@ -1826,51 +1957,36 @@ mod tests {
         symlink("../.ssh", f.ws().join("x")).unwrap();
         symlink("../.ssh", f.ws().join("d")).unwrap();
         let ssh = f.root.join("home/.ssh");
-        let followed = |body: &str| {
-            let e = compile_body(&f, body).unwrap_err();
-            let CompileError::Profile { error, .. } = e else {
-                panic!("{body}: expected a profile error, got {e:?}");
-            };
-            match *error {
-                SpecError::WorkspaceLinkFollowed {
-                    provider,
-                    mode,
-                    host,
-                    resolved,
-                    sandbox,
-                    workspace,
-                } => {
-                    assert_eq!(provider.as_str(), "p", "{body}");
-                    assert_eq!(workspace, f.ws(), "{body}");
-                    (mode, host, resolved, sandbox)
-                }
-                other => panic!("{body}: expected WorkspaceLinkFollowed, got {other:?}"),
-            }
-        };
+        let x = f.ws().join("x");
         assert_eq!(
-            followed("fs.ro = [\"~/proj/x\"]"),
+            link_followed(&f, "fs.ro = [\"~/proj/x\"]"),
             (
                 Ro,
-                f.ws().join("x"),
+                x.clone(),
+                x.clone(),
                 ssh.clone(),
                 PathBuf::from("/home/user/proj/x")
             )
         );
         assert_eq!(
-            followed("fs.rw = [\"~/proj/d/id_ed25519\"]"),
+            link_followed(&f, "fs.rw = [\"~/proj/d/id_ed25519\"]"),
             (
                 Rw,
                 f.ws().join("d/id_ed25519"),
+                f.ws().join("d"),
                 ssh.join("id_ed25519"),
                 PathBuf::from("/home/user/proj/d/id_ed25519")
             )
         );
-        let abs = f.ws().join("x");
-        let (_, host, resolved, sandbox) =
-            followed(&format!("fs.protected = [{:?}]", abs.to_str().unwrap()));
-        assert_eq!((host, resolved, sandbox), (abs.clone(), ssh.clone(), abs));
+        let (_, host, link, resolved, sandbox) =
+            link_followed(&f, &format!("fs.protected = [{:?}]", x.to_str().unwrap()));
+        assert_eq!(
+            (host, link, resolved, sandbox),
+            (x.clone(), x.clone(), ssh.clone(), x.clone())
+        );
         let bind = "fs.bind = [{ host = \"~/proj/x\", sandbox = \"/opt/x\", mode = \"ro\" }]";
-        assert_eq!(followed(bind).2, ssh);
+        let (_, _, link, resolved, _) = link_followed(&f, bind);
+        assert_eq!((link, resolved), (x.clone(), ssh.clone()));
         // Masked, it shows nothing of the target.
         if let Err(e) = compile_body(&f, "fs.masked = [\"~/proj/x\"]") {
             panic!("masked: {e}");
@@ -1879,14 +1995,288 @@ mod tests {
         assert_eq!(
             e.to_string(),
             format!(
-                "cannot compile profile \"main\": provider \"p\": ro mount of {:?} at \
-                 \"/home/user/proj/x\" runs through a symlink inside the host workspace {:?} \
-                 (resolving to {ssh:?}); links inside the workspace are never followed, whatever \
-                 the rule's anchor",
-                f.ws().join("x"),
+                "cannot compile profile \"main\": provider \"p\": ro mount of {x:?} at \
+                 \"/home/user/proj/x\" runs through the symlink {x:?} inside the host workspace \
+                 {:?} (resolving to {ssh:?}); links inside the workspace are never followed, \
+                 whatever the rule's anchor or the links leading there: remove the link or change \
+                 the rule",
                 f.ws()
             )
         );
+    }
+
+    #[test]
+    fn links_inside_the_workspace_are_refused_when_reached_through_outside_links() {
+        // The workspace is `~/Projects/stopit`, mounted at `/workspace`, and
+        // the user has links leading into it. The sandbox has planted
+        // `config -> ../../.ssh` and `d -> ../..` in it.
+        let f = Fixture::with_workspace("home/Projects/stopit", "/workspace");
+        let home = f.root.join("home");
+        f.file("home/.ssh/id_ed25519");
+        symlink("Projects/stopit", home.join("current")).unwrap();
+        f.mkdir("home/links");
+        symlink("../Projects/stopit/config", home.join("links/a")).unwrap();
+        // A link whose target is a path inside the workspace (a dotfiles
+        // repository as the workspace, say).
+        symlink("Projects/stopit/config", home.join(".toolrc")).unwrap();
+        // An absolute link to the workspace, whose target runs through it.
+        symlink(f.ws().join("d/.ssh"), home.join("deep")).unwrap();
+        symlink("../../.ssh", f.ws().join("config")).unwrap();
+        symlink("../..", f.ws().join("d")).unwrap();
+        // A `..` after the planted `d` applies to its target, not to `d`'s
+        // parent: `current/d/../x` is `~/../x`, i.e. the temp root's `x`.
+        f.file("x");
+        symlink("current/d/../x", home.join("up-x")).unwrap();
+        let ssh = home.join(".ssh");
+        let config = f.ws().join("config");
+        let d = f.ws().join("d");
+        assert_eq!(
+            link_followed(&f, "fs.ro = [\"~/current/config\"]"),
+            (
+                Ro,
+                home.join("current/config"),
+                config.clone(),
+                ssh.clone(),
+                PathBuf::from("/home/user/current/config")
+            )
+        );
+        // `(rule, host, planted link, resolved)`.
+        for (rule, host, link, resolved) in [
+            // A glob below an entering link: the walk follows its root link
+            // and matches the planted link itself.
+            ("~/current/conf*", "current/config", &config, ssh.clone()),
+            // A glob matching a link into the workspace, whose target is the
+            // planted link. (A glob walk does not descend through links
+            // below its root, so `~/links/*/config` would match nothing.)
+            ("~/links/*", "links/a", &config, ssh.clone()),
+            // A planted link on the way.
+            (
+                "~/current/d/.ssh/id_ed25519",
+                "current/d/.ssh/id_ed25519",
+                &d,
+                ssh.join("id_ed25519"),
+            ),
+            // Links whose targets run through the workspace, with nothing
+            // written after them.
+            ("~/.toolrc", ".toolrc", &config, ssh.clone()),
+            ("~/deep", "deep", &d, ssh.clone()),
+            ("~/up-x", "up-x", &d, f.root.join("x")),
+        ] {
+            let (_, got_host, got_link, got_resolved, _) =
+                link_followed(&f, &format!("fs.ro = [\"{rule}\"]"));
+            assert_eq!(
+                (got_host, &got_link, got_resolved),
+                (home.join(host), link, resolved),
+                "{rule}"
+            );
+        }
+        // Binds and absolute rules alike.
+        let bind =
+            "fs.bind = [{ host = \"~/current/config\", sandbox = \"/opt/c\", mode = \"ro\" }]";
+        let (_, _, link, resolved, _) = link_followed(&f, bind);
+        assert_eq!((link, resolved), (config.clone(), ssh.clone()));
+        let abs = home.join("current/config");
+        let (_, _, link, _, sandbox) =
+            link_followed(&f, &format!("fs.protected = [{:?}]", abs.to_str().unwrap()));
+        assert_eq!((link, sandbox), (config, abs));
+        // Masked, it shows nothing of the target.
+        if let Err(e) = compile_body(&f, "fs.masked = [\"~/current/config\"]") {
+            panic!("masked: {e}");
+        }
+    }
+
+    #[test]
+    fn entering_links_without_planted_ones_get_the_alignment_check() {
+        // Without the planted link, `~/current/config` resolves inside the
+        // workspace but is not mounted at its aligned path: the existing
+        // exposure check rejects it.
+        let f = Fixture::with_workspace("home/Projects/stopit", "/workspace");
+        let home = f.root.join("home");
+        f.file("home/Projects/stopit/config");
+        symlink("Projects/stopit", home.join("current")).unwrap();
+        let e = compile_body(&f, "fs.ro = [\"~/current/config\"]").unwrap_err();
+        assert_eq!(
+            exposure(&f, e),
+            (
+                Ro,
+                home.join("current/config"),
+                f.ws().join("config"),
+                PathBuf::from("/home/user/current/config")
+            )
+        );
+        // Links outside the workspace on the way out of it are followed.
+        f.mkdir("elsewhere");
+        symlink(f.root.join("elsewhere"), home.join("out")).unwrap();
+        symlink("Projects/stopit/../../out", home.join("via")).unwrap();
+        if let Err(e) = compile_body(&f, "fs.ro = [\"~/via\"]") {
+            panic!("~/via: {e}");
+        }
+    }
+
+    #[test]
+    fn entering_links_to_the_aligned_path_are_accepted() {
+        // The workspace lives at `~/real/proj` but is mounted at
+        // `/home/user/proj`, and `~/proj -> real/proj`: `~/proj/...` rules
+        // land on the aligned path through a link outside the workspace.
+        let f = Fixture::with_workspace("home/real/proj", "/home/user/proj");
+        let home = f.root.join("home");
+        f.mkdir("home/real/proj/x");
+        f.mkdir("home/.ssh");
+        symlink("real/proj", home.join("proj")).unwrap();
+        for body in ["fs.ro = [\"~/proj/x\"]", "fs.protected = [\"~/proj\"]"] {
+            if let Err(e) = compile_body(&f, body) {
+                panic!("{body}: {e}");
+            }
+        }
+        // A link planted there is refused by the planner's destination
+        // check first, since the destination is inside the workspace mount.
+        symlink("../../.ssh", f.ws().join("y")).unwrap();
+        let e = compile_body(&f, "fs.ro = [\"~/proj/y\"]").unwrap_err();
+        assert!(
+            matches!(
+                e,
+                CompileError::Profile { ref error, .. }
+                    if matches!(**error, SpecError::Mounts(PathPlanError::WorkspaceSymlink { .. }))
+            ),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_host_source_matches_canonicalize_and_reports_loops() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ws = root.join("ws");
+        fs::create_dir_all(ws.join("a/b")).unwrap();
+        fs::create_dir_all(root.join("out/c")).unwrap();
+        symlink("../out", ws.join("up")).unwrap();
+        symlink(root.join("ws/a"), root.join("abs")).unwrap();
+        symlink("./ws/a/../a/b", root.join("rel")).unwrap();
+        symlink("out/c", root.join("chain")).unwrap();
+        symlink("chain", root.join("chain2")).unwrap();
+        // Links outside the workspace leading into it, then through `up`.
+        symlink("ws", root.join("cur")).unwrap();
+        symlink("ws/up/c", root.join("to-up")).unwrap();
+        // A planted `d`: a `..` after it applies to its target, so
+        // `cur/d/../b` is `ws/a/b`, not the (missing) `ws/b`.
+        symlink("a/b", ws.join("d")).unwrap();
+        // `..` at `/` stays at `/`.
+        let above_root = Path::new("/../..").join(root.strip_prefix("/").unwrap());
+        for (path, link) in [
+            (root.join("cur/d/../b"), Some(ws.join("d"))),
+            (above_root.join("ws/a"), None),
+            (above_root.join("cur/up"), Some(ws.join("up"))),
+            // A trailing `/` or `/.` after a directory is fine.
+            (root.join("ws/a/"), None),
+            (root.join("ws/a/."), None),
+            (root.join("cur/"), None),
+            (root.join("cur/up/c"), Some(ws.join("up"))),
+            (root.join("to-up"), Some(ws.join("up"))),
+            (root.join("abs/b"), None),
+            (root.join("rel"), None),
+            (root.join("chain2"), None),
+            (root.join("ws/a/b"), None),
+            (root.join("ws/up/c"), Some(ws.join("up"))),
+            (root.join("ws/a/../up"), Some(ws.join("up"))),
+        ] {
+            assert_eq!(
+                resolve_host_source(&path, &ws).unwrap(),
+                (path.canonicalize().unwrap(), link),
+                "{path:?}"
+            );
+        }
+        // Lookup errors are the kernel's.
+        symlink("loop", root.join("loop")).unwrap();
+        fs::write(root.join("file"), "").unwrap();
+        symlink("file/..", root.join("through-file")).unwrap();
+        symlink("file/", root.join("slash-target")).unwrap();
+        symlink("file", root.join("file-link")).unwrap();
+        for (path, errno) in [
+            (root.join("loop"), Errno::LOOP),
+            (root.join("file/x"), Errno::NOTDIR),
+            (root.join("through-file"), Errno::NOTDIR),
+            // A trailing `/` (or `/.`) requires a directory, after any link.
+            (root.join("file/"), Errno::NOTDIR),
+            (root.join("file/."), Errno::NOTDIR),
+            (root.join("file-link/"), Errno::NOTDIR),
+            (root.join("slash-target"), Errno::NOTDIR),
+        ] {
+            assert_eq!(
+                resolve_host_source(&path, &ws).unwrap_err().raw_os_error(),
+                Some(errno.raw_os_error()),
+                "{path:?}"
+            );
+            assert_eq!(
+                path.canonicalize().unwrap_err().raw_os_error(),
+                Some(errno.raw_os_error()),
+                "{path:?}"
+            );
+        }
+        symlink("nowhere", ws.join("dangling")).unwrap();
+        assert_eq!(
+            resolve_host_source(&ws.join("dangling"), &ws)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn resolve_host_source_follows_at_most_40_links() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ws = root.join("ws");
+        fs::create_dir_all(root.join("out")).unwrap();
+        fs::create_dir(&ws).unwrap();
+        // `l0 -> out` and `l{i} -> l{i-1}`: resolving `l{i}` follows i + 1
+        // links.
+        symlink("out", root.join("l0")).unwrap();
+        for i in 1..=MAX_SYMLINKS {
+            symlink(format!("l{}", i - 1), root.join(format!("l{i}"))).unwrap();
+        }
+        let last_ok = root.join(format!("l{}", MAX_SYMLINKS - 1));
+        assert_eq!(
+            resolve_host_source(&last_ok, &ws).unwrap(),
+            (root.join("out"), None)
+        );
+        assert!(fs::metadata(&last_ok).unwrap().is_dir());
+        let too_many = root.join(format!("l{MAX_SYMLINKS}"));
+        let loop_errno = Some(Errno::LOOP.raw_os_error());
+        assert_eq!(
+            resolve_host_source(&too_many, &ws)
+                .unwrap_err()
+                .raw_os_error(),
+            loop_errno
+        );
+        assert_eq!(
+            fs::metadata(&too_many).unwrap_err().raw_os_error(),
+            loop_errno
+        );
+    }
+
+    #[test]
+    fn resolve_host_source_fails_on_unreadable_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            // Root bypasses directory permissions.
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ws = root.join("ws");
+        let locked = root.join("locked");
+        fs::create_dir(&ws).unwrap();
+        fs::create_dir_all(locked.join("d")).unwrap();
+        symlink("locked/d", root.join("via")).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let results = [locked.join("d"), root.join("via")]
+            .map(|path| resolve_host_source(&path, &ws).map_err(|e| e.raw_os_error()));
+        // Restore permissions before asserting, so the tempdir can be
+        // removed even if an assertion fails.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        for result in results {
+            assert_eq!(result, Err(Some(Errno::ACCESS.raw_os_error())));
+        }
     }
 
     #[test]
