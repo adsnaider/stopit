@@ -187,6 +187,20 @@ pub enum SpecError {
         /// The rule it breaks.
         reason: ReservedReason,
     },
+    /// A planned mount's destination collides with a path stopit sets up
+    /// itself (§6.2, "Reserved paths").
+    #[error(
+        "provider {:?}: mount destination {path:?} {reason}",
+        .provider.as_str()
+    )]
+    ReservedMount {
+        /// The provider whose rule produced the mount.
+        provider: ProviderName,
+        /// The mount's sandbox destination.
+        path: PathBuf,
+        /// What it collides with.
+        reason: ReservedReason,
+    },
 }
 
 /// The path a [`SpecError::ReservedPath`] is about.
@@ -225,13 +239,76 @@ pub enum ReservedReason {
     InsideWorkspace(PathBuf),
 }
 
-/// Paths stopit mounts itself; neither the workspace mount nor `HOME` may be
-/// one of them or contain one.
-const RESERVED: [&str; 5] = ["/proc", "/dev", "/etc", "/tmp", "/run/stopit"];
+/// The directories stopit sets up itself and that nothing else may equal,
+/// contain or be placed inside: the masked `/proc`, the `/dev`, and
+/// stopit's own runtime directory.
+const SYSTEM_DIRS: [&str; 3] = ["/proc", "/dev", "/run/stopit"];
 
-/// The reserved paths that nothing may be placed inside (`/tmp` is
-/// ephemeral, so mounting over a path inside it is fine).
-const RESERVED_DIRS: [&str; 4] = ["/proc", "/dev", "/etc", "/run/stopit"];
+/// `/etc`: stopit synthesizes some files in it (every [`EtcFile`]), but the
+/// rest of it is an ordinary place for mounts.
+const ETC_DIR: &str = "/etc";
+
+/// `/tmp`: the base's ephemeral directory. Nothing may contain it, but
+/// mounting over a path inside it is fine.
+const TMP_DIR: &str = "/tmp";
+
+/// The paths the workspace mount and `HOME` may be neither equal to nor an
+/// ancestor of.
+fn reserved_paths() -> impl Iterator<Item = &'static str> {
+    SYSTEM_DIRS.into_iter().chain([ETC_DIR, TMP_DIR])
+}
+
+/// The paths the workspace mount and `HOME` may not be inside.
+fn reserved_dirs() -> impl Iterator<Item = &'static str> {
+    SYSTEM_DIRS.into_iter().chain([ETC_DIR])
+}
+
+/// Checks every planned mount's sandbox destination (DESIGN.md §6.2,
+/// "Reserved paths"): it must not equal, contain or be inside a
+/// [`SYSTEM_DIRS`] directory, nor equal or contain a synthesized `/etc`
+/// file. Other `/etc` paths and `/run` subtrees are fine.
+///
+/// Every synthesized `/etc` file is checked whether or not the profile
+/// enables it (`system.etc`), so a mount's validity does not depend on it.
+///
+/// This runs after mount planning, because glob rules only have concrete
+/// destinations then. It applies to every mode, `masked` and `protected`
+/// included: allowing some modes would buy little, since these paths are
+/// stopit's own and no rule has a reason to touch them, and one rule for all
+/// modes is simpler to state and to check.
+fn check_mount_destinations(mounts: &[PlannedMount]) -> Result<(), SpecError> {
+    // Each reserved path, and whether nothing may be inside it (true for the
+    // system directories, false for the synthesized files).
+    let reserved: Vec<(PathBuf, bool)> = SYSTEM_DIRS
+        .iter()
+        .map(|r| (PathBuf::from(r), true))
+        .chain(
+            EtcFile::ALL
+                .iter()
+                .map(|f| (Path::new(ETC_DIR).join(f.as_str()), false)),
+        )
+        .collect();
+    for m in mounts {
+        let dest = m.sandbox.as_path();
+        let collision = reserved.iter().find_map(|(r, is_dir)| {
+            if r.starts_with(dest) {
+                Some(ReservedReason::CoversReserved(r.clone()))
+            } else if *is_dir && dest.starts_with(r) {
+                Some(ReservedReason::InsideReserved(r.clone()))
+            } else {
+                None
+            }
+        });
+        if let Some(reason) = collision {
+            return Err(SpecError::ReservedMount {
+                provider: m.provider.clone(),
+                path: m.sandbox.clone(),
+                reason,
+            });
+        }
+    }
+    Ok(())
+}
 
 /// Checks the workspace mount point and sandbox `HOME` against the
 /// reserved-path rules of DESIGN.md §6.2.
@@ -246,10 +323,10 @@ fn check_reserved_paths(workspace: &Path, home: &Path) -> Result<(), SpecError> 
             path: path.to_owned(),
             reason,
         };
-        if let Some(r) = RESERVED.iter().find(|r| Path::new(r).starts_with(path)) {
+        if let Some(r) = reserved_paths().find(|r| Path::new(r).starts_with(path)) {
             return Err(fail(ReservedReason::CoversReserved(PathBuf::from(r))));
         }
-        if let Some(r) = RESERVED_DIRS.iter().find(|r| path.starts_with(r)) {
+        if let Some(r) = reserved_dirs().find(|r| path.starts_with(r)) {
             return Err(fail(ReservedReason::InsideReserved(PathBuf::from(r))));
         }
     }
@@ -288,6 +365,7 @@ pub fn compile_profile(
     let home = grants.system.home.clone().unwrap_or_default();
     check_reserved_paths(ctx.workspace_sandbox(), Path::new(home.as_str()))?;
     let plan = plan_mounts(&grants.fs, &ctx.with_sandbox_home(&home))?;
+    check_mount_destinations(&plan.mounts)?;
     let mut warnings: Vec<SpecWarning> = plan.warnings.into_iter().map(Into::into).collect();
     let inherited_domains = parent.map(|p| &p.network.allow_domains);
     let network = network_spec(&grants.network, inherited_domains, &mut warnings);
@@ -1316,6 +1394,117 @@ mod tests {
             "[profiles.harness]\n{}",
             prov("p", "harness", "system.home = \"/tmp/h\""),
         ));
+    }
+
+    /// Compiles a `base = "none"` session whose only provider, `p`, targets
+    /// `main` with `body` as its sandbox grants. Creates `~/x` first, as a
+    /// host source for [`bind_at`].
+    fn compile_with_rule(f: &Fixture, body: &str) -> Result<CompiledSession, CompileError> {
+        f.mkdir("home/x");
+        f.try_compile(&format!("base = \"none\"\n{}", prov("p", "main", body)))
+    }
+
+    /// A read-only bind of the host's `~/x` at `dest`.
+    fn bind_at(dest: &str) -> String {
+        format!("fs.bind = [{{ host = \"~/x\", sandbox = \"{dest}\", mode = \"ro\" }}]")
+    }
+
+    #[test]
+    fn mount_destinations_colliding_with_system_paths_are_rejected() {
+        use ReservedReason::*;
+        let p = |s: &str| PathBuf::from(s);
+        let f = Fixture::new();
+        let rejected = [
+            ("/proc", CoversReserved(p("/proc"))),
+            ("/proc/self", InsideReserved(p("/proc"))),
+            ("/dev", CoversReserved(p("/dev"))),
+            ("/dev/shm", InsideReserved(p("/dev"))),
+            ("/run/stopit/x", InsideReserved(p("/run/stopit"))),
+            ("/run/stopit", CoversReserved(p("/run/stopit"))),
+            ("/run", CoversReserved(p("/run/stopit"))),
+            ("/etc", CoversReserved(p("/etc/passwd"))),
+            ("/etc/passwd", CoversReserved(p("/etc/passwd"))),
+            ("/etc/hosts", CoversReserved(p("/etc/hosts"))),
+            ("/etc/group", CoversReserved(p("/etc/group"))),
+            (
+                "/etc/nsswitch.conf",
+                CoversReserved(p("/etc/nsswitch.conf")),
+            ),
+        ];
+        for (dest, reason) in rejected {
+            let e = compile_with_rule(&f, &bind_at(dest)).unwrap_err();
+            let CompileError::Profile { profile, error } = &e else {
+                panic!("{dest}: expected a profile error, got {e:?}");
+            };
+            assert_eq!(profile, &pr("main"), "{dest}");
+            assert_eq!(
+                **error,
+                SpecError::ReservedMount {
+                    provider: "p".parse().unwrap(),
+                    path: p(dest),
+                    reason
+                },
+                "{dest}"
+            );
+        }
+    }
+
+    #[test]
+    fn mount_destination_messages_name_provider_path_and_reserved_path() {
+        let f = Fixture::new();
+        let e = compile_with_rule(&f, &bind_at("/proc/self")).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            r#"cannot compile profile "main": provider "p": mount destination "/proc/self" is inside the reserved path "/proc""#
+        );
+        let e = compile_with_rule(&f, &bind_at("/etc")).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            r#"cannot compile profile "main": provider "p": mount destination "/etc" is or contains the reserved path "/etc/passwd""#
+        );
+    }
+
+    #[test]
+    fn every_mode_and_rule_kind_is_checked_at_the_destination() {
+        let f = Fixture::new();
+        // An ephemeral rule, and path rules matching the host's /proc and
+        // /dev, in several modes.
+        for body in [
+            "fs.ephemeral = [\"/etc\"]",
+            "fs.ro = [\"/proc\"]",
+            "fs.rw = [\"/dev\"]",
+            "fs.masked = [\"/proc\"]",
+            "fs.protected = [\"/dev\"]",
+        ] {
+            let e = compile_with_rule(&f, body).unwrap_err();
+            assert!(
+                matches!(
+                    e,
+                    CompileError::Profile { ref error, .. }
+                        if matches!(**error, SpecError::ReservedMount { .. })
+                ),
+                "{body}: {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_etc_run_and_lookalike_destinations_are_accepted() {
+        let f = Fixture::new();
+        for dest in [
+            "/etc/ssl/certs",
+            "/etc/static",
+            "/run/user/1000",
+            "/procfs",
+            "/devices",
+            "/run/stopitx",
+            "/tmp",
+            "/nix/store",
+        ] {
+            if let Err(e) = compile_with_rule(&f, &bind_at(dest)) {
+                panic!("{dest}: {e}");
+            }
+        }
     }
 
     #[test]

@@ -91,6 +91,14 @@ pub enum EtcFile {
 }
 
 impl EtcFile {
+    /// Every variant, in declaration order.
+    pub const ALL: [EtcFile; 4] = [
+        EtcFile::Passwd,
+        EtcFile::Group,
+        EtcFile::Hosts,
+        EtcFile::NsswitchConf,
+    ];
+
     /// The file name as written in configuration.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -161,13 +169,9 @@ mod tests {
     use super::super::test_util::*;
     use super::*;
 
-    const ETC_FILES: [EtcFile; 4] = [
-        EtcFile::Passwd,
-        EtcFile::Group,
-        EtcFile::Hosts,
-        EtcFile::NsswitchConf,
-    ];
-    // Adding a variant breaks the build here, reminding to extend the tests.
+    const ETC_FILES: [EtcFile; 4] = EtcFile::ALL;
+    // Adding a variant breaks the build here, reminding to extend
+    // `EtcFile::ALL` and the tests.
     const _: fn(EtcFile) = |e| match e {
         EtcFile::Passwd | EtcFile::Group | EtcFile::Hosts | EtcFile::NsswitchConf => {}
     };
