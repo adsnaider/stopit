@@ -489,7 +489,7 @@ The only implementation is **`BwrapEngine`**. The trait is kept so other engines
 7. **Environment:** `--clearenv` plus the filtered/explicit variables (§9).
 8. **Command:** `stopit __init -- <cmd…>`.
 
-**Reserved paths.** The workspace mount (`[workspace] mount`) and `system.home` must not be equal to or an ancestor of any of `/proc`, `/dev`, `/etc`, `/tmp`, `/run/stopit`, or each other, and must not be inside `/proc`, `/dev`, `/etc` or `/run/stopit`. A workspace mount *inside* `system.home` or `/tmp` is allowed (it is mounted over the ephemeral directory). This is checked when the `SandboxSpec` is built.
+**Reserved paths.** The workspace mount (`[workspace] mount`) and `system.home` must not be equal to or an ancestor of any of `/proc`, `/dev`, `/etc`, `/tmp`, `/run/stopit`, and must not be inside `/proc`, `/dev`, `/etc` or `/run/stopit`. `system.home` must not equal the workspace mount or lie inside it. A workspace mount *inside* `system.home` or `/tmp` is allowed (it is mounted over the ephemeral directory), and so is a `system.home` inside `/tmp`. Paths are compared by component (`/procfs` is not inside `/proc`). This is checked when the `SandboxSpec` is built.
 
 **Mount locking.** bubblewrap drops all capabilities before executing the init helper, so the sandbox cannot `umount` or `mount -o remount,rw` anything (no `CAP_SYS_ADMIN`). `--disable-userns` plus seccomp prevent creating a new user namespace to regain capabilities; even if one were created, the kernel marks all inherited mounts `MNT_LOCKED` and locks their `ro`/`nosuid`/`nodev` flags, so they could not be detached or remounted read-write individually.
 

@@ -12,11 +12,15 @@
 //! configuration and the providers' outputs to one compiled spec per
 //! profile; [`compile_profile`] compiles a single profile's merged grants.
 //!
-//! Not yet checked here (separate steps): the reserved-path rules for the
-//! workspace mount and the sandbox `HOME` (§6.2), and grants whose host
-//! source overlaps the host workspace (§11).
+//! Each profile's workspace mount point and sandbox `HOME` are checked
+//! against the reserved-path rules (§6.2) before any mounts are planned.
+//!
+//! Not yet checked here (a separate step): grants whose host source
+//! overlaps the host workspace (§11).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
@@ -172,6 +176,95 @@ pub enum SpecError {
     /// Planning the filesystem mounts failed.
     #[error(transparent)]
     Mounts(#[from] PathPlanError),
+    /// The workspace mount or the sandbox `HOME` collides with a path
+    /// stopit mounts itself, or with each other (§6.2, "Reserved paths").
+    #[error("{which} {path:?} {reason}")]
+    ReservedPath {
+        /// Which of the two paths is at fault.
+        which: PathRole,
+        /// The offending path.
+        path: PathBuf,
+        /// The rule it breaks.
+        reason: ReservedReason,
+    },
+}
+
+/// The path a [`SpecError::ReservedPath`] is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathRole {
+    /// The workspace mount point.
+    Workspace,
+    /// The sandbox `HOME` (`system.home`).
+    Home,
+}
+
+impl fmt::Display for PathRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            PathRole::Workspace => "workspace mount",
+            PathRole::Home => "sandbox home (system.home)",
+        })
+    }
+}
+
+/// Why a path is rejected by the reserved-path rules.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ReservedReason {
+    /// The path is the reserved path or one of its ancestors, so it would
+    /// cover it.
+    #[error("is or contains the reserved path {0:?}")]
+    CoversReserved(PathBuf),
+    /// The path is inside a reserved directory.
+    #[error("is inside the reserved path {0:?}")]
+    InsideReserved(PathBuf),
+    /// The sandbox home is the workspace mount.
+    #[error("is the same as the workspace mount")]
+    SameAsWorkspace,
+    /// The sandbox home is inside the workspace mount.
+    #[error("is inside the workspace mount {0:?}")]
+    InsideWorkspace(PathBuf),
+}
+
+/// Paths stopit mounts itself; neither the workspace mount nor `HOME` may be
+/// one of them or contain one.
+const RESERVED: [&str; 5] = ["/proc", "/dev", "/etc", "/tmp", "/run/stopit"];
+
+/// The reserved paths that nothing may be placed inside (`/tmp` is
+/// ephemeral, so mounting over a path inside it is fine).
+const RESERVED_DIRS: [&str; 4] = ["/proc", "/dev", "/etc", "/run/stopit"];
+
+/// Checks the workspace mount point and sandbox `HOME` against the
+/// reserved-path rules of DESIGN.md §6.2.
+///
+/// A workspace inside `home` or `/tmp`, and a `HOME` inside `/tmp`, are
+/// allowed. Paths are compared by component, so `/procfs` is not inside
+/// `/proc`.
+fn check_reserved_paths(workspace: &Path, home: &Path) -> Result<(), SpecError> {
+    for (which, path) in [(PathRole::Workspace, workspace), (PathRole::Home, home)] {
+        let fail = |reason| SpecError::ReservedPath {
+            which,
+            path: path.to_owned(),
+            reason,
+        };
+        if let Some(r) = RESERVED.iter().find(|r| Path::new(r).starts_with(path)) {
+            return Err(fail(ReservedReason::CoversReserved(PathBuf::from(r))));
+        }
+        if let Some(r) = RESERVED_DIRS.iter().find(|r| path.starts_with(r)) {
+            return Err(fail(ReservedReason::InsideReserved(PathBuf::from(r))));
+        }
+    }
+    let fail = |reason| SpecError::ReservedPath {
+        which: PathRole::Home,
+        path: home.to_owned(),
+        reason,
+    };
+    if home == workspace {
+        return Err(fail(ReservedReason::SameAsWorkspace));
+    }
+    if home.starts_with(workspace) {
+        return Err(fail(ReservedReason::InsideWorkspace(workspace.to_owned())));
+    }
+    Ok(())
 }
 
 /// Compiles one profile's merged grants into a [`SandboxSpec`].
@@ -193,6 +286,7 @@ pub fn compile_profile(
     ctx: &ExpansionContext,
 ) -> Result<CompiledProfile, SpecError> {
     let home = grants.system.home.clone().unwrap_or_default();
+    check_reserved_paths(ctx.workspace_sandbox(), Path::new(home.as_str()))?;
     let plan = plan_mounts(&grants.fs, &ctx.with_sandbox_home(&home))?;
     let mut warnings: Vec<SpecWarning> = plan.warnings.into_iter().map(Into::into).collect();
     let inherited_domains = parent.map(|p| &p.network.allow_domains);
@@ -1008,6 +1102,220 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("never followed"), "{msg}");
+    }
+
+    #[test]
+    fn reserved_path_check_accepts_and_rejects() {
+        use ReservedReason::*;
+        let p = |s: &str| PathBuf::from(s);
+        let covers = |r: &str| CoversReserved(p(r));
+        let inside = |r: &str| InsideReserved(p(r));
+
+        for (w, h) in [
+            ("/workspace", "/home/user"),
+            ("/home/user/proj", "/home/user"),
+            ("/tmp/ws", "/home/user"),
+            ("/workspace", "/tmp/home"),
+            ("/procfs", "/home/user"),
+            ("/workspace", "/etcetera"),
+            ("/srv/run/stopit", "/home/user"),
+            ("/run/other", "/home/user"),
+            ("/workspace", "/workspace2"),
+            ("/tmp/h/ws", "/tmp/h"),
+        ] {
+            assert_eq!(check_reserved_paths(&p(w), &p(h)), Ok(()), "W={w} H={h}");
+        }
+
+        // (workspace, home, which, path, reason)
+        let rejected = [
+            ("/", "/home/user", PathRole::Workspace, "/", covers("/proc")),
+            (
+                "/proc",
+                "/home/user",
+                PathRole::Workspace,
+                "/proc",
+                covers("/proc"),
+            ),
+            (
+                "/proc/x",
+                "/home/user",
+                PathRole::Workspace,
+                "/proc/x",
+                inside("/proc"),
+            ),
+            (
+                "/dev/shm",
+                "/home/user",
+                PathRole::Workspace,
+                "/dev/shm",
+                inside("/dev"),
+            ),
+            (
+                "/dev",
+                "/home/user",
+                PathRole::Workspace,
+                "/dev",
+                covers("/dev"),
+            ),
+            (
+                "/etc",
+                "/home/user",
+                PathRole::Workspace,
+                "/etc",
+                covers("/etc"),
+            ),
+            (
+                "/etc/foo",
+                "/home/user",
+                PathRole::Workspace,
+                "/etc/foo",
+                inside("/etc"),
+            ),
+            (
+                "/tmp",
+                "/home/user",
+                PathRole::Workspace,
+                "/tmp",
+                covers("/tmp"),
+            ),
+            (
+                "/run",
+                "/home/user",
+                PathRole::Workspace,
+                "/run",
+                covers("/run/stopit"),
+            ),
+            (
+                "/run/stopit",
+                "/home/user",
+                PathRole::Workspace,
+                "/run/stopit",
+                covers("/run/stopit"),
+            ),
+            (
+                "/run/stopit/x",
+                "/home/user",
+                PathRole::Workspace,
+                "/run/stopit/x",
+                inside("/run/stopit"),
+            ),
+            ("/workspace", "/", PathRole::Home, "/", covers("/proc")),
+            (
+                "/workspace",
+                "/proc",
+                PathRole::Home,
+                "/proc",
+                covers("/proc"),
+            ),
+            (
+                "/workspace",
+                "/dev/shm",
+                PathRole::Home,
+                "/dev/shm",
+                inside("/dev"),
+            ),
+            (
+                "/workspace",
+                "/etc/x",
+                PathRole::Home,
+                "/etc/x",
+                inside("/etc"),
+            ),
+            ("/workspace", "/tmp", PathRole::Home, "/tmp", covers("/tmp")),
+            (
+                "/workspace",
+                "/run",
+                PathRole::Home,
+                "/run",
+                covers("/run/stopit"),
+            ),
+            (
+                "/workspace",
+                "/run/stopit/x",
+                PathRole::Home,
+                "/run/stopit/x",
+                inside("/run/stopit"),
+            ),
+            ("/same", "/same", PathRole::Home, "/same", SameAsWorkspace),
+            (
+                "/ws",
+                "/ws/home",
+                PathRole::Home,
+                "/ws/home",
+                InsideWorkspace(p("/ws")),
+            ),
+        ];
+        for (w, h, which, path, reason) in rejected {
+            assert_eq!(
+                check_reserved_paths(&p(w), &p(h)),
+                Err(SpecError::ReservedPath {
+                    which,
+                    path: p(path),
+                    reason
+                }),
+                "W={w} H={h}"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_path_messages_quote_the_path_and_name_the_rule() {
+        let e = check_reserved_paths(Path::new("/workspace"), Path::new("/etc/x")).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            r#"sandbox home (system.home) "/etc/x" is inside the reserved path "/etc""#
+        );
+        let e = check_reserved_paths(Path::new("/run"), Path::new("/home/user")).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            r#"workspace mount "/run" is or contains the reserved path "/run/stopit""#
+        );
+        let e = check_reserved_paths(Path::new("/a"), Path::new("/a/b")).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            r#"sandbox home (system.home) "/a/b" is inside the workspace mount "/a""#
+        );
+    }
+
+    #[test]
+    fn reserved_path_errors_name_the_profile() {
+        let f = Fixture::new();
+        // The fixture's workspace mount is `/workspace`.
+        for (home, reason) in [
+            ("/etc/x", ReservedReason::InsideReserved("/etc".into())),
+            ("/workspace", ReservedReason::SameAsWorkspace),
+            (
+                "/workspace/home",
+                ReservedReason::InsideWorkspace("/workspace".into()),
+            ),
+        ] {
+            let e = f.compile_err(&format!(
+                "[profiles.harness]\n{}",
+                prov("p", "harness", &format!("system.home = \"{home}\"")),
+            ));
+            let CompileError::Profile { profile, error } = &e else {
+                panic!("expected a profile error, got {e:?}");
+            };
+            assert_eq!(profile, &pr("harness"), "{home}");
+            assert_eq!(
+                **error,
+                SpecError::ReservedPath {
+                    which: PathRole::Home,
+                    path: home.into(),
+                    reason
+                }
+            );
+            assert!(
+                e.to_string()
+                    .starts_with(r#"cannot compile profile "harness": sandbox home"#),
+                "{e}"
+            );
+        }
+        // `main` is unaffected by the child's home.
+        f.compile(&format!(
+            "[profiles.harness]\n{}",
+            prov("p", "harness", "system.home = \"/tmp/h\""),
+        ));
     }
 
     #[test]
