@@ -14,22 +14,17 @@
 //! sandbox paths are separate mounts, and the plan is ordered so that
 //! children are mounted after, and therefore on top of, their parents.
 //!
-//! Symlinks below the workspace are never followed on the way to a
-//! `{workspace}` rule's host path (DESIGN.md §3.4, Symlinks). A rule whose
-//! literal part (a literal path, or a glob's literal prefix) runs into one
-//! is a startup error if it restricts access (every mode but `rw`), since a
-//! planted link (e.g. a renamed directory replaced by a link to it) would
-//! redirect the rule away from the real file, and is skipped with a warning
-//! otherwise (an `rw` rule, or a bind's host side), since dropping a grant
-//! only removes access. A link matched by a glob is skipped with a warning
-//! whatever the mode: the walk never follows links and visits the real
-//! files directly, so the rule still reaches them under their real names.
-//!
-//! Mount destinations are not checked here: whether a link on the way to a
-//! destination may have been planted depends on the mount underneath it and
-//! on the untrusted roots of the whole session, so the spec compiler checks
-//! them once every profile is planned (`crate::spec`; DESIGN.md §6.2,
-//! "Untrusted links").
+//! Every anchor is resolved alike (see [`resolve`]): symlinks on the way to
+//! a rule's host path are followed, and a matched path is kept as written.
+//! Whether a link may have been planted by a sandbox depends on the
+//! untrusted roots of the whole session (DESIGN.md §3.4, Symlinks), so the
+//! spec compiler checks host sources and mount destinations for such links
+//! once every profile is planned (`crate::spec`; DESIGN.md §6.2, "Untrusted
+//! links"), and skips links matched by a glob there. To that end each mount
+//! records whether its winning rule is a glob that matched a link
+//! ([`PlannedMount::glob_link`]). The one root known while planning, the
+//! host workspace, is checked here for a glob's walk root, so that a planted
+//! link there is refused before it is walked.
 //!
 //! Likewise, a restrictive rule that cannot be resolved because a path
 //! cannot be inspected or a directory cannot be read (anything but a
@@ -54,8 +49,9 @@ use crate::expand::{
     EntryKind, ExpandError, ExpandedPattern, ExpansionContext, ResolveWarning, ResolvedPath,
     expand_bind, expand_pattern, resolve,
 };
-use crate::manifest::{PathPattern, PatternAnchor};
+use crate::manifest::PathPattern;
 use crate::policy::PathMode;
+use crate::spec::first_link_inside;
 
 /// What a planned mount shows at its sandbox path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,8 +61,10 @@ pub enum MountSource {
         /// The host path, as written in the rule (with globs expanded).
         path: PathBuf,
         /// The kind of entry at `path`; for `masked` it decides whether an
-        /// empty file or an empty directory is shown, and for a masked `~`
-        /// or absolute symlink it is the kind of the link's target.
+        /// empty file or an empty directory is shown, and for a masked
+        /// symlink it is the kind of the link's target, except that a
+        /// masked link matched by a glob whose target cannot be inspected
+        /// keeps [`EntryKind::Symlink`] (see [`PlannedMount::glob_link`]).
         kind: EntryKind,
     },
     /// A fresh, empty, session-scoped directory (`fs.ephemeral`), with no
@@ -94,6 +92,14 @@ pub struct PlannedMount {
     pub mode: PathMode,
     /// The provider whose rule won at this path.
     pub provider: ProviderName,
+    /// Whether the winning rule is a glob that matched a symlink here (the
+    /// host source is the link itself; for `masked`, `source`'s kind is its
+    /// target's, or [`EntryKind::Symlink`] if the target cannot be
+    /// inspected). The spec compiler skips such a mount when the link lies
+    /// inside an untrusted root: the walk never follows links and reaches
+    /// the real files under their own names (DESIGN.md §3.4, Symlinks). A
+    /// masked one it keeps must have had an inspectable target.
+    pub glob_link: bool,
 }
 
 /// The outcome of [`plan_mounts`].
@@ -127,22 +133,9 @@ pub enum PlanWarningKind {
     /// cannot be inspected.
     #[error(transparent)]
     Resolve(#[from] ResolveWarning),
-    /// An `rw` rule's path, a bind's host path, or a path matched by a
-    /// `{workspace}` glob of any mode, is or runs through a symlink below
-    /// the workspace, which is never followed (DESIGN.md §3.4, Symlinks).
-    #[error(
-        "{path:?} is or runs through the symlink {link:?} in the workspace, which is never \
-         followed; write a rule for the link's target if it needs one"
-    )]
-    WorkspaceSymlink {
-        /// The host path that was to be mounted, or mounted over.
-        path: PathBuf,
-        /// The first symlink on the way to it (possibly `path` itself).
-        link: PathBuf,
-    },
-    /// A `masked` rule outside the workspace matched a symlink whose target
-    /// is missing (a dangling link), so whether to show an empty file or an
-    /// empty directory is unknown; there is no content to hide either.
+    /// A `masked` rule matched a symlink whose target is missing (a
+    /// dangling link), so whether to show an empty file or an empty
+    /// directory is unknown; there is no content to hide either.
     #[error("cannot inspect the target of the symlink {path:?}: {error}")]
     SymlinkTarget {
         /// The symlink's host path.
@@ -150,6 +143,24 @@ pub enum PlanWarningKind {
         /// The error inspecting its target.
         #[source]
         error: io::Error,
+    },
+    /// An `rw` glob's walk root runs through a symlink inside the host
+    /// workspace, which a sandbox may have planted (see
+    /// [`PathPlanError::WalkRootLink`]); the rule is skipped, since dropping
+    /// a grant only removes access.
+    #[error(
+        "the glob's walk root {root:?} runs through the symlink {link:?} inside the host \
+         workspace {workspace:?}; a sandbox can write there, so links inside it are never \
+         followed, and the rw rule is skipped"
+    )]
+    WalkRootLink {
+        /// The walk root, as written.
+        root: PathBuf,
+        /// The first symlink inside the workspace on the way to it, named
+        /// below its canonical parent directory.
+        link: PathBuf,
+        /// The host workspace.
+        workspace: PathBuf,
     },
 }
 
@@ -160,31 +171,9 @@ pub enum PathPlanError {
     /// sandbox path. Boxed to keep `PathPlanError` small.
     #[error(transparent)]
     Conflict(Box<MountConflict>),
-    /// A restrictive rule's literal path or glob literal prefix is or runs
-    /// through a symlink below the workspace. Such a rule is never skipped:
-    /// a planted link (e.g. a renamed directory replaced by a link to it)
-    /// must not switch a restriction off.
-    #[error(
-        "provider {:?}, rule {:?}: {path:?} is or runs through the symlink {link:?} in the \
-         workspace, which is never followed, and a {mode} rule is never skipped",
-        .provider.as_str(),
-        .pattern
-    )]
-    WorkspaceSymlink {
-        /// The provider that granted the rule.
-        provider: ProviderName,
-        /// The rule's pattern as written; for a bind, its host path.
-        pattern: String,
-        /// The rule's mode.
-        mode: PathMode,
-        /// The host path that was to be mounted, or mounted over.
-        path: PathBuf,
-        /// The first symlink on the way to it (possibly `path` itself).
-        link: PathBuf,
-    },
     /// Resolving a restrictive rule failed on a path that exists but cannot
     /// be inspected, or a directory that cannot be read during a glob walk
-    /// (or, for a `masked` `~` or absolute symlink, its target cannot be
+    /// (or, for a literal `masked` symlink, its target cannot be
     /// inspected). Skipping it would let the sandbox switch the rule off by
     /// making a directory it owns unreadable.
     #[error(
@@ -205,6 +194,10 @@ pub enum PathPlanError {
         /// What went wrong.
         kind: io::ErrorKind,
     },
+    /// A restrictive glob's walk root runs through a symlink inside the
+    /// host workspace. Boxed to keep `PathPlanError` small.
+    #[error(transparent)]
+    WalkRootLink(Box<WalkRootLink>),
     /// A rule could not be resolved.
     ///
     /// Unreachable for validated patterns (see [`ExpandError::InvalidGlob`]);
@@ -264,6 +257,36 @@ pub struct MountConflict {
     pub second: MountSource,
 }
 
+/// A restrictive glob's walk root runs through a symlink inside the host
+/// workspace, which a sandbox may have planted (DESIGN.md §3.4, Symlinks;
+/// see [`PathPlanError::WalkRootLink`]). It is refused before walking: the
+/// walk would follow the link, which may lead anywhere (`config -> /` would
+/// walk the whole host filesystem), and the spec compiler would refuse
+/// whatever it matched there anyway.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "provider {:?}, rule {:?}: the glob's walk root {root:?} runs through the symlink {link:?} \
+     inside the host workspace {workspace:?}; a sandbox can write there, so links inside it are \
+     never followed, and a {mode} rule is never skipped: remove the link or change the rule",
+    .provider.as_str(),
+    .pattern
+)]
+pub struct WalkRootLink {
+    /// The provider that granted the rule.
+    pub provider: ProviderName,
+    /// The rule's pattern as written.
+    pub pattern: String,
+    /// The rule's mode.
+    pub mode: PathMode,
+    /// The walk root, as written.
+    pub root: PathBuf,
+    /// The first symlink inside the workspace on the way to it, named below
+    /// its canonical parent directory.
+    pub link: PathBuf,
+    /// The host workspace.
+    pub workspace: PathBuf,
+}
+
 /// One rule's proposal for one concrete sandbox path.
 struct Candidate<'a> {
     sandbox: PathBuf,
@@ -271,6 +294,9 @@ struct Candidate<'a> {
     mode: PathMode,
     /// Whether the rule was an exact path rather than a glob.
     literal: bool,
+    /// Whether the host entry is a symlink matched by a glob (see
+    /// [`PlannedMount::glob_link`]).
+    glob_link: bool,
     rule: &'a FsRule,
 }
 
@@ -286,6 +312,7 @@ impl Candidate<'_> {
             source: self.source,
             mode: self.mode,
             provider: self.rule.provider.clone(),
+            glob_link: self.glob_link,
         }
     }
 }
@@ -303,21 +330,18 @@ impl Candidate<'_> {
 /// host skips the bind with a warning. `fs.ephemeral` rules have no host
 /// source and always produce a candidate.
 ///
-/// Symlinks: the literal part of a `{workspace}` rule (a literal path, or a
-/// glob's literal prefix) must contain no symlink below the workspace
-/// (its final component is left to the later checks, see below).
-/// Otherwise a restrictive rule is an error and an `rw` rule is dropped
-/// with a warning; a bind whose host is or runs through such a symlink is
-/// always dropped with a warning. A symlink matched by a `{workspace}` glob
-/// is dropped with a warning whatever the mode, before the winner at its
-/// sandbox path is picked. A `masked` `~` or absolute rule matching a
-/// symlink takes the kind of the link's target; it is dropped with a
-/// warning if the target is missing, and is an error if the target cannot
-/// be inspected otherwise.
-///
-/// Mount destinations, and host sources running through links a sandbox
-/// may have planted, are checked by the spec compiler once every profile
-/// of the session is planned (DESIGN.md §6.2, "Untrusted links").
+/// Symlinks are resolved alike for every anchor: links on the way are
+/// followed and a matched path is kept as written. A `masked` rule matching
+/// a symlink takes the kind of the link's target; it is dropped with a
+/// warning if the target is missing, and if the target cannot be inspected
+/// otherwise it is an error for a literal rule, while a glob match is left
+/// to the spec compiler (see [`PlannedMount::glob_link`]). A glob whose walk
+/// root runs through a symlink inside the host workspace is refused before
+/// walking (an error, or for `rw` a warning; see `check_walk_root`). Host
+/// sources running through links a sandbox may
+/// have planted, links matched by globs inside such places, and mount
+/// destinations are checked by the spec compiler once every profile of the
+/// session is planned (DESIGN.md §3.4, Symlinks; §6.2, "Untrusted links").
 ///
 /// Fails if two candidates of equal precedence map different sources to the
 /// same sandbox path; identical candidates collapse into one mount, credited
@@ -377,45 +401,18 @@ fn is_missing(kind: io::ErrorKind) -> bool {
     matches!(kind, io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
 }
 
-/// Handles `rule` running into the symlink `link` below the workspace on
-/// the way to `path`: an error if `refused` (the rule's mode, see
-/// [`unskippable`]), otherwise a warning, the caller skipping the path.
-fn workspace_symlink(
-    rule: &FsRule,
-    refused: Option<PathMode>,
-    path: PathBuf,
-    link: PathBuf,
-    warnings: &mut Vec<PlanWarning>,
-) -> Result<(), PathPlanError> {
-    match refused {
-        Some(mode) => Err(PathPlanError::WorkspaceSymlink {
-            provider: rule.provider.clone(),
-            pattern: rule_pattern(rule),
-            mode,
-            path,
-            link,
-        }),
-        None => {
-            warnings.push(plan_warning(
-                rule,
-                PlanWarningKind::WorkspaceSymlink { path, link },
-            ));
-            Ok(())
-        }
-    }
-}
-
 /// Expands and resolves one rule into its candidates, recording warnings.
 fn rule_candidates<'a>(
     rule: &'a FsRule,
     ctx: &ExpansionContext,
     warnings: &mut Vec<PlanWarning>,
 ) -> Result<Vec<Candidate<'a>>, PathPlanError> {
-    let candidate = |sandbox, source, mode, literal| Candidate {
+    let candidate = |sandbox, source, mode, literal, glob_link| Candidate {
         sandbox,
         source,
         mode,
         literal,
+        glob_link,
         rule,
     };
     match &rule.kind {
@@ -434,65 +431,63 @@ fn rule_candidates<'a>(
                 MountSource::Ephemeral,
                 PathMode::Ephemeral,
                 true,
+                false,
             )])
         }
         FsRuleKind::Path { mode, pattern } => {
             let expanded = expand_pattern(pattern, ctx);
             let literal = !expanded.has_glob();
-            let in_workspace = expanded.anchor() == PatternAnchor::Workspace;
             let refused = unskippable(*mode);
-            let paths = resolve_host(rule, pattern, &expanded, refused, warnings)?;
+            let Some(paths) = resolve_host(rule, pattern, &expanded, refused, ctx, warnings)?
+            else {
+                return Ok(Vec::new());
+            };
             let mut out = Vec::with_capacity(paths.len());
             for p in paths {
-                // A literal path's final link is left as it is: the spec
-                // compiler refuses it, by its destination check when the
-                // workspace (or a mount of something inside it) is mounted
-                // underneath, and by its host-source check otherwise (the
-                // workspace is always an untrusted root). A link matched by
-                // the glob is dropped whatever the mode: the walk never
-                // follows links and reaches the real files under their real
-                // names, so a planted link cannot make the rule miss them.
-                // Dropping it before the winner is picked never lets a
-                // weaker candidate win: every `{workspace}` glob matching
-                // this sandbox path matched the same link and is dropped
-                // alike, any literal candidate outranks globs anyway, and
-                // any other glob candidate left is refused by those checks.
-                if in_workspace && !literal && p.kind == EntryKind::Symlink {
-                    workspace_symlink(rule, None, p.host.clone(), p.host, warnings)?;
-                    continue;
-                }
-                let kind =
-                    if *mode == PathMode::Masked && p.kind == EntryKind::Symlink && !in_workspace {
-                        match p.host.metadata() {
-                            Ok(meta) => EntryKind::from_file_type(meta.file_type()),
-                            Err(error) if is_missing(error.kind()) => {
-                                warnings.push(plan_warning(
-                                    rule,
-                                    PlanWarningKind::SymlinkTarget {
-                                        path: p.host,
-                                        error,
-                                    },
-                                ));
-                                continue;
-                            }
-                            Err(error) => {
-                                return Err(PathPlanError::Inaccessible {
-                                    provider: rule.provider.clone(),
-                                    pattern: rule_pattern(rule),
-                                    mode: *mode,
+                // A matched link is kept as it is, whatever the anchor; the
+                // spec compiler refuses it, or for a glob skips it, if it
+                // lies inside an untrusted root.
+                let glob_link = !literal && p.kind == EntryKind::Symlink;
+                let kind = if *mode == PathMode::Masked && p.kind == EntryKind::Symlink {
+                    match p.host.metadata() {
+                        Ok(meta) => EntryKind::from_file_type(meta.file_type()),
+                        Err(error) if is_missing(error.kind()) => {
+                            warnings.push(plan_warning(
+                                rule,
+                                PlanWarningKind::SymlinkTarget {
                                     path: p.host,
-                                    kind: error.kind(),
-                                });
-                            }
+                                    error,
+                                },
+                            ));
+                            continue;
                         }
-                    } else {
-                        p.kind
-                    };
+                        // A link matched by a glob may have been planted
+                        // inside an untrusted root, where the spec compiler
+                        // skips it without looking at its target (DESIGN.md
+                        // §3.4, Symlinks); only then are the roots known. So
+                        // its own kind stands in for the target's, and the
+                        // spec compiler fails closed if it keeps the mount
+                        // (`SpecError::MaskTargetUninspectable`).
+                        Err(_) if glob_link => EntryKind::Symlink,
+                        Err(error) => {
+                            return Err(PathPlanError::Inaccessible {
+                                provider: rule.provider.clone(),
+                                pattern: rule_pattern(rule),
+                                mode: *mode,
+                                path: p.host,
+                                kind: error.kind(),
+                            });
+                        }
+                    }
+                } else {
+                    p.kind
+                };
                 out.push(candidate(
                     p.sandbox,
                     host_source(p.host, kind),
                     *mode,
                     literal,
+                    glob_link,
                 ));
             }
             Ok(out)
@@ -501,22 +496,21 @@ fn rule_candidates<'a>(
             let pattern = bind.host.as_pattern();
             let expanded = expand_pattern(pattern, ctx);
             let sandbox = expand_bind(bind, ctx).sandbox;
-            let in_workspace = expanded.anchor() == PatternAnchor::Workspace;
             // A bind's host side is a grant of host content wherever it is
-            // mounted, so running into a symlink only skips it.
-            let paths = resolve_host(rule, pattern, &expanded, None, warnings)?;
+            // mounted, so a path that cannot be inspected only skips it. A
+            // final link is kept: the bind follows it, as the spec compiler
+            // does when checking the source.
+            let Some(paths) = resolve_host(rule, pattern, &expanded, None, ctx, warnings)? else {
+                return Ok(Vec::new());
+            };
             let mut out = Vec::with_capacity(paths.len());
             for p in paths {
-                if in_workspace && p.kind == EntryKind::Symlink {
-                    // A bind mount would follow it.
-                    workspace_symlink(rule, None, p.host.clone(), p.host, warnings)?;
-                    continue;
-                }
                 out.push(candidate(
                     sandbox.clone(),
                     host_source(p.host, p.kind),
                     bind.mode.into(),
                     true,
+                    false,
                 ));
             }
             Ok(out)
@@ -529,17 +523,45 @@ fn host_source(path: PathBuf, kind: EntryKind) -> MountSource {
 }
 
 /// Resolves `expanded` (the expansion of `rule`'s `pattern`), recording its
-/// warnings. A literal part running through a symlink below the workspace
-/// (see [`workspace_symlink`]), and a path that cannot be inspected or read
-/// for any reason but being missing, are errors if `refused` (the rule's
-/// mode, see [`unskippable`]).
+/// warnings. A path that cannot be inspected or read for any reason but
+/// being missing is an error if `refused` (the rule's mode, see
+/// [`unskippable`]).
+///
+/// A glob whose walk root runs through a symlink inside the host workspace
+/// is not walked (see [`check_walk_root`]): an error if `refused`, and
+/// otherwise `None` with a warning.
 fn resolve_host(
     rule: &FsRule,
     pattern: &PathPattern,
     expanded: &ExpandedPattern,
     refused: Option<PathMode>,
+    ctx: &ExpansionContext,
     warnings: &mut Vec<PlanWarning>,
-) -> Result<Vec<ResolvedPath>, PathPlanError> {
+) -> Result<Option<Vec<ResolvedPath>>, PathPlanError> {
+    if let Some((root, link)) = check_walk_root(expanded, ctx) {
+        let workspace = ctx.workspace_host().to_owned();
+        return match refused {
+            Some(mode) => Err(PathPlanError::WalkRootLink(Box::new(WalkRootLink {
+                provider: rule.provider.clone(),
+                pattern: rule_pattern(rule),
+                mode,
+                root,
+                link,
+                workspace,
+            }))),
+            None => {
+                warnings.push(plan_warning(
+                    rule,
+                    PlanWarningKind::WalkRootLink {
+                        root,
+                        link,
+                        workspace,
+                    },
+                ));
+                Ok(None)
+            }
+        };
+    }
     let res = resolve(expanded).map_err(|error| PathPlanError::Expand {
         provider: rule.provider.clone(),
         pattern: pattern.clone(),
@@ -547,9 +569,6 @@ fn resolve_host(
     })?;
     for w in res.warnings {
         match w {
-            ResolveWarning::SymlinkInWorkspace { path, link } => {
-                workspace_symlink(rule, refused, path, link, warnings)?
-            }
             // The resolver reports a missing path, including an entry that
             // vanished during a glob walk, as `Missing`, so this is
             // anything else (e.g. `EACCES`).
@@ -573,7 +592,35 @@ fn resolve_host(
             }
         }
     }
-    Ok(res.paths)
+    Ok(Some(res.paths))
+}
+
+/// For a glob, the `(walk root, link)` if its walk root (as written) runs
+/// through a symlink inside the host workspace, the walk root itself
+/// included.
+///
+/// The walk follows its root, like every component before it, and the spec
+/// compiler later refuses (or for `rw` drops) whatever was matched through
+/// such a link. But a planted link may lead anywhere, and walking there
+/// first can take very long: with `config` replaced by `config -> /`,
+/// `{workspace}/config/**/*.env` would walk the whole host filesystem
+/// before failing. So the link is refused before walking.
+///
+/// Of the session's untrusted roots (DESIGN.md §3.4, Symlinks) only the
+/// workspace is known while a single profile is planned: the `rw` grants of
+/// every profile are collected after planning. A walk root through a link
+/// planted in an `rw` grant is walked, and its matches refused afterwards,
+/// which can take long (DESIGN.md §11).
+///
+/// A walk root that cannot be resolved is left to the walk, which reports
+/// it as missing or inaccessible.
+fn check_walk_root(
+    expanded: &ExpandedPattern,
+    ctx: &ExpansionContext,
+) -> Option<(PathBuf, PathBuf)> {
+    let root = expanded.walk_root()?;
+    let link = first_link_inside(&root, ctx.workspace_host()).ok()??;
+    Some((root, link))
 }
 
 /// Picks the winner among the candidates for one sandbox path (non-empty,
@@ -686,36 +733,6 @@ mod tests {
             assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
             plan.mounts
         }
-
-        /// The `(mode, path, link)` of a `WorkspaceSymlink` error, with the
-        /// paths relative to the workspace.
-        fn symlink_err(&self, rules: &[FsRule]) -> (PathMode, PathBuf, PathBuf) {
-            match self.plan_err(rules) {
-                PathPlanError::WorkspaceSymlink {
-                    mode, path, link, ..
-                } => (mode, self.rel(&path), self.rel(&link)),
-                other => panic!("expected a WorkspaceSymlink error, got {other:?}"),
-            }
-        }
-
-        /// The `(provider, path, link)` of each `WorkspaceSymlink` warning,
-        /// with the paths relative to the workspace; panics on any other
-        /// warning.
-        fn symlink_warnings(&self, plan: &MountPlan) -> Vec<(String, PathBuf, PathBuf)> {
-            plan.warnings
-                .iter()
-                .map(|w| match &w.kind {
-                    PlanWarningKind::WorkspaceSymlink { path, link } => {
-                        (w.provider.to_string(), self.rel(path), self.rel(link))
-                    }
-                    other => panic!("unexpected warning {other:?}"),
-                })
-                .collect()
-        }
-
-        fn rel(&self, path: &Path) -> PathBuf {
-            path.strip_prefix(self.ws()).unwrap().to_owned()
-        }
     }
 
     fn pn(s: &str) -> ProviderName {
@@ -761,6 +778,7 @@ mod tests {
             source: MountSource::Host { path, kind },
             mode,
             provider: pn(p),
+            glob_link: false,
         }
     }
 
@@ -770,6 +788,7 @@ mod tests {
             source: MountSource::Ephemeral,
             mode: Ephemeral,
             provider: pn(p),
+            glob_link: false,
         }
     }
 
@@ -844,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn masked_home_symlink_takes_the_kind_of_its_target() {
+    fn masked_symlink_takes_the_kind_of_its_target() {
         let f = Fixture::new();
         f.file("home/file");
         f.mkdir("home/dir");
@@ -852,12 +871,17 @@ mod tests {
         f.symlink("dir", "home/dirlink");
         f.mkdir("home/sub");
         f.symlink("../file", "home/sub/glink");
+        f.mkdir("ws/real");
+        f.symlink("real", "ws/wslink");
         let abs = f.home().join("dirlink");
         let mounts = f.clean(&[
             rule(Masked, "~/filelink", "a", 0),
             rule(Masked, "~/dirlink", "a", 0),
             rule(Masked, abs.to_str().unwrap(), "a", 0),
             rule(Masked, "~/sub/*", "b", 0),
+            // Every anchor alike: whether the link may have been planted is
+            // the spec compiler's to decide.
+            rule(Masked, "{workspace}/wslink", "w", 0),
             // Other modes keep the link itself, which a bind follows.
             bind("~/filelink", "/opt/f", BindMode::Ro, "c", 0),
         ]);
@@ -869,6 +893,7 @@ mod tests {
             got,
             [
                 (p("/opt/f"), EntryKind::Symlink, Ro),
+                (p("/workspace/wslink"), EntryKind::Dir, Masked),
                 (p("/home/user/dirlink"), EntryKind::Dir, Masked),
                 (p("/home/user/filelink"), EntryKind::File, Masked),
                 (p("/home/user/sub/glink"), EntryKind::File, Masked),
@@ -877,7 +902,7 @@ mod tests {
         );
         // The source is still the link as written.
         assert_eq!(
-            mounts[2].source,
+            mounts[3].source,
             MountSource::Host {
                 path: f.home().join("filelink"),
                 kind: EntryKind::File
@@ -1111,41 +1136,6 @@ mod tests {
     }
 
     #[test]
-    fn bind_host_through_a_workspace_symlink_is_skipped_whatever_its_mode() {
-        let f = Fixture::new();
-        f.file("ws/real/x");
-        f.file("outside/secret");
-        f.symlink("real", "ws/via");
-        f.symlink(f.root.join("outside"), "ws/out");
-        f.symlink(f.root.join("outside/secret"), "ws/final");
-        for mode in [BindMode::Ro, BindMode::Rw, BindMode::Protected] {
-            let plan = f.plan(&[
-                bind("{workspace}/via/x", "/opt/x", mode, "a", 0),
-                bind("{workspace}/out/secret", "/opt/s", mode, "b", 0),
-                bind("{workspace}/final", "/opt/f", mode, "c", 0),
-            ]);
-            assert!(plan.mounts.is_empty(), "{mode}: {:?}", plan.mounts);
-            assert_eq!(
-                f.symlink_warnings(&plan),
-                [
-                    ("a".into(), p("via/x"), p("via")),
-                    ("b".into(), p("out/secret"), p("out")),
-                    ("c".into(), p("final"), p("final")),
-                ],
-                "{mode}"
-            );
-        }
-        let plan = f.plan(&[bind("{workspace}/via/x", "/opt/x", BindMode::Ro, "a", 0)]);
-        let msg = plan.warnings[0].to_string();
-        assert!(
-            msg.starts_with(r#"provider "a", rule "{workspace}/via/x": "#),
-            "{msg}"
-        );
-        assert!(msg.contains(&format!("{:?}", f.ws().join("via"))), "{msg}");
-        assert!(msg.contains("never followed"), "{msg}");
-    }
-
-    #[test]
     fn conflicting_binds_are_an_error() {
         let f = Fixture::new();
         f.file("home/a");
@@ -1249,266 +1239,199 @@ mod tests {
     }
 
     #[test]
-    fn rw_workspace_symlinks_are_dropped_but_home_symlinks_kept() {
+    fn workspace_links_are_planned_like_any_anchor() {
+        // The planner leaves links to the spec compiler, which refuses (or
+        // for `rw` drops) those inside an untrusted root such as the
+        // workspace, whatever the rule's anchor (DESIGN.md §6.2, Untrusted
+        // links). So `{workspace}` rules and binds through links plan like
+        // `~` ones, with their paths as written.
         let f = Fixture::new();
         f.file("ws/real/x");
         f.file("outside/secret");
         f.symlink("real", "ws/link");
         f.symlink(f.root.join("outside/secret"), "ws/.env");
         f.symlink(f.root.join("outside/secret"), "home/link");
-        let plan = f.plan(&[
-            rule(Rw, "{workspace}", "base", 0),
-            rule(Rw, "{workspace}/link", "a", 0),
-            rule(Rw, "{workspace}/link/x", "b", 0),
-            rule(Rw, "{workspace}/**/.env", "c", 0),
-            bind("{workspace}/link", "/opt/l", BindMode::Rw, "d", 0),
-            rule(Ro, "~/link", "e", 0),
-            bind("~/link", "/opt/h", BindMode::Ro, "f", 0),
-        ]);
-        // A literal rule's final link is left to the spec compiler, whose
-        // destination check drops `{workspace}/link` (DESIGN.md §6.2,
-        // Untrusted links).
-        assert_eq!(
-            plan.mounts,
-            vec![
-                host("/workspace", f.ws(), EntryKind::Dir, Rw, "base"),
-                host("/opt/h", f.home().join("link"), EntryKind::Symlink, Ro, "f"),
-                host(
-                    "/workspace/link",
-                    f.ws().join("link"),
-                    EntryKind::Symlink,
-                    Rw,
-                    "a"
-                ),
-                host(
-                    "/home/user/link",
-                    f.home().join("link"),
-                    EntryKind::Symlink,
-                    Ro,
-                    "e"
-                ),
-            ]
-        );
-        // Resolution warnings in rule order, including the glob-matched
-        // link.
-        assert_eq!(
-            f.symlink_warnings(&plan),
-            [
-                ("b".into(), p("link/x"), p("link")),
-                ("c".into(), p(".env"), p(".env")),
-                ("d".into(), p("link"), p("link")),
-            ]
-        );
-        let msg = plan.warnings[2].to_string();
-        assert!(msg.contains("symlink"), "{msg}");
-        assert!(msg.contains("in the workspace"), "{msg}");
-        assert!(msg.contains("never followed"), "{msg}");
-    }
-
-    #[test]
-    fn restrictive_rules_over_workspace_symlinks_are_errors() {
-        let f = Fixture::new();
-        f.file("ws/real/x");
-        f.file("ws/real/.env");
-        f.symlink("real", "ws/link");
-        f.symlink("nowhere", "ws/.env");
-        for mode in [Masked, Protected, Ro] {
-            // A parent component, found by resolution. The final component,
-            // and every component of an ephemeral rule (which resolves
-            // nothing), are left to the spec compiler's checks, so they plan
-            // fine here.
-            let plan = f.plan(&[
+        for mode in [Masked, Protected, Ro, Rw] {
+            let mounts = f.clean(&[
                 rule(Rw, "{workspace}", "base", 0),
-                rule(mode, "{workspace}/link", "p", 0),
-                rule(Ephemeral, "{workspace}/link/x", "e", 0),
+                rule(mode, "{workspace}/link/x", "a", 0),
+                rule(mode, "{workspace}/real/*", "g", 1),
+                bind("{workspace}/link", "/opt/l", BindMode::Rw, "c", 0),
+                bind("{workspace}/.env", "/opt/e", BindMode::Ro, "d", 0),
+                rule(Ro, "~/link", "e", 0),
             ]);
             assert_eq!(
-                summary(&plan.mounts),
-                [
-                    row("/workspace", Rw, "base"),
-                    row("/workspace/link", mode, "p"),
-                    row("/workspace/link/x", Ephemeral, "e"),
+                mounts,
+                vec![
+                    host("/workspace", f.ws(), EntryKind::Dir, Rw, "base"),
+                    host("/opt/e", f.ws().join(".env"), EntryKind::Symlink, Ro, "d"),
+                    host("/opt/l", f.ws().join("link"), EntryKind::Symlink, Rw, "c"),
+                    host(
+                        "/home/user/link",
+                        f.home().join("link"),
+                        EntryKind::Symlink,
+                        Ro,
+                        "e"
+                    ),
+                    host(
+                        "/workspace/link/x",
+                        f.ws().join("link/x"),
+                        EntryKind::File,
+                        mode,
+                        "a"
+                    ),
+                    host(
+                        "/workspace/real/x",
+                        f.ws().join("real/x"),
+                        EntryKind::File,
+                        mode,
+                        "g"
+                    ),
                 ],
                 "{mode}"
             );
-            for (pattern, path, link) in [
-                ("{workspace}/link/x", "link/x", "link"),
-                (
-                    "{workspace}/link/target/deeper",
-                    "link/target/deeper",
-                    "link",
-                ),
-            ] {
-                let got = f.symlink_err(&[
-                    rule(Rw, "{workspace}", "base", 0),
-                    rule(mode, pattern, "p", 0),
-                ]);
-                assert_eq!(got, (mode, p(path), p(link)), "{mode} {pattern}");
-            }
-        }
-        // A glob whose literal prefix runs through a link (a glob matching
-        // a link is only a warning, see below).
-        for mode in [Masked, Protected, Ro] {
-            for (pattern, path) in [
-                ("{workspace}/link/*", "link"),
-                ("{workspace}/link/**/*.env", "link"),
-                ("{workspace}/link/x/*", "link/x"),
-            ] {
-                let got = f.symlink_err(&[rule(mode, pattern, "p", 0)]);
-                assert_eq!(got, (mode, p(path), p("link")), "{mode} {pattern}");
-            }
-        }
-        let e = f.plan_err(&[rule(Masked, "{workspace}/link/x", "p", 0)]);
-        assert_eq!(
-            e,
-            PathPlanError::WorkspaceSymlink {
-                provider: pn("p"),
-                pattern: "{workspace}/link/x".into(),
-                mode: Masked,
-                path: f.ws().join("link/x"),
-                link: f.ws().join("link"),
-            }
-        );
-        let msg = e.to_string();
-        for part in [
-            r#"provider "p", rule "{workspace}/link/x": "#.to_owned(),
-            format!("{:?}", f.ws().join("link/x")),
-            format!("{:?}", f.ws().join("link")),
-            "never followed".to_owned(),
-            "masked rule is never skipped".to_owned(),
-        ] {
-            assert!(msg.contains(&part), "{part}: {msg}");
         }
     }
 
     #[test]
-    fn restrictive_glob_matching_a_link_skips_it_with_a_warning() {
+    fn globs_walking_through_a_workspace_link_are_refused_before_walking() {
+        let f = Fixture::new();
+        f.file("ws/real/a.env");
+        f.mkdir("ws/real/sub");
+        f.file("outside/b.env");
+        f.symlink("real", "ws/link");
+        // Walking this would take the whole host filesystem.
+        f.symlink("/", "ws/config");
+        f.symlink(f.root.join("outside"), "home/hostlink");
+        f.symlink(f.ws(), "home/current");
+        // `(pattern, walk root, link)`: the walk root itself, a component
+        // before it, and a link reached through a host link.
+        let cases = [
+            (
+                "{workspace}/link/*.env",
+                f.ws().join("link"),
+                f.ws().join("link"),
+            ),
+            (
+                "{workspace}/link/sub/*",
+                f.ws().join("link/sub"),
+                f.ws().join("link"),
+            ),
+            (
+                "{workspace}/config/**/*.env",
+                f.ws().join("config"),
+                f.ws().join("config"),
+            ),
+            (
+                "~/current/link/*",
+                f.home().join("current/link"),
+                f.ws().join("link"),
+            ),
+        ];
+        for mode in [Masked, Protected, Ro] {
+            for (pattern, root, link) in &cases {
+                let e = f.plan_err(&[rule(mode, pattern, "p", 0)]);
+                assert_eq!(
+                    e,
+                    PathPlanError::WalkRootLink(Box::new(WalkRootLink {
+                        provider: pn("p"),
+                        pattern: (*pattern).into(),
+                        mode,
+                        root: root.clone(),
+                        link: link.clone(),
+                        workspace: f.ws(),
+                    })),
+                    "{mode} {pattern}"
+                );
+            }
+        }
+        let e = f.plan_err(&[rule(Masked, "{workspace}/config/**/*.env", "p", 0)]);
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "provider \"p\", rule \"{{workspace}}/config/**/*.env\": the glob's walk root {:?} \
+                 runs through the symlink {:?} inside the host workspace {:?}; a sandbox can \
+                 write there, so links inside it are never followed, and a masked rule is never \
+                 skipped: remove the link or change the rule",
+                f.ws().join("config"),
+                f.ws().join("config"),
+                f.ws()
+            )
+        );
+        // `rw` rules are skipped with a warning instead.
+        for (pattern, root, link) in &cases {
+            let plan = f.plan(&[rule(Rw, pattern, "p", 0)]);
+            assert!(plan.mounts.is_empty(), "{pattern}");
+            match plan.warnings.as_slice() {
+                [
+                    PlanWarning {
+                        kind:
+                            PlanWarningKind::WalkRootLink {
+                                root: r,
+                                link: l,
+                                workspace,
+                            },
+                        ..
+                    },
+                ] => assert_eq!((r, l, workspace), (root, link, &f.ws()), "{pattern}"),
+                other => panic!("{pattern}: expected one WalkRootLink warning, got {other:?}"),
+            }
+        }
+        // Host links on the way, and the workspace itself, are walked.
+        assert_eq!(
+            summary(&f.clean(&[
+                rule(Masked, "~/hostlink/*.env", "p", 0),
+                rule(Masked, "{workspace}/real/*.env", "p", 0),
+            ])),
+            [
+                row("/workspace/real/a.env", Masked, "p"),
+                row("/home/user/hostlink/b.env", Masked, "p"),
+            ]
+        );
+    }
+
+    #[test]
+    fn glob_matched_links_are_flagged() {
         let f = Fixture::new();
         f.file("ws/bar.nix");
         f.file("ws/nix/real.nix");
         f.symlink("bar.nix", "ws/foo.nix");
         f.symlink("real.nix", "ws/nix/alias.nix");
-        for mode in [Masked, Protected, Ro] {
-            let plan = f.plan(&[
-                rule(Rw, "{workspace}", "base", 0),
-                rule(mode, "{workspace}/**/*.nix", "nix", 0),
-            ]);
-            // The links are not mounted; their targets are matched directly.
-            assert_eq!(
-                summary(&plan.mounts),
-                [
-                    row("/workspace", Rw, "base"),
-                    row("/workspace/bar.nix", mode, "nix"),
-                    row("/workspace/nix/real.nix", mode, "nix"),
-                ],
-                "{mode}"
-            );
-            assert_eq!(
-                f.symlink_warnings(&plan),
-                [
-                    ("nix".into(), p("foo.nix"), p("foo.nix")),
-                    ("nix".into(), p("nix/alias.nix"), p("nix/alias.nix")),
-                ],
-                "{mode}"
-            );
-        }
-        // The same for a glob with a literal prefix and a final `*`.
-        let plan = f.plan(&[rule(Masked, "{workspace}/nix/*", "nix", 0)]);
-        assert_eq!(
-            summary(&plan.mounts),
-            [row("/workspace/nix/real.nix", Masked, "nix")]
-        );
-        assert_eq!(
-            f.symlink_warnings(&plan),
-            [("nix".into(), p("nix/alias.nix"), p("nix/alias.nix"))]
-        );
-        let msg = plan.warnings[0].to_string();
-        assert!(
-            msg.starts_with(r#"provider "nix", rule "{workspace}/nix/*": "#),
-            "{msg}"
-        );
-        assert!(msg.contains("never followed"), "{msg}");
-        assert!(msg.contains("write a rule for the link's target"), "{msg}");
-    }
-
-    #[test]
-    fn renamed_dir_replaced_by_a_link_is_still_masked_through_a_glob() {
-        let f = Fixture::new();
-        f.file("ws/config2/prod.env");
-        f.symlink("config2", "ws/config");
-        // `**` does not descend into the link, and the link's own name does
-        // not match, so there is nothing to warn about.
+        f.file("home/sub/file");
+        f.symlink("file", "home/sub/glink");
         let mounts = f.clean(&[
-            rule(Rw, "{workspace}", "base", 0),
-            rule(Masked, "{workspace}/**/*.env", "base", 0),
+            rule(Protected, "{workspace}/**/*.nix", "nix", 0),
+            rule(Masked, "~/sub/*", "m", 0),
+            // A literal rule at a matched link outranks the glob, and is no
+            // glob match.
+            rule(Ro, "{workspace}/foo.nix", "lit", 1),
         ]);
+        let got: Vec<_> = mounts
+            .iter()
+            .map(|m| (m.sandbox.clone(), m.mode, kind_of(m), m.glob_link))
+            .collect();
         assert_eq!(
-            summary(&mounts),
+            got,
             [
-                row("/workspace", Rw, "base"),
-                row("/workspace/config2/prod.env", Masked, "base"),
+                (p("/workspace/bar.nix"), Protected, EntryKind::File, false),
+                (p("/workspace/foo.nix"), Ro, EntryKind::Symlink, false),
+                (
+                    p("/workspace/nix/alias.nix"),
+                    Protected,
+                    EntryKind::Symlink,
+                    true
+                ),
+                (
+                    p("/workspace/nix/real.nix"),
+                    Protected,
+                    EntryKind::File,
+                    false
+                ),
+                (p("/home/user/sub/file"), Masked, EntryKind::File, false),
+                // A mask takes its target's kind, and is still a link.
+                (p("/home/user/sub/glink"), Masked, EntryKind::File, true),
             ]
         );
-        // A bare `**` matches the link itself, which is skipped; the real
-        // directory and its files are masked.
-        let plan = f.plan(&[rule(Masked, "{workspace}/**", "base", 0)]);
-        assert_eq!(
-            summary(&plan.mounts),
-            [
-                row("/workspace/config2", Masked, "base"),
-                row("/workspace/config2/prod.env", Masked, "base"),
-            ]
-        );
-        assert_eq!(
-            f.symlink_warnings(&plan),
-            [("base".into(), p("config"), p("config"))]
-        );
-    }
-
-    #[test]
-    fn glob_matched_link_is_dropped_for_every_candidate() {
-        let f = Fixture::new();
-        f.file("ws/real.env");
-        f.symlink("real.env", "ws/link.env");
-        // An inherited rw glob and an own masked glob both match the link:
-        // both are dropped, so neither wins and nothing is mounted there.
-        let plan = f.plan(&[
-            rule(Rw, "{workspace}/*.env", "parent", 1),
-            rule(Masked, "{workspace}/*.env", "own", 0),
-        ]);
-        assert_eq!(
-            summary(&plan.mounts),
-            [row("/workspace/real.env", Masked, "own")]
-        );
-        assert_eq!(
-            f.symlink_warnings(&plan),
-            [
-                ("parent".into(), p("link.env"), p("link.env")),
-                ("own".into(), p("link.env"), p("link.env")),
-            ]
-        );
-        // A literal rule at the link still outranks the glob; its final link
-        // is left to the spec compiler, which refuses it (an error, or for
-        // `rw` a dropped mount).
-        for (mode, depth) in [(Ro, 1), (Rw, 0)] {
-            let plan = f.plan(&[
-                rule(Masked, "{workspace}/*.env", "a", 0),
-                rule(mode, "{workspace}/link.env", "b", depth),
-            ]);
-            assert_eq!(
-                summary(&plan.mounts),
-                [
-                    row("/workspace/link.env", mode, "b"),
-                    row("/workspace/real.env", Masked, "a"),
-                ],
-                "{mode}"
-            );
-            assert_eq!(
-                f.symlink_warnings(&plan),
-                [("a".into(), p("link.env"), p("link.env"))],
-                "{mode}"
-            );
-        }
     }
 
     /// Runs `body` with the directories `rels` (below the temp root) made

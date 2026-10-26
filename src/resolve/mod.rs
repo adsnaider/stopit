@@ -21,5 +21,5 @@ pub use merge::{
 };
 pub use paths::{
     MountConflict, MountPlan, MountSource, PathPlanError, PlanWarning, PlanWarningKind,
-    PlannedMount, plan_mounts,
+    PlannedMount, WalkRootLink, plan_mounts,
 };

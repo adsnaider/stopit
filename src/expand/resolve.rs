@@ -5,12 +5,14 @@
 //! [`ExpandedPattern`] into the host/sandbox path pairs that exist right now.
 //! Files created later are not picked up.
 //!
-//! For `{workspace}` patterns, symlinks on the way to a path are never
-//! followed: any symlink below the workspace on the way to it skips the rule
-//! (see [`resolve`]). The walk never follows symlinks below the walk root (a
-//! symlinked directory could point outside the workspace or form a loop) and
-//! never consults `.gitignore` or other ignore files: secrets such as `.env`
-//! are typically gitignored and must still be found.
+//! Every anchor resolves alike. Symlinks on the way to a path are followed
+//! as the kernel follows them, and the final component of a match is never
+//! followed; whether a link was one a sandbox may have planted is decided
+//! later, against the session's untrusted roots (`crate::spec`; DESIGN.md
+//! §3.4, Symlinks). The walk never follows symlinks below the walk root (a
+//! symlinked directory could point anywhere or form a loop) and never
+//! consults `.gitignore` or other ignore files: secrets such as `.env` are
+//! typically gitignored and must still be found.
 
 use std::fs::FileType;
 use std::io;
@@ -21,7 +23,7 @@ use thiserror::Error;
 use walkdir::WalkDir;
 
 use super::{ExpandError, ExpandedPattern, join};
-use crate::manifest::{PatternAnchor, compile_glob, has_glob};
+use crate::manifest::{compile_glob, has_glob};
 
 /// What kind of filesystem entry a resolved path is, as reported by
 /// `symlink_metadata` (the final symlink is never followed).
@@ -77,22 +79,6 @@ pub enum ResolveWarning {
         /// The missing host path.
         path: PathBuf,
     },
-    /// A `{workspace}` path goes through a symlink below the workspace, so
-    /// it yields no paths. The workspace is writable by the sandbox, so the
-    /// link may have been planted, either to reach host files outside the
-    /// workspace or to move the rule underneath a stricter one inside it
-    /// (e.g. `x -> .git` turning `{workspace}/x/hooks` into `.git/hooks`).
-    ///
-    /// The resolver only reports the link; the caller decides by rule mode
-    /// whether that skips the rule with a warning or is an error (skipping
-    /// a restrictive rule would let a planted link switch it off).
-    #[error("{path:?} goes through the symlink {link:?} in the workspace")]
-    SymlinkInWorkspace {
-        /// The host path as written in the rule.
-        path: PathBuf,
-        /// The first symlink on the way to it.
-        link: PathBuf,
-    },
     /// A path could not be inspected, or a directory could not be read
     /// during a walk. Resolution continues without it.
     #[error("cannot access {path:?}: {error}")]
@@ -139,81 +125,11 @@ impl Resolution {
         self.warn_io(path.clone(), path, err.into());
     }
 
-    fn warn_no_symlinks(&mut self, original: PathBuf, error: NoSymlinksError) {
-        match error {
-            NoSymlinksError::Symlink { link } => {
-                self.warnings.push(ResolveWarning::SymlinkInWorkspace {
-                    path: original,
-                    link,
-                })
-            }
-            NoSymlinksError::Io { path, error } => self.warn_io(original, path, error),
-        }
-    }
-
     fn finish(mut self) -> Self {
         self.paths.sort_by(|a, b| a.host.cmp(&b.host));
         self.paths.dedup_by(|a, b| a.host == b.host);
         self
     }
-}
-
-/// Why a path failed [`check_no_symlinks`].
-#[derive(Debug)]
-pub(crate) enum NoSymlinksError {
-    /// `link` is a symlink.
-    Symlink {
-        /// The first symlink found.
-        link: PathBuf,
-    },
-    /// Inspecting `path` failed.
-    Io {
-        /// The path that could not be inspected.
-        path: PathBuf,
-        /// The underlying error.
-        error: io::Error,
-    },
-}
-
-/// Checks that no component of the relative path `rest` below `anchor` is
-/// a symlink, inspecting the components in order; the final component is
-/// inspected only if `check_final` (otherwise it may be anything, or
-/// missing). Every component passed through must be a directory, as in the
-/// kernel.
-///
-/// Following in-workspace symlinks is not safe either: a planted link can
-/// move a rule underneath a stricter one (`x -> .git` turns an rw
-/// `{workspace}/x/hooks` into a mount at `.git/hooks`, below the masked
-/// `.git`). `rest` must have no `.` or `..` components, as validated
-/// patterns and sandbox paths guarantee.
-pub(crate) fn check_no_symlinks(
-    anchor: &Path,
-    rest: &Path,
-    check_final: bool,
-) -> Result<(), NoSymlinksError> {
-    let mut path = anchor.to_owned();
-    let mut components = rest.components().peekable();
-    while let Some(c) = components.next() {
-        let last = components.peek().is_none();
-        if last && !check_final {
-            break;
-        }
-        path.push(c);
-        let io_err = |error| NoSymlinksError::Io {
-            path: path.clone(),
-            error,
-        };
-        let meta = path.symlink_metadata().map_err(io_err)?;
-        if meta.file_type().is_symlink() {
-            return Err(NoSymlinksError::Symlink { link: path });
-        }
-        if !last && !meta.is_dir() {
-            return Err(io_err(io::Error::from_raw_os_error(
-                rustix::io::Errno::NOTDIR.raw_os_error(),
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// Resolves `pattern` against the host filesystem as it is right now.
@@ -222,19 +138,20 @@ pub(crate) fn check_no_symlinks(
 /// one running through a non-directory) yields a
 /// [`ResolveWarning::Missing`] rather than an error. A glob is matched by
 /// walking from its literal prefix (the components before the first one
-/// containing a glob character) without following symlinks; `*` and `?`
-/// never match `/`, `**` matches zero or more components, and dotfiles are
-/// not special. Unreadable directories become warnings and the walk
-/// continues.
+/// containing a glob character) without following symlinks below the walk
+/// root; `*` and `?` never match `/`, `**` matches zero or more components,
+/// and dotfiles are not special. Unreadable directories become warnings and
+/// the walk continues.
 ///
 /// Symlinks: the final component of a match is never followed (it is
-/// reported as [`EntryKind::Symlink`]). For `{workspace}` patterns, which
-/// the sandbox can write to, a symlink in any component below the anchor
-/// (of the literal path before its final component, or of a glob's literal
-/// prefix including the walk root) skips the rule with
-/// [`ResolveWarning::SymlinkInWorkspace`]. `~` and absolute patterns follow
-/// intermediate symlinks freely (home-manager and `/etc/static` rely on
-/// it). Paths are always reported as written.
+/// reported as [`EntryKind::Symlink`]), and a glob never descends into a
+/// symlinked directory it meets during the walk. Symlinks on the way (in a
+/// literal path before its final component, or in a glob's literal prefix,
+/// the walk root included) are followed, whatever the anchor: home-manager
+/// and `/etc/static` rely on it, and links a sandbox may have planted are
+/// refused later, against the session's untrusted roots (DESIGN.md §3.4,
+/// Symlinks; §6.2, "Untrusted links"). Paths are always reported as
+/// written.
 ///
 /// The only error is a glob that does not compile (e.g. an unclosed `[`).
 /// A validated [`PathPattern`](crate::manifest::PathPattern) never has one,
@@ -248,38 +165,9 @@ pub fn resolve(pattern: &ExpandedPattern) -> Result<Resolution, ExpandError> {
     Ok(res.finish())
 }
 
-/// Whether symlinks below the anchor are refused rather than followed.
-fn confined(pattern: &ExpandedPattern) -> bool {
-    pattern.anchor() == PatternAnchor::Workspace
-}
-
-/// For a confined `pattern`, checks that the relative path `rel` contains
-/// no symlinks (the final component only if `check_final`). Records a
-/// warning and returns false if it does or cannot be inspected.
-fn rel_is_safe(
-    pattern: &ExpandedPattern,
-    rel: &Path,
-    check_final: bool,
-    res: &mut Resolution,
-) -> bool {
-    if !confined(pattern) {
-        return true;
-    }
-    match check_no_symlinks(pattern.host_anchor(), rel, check_final) {
-        Ok(()) => true,
-        Err(error) => {
-            res.warn_no_symlinks(join(pattern.host_anchor(), rel), error);
-            false
-        }
-    }
-}
-
 fn resolve_literal(pattern: &ExpandedPattern) -> Resolution {
     let mut res = Resolution::default();
     let rel = pattern.rest();
-    if !rel_is_safe(pattern, rel, false, &mut res) {
-        return res;
-    }
     let host = join(pattern.host_anchor(), rel);
     match host.symlink_metadata() {
         Ok(meta) => res.paths.push(ResolvedPath {
@@ -310,12 +198,8 @@ fn resolve_glob(pattern: &ExpandedPattern) -> Result<Resolution, ExpandError> {
     })?;
 
     let mut res = Resolution::default();
-    // For a confined pattern no component of the prefix, the walk root
-    // included, may be a symlink.
-    if !rel_is_safe(pattern, &prefix, true, &mut res) {
-        return Ok(res);
-    }
     let root = join(pattern.host_anchor(), &prefix);
+    debug_assert_eq!(pattern.walk_root().as_ref(), Some(&root));
     let sandbox_root = join(pattern.sandbox_anchor(), &prefix);
     if let Err(error) = root.metadata() {
         res.warn_io(join(pattern.host_anchor(), &prefix), root, error);
@@ -324,10 +208,9 @@ fn resolve_glob(pattern: &ExpandedPattern) -> Result<Resolution, ExpandError> {
 
     let mut walk = WalkDir::new(&root)
         .follow_links(false)
-        // A confined root was just checked not to be a symlink; should one
-        // appear in the meantime it is still not followed. `~` and absolute
-        // roots may be symlinks, which are followed.
-        .follow_root_links(!confined(pattern))
+        // The root is on the way to every match, like the components before
+        // it, so a link there is followed; links below it never are.
+        .follow_root_links(true)
         .min_depth(1);
     if !remainder.contains("**") {
         // Without `**` every match has exactly this many components. This is
@@ -672,115 +555,105 @@ mod tests {
         assert_eq!(rels, ["a", "a/.env", "a/up", "self"].map(PathBuf::from));
     }
 
-    /// The `(path, link)` of the only warning, which must be
-    /// `SymlinkInWorkspace`, for a resolution that found nothing.
-    fn symlink_warning(res: &Resolution) -> (&Path, &Path) {
-        assert!(res.paths.is_empty(), "{:?}", res.paths);
-        match res.warnings.as_slice() {
-            [ResolveWarning::SymlinkInWorkspace { path, link }] => (path, link),
-            other => panic!("expected one SymlinkInWorkspace warning, got {other:?}"),
-        }
-    }
-
-    /// Asserts that `{workspace}/{via}/…` is skipped because of the symlink
-    /// `{workspace}/{link}`, as a literal path and as globs.
-    fn skipped_through(f: &Fixture, via: &str, link: &str) {
-        let res = f.resolve(&format!("{{workspace}}/{via}/.env"));
-        assert_eq!(
-            symlink_warning(&res),
-            (
-                f.ws().join(via).join(".env").as_path(),
-                f.ws().join(link).as_path()
-            ),
-            "{via}"
-        );
-        let msg = res.warnings[0].to_string();
-        assert!(msg.contains("symlink"), "{msg}");
-        assert!(msg.contains(&format!("{:?}", f.ws().join(link))), "{msg}");
-
-        for glob in ["*", "**", "**/*.nix"] {
-            let res = f.resolve(&format!("{{workspace}}/{via}/{glob}"));
-            assert_eq!(
-                symlink_warning(&res),
-                (f.ws().join(via).as_path(), f.ws().join(link).as_path()),
-                "{via}/{glob}"
-            );
-        }
+    /// The matches of `pattern` as `(host relative to the workspace,
+    /// sandbox, kind)`, asserting that there are no warnings.
+    fn matches(f: &Fixture, pattern: &str) -> Vec<(PathBuf, PathBuf, EntryKind)> {
+        let res = f.resolve(pattern);
+        assert!(res.warnings.is_empty(), "{pattern}: {:?}", res.warnings);
+        res.paths
+            .into_iter()
+            .map(|p| {
+                (
+                    p.host.strip_prefix(f.ws()).unwrap().to_owned(),
+                    p.sandbox,
+                    p.kind,
+                )
+            })
+            .collect()
     }
 
     #[test]
-    fn workspace_symlinks_escaping_are_skipped() {
+    fn workspace_links_on_the_way_are_followed_like_any_anchor() {
+        // The resolver treats `{workspace}` like `~` and absolute anchors:
+        // links on the way are followed, and the match is reported as
+        // written. Whether such a link may have been planted is decided
+        // against the session's untrusted roots (`crate::spec`), which
+        // refuse every link inside the workspace.
         let f = Fixture::new();
         let outside = f.outside();
-        f.symlink(&outside, "abs");
-        f.symlink(Path::new("../outside"), "rel");
-        f.symlink(Path::new(".."), "up");
-        f.mkdir("sub");
-        f.symlink(Path::new("../rel"), "sub/chain");
-        for (via, link) in [
-            ("abs", "abs"),
-            ("rel", "rel"),
-            ("up", "up"),
-            ("sub/chain", "sub/chain"),
-        ] {
-            skipped_through(&f, via, link);
-        }
-    }
-
-    #[test]
-    fn workspace_symlinks_staying_inside_are_skipped_too() {
-        let f = Fixture::new();
         f.file("real/.env");
         f.file("real/a.nix");
+        f.symlink(&outside, "abs");
+        f.symlink(Path::new("../outside"), "rel");
         f.symlink(Path::new("real"), "link");
-        f.symlink(&f.ws().join("real"), "abs");
         f.mkdir("sub");
         f.symlink(Path::new("../link"), "sub/chain");
         f.symlink(&f.ws(), "top");
-        f.symlink(Path::new("nowhere"), "dangling");
-        // The first symlink on the way is named.
-        for (via, link) in [
-            ("link", "link"),
-            ("abs", "abs"),
-            ("sub/chain", "sub/chain"),
-            ("top/real", "top"),
-            ("top/link", "top"),
-            ("dangling", "dangling"),
+        for (via, file) in [
+            ("abs", "secret"),
+            ("rel", "secret"),
+            ("link", ".env"),
+            ("sub/chain", ".env"),
+            ("top/real", ".env"),
         ] {
-            skipped_through(&f, via, link);
+            let rel = Path::new(via).join(file);
+            assert_eq!(
+                matches(&f, &format!("{{workspace}}/{via}/{file}")),
+                [(
+                    rel.clone(),
+                    Path::new("/workspace").join(&rel),
+                    EntryKind::File
+                )],
+                "{via}"
+            );
+            // A glob's literal prefix, the walk root included, too.
+            assert_eq!(
+                matches(&f, &format!("{{workspace}}/{via}/*")),
+                matches(&f, &format!("{{workspace}}/{via}/**")),
+                "{via}"
+            );
+            assert!(
+                matches(&f, &format!("{{workspace}}/{via}/*"))
+                    .iter()
+                    .any(|(host, _, _)| *host == rel),
+                "{via}"
+            );
         }
-        // The real paths still resolve.
-        assert_eq!(f.rels("{workspace}/real/.env"), ["real/.env"]);
-        assert_eq!(f.rels("{workspace}/real/*"), ["real/.env", "real/a.nix"]);
-    }
-
-    #[test]
-    fn planted_link_cannot_move_a_rule_under_a_stricter_one() {
-        let f = Fixture::new();
+        // Followed, `{workspace}/x/hooks` lands at `.git/hooks` on the host,
+        // but is reported as written, at its own sandbox path.
         f.file(".git/hooks/pre-commit");
         f.symlink(Path::new(".git"), "x");
-        // Followed, `{workspace}/x/hooks` would land at `.git/hooks`.
-        for pattern in ["{workspace}/x/hooks", "{workspace}/x/hooks/*"] {
-            let res = f.resolve(pattern);
-            assert_eq!(symlink_warning(&res).1, f.ws().join("x"), "{pattern}");
-        }
+        assert_eq!(
+            matches(&f, "{workspace}/x/hooks"),
+            [(
+                PathBuf::from("x/hooks"),
+                PathBuf::from("/workspace/x/hooks"),
+                EntryKind::Dir
+            )]
+        );
         // The link itself, as a final component, is reported unfollowed.
-        let res = f.resolve("{workspace}/x");
-        assert!(res.warnings.is_empty(), "{:?}", res.warnings);
-        assert_eq!(res.paths[0].kind, EntryKind::Symlink);
-        assert_eq!(res.paths[0].sandbox, PathBuf::from("/workspace/x"));
+        assert_eq!(
+            matches(&f, "{workspace}/x"),
+            [(
+                PathBuf::from("x"),
+                PathBuf::from("/workspace/x"),
+                EntryKind::Symlink
+            )]
+        );
     }
 
     #[test]
-    fn workspace_walk_root_symlink_is_skipped() {
+    fn dangling_links_on_the_way_are_missing() {
         let f = Fixture::new();
-        f.file("real/a.nix");
-        f.symlink(Path::new("real"), "link");
-        let res = f.resolve("{workspace}/link/*.nix");
-        assert_eq!(
-            symlink_warning(&res),
-            (f.ws().join("link").as_path(), f.ws().join("link").as_path())
-        );
+        f.symlink(Path::new("nowhere"), "dangling");
+        for (pattern, missing) in [
+            ("{workspace}/dangling/.env", "dangling/.env"),
+            ("{workspace}/dangling/*", "dangling"),
+        ] {
+            let res = f.resolve(pattern);
+            assert!(res.paths.is_empty(), "{pattern}");
+            assert_eq!(missing_path(&res), f.ws().join(missing), "{pattern}");
+        }
     }
 
     #[test]
@@ -815,14 +688,26 @@ mod tests {
     }
 
     #[test]
-    fn workspace_symlink_loop_in_prefix_is_a_warning() {
+    fn symlink_loop_on_the_way_is_an_io_warning() {
         let f = Fixture::new();
         f.symlink(Path::new("b"), "a");
         f.symlink(Path::new("a"), "b");
-        // Never followed, so never looped: it is just a symlink.
-        for pattern in ["{workspace}/a/x", "{workspace}/a/*"] {
+        // The lookup gives up with `ELOOP`: the path exists but cannot be
+        // inspected, which a restrictive rule must not skip.
+        for (pattern, path) in [("{workspace}/a/x", "a/x"), ("{workspace}/a/*", "a")] {
             let res = f.resolve(pattern);
-            assert_eq!(symlink_warning(&res).1, f.ws().join("a"), "{pattern}");
+            assert!(res.paths.is_empty(), "{pattern}");
+            match res.warnings.as_slice() {
+                [ResolveWarning::Io { path: got, error }] => {
+                    assert_eq!(got, &f.ws().join(path), "{pattern}");
+                    assert_eq!(
+                        error.raw_os_error(),
+                        Some(rustix::io::Errno::LOOP.raw_os_error()),
+                        "{pattern}"
+                    );
+                }
+                other => panic!("{pattern}: expected one Io warning, got {other:?}"),
+            }
         }
     }
 

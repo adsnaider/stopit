@@ -15,11 +15,13 @@
 //! Each profile's workspace mount point and sandbox `HOME` are checked
 //! against the reserved-path rules (§6.2) before any mounts are planned;
 //! the planned mounts' destinations are checked against them afterwards.
-//! Once every profile is planned, each profile's destinations are checked
-//! for links into the session's untrusted roots on the way through the
-//! mount underneath them, and its host sources against those roots (§3.4,
-//! Symlinks; §6.2, "Untrusted links") and the host workspace (§6.2,
-//! "Workspace exposure").
+//! Once every profile is planned, each profile's glob-matched links inside
+//! the session's untrusted roots are skipped, its destinations are checked
+//! for links into those roots on the way through the mount underneath them,
+//! and its host sources against those roots (§3.4, Symlinks; §6.2,
+//! "Untrusted links"), against the host workspace (§6.2, "Workspace
+//! exposure") and against the profile's masked and protected mounts (§6.2,
+//! "Restricted content exposure").
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -33,7 +35,7 @@ use rustix::io::Errno;
 use thiserror::Error;
 
 use crate::config::{Config, ProfileRef, ProviderName};
-use crate::expand::{ExpansionContext, NoSymlinksError, check_no_symlinks};
+use crate::expand::{EntryKind, ExpansionContext};
 use crate::manifest::{
     DevMode, Domain, EtcFile, OptInSyscall, SandboxHome, ShareableNamespace, ShimName, ShimSpec,
 };
@@ -188,6 +190,20 @@ pub enum SpecWarning {
          mount is skipped"
     )]
     SourceLink(Box<LinkFollowed>),
+    /// A path matched by a glob rule is a symlink inside an untrusted root,
+    /// so the match is skipped whatever the rule's mode (DESIGN.md §3.4,
+    /// Symlinks).
+    #[error(transparent)]
+    GlobLink(Box<GlobLink>),
+    /// A mount shows host content that a `masked` mount of the profile
+    /// covers, or lets the sandbox write content that a `protected` mount
+    /// covers, at another sandbox path, where that restriction does not
+    /// apply (DESIGN.md §6.2, "Restricted content exposure"). A warning
+    /// rather than an error: such content is commonly host-controlled (a
+    /// home-manager file masked at `~/.config/foo` whose `/nix/store` target
+    /// is mounted too), and the warning names where it is still visible.
+    #[error(transparent)]
+    RestrictedContentExposed(Box<Exposure>),
     /// The profile itself granted `network.allow_domains` but its network
     /// mode is not `proxy`, the only mode that uses them, so the domains
     /// were dropped. Domains inherited from the parent are dropped without
@@ -249,13 +265,16 @@ pub enum SpecError {
     },
     /// A mount's host source contains the host workspace, or lies inside it
     /// but is mounted away from the workspace mount, so it would show
-    /// workspace files where their masks and protections do not apply
-    /// (§6.2, "Workspace exposure").
+    /// workspace files at a second sandbox path (§6.2, "Workspace
+    /// exposure"): the workspace must appear only at its mount, where its
+    /// restrictions, pinned parents and the supervisor's workspace-relative
+    /// checks apply.
     #[error(
         "provider {:?}: {mode} mount of {host:?}{} at {sandbox:?} exposes the host workspace \
-         {workspace:?} outside the workspace mount, where its masks and protected files do not \
-         apply; grant narrower paths that leave the workspace out, mask this one, or reach these \
-         files through the workspace mount",
+         {workspace:?} outside the workspace mount; the workspace must appear only at its mount, \
+         where its restrictions, pinned parents and the supervisor's checks apply; grant \
+         narrower paths that leave the workspace out, mask this one, or reach these files through \
+         the workspace mount",
         .provider.as_str(),
         resolved_note(.host, .resolved)
     )]
@@ -272,6 +291,28 @@ pub enum SpecError {
         sandbox: PathBuf,
         /// The host workspace.
         workspace: PathBuf,
+    },
+    /// A `masked` glob matched a symlink outside every untrusted root (one
+    /// the host controls) whose target cannot be inspected, so whether to
+    /// mask it as an empty file or an empty directory is unknown, and a
+    /// masked rule is never skipped. (A literal rule fails the same way
+    /// while planning, [`PathPlanError::Inaccessible`]; a glob match is
+    /// decided here, since one inside an untrusted root is skipped with
+    /// [`SpecWarning::GlobLink`] without looking at its target.)
+    #[error(
+        "provider {:?}: the masked glob match {host:?} at {sandbox:?} is a symlink whose target \
+         cannot be inspected ({kind}), so its shape is unknown, and a masked rule is never skipped",
+        .provider.as_str()
+    )]
+    MaskTargetUninspectable {
+        /// The provider whose rule matched the link.
+        provider: ProviderName,
+        /// The matched link's host path, as planned.
+        host: PathBuf,
+        /// The mount's sandbox destination.
+        sandbox: PathBuf,
+        /// What went wrong inspecting the target.
+        kind: io::ErrorKind,
     },
     /// A restrictive mount's host source runs through a symlink inside an
     /// untrusted root, a host directory some sandbox of the session can
@@ -404,6 +445,77 @@ pub struct DestinationLink {
     pub ancestor_source: PathBuf,
     /// The untrusted root `link` lies in (the innermost one).
     pub root: UntrustedRoot,
+}
+
+/// A path matched by a glob rule is a symlink inside an untrusted root, so
+/// a sandbox may have planted it (DESIGN.md §3.4, Symlinks). The match is
+/// skipped whatever the rule's mode: the glob walk never follows links and
+/// reaches the real files under their own names, so a planted link can
+/// neither redirect the rule nor make it miss them.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "provider {:?}: the {mode} glob match {host:?} at {sandbox:?} is the symlink {link:?} inside \
+     {root}; a sandbox can write there, so links inside it are never followed, and the match is \
+     skipped (write a rule for the link's target if it needs one)",
+    .provider.as_str()
+)]
+pub struct GlobLink {
+    /// The provider whose rule matched the link.
+    pub provider: ProviderName,
+    /// The rule's mode.
+    pub mode: PathMode,
+    /// The matched host path, as planned.
+    pub host: PathBuf,
+    /// The link, named below its canonical parent directory.
+    pub link: PathBuf,
+    /// The sandbox path the match would have been mounted at.
+    pub sandbox: PathBuf,
+    /// The untrusted root `link` lies in (the innermost one).
+    pub root: UntrustedRoot,
+}
+
+/// A mount shows host content that a `masked` mount of the same profile
+/// covers, or shows writable content that a `protected` mount covers, at a
+/// sandbox path where that restriction does not apply (DESIGN.md §6.2,
+/// "Restricted content exposure"). Masks and protected files apply to
+/// sandbox paths, not to host content.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "provider {:?}: {mode} mount of {host:?}{} at {sandbox:?} shows {shown:?} at {shown_at:?}, \
+     where the {restricted_mode} mount of {restricted_host:?} by provider {:?} at \
+     {restricted_sandbox:?} does not apply, so it is still {} there; narrow this grant to leave \
+     it out, add a rule for {shown:?} if this mount shows it at its own host path, or cover \
+     {shown_at:?} with an ephemeral rule (an absolute rule names a host path, so one for a bind \
+     destination would be skipped as missing)",
+    .provider.as_str(),
+    resolved_note(.host, .resolved),
+    .restricted_provider.as_str(),
+    if *.restricted_mode == PathMode::Protected { "writable" } else { "visible" }
+)]
+pub struct Exposure {
+    /// The provider whose rule produced the exposing mount.
+    pub provider: ProviderName,
+    /// The exposing mount's mode.
+    pub mode: PathMode,
+    /// The exposing mount's host source, as planned.
+    pub host: PathBuf,
+    /// `host` with every symlink resolved.
+    pub resolved: PathBuf,
+    /// The exposing mount's sandbox destination.
+    pub sandbox: PathBuf,
+    /// The restricted host content it shows (canonical): the restricted
+    /// path itself, or the exposing mount's source inside it.
+    pub shown: PathBuf,
+    /// Where in the sandbox it shows `shown`.
+    pub shown_at: PathBuf,
+    /// The provider whose rule produced the restrictive mount.
+    pub restricted_provider: ProviderName,
+    /// The restrictive mount's mode (`masked` or `protected`).
+    pub restricted_mode: PathMode,
+    /// The restrictive mount's host source, resolved to its canonical path.
+    pub restricted_host: PathBuf,
+    /// The restrictive mount's sandbox destination.
+    pub restricted_sandbox: PathBuf,
 }
 
 /// A host directory that a sandbox of the session can write, so that any
@@ -655,8 +767,10 @@ fn check_mount_destinations(mounts: &[PlannedMount]) -> Result<(), SpecError> {
 }
 
 /// Checks every planned mount's host source against the untrusted `roots`
-/// (DESIGN.md §3.4, Symlinks; §6.2, "Untrusted links") and the host
-/// workspace (§6.2, "Workspace exposure").
+/// (DESIGN.md §3.4, Symlinks; §6.2, "Untrusted links"), the host workspace
+/// (§6.2, "Workspace exposure") and the profile's masked and protected
+/// mounts (§6.2, "Restricted content exposure"; see
+/// [`check_restricted_exposure`]).
 ///
 /// The planner keeps host sources as written: `~` and absolute rules follow
 /// symlinks on the way and binds follow a final symlink, as bwrap does when
@@ -672,8 +786,7 @@ fn check_mount_destinations(mounts: &[PlannedMount]) -> Result<(), SpecError> {
 /// (`~/current/x` with `~/current -> proj`, or `~/.bashrc -> proj/bashrc`
 /// replaced by a link in the workspace), where the planted link would turn
 /// a rule that shows nothing or is rejected into a mount of any host path.
-/// Links the host controls, outside every root, are followed. This extends
-/// the `{workspace}` anchor's no-symlink rule to every rule and root. Such a
+/// Links the host controls, outside every root, are followed. Such a
 /// link is an error for a restrictive mount (every mode but `rw`); an `rw`
 /// mount (rule or bind) through one has already been dropped with a warning
 /// by [`check_destination_links`], since dropping a grant only removes
@@ -691,16 +804,24 @@ fn check_mount_destinations(mounts: &[PlannedMount]) -> Result<(), SpecError> {
 /// lookup ends at, so they are checked for untrusted links too: a planted
 /// link must not decide a mask's shape.
 ///
-/// **Workspace exposure.** Masks and protected files apply to sandbox paths
-/// inside the workspace mount, not to host content, so the same files
-/// shown elsewhere would escape them. Every source except a `masked` one
-/// must, resolved, not be the host workspace or an ancestor of it, unless
-/// it is the workspace itself mounted at the workspace mount; and if it
-/// lies inside the host workspace, the mount must be at the aligned path,
-/// i.e. the workspace mount joined with the source's path relative to the
-/// host workspace. `{workspace}` sources contain no symlinks below the
-/// workspace (the planner refuses them), so aligned ones resolve to
-/// themselves.
+/// **Workspace exposure.** The workspace must appear in the sandbox only at
+/// its mount: its restrictions, the pinned parents below it and the
+/// supervisor's workspace-relative checks all apply to sandbox paths inside
+/// the workspace mount, not to host content. Every source except a
+/// `masked` one must, resolved, not be the host workspace or an ancestor of
+/// it, unless it is the workspace itself mounted at the workspace mount;
+/// and if it lies inside the host workspace, the mount must be at the
+/// aligned path, i.e. the workspace mount joined with the source's path
+/// relative to the host workspace. A source through a link inside the
+/// workspace has been refused above, so aligned ones resolve to
+/// themselves. This runs mount by mount, before the restricted content
+/// check, which covers the workspace's masks and protected files too.
+///
+/// A masked glob match whose target could not be inspected while planning
+/// (see [`PlannedMount::glob_link`]) and that was not skipped as a link
+/// inside an untrusted root fails closed: its shape is unknown
+/// ([`SpecError::MaskTargetUninspectable`]), unless the way to it runs
+/// through a planted link, which is reported instead.
 ///
 /// `ctx`'s host workspace is canonical by contract, and is one of `roots`.
 /// Paths are compared by component.
@@ -708,21 +829,49 @@ fn check_host_sources(
     mounts: &[PlannedMount],
     ctx: &ExpansionContext,
     roots: &UntrustedRoots,
+    warnings: &mut Vec<SpecWarning>,
 ) -> Result<(), SpecError> {
     let ws_host = ctx.workspace_host();
     let ws_sandbox = ctx.workspace_sandbox();
+    // The canonical source of each mount, `None` for an ephemeral one.
+    let mut sources = Vec::with_capacity(mounts.len());
     for m in mounts {
-        let MountSource::Host { path: host, .. } = &m.source else {
+        let MountSource::Host { path: host, kind } = &m.source else {
+            sources.push(None);
             continue;
         };
-        let source =
-            resolve_host_source(host, roots).map_err(|error| SpecError::HostSourceUnresolved {
+        let unresolved = |error: io::Error| SpecError::HostSourceUnresolved {
+            provider: m.provider.clone(),
+            mode: m.mode,
+            host: host.clone(),
+            sandbox: m.sandbox.clone(),
+            kind: error.kind(),
+        };
+        // The planner resolves every other masked link to its target's kind.
+        if m.mode == PathMode::Masked && *kind == EntryKind::Symlink {
+            let (Some(parent), Some(name)) = (host.parent(), host.file_name()) else {
+                unreachable!("a matched link has a parent and a name");
+            };
+            let way = resolve_host_source(parent, roots).map_err(unresolved)?;
+            if let Some(followed) = way.untrusted.first() {
+                return Err(SpecError::UntrustedLinkFollowed(link_followed(
+                    m,
+                    host,
+                    &way.path.join(name),
+                    followed,
+                )));
+            }
+            return Err(SpecError::MaskTargetUninspectable {
                 provider: m.provider.clone(),
-                mode: m.mode,
                 host: host.clone(),
                 sandbox: m.sandbox.clone(),
-                kind: error.kind(),
-            })?;
+                kind: host
+                    .metadata()
+                    .err()
+                    .map_or(io::ErrorKind::Other, |e| e.kind()),
+            });
+        }
+        let source = resolve_host_source(host, roots).map_err(unresolved)?;
         // Only a restrictive mount gets here with such a link:
         // `check_destination_links` has dropped every `rw` one.
         if let Some(followed) = source.untrusted.first() {
@@ -734,17 +883,14 @@ fn check_host_sources(
             )));
         }
         let resolved = source.path;
-        if m.mode == PathMode::Masked {
-            continue;
-        }
-        let exposed = match resolved.strip_prefix(ws_host) {
-            // Inside the workspace (or the workspace itself): only the
-            // aligned mapping is allowed.
-            Ok(rel) if rel.as_os_str().is_empty() => m.sandbox != ws_sandbox,
-            Ok(rel) => m.sandbox != ws_sandbox.join(rel),
-            // Elsewhere: it must not contain the workspace.
-            Err(_) => ws_host.starts_with(&resolved),
-        };
+        let exposed = m.mode != PathMode::Masked
+            && match resolved.strip_prefix(ws_host) {
+                // Inside the workspace (or the workspace itself): only the
+                // aligned mapping is allowed.
+                Ok(rel) => m.sandbox != join_rel(ws_sandbox, rel),
+                // Elsewhere: it must not contain the workspace.
+                Err(_) => ws_host.starts_with(&resolved),
+            };
         if exposed {
             return Err(SpecError::WorkspaceExposed {
                 provider: m.provider.clone(),
@@ -755,8 +901,116 @@ fn check_host_sources(
                 workspace: ws_host.to_owned(),
             });
         }
+        sources.push(Some(resolved));
     }
+    check_restricted_exposure(mounts, &sources, warnings);
     Ok(())
+}
+
+/// `base` joined with the relative path `rel`, or `base` itself if `rel` is
+/// empty (where `Path::join` would add a trailing `/`).
+fn join_rel(base: &Path, rel: &Path) -> PathBuf {
+    if rel.as_os_str().is_empty() {
+        base.to_owned()
+    } else {
+        base.join(rel)
+    }
+}
+
+/// Warns about host content a `masked` or `protected` mount covers that is
+/// shown at another sandbox path (DESIGN.md §6.2, "Restricted content
+/// exposure"), one [`SpecWarning::RestrictedContentExposed`] per pair of
+/// mounts. `sources` holds each mount's canonical host source (`None` for
+/// an ephemeral mount), as [`check_host_sources`] resolved it.
+///
+/// A warning rather than an error: such content is commonly controlled by
+/// the host (a home-manager file masked at `~/.config/foo` whose
+/// `/nix/store` target is mounted too), and the warning says where it is
+/// still visible and how to cover it there.
+///
+/// Masks and protected files apply to sandbox paths, not to host content.
+/// So for every such mount R, of the canonical host path P at the sandbox
+/// path T_R, every other mount M that shows something (any mode but
+/// `masked`; for a `protected` R only `rw` mounts count, since protected
+/// content is readable anyway), of the canonical source S at T_M, should
+/// show none of P away from T_R:
+///
+/// * If S is P or an ancestor of it, M shows P at T_M joined with P's path
+///   below S. That is fine if it is T_R (R covers it there), or if another
+///   mount lies between T_M (exclusive) and that path (inclusive): it is
+///   mounted on top and hides what M shows there (that mount is checked in
+///   turn). Otherwise P is exposed: masked `~/.config/tool/token` with
+///   `~/.config` also mounted at `/opt/cfg` shows the token at
+///   `/opt/cfg/tool/token`.
+/// * If S lies inside P (a directory), M shows that part of P at T_M, which
+///   is fine only at its aligned path inside R's, T_R joined with S's path
+///   below P: a deeper rule granting part of a masked directory where the
+///   directory is masked.
+///
+/// Only one profile's mounts are compared: each sandbox is one profile. A
+/// mount dropped earlier is not among `mounts`, so it neither exposes nor
+/// covers anything.
+fn check_restricted_exposure(
+    mounts: &[PlannedMount],
+    sources: &[Option<PathBuf>],
+    warnings: &mut Vec<SpecWarning>,
+) {
+    let at: BTreeSet<&Path> = mounts.iter().map(|m| m.sandbox.as_path()).collect();
+    // Whether a mount lies strictly below `top` and at or above `path` (a
+    // path below `top`), hiding what the mount at `top` shows at `path`.
+    let overmounted = |top: &Path, path: &Path| {
+        path.ancestors()
+            .take_while(|a| *a != top)
+            .any(|a| at.contains(a))
+    };
+    for (i, (r, p)) in mounts.iter().zip(sources).enumerate() {
+        let Some(p) = p else { continue };
+        if !matches!(r.mode, PathMode::Masked | PathMode::Protected) {
+            continue;
+        }
+        for (j, (m, s)) in mounts.iter().zip(sources).enumerate() {
+            let Some(s) = s else { continue };
+            // A read-only view of protected content exposes nothing
+            // protected: it is readable at its own path too.
+            let shows = match r.mode {
+                PathMode::Protected => m.mode == PathMode::Rw,
+                _ => m.mode != PathMode::Masked,
+            };
+            if i == j || !shows {
+                continue;
+            }
+            let (shown, shown_at) = if let Ok(rel) = p.strip_prefix(s) {
+                let shown_at = join_rel(&m.sandbox, rel);
+                if shown_at == r.sandbox || overmounted(&m.sandbox, &shown_at) {
+                    continue;
+                }
+                (p.clone(), shown_at)
+            } else if let Ok(rel) = s.strip_prefix(p) {
+                if m.sandbox == join_rel(&r.sandbox, rel) {
+                    continue;
+                }
+                (s.clone(), m.sandbox.clone())
+            } else {
+                continue;
+            };
+            let MountSource::Host { path: host, .. } = &m.source else {
+                unreachable!("a mount with a canonical source has a host source");
+            };
+            warnings.push(SpecWarning::RestrictedContentExposed(Box::new(Exposure {
+                provider: m.provider.clone(),
+                mode: m.mode,
+                host: host.clone(),
+                resolved: s.clone(),
+                sandbox: m.sandbox.clone(),
+                shown,
+                shown_at,
+                restricted_provider: r.provider.clone(),
+                restricted_mode: r.mode,
+                restricted_host: p.clone(),
+                restricted_sandbox: r.sandbox.clone(),
+            })));
+        }
+    }
 }
 
 /// The [`LinkFollowed`] for the mount `m` of `host`, resolving to
@@ -808,8 +1062,7 @@ enum Underneath {
 /// root, a sandbox may have planted it to move the mount elsewhere: a mask
 /// or a read-only mount onto a decoy, leaving the real path as it was. Then
 /// a restrictive mount (every mode but `rw`) is an error and an `rw` one is
-/// dropped with a warning, as a link below the workspace is for
-/// `{workspace}` rules.
+/// dropped with a warning.
 ///
 /// The walk stops at the first symlink: one outside every root is the
 /// host's (a home-manager link under an `ro ~`, say) and bwrap follows it
@@ -833,12 +1086,21 @@ enum Underneath {
 /// that is [`check_host_sources`]'s rule (which refuses such a restrictive
 /// mount), applied here so that the dropped mount is never an ancestor.
 ///
-/// A dropped `rw` mount is not an ancestor of later mounts: mounts are
-/// checked in plan order, parents first, so those below it are checked
-/// against the mount that is actually underneath them (for a destination
-/// link, they meet the same link: an error for a restrictive one, a drop
-/// for an `rw` one). Its host source stays an untrusted root (the roots
-/// were collected from the plans as planned): that only refuses more
+/// Before any of that, a mount of a link matched by a glob that lies inside
+/// an untrusted root is dropped with [`SpecWarning::GlobLink`], whatever its
+/// mode (see [`glob_link_in_root`]). It is dropped after the winner at its
+/// sandbox path was picked, so nothing is mounted there: any literal rule
+/// at that path would have won, and every other glob candidate there was
+/// outranked. Nothing is lost by that: the sandbox path shows the link
+/// through the mount underneath, and the glob walk reached the real files
+/// under their own names.
+///
+/// A dropped mount is not an ancestor of later mounts: mounts are checked
+/// in plan order, parents first, so those below it are checked against the
+/// mount that is actually underneath them (for a destination link, they
+/// meet the same link: an error for a restrictive one, a drop for an `rw`
+/// one). A dropped `rw` mount's host source stays an untrusted root (the
+/// roots were collected from the plans as planned): that only refuses more
 /// links, never fewer.
 fn check_destination_links(
     mounts: Vec<PlannedMount>,
@@ -848,6 +1110,12 @@ fn check_destination_links(
     let mut underneath: BTreeMap<PathBuf, Underneath> = BTreeMap::new();
     let mut kept = Vec::with_capacity(mounts.len());
     for m in mounts {
+        if m.glob_link {
+            if let Some(found) = glob_link_in_root(&m, roots) {
+                warnings.push(SpecWarning::GlobLink(found));
+                continue;
+            }
+        }
         let ancestor = m
             .sandbox
             .ancestors()
@@ -938,6 +1206,38 @@ fn check_destination_links(
     Ok(kept)
 }
 
+/// For the mount `m` of a link matched by a glob
+/// ([`PlannedMount::glob_link`]), the [`GlobLink`] to skip it with if the
+/// link lies inside one of `roots` and the way to it runs through no link
+/// inside a root.
+///
+/// A link outside every root is the host's (a home-manager link matched by
+/// `~/.config/*`), and is kept and followed. A way that runs through a link
+/// inside a root (a glob whose literal prefix or walk root is a planted
+/// link in an `rw` grant; in the workspace the planner refuses it before
+/// walking), or that cannot be resolved, is left to the destination and
+/// host-source checks, which refuse it like any rule's: the walk did not
+/// reach the real files there, but whatever the planted link leads to.
+fn glob_link_in_root(m: &PlannedMount, roots: &UntrustedRoots) -> Option<Box<GlobLink>> {
+    let MountSource::Host { path: host, .. } = &m.source else {
+        return None;
+    };
+    let name = host.file_name()?;
+    let parent = resolve_host_source(host.parent()?, roots).ok()?;
+    if !parent.untrusted.is_empty() {
+        return None;
+    }
+    let root = roots.containing(&parent.path)?;
+    Some(Box::new(GlobLink {
+        provider: m.provider.clone(),
+        mode: m.mode,
+        host: host.clone(),
+        link: parent.path.join(name),
+        sandbox: m.sandbox.clone(),
+        root: root.clone(),
+    }))
+}
+
 /// What [`find_destination_link`] found on the way to a destination.
 enum DestinationProblem<'r> {
     /// A symlink inside an untrusted root.
@@ -966,27 +1266,35 @@ fn find_destination_link<'r>(
     rel: &Path,
     roots: &'r UntrustedRoots,
 ) -> Result<(), DestinationProblem<'r>> {
-    match check_no_symlinks(source, rel, true) {
-        Ok(()) => Ok(()),
-        Err(NoSymlinksError::Symlink { link }) => {
-            let parent = link.parent().expect("a link below `source` has a parent");
-            match roots.containing(parent) {
-                Some(root) => Err(DestinationProblem::Link { link, root }),
-                None => Ok(()),
+    let mut path = source.to_owned();
+    let mut components = rel.components().peekable();
+    while let Some(c) = components.next() {
+        path.push(c);
+        let meta = match path.symlink_metadata() {
+            Ok(meta) => meta,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(());
             }
+            Err(error) => return Err(DestinationProblem::Unchecked { path, error }),
+        };
+        if meta.is_symlink() {
+            let parent = path.parent().expect("a link below `source` has a parent");
+            return match roots.containing(parent) {
+                Some(root) => Err(DestinationProblem::Link { link: path, root }),
+                None => Ok(()),
+            };
         }
-        Err(NoSymlinksError::Io { error, .. })
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-            ) =>
-        {
-            Ok(())
-        }
-        Err(NoSymlinksError::Io { path, error }) => {
-            Err(DestinationProblem::Unchecked { path, error })
+        // Like the kernel, only a directory can be passed through.
+        if components.peek().is_some() && !meta.is_dir() {
+            return Ok(());
         }
     }
+    Ok(())
 }
 
 /// The kernel's limit on symlinks followed in one path lookup
@@ -1096,6 +1404,20 @@ fn resolve_host_source<'r>(
     })
 }
 
+/// The first symlink inside the host directory `root` (canonical) that
+/// resolving the absolute host path `path` follows, as
+/// [`resolve_host_source`] finds it, named below its canonical parent
+/// directory. Errors are those of the lookup.
+///
+/// The planner uses it to refuse a glob's walk root running through a link
+/// inside the host workspace before walking (see
+/// [`plan_mounts`]).
+pub(crate) fn first_link_inside(path: &Path, root: &Path) -> io::Result<Option<PathBuf>> {
+    let roots = UntrustedRoots::new(root);
+    let resolved = resolve_host_source(path, &roots)?;
+    Ok(resolved.untrusted.into_iter().next().map(|l| l.link))
+}
+
 /// Checks the workspace mount point and sandbox `HOME` against the
 /// reserved-path rules of DESIGN.md §6.2.
 ///
@@ -1188,9 +1510,9 @@ fn plan_profile(
 /// assembles the spec.
 ///
 /// Destinations come first because their check settles what is mounted
-/// (it drops `rw` mounts, for a link on the way to their destination or in
-/// their source): a dropped mount's source is not checked, as a
-/// `{workspace}` rule dropped by the planner is not. A restrictive mount
+/// (it drops glob-matched links inside untrusted roots, and `rw` mounts for
+/// a link on the way to their destination or in their source): a dropped
+/// mount's source is not checked, and it exposes nothing. A restrictive mount
 /// that fails both checks (a `~` rule below an `rw` grant of its parent,
 /// through a planted link) is reported by the destination check.
 fn finish_profile(
@@ -1203,7 +1525,7 @@ fn finish_profile(
     let PlannedProfile { home, plan } = planned;
     let mut warnings: Vec<SpecWarning> = plan.warnings.into_iter().map(Into::into).collect();
     let mounts = check_destination_links(plan.mounts, roots, &mut warnings)?;
-    check_host_sources(&mounts, ctx, roots)?;
+    check_host_sources(&mounts, ctx, roots, &mut warnings)?;
     let inherited_domains = parent.map(|p| &p.network.allow_domains);
     let network = network_spec(&grants.network, inherited_domains, &mut warnings);
     let spec = SandboxSpec {
@@ -1377,7 +1699,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::expand::{EntryKind, ResolveWarning};
+    use crate::expand::ResolveWarning;
     use crate::policy::PathMode::{self, Ephemeral, Masked, Protected, Ro, Rw};
     use crate::provider::{ProviderContext, session_providers};
     use crate::resolve::{MountSource, PlanWarningKind};
@@ -2018,34 +2340,31 @@ mod tests {
     #[test]
     fn mount_planning_errors_name_the_profile() {
         let f = Fixture::new();
-        f.file("ws/real/x");
-        symlink("real", f.ws().join("link")).unwrap();
+        f.file("home/a");
+        f.file("home/b");
         let e = f.compile_err(&format!(
             "[profiles.harness]\n{}",
-            prov("p", "harness", "fs.masked = [\"{workspace}/link/x\"]"),
+            prov(
+                "p",
+                "harness",
+                "fs.bind = [\n\
+                 { host = \"~/a\", sandbox = \"/opt/x\", mode = \"ro\" },\n\
+                 { host = \"~/b\", sandbox = \"/opt/x\", mode = \"ro\" },\n]"
+            ),
         ));
         let CompileError::Profile { profile, error } = &e else {
             panic!("expected a profile error, got {e:?}");
         };
         assert_eq!(profile, &pr("harness"));
-        assert_eq!(
-            **error,
-            SpecError::Mounts(PathPlanError::WorkspaceSymlink {
-                provider: "p".parse().unwrap(),
-                pattern: "{workspace}/link/x".into(),
-                mode: Masked,
-                path: f.ws().join("link/x"),
-                link: f.ws().join("link"),
-            })
+        assert!(
+            matches!(**error, SpecError::Mounts(PathPlanError::Conflict(ref c)) if c.sandbox == Path::new("/opt/x")),
+            "{error:?}"
         );
         let msg = e.to_string();
         assert!(
-            msg.starts_with(
-                r#"cannot compile profile "harness": provider "p", rule "{workspace}/link/x": "#
-            ),
+            msg.starts_with(r#"cannot compile profile "harness": sandbox path "/opt/x" is mapped"#),
             "{msg}"
         );
-        assert!(msg.contains("never followed"), "{msg}");
     }
 
     #[test]
@@ -2701,11 +3020,21 @@ mod tests {
                 PathBuf::from("/home/user/current/config")
             )
         );
+        // A glob below an entering link: the walk follows its root link and
+        // matches the planted link itself, which lies inside the workspace,
+        // so the match is skipped with a warning (the walk reaches the real
+        // files under their own names).
+        let s = compile_body(&f, "fs.ro = [\"~/current/conf*\"]").unwrap();
+        assert!(spec(&s, "main").mounts.is_empty());
+        match get(&s, "main").warnings.as_slice() {
+            [SpecWarning::GlobLink(gl)] => assert_eq!(
+                (&gl.host, &gl.link, &gl.root.path),
+                (&home.join("current/config"), &config, &f.ws())
+            ),
+            other => panic!("expected one GlobLink warning, got {other:?}"),
+        }
         // `(rule, host, planted link, resolved)`.
         for (rule, host, link, resolved) in [
-            // A glob below an entering link: the walk follows its root link
-            // and matches the planted link itself.
-            ("~/current/conf*", "current/config", &config, ssh.clone()),
             // A glob matching a link into the workspace, whose target is the
             // planted link. (A glob walk does not descend through links
             // below its root, so `~/links/*/config` would match nothing.)
@@ -2907,6 +3236,7 @@ mod tests {
                 },
                 mode: Rw,
                 provider: "p".parse().unwrap(),
+                glob_link: false,
             }],
         );
         let got = resolve_host_source(&ws.join("l1"), &roots).unwrap();
@@ -3025,8 +3355,9 @@ mod tests {
             format!(
                 "cannot compile profile \"main\": provider \"p\": ro mount of {:?} at \
                  \"/home/user/Projects\" exposes the host workspace {:?} outside the workspace \
-                 mount, where its masks and protected files do not apply; grant narrower paths \
-                 that leave the workspace out, mask this one, or reach these files through the \
+                 mount; the workspace must appear only at its mount, where its restrictions, \
+                 pinned parents and the supervisor's checks apply; grant narrower paths that \
+                 leave the workspace out, mask this one, or reach these files through the \
                  workspace mount",
                 home.join("Projects"),
                 f.ws()
@@ -3038,9 +3369,10 @@ mod tests {
             format!(
                 "cannot compile profile \"main\": provider \"p\": ro mount of {:?} (resolving to \
                  {:?}) at \"/home/user/ws-link\" exposes the host workspace {:?} outside the \
-                 workspace mount, where its masks and protected files do not apply; grant \
-                 narrower paths that leave the workspace out, mask this one, or reach these files \
-                 through the workspace mount",
+                 workspace mount; the workspace must appear only at its mount, where its \
+                 restrictions, pinned parents and the supervisor's checks apply; grant narrower \
+                 paths that leave the workspace out, mask this one, or reach these files through \
+                 the workspace mount",
                 home.join("ws-link"),
                 f.ws(),
                 f.ws()
@@ -3856,7 +4188,10 @@ mod tests {
     fn workspace_destination_links_are_decided_by_the_winning_mode() {
         let f = Fixture::new();
         f.file("home/cfg");
-        symlink("nowhere", f.ws().join("cfg")).unwrap();
+        // Not dangling: a mask of a dangling link is dropped by the planner,
+        // whatever the anchor, as there is no target to take a shape from.
+        f.file("ws/decoy");
+        symlink("decoy", f.ws().join("cfg")).unwrap();
         // The masked rule wins over the ro bind, so the link is an error.
         let e = compile_body(
             &f,
@@ -3892,6 +4227,694 @@ mod tests {
             "{:?}",
             child.warnings
         );
+    }
+
+    #[test]
+    fn workspace_rules_through_planted_links_are_refused() {
+        // `{workspace}` rules are resolved like any other: a link on the
+        // way is refused because the workspace is an untrusted root, by the
+        // destination check when the workspace is mounted underneath and by
+        // the host-source check otherwise.
+        let f = Fixture::new();
+        f.file("ws/real/x");
+        f.file("ws/real/.env");
+        symlink("real", f.ws().join("link")).unwrap();
+        let link = f.ws().join("link");
+        for (mode, pm) in [("masked", Masked), ("protected", Protected), ("ro", Ro)] {
+            let rule = format!("fs.{mode} = [\"{{workspace}}/link/x\"]");
+            let e = compile_body(&f, &format!("fs.rw = [\"{{workspace}}\"]\n{rule}")).unwrap_err();
+            let dl = destination_link(e, "main");
+            assert_eq!(
+                (dl.mode, &dl.link, dl.ancestor.as_path(), dl.root.kind),
+                (pm, &link, Path::new("/workspace"), UntrustedKind::Workspace),
+                "{rule}"
+            );
+            let lf = untrusted_link(compile_body(&f, &rule).unwrap_err(), "main");
+            assert_eq!((lf.mode, &lf.link), (pm, &link), "{rule}");
+            // A glob whose walk root is the link, or below it, is refused by
+            // the planner before walking, with or without the workspace
+            // mount.
+            for pattern in ["{workspace}/link/*", "{workspace}/link/**/*.env"] {
+                let rule = format!("fs.{mode} = [\"{pattern}\"]");
+                for body in [rule.clone(), format!("fs.rw = [\"{{workspace}}\"]\n{rule}")] {
+                    let CompileError::Profile { error, .. } = compile_body(&f, &body).unwrap_err()
+                    else {
+                        panic!("{body}: expected a profile error");
+                    };
+                    match *error {
+                        SpecError::Mounts(PathPlanError::WalkRootLink(ref w)) => {
+                            assert_eq!((w.mode, &w.link), (pm, &link), "{body}")
+                        }
+                        ref other => panic!("{body}: expected WalkRootLink, got {other:?}"),
+                    }
+                }
+            }
+        }
+        // Links escaping the workspace (`up -> ..`, an absolute link out of
+        // it) are refused alike for restrictive rules, here without the
+        // workspace mount, by the host-source check.
+        f.file("outside/secret");
+        symlink("..", f.ws().join("up")).unwrap();
+        symlink(f.root.join("outside"), f.ws().join("out")).unwrap();
+        for (pattern, via, resolved) in [
+            (
+                "{workspace}/up/outside/secret",
+                "up",
+                f.root.join("outside/secret"),
+            ),
+            (
+                "{workspace}/out/secret",
+                "out",
+                f.root.join("outside/secret"),
+            ),
+        ] {
+            for (mode, pm) in [("masked", Masked), ("protected", Protected), ("ro", Ro)] {
+                let rule = format!("fs.{mode} = [\"{pattern}\"]");
+                let lf = untrusted_link(compile_body(&f, &rule).unwrap_err(), "main");
+                assert_eq!(
+                    (
+                        lf.mode,
+                        &lf.link,
+                        &lf.resolved,
+                        lf.sandbox.as_path(),
+                        lf.root.kind
+                    ),
+                    (
+                        pm,
+                        &f.ws().join(via),
+                        &resolved,
+                        Path::new("/workspace")
+                            .join(pattern.trim_start_matches("{workspace}/"))
+                            .as_path(),
+                        UntrustedKind::Workspace
+                    ),
+                    "{rule}"
+                );
+            }
+        }
+        // `rw` rules are dropped with a warning instead.
+        let s = compile_body(&f, "fs.rw = [\"{workspace}\", \"{workspace}/link/x\"]").unwrap();
+        assert_eq!(mounts(spec(&s, "main")), [row("/workspace", Rw, "p")]);
+        assert_eq!(destination_warnings(&s, "main")[0].link, link);
+        let s = compile_body(&f, "fs.rw = [\"{workspace}/link/x\"]").unwrap();
+        assert!(spec(&s, "main").mounts.is_empty());
+        assert_eq!(source_warnings(&s, "main")[0].link, link);
+        // A path through a link that leads nowhere is missing, like any
+        // missing path: there is nothing to restrict.
+        let s = compile_body(&f, "fs.masked = [\"{workspace}/link/nope/deeper\"]").unwrap();
+        assert!(spec(&s, "main").mounts.is_empty());
+        assert!(
+            matches!(
+                get(&s, "main").warnings.as_slice(),
+                [SpecWarning::Mount(PlanWarning {
+                    kind: PlanWarningKind::Resolve(ResolveWarning::Missing { .. }),
+                    ..
+                })]
+            ),
+            "{:?}",
+            get(&s, "main").warnings
+        );
+    }
+
+    #[test]
+    fn masked_dangling_workspace_links_are_skipped() {
+        // A masked link whose target is missing has nothing to hide and no
+        // shape to take, whatever the anchor: it is skipped with a warning,
+        // literal or matched by a glob, with or without the workspace mount.
+        let f = Fixture::new();
+        symlink("nowhere", f.ws().join("a.env")).unwrap();
+        for body in [
+            "fs.masked = [\"{workspace}/a.env\"]",
+            "fs.masked = [\"{workspace}/*.env\"]",
+            "fs.rw = [\"{workspace}\"]\nfs.masked = [\"{workspace}/a.env\"]",
+        ] {
+            let s = compile_body(&f, body).unwrap();
+            assert!(
+                spec(&s, "main")
+                    .mounts
+                    .iter()
+                    .all(|m| m.sandbox == Path::new("/workspace")),
+                "{body}"
+            );
+            match get(&s, "main").warnings.as_slice() {
+                [
+                    SpecWarning::Mount(PlanWarning {
+                        kind: PlanWarningKind::SymlinkTarget { path, error },
+                        ..
+                    }),
+                ] => assert_eq!(
+                    (path, error.kind()),
+                    (&f.ws().join("a.env"), io::ErrorKind::NotFound),
+                    "{body}"
+                ),
+                other => panic!("{body}: expected one SymlinkTarget warning, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn masked_glob_links_with_uninspectable_targets() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipping: permission checks do not apply to root");
+            return;
+        }
+        let f = Fixture::new();
+        f.file("ws/locked/x");
+        f.file("home/locked/x");
+        f.mkdir("home/sub");
+        symlink("locked/x", f.ws().join("a.env")).unwrap();
+        symlink("../locked/x", f.root.join("home/sub/l")).unwrap();
+        let locked = [f.ws().join("locked"), f.root.join("home/locked")];
+        for l in &locked {
+            fs::set_permissions(l, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        // Inside the workspace, the match is skipped like any glob-matched
+        // link there, without looking at its target.
+        let skipped = compile_body(&f, "fs.masked = [\"{workspace}/*.env\"]");
+        // A host link outside every root must have an inspectable target:
+        // a masked rule is never skipped.
+        let host = compile_body(&f, "fs.masked = [\"~/sub/*\"]");
+        // A literal rule fails while planning, as before.
+        let literal = compile_body(&f, "fs.masked = [\"{workspace}/a.env\"]");
+        for l in &locked {
+            fs::set_permissions(l, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let s = skipped.unwrap();
+        assert!(spec(&s, "main").mounts.is_empty());
+        assert_eq!(glob_links(&s, "main")[0].2, f.ws().join("a.env"));
+        let CompileError::Profile { error, .. } = host.unwrap_err() else {
+            panic!("expected a profile error");
+        };
+        let msg = error.to_string();
+        assert_eq!(
+            *error,
+            SpecError::MaskTargetUninspectable {
+                provider: "p".parse().unwrap(),
+                host: f.root.join("home/sub/l"),
+                sandbox: "/home/user/sub/l".into(),
+                kind: io::ErrorKind::PermissionDenied,
+            }
+        );
+        assert!(msg.contains("a masked rule is never skipped"), "{msg}");
+        let CompileError::Profile { error, .. } = literal.unwrap_err() else {
+            panic!("expected a profile error");
+        };
+        assert!(
+            matches!(
+                *error,
+                SpecError::Mounts(PathPlanError::Inaccessible { mode: Masked, .. })
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_binds_through_planted_links_are_refused() {
+        // A bind's host side through a link inside the workspace is refused
+        // like a `~` bind's: an error for `ro` and `protected`, a dropped
+        // mount for `rw`. (The planner used to skip every such bind with a
+        // warning; a restrictive bind now fails closed like any other.)
+        let f = Fixture::new();
+        f.file("ws/real/x");
+        f.file("outside/secret");
+        symlink("real", f.ws().join("via")).unwrap();
+        symlink(f.root.join("outside"), f.ws().join("out")).unwrap();
+        symlink(f.root.join("outside/secret"), f.ws().join("final")).unwrap();
+        for (host, link) in [("via/x", "via"), ("out/secret", "out"), ("final", "final")] {
+            for (mode, pm) in [("ro", Ro), ("protected", Protected)] {
+                let bind = format!(
+                    "fs.bind = [{{ host = \"{{workspace}}/{host}\", sandbox = \"/opt/b\", \
+                     mode = \"{mode}\" }}]"
+                );
+                let lf = untrusted_link(compile_body(&f, &bind).unwrap_err(), "main");
+                assert_eq!(
+                    (lf.mode, &lf.link, lf.sandbox.as_path()),
+                    (pm, &f.ws().join(link), Path::new("/opt/b")),
+                    "{bind}"
+                );
+            }
+            let bind = format!(
+                "fs.bind = [{{ host = \"{{workspace}}/{host}\", sandbox = \"/opt/b\", \
+                 mode = \"rw\" }}]"
+            );
+            let s = compile_body(&f, &bind).unwrap();
+            assert!(spec(&s, "main").mounts.is_empty(), "{bind}");
+            assert_eq!(
+                source_warnings(&s, "main")[0].link,
+                f.ws().join(link),
+                "{bind}"
+            );
+        }
+    }
+
+    /// The `GlobLink` of every `GlobLink` warning of `profile` as
+    /// `(provider, mode, link, sandbox)`; panics on any other warning.
+    fn glob_links(s: &CompiledSession, profile: &str) -> Vec<(String, PathMode, PathBuf, PathBuf)> {
+        get(s, profile)
+            .warnings
+            .iter()
+            .map(|w| match w {
+                SpecWarning::GlobLink(gl) => (
+                    gl.provider.to_string(),
+                    gl.mode,
+                    gl.link.clone(),
+                    gl.sandbox.clone(),
+                ),
+                other => panic!("unexpected warning {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn glob_matched_links_in_untrusted_roots_are_skipped_for_every_mode() {
+        let f = Fixture::new();
+        f.file("ws/bar.nix");
+        f.file("ws/nix/real.nix");
+        symlink("bar.nix", f.ws().join("foo.nix")).unwrap();
+        symlink("real.nix", f.ws().join("nix/alias.nix")).unwrap();
+        for (mode, pm) in [
+            ("masked", Masked),
+            ("protected", Protected),
+            ("ro", Ro),
+            ("rw", Rw),
+        ] {
+            let body = if pm == Rw {
+                "fs.rw = [\"{workspace}\", \"{workspace}/**/*.nix\"]".to_owned()
+            } else {
+                format!("fs.rw = [\"{{workspace}}\"]\nfs.{mode} = [\"{{workspace}}/**/*.nix\"]")
+            };
+            let s = compile_body(&f, &body).unwrap();
+            // The links are not mounted; their targets are matched directly.
+            assert_eq!(
+                mounts(spec(&s, "main")),
+                [
+                    row("/workspace", Rw, "p"),
+                    row("/workspace/bar.nix", pm, "p"),
+                    row("/workspace/nix/real.nix", pm, "p"),
+                ],
+                "{mode}"
+            );
+            assert_eq!(
+                glob_links(&s, "main"),
+                [
+                    (
+                        "p".into(),
+                        pm,
+                        f.ws().join("foo.nix"),
+                        PathBuf::from("/workspace/foo.nix")
+                    ),
+                    (
+                        "p".into(),
+                        pm,
+                        f.ws().join("nix/alias.nix"),
+                        PathBuf::from("/workspace/nix/alias.nix")
+                    ),
+                ],
+                "{mode}"
+            );
+        }
+        // Without the workspace mount too: the workspace is always a root.
+        let s = compile_body(&f, "fs.masked = [\"{workspace}/nix/*\"]").unwrap();
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [row("/workspace/nix/real.nix", Masked, "p")]
+        );
+        assert_eq!(get(&s, "main").warnings.len(), 1);
+        assert_eq!(
+            get(&s, "main").warnings[0].to_string(),
+            format!(
+                "provider \"p\": the masked glob match {:?} at \"/workspace/nix/alias.nix\" is the \
+                 symlink {:?} inside the host workspace {:?}; a sandbox can write there, so \
+                 links inside it are never followed, and the match is skipped (write a rule for \
+                 the link's target if it needs one)",
+                f.ws().join("nix/alias.nix"),
+                f.ws().join("nix/alias.nix"),
+                f.ws()
+            )
+        );
+    }
+
+    #[test]
+    fn glob_matched_links_are_skipped_whatever_the_anchor_or_root() {
+        // Inside an rw grant, in this profile or another one.
+        let f = planted_cache_link();
+        let tool = f.root.join("home/.cache/tool");
+        let s = compile_body(
+            &f,
+            "fs.rw = [\"~/.cache/tool\"]\nfs.masked = [\"~/.cache/tool/*\"]",
+        )
+        .unwrap();
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [row("/home/user/.cache/tool", Rw, "p")]
+        );
+        assert_eq!(
+            glob_links(&s, "main"),
+            [(
+                "p".into(),
+                Masked,
+                tool.join("cfg"),
+                PathBuf::from("/home/user/.cache/tool/cfg")
+            )]
+        );
+        let s = f
+            .try_compile(&format!(
+                "base = \"none\"\n[profiles.agent]\ninherit = \"none\"\n{}{}",
+                prov("w", "agent", "fs.rw = [\"~/.cache/tool\"]"),
+                prov("p", "main", "fs.ro = [\"~/.cache/*/cfg\"]"),
+            ))
+            .unwrap();
+        assert!(spec(&s, "main").mounts.is_empty());
+        assert_eq!(glob_links(&s, "main")[0].2, tool.join("cfg"));
+        // A host link outside every root is kept, and followed.
+        let f = Fixture::new();
+        f.file("store/foo/config");
+        f.mkdir("home/.config");
+        symlink(f.root.join("store/foo"), f.root.join("home/.config/foo")).unwrap();
+        let s = compile_body(&f, "fs.ro = [\"~/.config/*\"]").unwrap();
+        assert!(get(&s, "main").warnings.is_empty());
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [row("/home/user/.config/foo", Ro, "p")]
+        );
+    }
+
+    #[test]
+    fn glob_matched_links_behind_planted_links_are_refused() {
+        // The walk root is a planted link, so the glob did not reach the
+        // real files: a link matched there is no skip but an error for a
+        // restrictive rule, like the files matched with it. Inside the
+        // workspace the planner refuses such a walk root before walking;
+        // inside an `rw` grant (not known while planning) it is walked and
+        // its matches are refused afterwards.
+        let f = planted_cache_link();
+        f.file("home/.ssh/b.nix");
+        symlink("b.nix", f.root.join("home/.ssh/a.nix")).unwrap();
+        let tool = f.root.join("home/.cache/tool");
+        let e = compile_body(
+            &f,
+            "fs.rw = [\"~/.cache/tool\"]\nfs.masked = [\"~/.cache/tool/cfg/a*\"]",
+        )
+        .unwrap_err();
+        assert_eq!(destination_link(e, "main").link, tool.join("cfg"));
+        let e = f
+            .try_compile(&format!(
+                "base = \"none\"\n[profiles.agent]\ninherit = \"none\"\n{}{}",
+                prov("w", "agent", "fs.rw = [\"~/.cache/tool\"]"),
+                prov("p", "main", "fs.masked = [\"~/.cache/tool/cfg/a*\"]"),
+            ))
+            .unwrap_err();
+        assert_eq!(untrusted_link(e, "main").link, tool.join("cfg"));
+    }
+
+    #[test]
+    fn a_skipped_glob_link_leaves_nothing_at_its_path() {
+        let f = Fixture::new();
+        f.file("ws/real.env");
+        symlink("real.env", f.ws().join("link.env")).unwrap();
+        // An inherited rw glob and an own masked glob both match the link:
+        // the masked one wins and is skipped, so nothing is mounted there
+        // (the link shows through whatever is underneath, and its target is
+        // matched directly).
+        let s = f
+            .try_compile(&format!(
+                "base = \"none\"\n[profiles.child]\n{}{}",
+                prov("parent", "main", "fs.rw = [\"{workspace}/*.env\"]"),
+                prov("own", "child", "fs.masked = [\"{workspace}/*.env\"]"),
+            ))
+            .unwrap();
+        assert_eq!(
+            mounts(spec(&s, "child")),
+            [row("/workspace/real.env", Masked, "own")]
+        );
+        assert_eq!(
+            glob_links(&s, "child"),
+            [(
+                "own".into(),
+                Masked,
+                f.ws().join("link.env"),
+                PathBuf::from("/workspace/link.env")
+            )]
+        );
+        // A literal rule at the link outranks the glob, and is refused like
+        // any literal rule through a planted link: an error, or for `rw` a
+        // dropped mount.
+        let e = compile_body(
+            &f,
+            "fs.masked = [\"{workspace}/*.env\"]\nfs.ro = [\"{workspace}/link.env\"]",
+        )
+        .unwrap_err();
+        assert_eq!(untrusted_link(e, "main").link, f.ws().join("link.env"));
+        let s = compile_body(
+            &f,
+            "fs.masked = [\"{workspace}/*.env\"]\nfs.rw = [\"{workspace}/link.env\"]",
+        )
+        .unwrap();
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [row("/workspace/real.env", Masked, "p")]
+        );
+        assert_eq!(source_warnings(&s, "main")[0].link, f.ws().join("link.env"));
+    }
+
+    #[test]
+    fn renamed_dir_replaced_by_a_link_is_still_masked_through_a_glob() {
+        let f = Fixture::new();
+        f.file("ws/config2/prod.env");
+        symlink("config2", f.ws().join("config")).unwrap();
+        // `**` does not descend into the link, and the link's own name does
+        // not match, so there is nothing to warn about.
+        let s = compile_body(
+            &f,
+            "fs.rw = [\"{workspace}\"]\nfs.masked = [\"{workspace}/**/*.env\"]",
+        )
+        .unwrap();
+        assert!(get(&s, "main").warnings.is_empty());
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [
+                row("/workspace", Rw, "p"),
+                row("/workspace/config2/prod.env", Masked, "p"),
+            ]
+        );
+        // A bare `**` matches the link itself, which is skipped; the real
+        // directory and its files are masked.
+        let s = compile_body(&f, "fs.masked = [\"{workspace}/**\"]").unwrap();
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [
+                row("/workspace/config2", Masked, "p"),
+                row("/workspace/config2/prod.env", Masked, "p"),
+            ]
+        );
+        assert_eq!(glob_links(&s, "main")[0].2, f.ws().join("config"));
+    }
+
+    /// The `Exposure` of every `RestrictedContentExposed` warning of `body`
+    /// compiled for `main`, which must compile; panics on any other
+    /// warning.
+    fn exposures(f: &Fixture, body: &str) -> Vec<Exposure> {
+        let s = compile_body(f, body).unwrap_or_else(|e| panic!("{body}: {e}"));
+        get(&s, "main")
+            .warnings
+            .iter()
+            .map(|w| match w {
+                SpecWarning::RestrictedContentExposed(x) => (**x).clone(),
+                other => panic!("{body}: unexpected warning {other:?}"),
+            })
+            .collect()
+    }
+
+    /// The only `Exposure` of `body` (see [`exposures`]), which must still
+    /// mount everything it was given: an exposure is a warning.
+    fn exposed(f: &Fixture, body: &str) -> Exposure {
+        match exposures(f, body).as_slice() {
+            [x] => x.clone(),
+            other => panic!("{body}: expected one exposure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn masked_content_shown_elsewhere_is_a_warning() {
+        let f = Fixture::new();
+        f.file("home/.config/tool/token");
+        f.file("home/.config/other");
+        let cfg = f.root.join("home/.config");
+        let token = cfg.join("tool/token");
+        let mask = "fs.masked = [\"~/.config/tool/token\"]\n";
+        let elsewhere =
+            "fs.bind = [{ host = \"~/.config\", sandbox = \"/opt/cfg\", mode = \"ro\" }]";
+        let body = format!("{mask}{elsewhere}");
+        let s = compile_body(&f, &body).unwrap();
+        // Both mounts are kept.
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [
+                row("/opt/cfg", Ro, "p"),
+                row("/home/user/.config/tool/token", Masked, "p"),
+            ]
+        );
+        let msg = get(&s, "main").warnings[0].to_string();
+        assert_eq!(
+            exposed(&f, &body),
+            Exposure {
+                provider: "p".parse().unwrap(),
+                mode: Ro,
+                host: cfg.clone(),
+                resolved: cfg.clone(),
+                sandbox: "/opt/cfg".into(),
+                shown: token.clone(),
+                shown_at: "/opt/cfg/tool/token".into(),
+                restricted_provider: "p".parse().unwrap(),
+                restricted_mode: Masked,
+                restricted_host: token.clone(),
+                restricted_sandbox: "/home/user/.config/tool/token".into(),
+            }
+        );
+        assert_eq!(
+            msg,
+            format!(
+                "provider \"p\": ro mount of {cfg:?} at \"/opt/cfg\" shows {token:?} at \
+                 \"/opt/cfg/tool/token\", where the masked mount of {token:?} by provider \"p\" at \
+                 \"/home/user/.config/tool/token\" does not apply, so it is still visible there; \
+                 narrow this grant to leave it out, add a rule for {token:?} if this mount shows \
+                 it at its own host path, or cover \"/opt/cfg/tool/token\" with an ephemeral rule \
+                 (an absolute rule names a host path, so one for a bind destination would be \
+                 skipped as missing)"
+            )
+        );
+        // At its aligned path, the mask covers what the grant shows there.
+        for ok in [
+            format!("{mask}fs.ro = [\"~/.config\"]"),
+            format!("{mask}fs.rw = [\"~/.config\"]"),
+            // Something mounted on top of the exposing mount hides it too:
+            // the fix the warning suggests for a bind destination.
+            format!("{mask}{elsewhere}\nfs.ephemeral = [\"/opt/cfg/tool\"]"),
+            // A masked ancestor shows nothing.
+            "fs.masked = [\"~/.config\", \"~/.config/tool/token\"]".to_owned(),
+            // Siblings are unrelated.
+            format!("{mask}fs.ro = [\"~/.config/other\"]"),
+        ] {
+            assert_eq!(exposures(&f, &ok), [], "{ok}");
+        }
+        // A link to the grant is resolved first.
+        symlink(&cfg, f.root.join("home/cfg-link")).unwrap();
+        let x = exposed(&f, &format!("{mask}fs.ro = [\"~/cfg-link\"]"));
+        assert_eq!(
+            (x.resolved, x.shown_at),
+            (cfg.clone(), PathBuf::from("/home/user/cfg-link/tool/token"))
+        );
+        // A source inside a masked directory is part of what it hides: fine
+        // at its aligned path, where the deeper rule wins, but not elsewhere.
+        let dir_mask = "fs.masked = [\"~/.config/tool\"]\n";
+        assert_eq!(
+            exposures(&f, &format!("{dir_mask}fs.ro = [\"~/.config/tool/token\"]")),
+            []
+        );
+        let x = exposed(
+            &f,
+            &format!(
+                "{dir_mask}fs.bind = [{{ host = \"~/.config/tool/token\", sandbox = \
+                 \"/opt/token\", mode = \"ro\" }}]"
+            ),
+        );
+        assert_eq!(
+            (x.shown, x.shown_at, x.restricted_host),
+            (token.clone(), PathBuf::from("/opt/token"), cfg.join("tool"))
+        );
+    }
+
+    #[test]
+    fn masked_host_link_whose_target_is_mounted_too_is_a_warning() {
+        // A home-manager file masked at `~/.config/foo`, linking into a
+        // store that is mounted read-only as well: the target stays
+        // visible in the store, which only the host controls.
+        let f = Fixture::new();
+        f.file("store/abc-foo/config");
+        f.mkdir("home/.config");
+        let target = f.root.join("store/abc-foo");
+        symlink(&target, f.root.join("home/.config/foo")).unwrap();
+        let store = f.root.join("store");
+        let body = format!(
+            "fs.masked = [\"~/.config/foo\"]\nfs.ro = [\"{}\"]",
+            store.display()
+        );
+        let x = exposed(&f, &body);
+        assert_eq!(
+            (x.mode, x.shown, x.shown_at, x.restricted_sandbox),
+            (
+                Ro,
+                target.clone(),
+                target.clone(),
+                PathBuf::from("/home/user/.config/foo")
+            )
+        );
+        // Masking the target at its host path, where the aligned store mount
+        // shows it, covers it.
+        assert_eq!(
+            exposures(
+                &f,
+                &format!(
+                    "fs.masked = [\"~/.config/foo\", \"{}\"]\nfs.ro = [\"{}\"]",
+                    target.display(),
+                    store.display()
+                )
+            ),
+            []
+        );
+    }
+
+    #[test]
+    fn protected_content_counts_only_writable_views() {
+        let f = Fixture::new();
+        f.file("home/proj2/flake.nix");
+        let proj = f.root.join("home/proj2");
+        let protect = "fs.protected = [\"~/proj2/flake.nix\"]\n";
+        let bind = |mode: &str| {
+            format!(
+                "{protect}fs.bind = [{{ host = \"~/proj2\", sandbox = \"/src\", mode = \
+                 \"{mode}\" }}]"
+            )
+        };
+        // A read-only view of protected content exposes nothing protected:
+        // it is readable at its own path too.
+        assert_eq!(exposures(&f, &bind("ro")), []);
+        assert_eq!(exposures(&f, &bind("protected")), []);
+        // A writable one does.
+        let body = bind("rw");
+        let x = exposed(&f, &body);
+        let msg = x.to_string();
+        assert_eq!(
+            (x.mode, x.restricted_mode, x.shown_at, x.shown),
+            (
+                Rw,
+                Protected,
+                PathBuf::from("/src/flake.nix"),
+                proj.join("flake.nix")
+            )
+        );
+        assert!(msg.contains("so it is still writable there"), "{msg}");
+        // At its aligned path, the protection applies.
+        assert_eq!(
+            exposures(&f, &format!("{protect}fs.rw = [\"~/proj2\"]")),
+            []
+        );
+    }
+
+    #[test]
+    fn workspace_content_shown_elsewhere_is_still_a_workspace_error() {
+        // The workspace rule runs first, so a grant containing the
+        // workspace is reported as such even when it exposes masked files.
+        let f = Fixture::with_workspace("home/Projects/stopit", "/workspace");
+        f.file("home/Projects/stopit/.env");
+        let e = f
+            .try_compile(&prov("p", "main", "fs.ro = [\"~/Projects\"]"))
+            .unwrap_err();
+        assert_eq!(exposure(&f, e).1, f.root.join("home/Projects"));
+        // Even without anything restricted in it.
+        let e = compile_body(&f, "fs.ro = [\"~/Projects\"]").unwrap_err();
+        assert_eq!(exposure(&f, e).1, f.root.join("home/Projects"));
     }
 
     #[test]
@@ -4201,6 +5224,7 @@ mod tests {
             },
             mode,
             provider: provider.parse().unwrap(),
+            glob_link: false,
         };
         let mut roots = UntrustedRoots::new(&ws);
         roots.add_rw_mounts(
@@ -4217,6 +5241,7 @@ mod tests {
                     source: MountSource::Ephemeral,
                     mode: Rw,
                     provider: "e".parse().unwrap(),
+                    glob_link: false,
                 },
             ],
         );

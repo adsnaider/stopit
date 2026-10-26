@@ -13,7 +13,6 @@
 mod resolve;
 
 pub use resolve::{EntryKind, Resolution, ResolveWarning, ResolvedPath, resolve};
-pub(crate) use resolve::{NoSymlinksError, check_no_symlinks};
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -204,6 +203,21 @@ impl ExpandedPattern {
     /// The sandbox path, or `None` if the pattern is a glob.
     pub fn sandbox(&self) -> Option<PathBuf> {
         (!self.has_glob()).then(|| join(&self.sandbox_anchor, &self.rest))
+    }
+
+    /// For a glob, the host directory its walk starts from: the host anchor
+    /// joined with the glob's literal prefix (the components before the
+    /// first one containing a glob character). `None` for a literal path.
+    pub fn walk_root(&self) -> Option<PathBuf> {
+        if !self.has_glob() {
+            return None;
+        }
+        let prefix: PathBuf = self
+            .rest
+            .components()
+            .take_while(|c| !has_glob(&c.as_os_str().to_string_lossy()))
+            .collect();
+        Some(join(&self.host_anchor, &prefix))
     }
 }
 
