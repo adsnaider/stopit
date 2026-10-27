@@ -918,10 +918,14 @@ pub enum ReservedReason {
     InsideWorkspace(PathBuf),
 }
 
+/// stopit's runtime directory inside the sandbox, where the session
+/// directory's shims, sockets and provisioned binary appear (DESIGN.md §2.1).
+pub const SANDBOX_RUNTIME_DIR: &str = "/run/stopit";
+
 /// The directories stopit sets up itself and that nothing else may equal,
 /// contain or be placed inside: the masked `/proc`, the `/dev`, and
 /// stopit's own runtime directory.
-const SYSTEM_DIRS: [&str; 3] = ["/proc", "/dev", "/run/stopit"];
+const SYSTEM_DIRS: [&str; 3] = ["/proc", "/dev", SANDBOX_RUNTIME_DIR];
 
 /// `/etc`: stopit synthesizes some files in it (every [`EtcFile`]), but the
 /// rest of it is an ordinary place for mounts.

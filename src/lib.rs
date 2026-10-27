@@ -8,6 +8,7 @@ pub mod expand;
 pub mod manifest;
 pub mod policy;
 pub mod provider;
+pub mod provision;
 pub mod resolve;
 mod serde_util;
 pub mod session;

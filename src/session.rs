@@ -225,7 +225,7 @@ impl Drop for SessionDir {
 
 /// Creates the directory `path` with mode 0700, failing if it exists. The mode
 /// is set explicitly, so it holds whatever the umask is.
-fn create_private_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
     DirBuilder::new().mode(PRIVATE_MODE).create(path)?;
     fs::set_permissions(path, Permissions::from_mode(PRIVATE_MODE))
 }
