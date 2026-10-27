@@ -35,6 +35,7 @@ use rustix::io::Errno;
 use thiserror::Error;
 
 use crate::config::{Config, ProfileRef, ProviderName};
+use crate::error::is_missing;
 use crate::expand::{EntryKind, ExpansionContext};
 use crate::manifest::{
     DevMode, Domain, EtcFile, OptInSyscall, SandboxHome, ShareableNamespace, ShimName, ShimSpec,
@@ -43,8 +44,8 @@ use crate::policy::{NetworkMode, PathMode};
 use crate::provider::ProviderOutput;
 use crate::resolve::{
     EffectiveEnv, EffectiveGrants, EffectiveNetwork, MergeError, MountPlan, MountSource,
-    PathPlanError, PlanWarning, PlannedMount, ProfileError, build_profile_graph, merge_profiles,
-    plan_mounts,
+    PathPlanError, PlanWarning, PlannedMount, ProfileError, build_profile_graph, hidden_note,
+    merge_profiles, plan_mounts,
 };
 
 /// One profile's sandbox, independent of the engine that builds it.
@@ -180,6 +181,51 @@ pub enum SpecWarning {
         #[source]
         error: io::Error,
     },
+    /// A restrictive mount's destination could not be checked for symlinks
+    /// (a directory on the way cannot be searched), so that directory is
+    /// masked as a whole, and the mount is kept on top of the mask (DESIGN.md
+    /// §1.5, §6.2, "Untrusted links").
+    #[error(transparent)]
+    DestinationMasked(Box<DestinationMasked>),
+    /// A mask synthesized for a [`SpecWarning::DestinationMasked`] lies at
+    /// the sandbox path of the mount underneath (that mount's own source
+    /// cannot be searched), so it replaces that mount: the whole grant (the
+    /// workspace mount, say) is hidden this session.
+    #[error(transparent)]
+    GrantHidden(Box<GrantHidden>),
+    /// A mount was skipped because its host source cannot be resolved: for
+    /// any mode, a final symlink whose target is missing (there is nothing
+    /// to show or hide, as for a missing path), and for an `rw` mount any
+    /// failure (dropping a grant only removes access). A restrictive mount
+    /// whose source cannot be resolved otherwise is an error
+    /// ([`SpecError::HostSourceUnresolved`]), unless it lies inside a masked
+    /// directory ([`SpecWarning::SourceUnderMask`]).
+    #[error("{0}, so the mount is skipped")]
+    SourceUnresolved(Box<SourceUnresolved>),
+    /// A restrictive mount was skipped because its host source cannot be
+    /// inspected (not because it is missing, nor after following a link
+    /// inside an untrusted root) and it lies inside a masked directory of
+    /// the profile, at the second path: the mask hides everything there,
+    /// which is stricter than the mount. A synthesized mask over a
+    /// directory that cannot be searched does that (DESIGN.md §1.5).
+    #[error(
+        "{0}; it lies inside the directory masked at {1:?}, which hides everything there, so the \
+         mount is skipped"
+    )]
+    SourceUnderMask(Box<SourceUnresolved>, PathBuf),
+    /// A `masked` mount's host source cannot be resolved to a canonical path
+    /// (it changed after planning, or it is a directory masked because a
+    /// restrictive rule could not inspect below it, reached through a host
+    /// symlink whose target cannot be resolved). The mask needs no host
+    /// content and its shape was decided while planning, so it is kept,
+    /// but whether the content it covers is visible at another sandbox path
+    /// is not checked for it (DESIGN.md §6.2, "Restricted content
+    /// exposure").
+    #[error(
+        "{0}; the mask is kept, but whether the content it covers is visible at another sandbox \
+         path is not checked"
+    )]
+    MaskSourceUnresolved(Box<SourceUnresolved>),
     /// An `rw` mount was skipped because its host source runs through a
     /// symlink inside an untrusted root (DESIGN.md §3.4, Symlinks; §6.2,
     /// "Untrusted links"); a restrictive one is an error
@@ -324,9 +370,16 @@ pub enum SpecError {
          rule's anchor or the links leading there: remove the link or change the rule"
     )]
     UntrustedLinkFollowed(Box<LinkFollowed>),
-    /// A mount's host source could not be resolved to a canonical path, so
-    /// whether it exposes the host workspace or follows a link the sandbox
-    /// may have planted cannot be checked.
+    /// A restrictive mount's host source could not be resolved to a
+    /// canonical path, so whether it exposes the host workspace or follows a
+    /// link the sandbox may have planted cannot be checked. This is a final
+    /// symlink outside every untrusted root whose target exists but cannot
+    /// be inspected (a loop, a directory that cannot be searched): the shape
+    /// of a mask over it would be unknown. A missing target, or an `rw`
+    /// mount, is skipped with [`SpecWarning::SourceUnresolved`] instead, a
+    /// mount inside a masked directory with [`SpecWarning::SourceUnderMask`],
+    /// and a lookup that followed a link inside an untrusted root first is
+    /// [`SpecError::UntrustedLinkFollowed`].
     #[error(
         "provider {:?}: cannot resolve the host source {host:?} of the {mode} mount at \
          {sandbox:?} ({kind}) to check that it neither exposes the host workspace nor follows a \
@@ -356,26 +409,91 @@ pub enum SpecError {
         mode = .0.mode
     )]
     DestinationLinkFollowed(Box<DestinationLink>),
-    /// A restrictive mount's destination could not be checked for symlinks
-    /// (a path on the way exists but cannot be inspected), so the mount can
-    /// neither be placed safely nor skipped.
-    #[error(
-        "provider {:?}: cannot check the destination {sandbox:?} of the {mode} mount for \
-         symlinks: inspecting {path:?} failed ({kind}), and a {mode} mount is never skipped",
-        .provider.as_str()
-    )]
-    DestinationUnchecked {
-        /// The provider whose rule produced the mount.
-        provider: ProviderName,
-        /// The mount's mode.
-        mode: PathMode,
-        /// The mount's sandbox destination.
-        sandbox: PathBuf,
-        /// The host path that could not be inspected.
-        path: PathBuf,
-        /// What went wrong inspecting it.
-        kind: io::ErrorKind,
-    },
+}
+
+/// A restrictive mount's destination could not be checked for symlinks: a
+/// path on the way, below the mount underneath it, exists but cannot be
+/// inspected, because the directory containing it cannot be searched. A
+/// restrictive mount is never skipped, so that directory is masked as a
+/// whole (an empty read-only directory, which bwrap reaches without passing
+/// through it), and the mount is kept on top of the mask, where nothing
+/// needs checking (DESIGN.md §1.5; §6.2, "Untrusted links"). That is
+/// stricter than the configuration: everything else in the directory is
+/// hidden too.
+#[derive(Debug, Error)]
+#[error(
+    "provider {:?}: cannot check the destination {sandbox:?} of the {mode} mount for symlinks: \
+     inspecting {path:?} failed: {error}; a {mode} mount is never skipped, so the directory \
+     {masked_host:?} is masked at {masked:?}, hiding everything in it, and the mount is kept on top",
+    .provider.as_str()
+)]
+pub struct DestinationMasked {
+    /// The provider whose rule produced the mount.
+    pub provider: ProviderName,
+    /// The mount's mode.
+    pub mode: PathMode,
+    /// The mount's sandbox destination.
+    pub sandbox: PathBuf,
+    /// The host path that could not be inspected.
+    pub path: PathBuf,
+    /// The error inspecting it.
+    #[source]
+    pub error: io::Error,
+    /// The sandbox path of the directory masked.
+    pub masked: PathBuf,
+    /// The host directory masked there (canonical): the directory
+    /// containing `path`.
+    pub masked_host: PathBuf,
+}
+
+/// A mount replaced by a mask over a directory that cannot be searched (see
+/// [`SpecWarning::GrantHidden`]).
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "provider {:?}: {}",
+    .provider.as_str(),
+    hidden_note(*.workspace, *.mode, .sandbox, .dir)
+)]
+pub struct GrantHidden {
+    /// The provider whose rule produced the hidden mount.
+    pub provider: ProviderName,
+    /// The hidden mount's mode.
+    pub mode: PathMode,
+    /// The hidden mount's sandbox path, where the mask is.
+    pub sandbox: PathBuf,
+    /// The host directory masked there (canonical), which cannot be
+    /// searched.
+    pub dir: PathBuf,
+    /// Whether `sandbox` is the workspace mount.
+    pub workspace: bool,
+}
+
+/// A mount's host source cannot be resolved to a canonical path (see
+/// [`SpecWarning::SourceUnresolved`], [`SpecWarning::SourceUnderMask`] and
+/// [`SpecWarning::MaskSourceUnresolved`]).
+#[derive(Debug, Error)]
+#[error(
+    "provider {:?}: cannot resolve the host source {host:?} of the {mode} mount at {sandbox:?}: \
+     {error}{}",
+    .provider.as_str(),
+    via_note(.link)
+)]
+pub struct SourceUnresolved {
+    /// The provider whose rule produced the mount.
+    pub provider: ProviderName,
+    /// The mount's mode.
+    pub mode: PathMode,
+    /// The mount's host source, as planned.
+    pub host: PathBuf,
+    /// The mount's sandbox destination.
+    pub sandbox: PathBuf,
+    /// The first symlink inside an untrusted root the lookup followed
+    /// before it failed (named below its canonical parent directory), and
+    /// that root: a planted dangling link, say.
+    pub link: Option<(PathBuf, UntrustedRoot)>,
+    /// What went wrong resolving it.
+    #[source]
+    pub error: io::Error,
 }
 
 /// A mount's host source runs through a symlink inside an untrusted root, a
@@ -401,7 +519,8 @@ pub struct LinkFollowed {
     /// The first symlink inside an untrusted root that resolving `host`
     /// follows, named below its canonical parent directory.
     pub link: PathBuf,
-    /// `host` with every symlink resolved.
+    /// `host` with every symlink resolved; if the lookup fails after
+    /// following `link`, the path it failed at.
     pub resolved: PathBuf,
     /// The mount's sandbox destination.
     pub sandbox: PathBuf,
@@ -612,8 +731,8 @@ impl UntrustedRoots {
     /// source that itself runs through a link inside a root is rejected by
     /// the host-source check of its own profile, so the root it adds here
     /// never matters. A source that cannot be resolved is not a root: bwrap
-    /// could not mount it either, and the same check rejects it
-    /// ([`SpecError::HostSourceUnresolved`]), so the session never starts.
+    /// could not mount it either, and the destination check drops it
+    /// ([`SpecWarning::SourceUnresolved`]).
     fn add_rw_mounts(&mut self, profile: Option<&ProfileRef>, mounts: &[PlannedMount]) {
         let none = UntrustedRoots::none();
         for m in mounts {
@@ -656,6 +775,15 @@ fn resolved_note(host: &Path, resolved: &Path) -> String {
         String::new()
     } else {
         format!(" (resolving to {resolved:?})")
+    }
+}
+
+/// `" (after following the symlink … inside …)"` for a lookup that followed
+/// a link inside an untrusted root before it failed.
+fn via_note(link: &Option<(PathBuf, UntrustedRoot)>) -> String {
+    match link {
+        Some((link, root)) => format!(" (after following the symlink {link:?} inside {root})"),
+        None => String::new(),
     }
 }
 
@@ -775,7 +903,20 @@ fn check_mount_destinations(mounts: &[PlannedMount]) -> Result<(), SpecError> {
 /// The planner keeps host sources as written: `~` and absolute rules follow
 /// symlinks on the way and binds follow a final symlink, as bwrap does when
 /// mounting. Hence each source is resolved first (see
-/// [`resolve_host_source`]); a source that cannot be resolved fails closed.
+/// [`resolve_host_source`]). [`check_destination_links`] has already
+/// dropped every non-masked mount whose source cannot be resolved for a
+/// missing target, and every such `rw` one. What is left fails closed: a
+/// restrictive source that cannot be resolved otherwise is an error
+/// ([`SpecError::HostSourceUnresolved`]), or, if the lookup followed a link
+/// inside an untrusted root first, [`SpecError::UntrustedLinkFollowed`];
+/// one inside a masked directory of `mounts` is dropped instead, with
+/// [`SpecWarning::SourceUnderMask`], since the mask hides it anyway (the
+/// planner masks a directory a restrictive rule cannot inspect below, so
+/// that is for a layout that changed since). Returns the mounts kept. A
+/// `masked` mount is kept even if its source cannot be resolved (it shows
+/// nothing of it, and its shape was decided while planning), with
+/// [`SpecWarning::MaskSourceUnresolved`], unless the lookup followed such a
+/// link, which is refused as for any mask.
 ///
 /// **Untrusted links.** No source may run through a symlink inside an
 /// untrusted root, a host directory some sandbox of the session can write:
@@ -826,18 +967,36 @@ fn check_mount_destinations(mounts: &[PlannedMount]) -> Result<(), SpecError> {
 /// `ctx`'s host workspace is canonical by contract, and is one of `roots`.
 /// Paths are compared by component.
 fn check_host_sources(
-    mounts: &[PlannedMount],
+    mounts: Vec<PlannedMount>,
     ctx: &ExpansionContext,
     roots: &UntrustedRoots,
     warnings: &mut Vec<SpecWarning>,
-) -> Result<(), SpecError> {
+) -> Result<Vec<PlannedMount>, SpecError> {
     let ws_host = ctx.workspace_host();
     let ws_sandbox = ctx.workspace_sandbox();
-    // The canonical source of each mount, `None` for an ephemeral one.
+    // The sandbox paths of the masked directories, none of which is dropped
+    // here.
+    let masked_dirs: Vec<PathBuf> = mounts
+        .iter()
+        .filter(|m| {
+            m.mode == PathMode::Masked
+                && matches!(
+                    m.source,
+                    MountSource::Host {
+                        kind: EntryKind::Dir,
+                        ..
+                    }
+                )
+        })
+        .map(|m| m.sandbox.clone())
+        .collect();
+    let mut kept = Vec::with_capacity(mounts.len());
+    // The canonical source of each kept mount, `None` for an ephemeral one.
     let mut sources = Vec::with_capacity(mounts.len());
     for m in mounts {
         let MountSource::Host { path: host, kind } = &m.source else {
             sources.push(None);
+            kept.push(m);
             continue;
         };
         let unresolved = |error: io::Error| SpecError::HostSourceUnresolved {
@@ -852,10 +1011,18 @@ fn check_host_sources(
             let (Some(parent), Some(name)) = (host.parent(), host.file_name()) else {
                 unreachable!("a matched link has a parent and a name");
             };
-            let way = resolve_host_source(parent, roots).map_err(unresolved)?;
+            // A lookup that failed after following a planted link is refused
+            // for that link, as below.
+            let way =
+                resolve_host_source(parent, roots).map_err(|u| match u.untrusted.first() {
+                    Some(followed) => {
+                        SpecError::UntrustedLinkFollowed(link_followed(&m, host, &u.path, followed))
+                    }
+                    None => unresolved(u.error),
+                })?;
             if let Some(followed) = way.untrusted.first() {
                 return Err(SpecError::UntrustedLinkFollowed(link_followed(
-                    m,
+                    &m,
                     host,
                     &way.path.join(name),
                     followed,
@@ -871,12 +1038,44 @@ fn check_host_sources(
                     .map_or(io::ErrorKind::Other, |e| e.kind()),
             });
         }
-        let source = resolve_host_source(host, roots).map_err(unresolved)?;
+        let source = match resolve_host_source(host, roots) {
+            Ok(source) => source,
+            Err(u) => {
+                if let Some(followed) = u.untrusted.first() {
+                    return Err(SpecError::UntrustedLinkFollowed(link_followed(
+                        &m, host, &u.path, followed,
+                    )));
+                }
+                if m.mode == PathMode::Masked {
+                    warnings.push(SpecWarning::MaskSourceUnresolved(source_unresolved(
+                        &m, host, u,
+                    )));
+                    sources.push(None);
+                    kept.push(m);
+                    continue;
+                }
+                // Below a masked directory the mask is stricter than the
+                // mount: the content is hidden either way. (The planner
+                // masks a directory a restrictive rule cannot inspect below,
+                // so this is defensive, for a layout that changed since.)
+                let mask = masked_dirs
+                    .iter()
+                    .find(|d| m.sandbox.starts_with(d) && m.sandbox != **d);
+                if let Some(mask) = mask {
+                    warnings.push(SpecWarning::SourceUnderMask(
+                        source_unresolved(&m, host, u),
+                        mask.clone(),
+                    ));
+                    continue;
+                }
+                return Err(unresolved(u.error));
+            }
+        };
         // Only a restrictive mount gets here with such a link:
         // `check_destination_links` has dropped every `rw` one.
         if let Some(followed) = source.untrusted.first() {
             return Err(SpecError::UntrustedLinkFollowed(link_followed(
-                m,
+                &m,
                 host,
                 &source.path,
                 followed,
@@ -902,9 +1101,10 @@ fn check_host_sources(
             });
         }
         sources.push(Some(resolved));
+        kept.push(m);
     }
-    check_restricted_exposure(mounts, &sources, warnings);
-    Ok(())
+    check_restricted_exposure(&kept, &sources, warnings);
+    Ok(kept)
 }
 
 /// `base` joined with the relative path `rel`, or `base` itself if `rel` is
@@ -1032,6 +1232,22 @@ fn link_followed(
     })
 }
 
+/// The [`SourceUnresolved`] for the mount `m` of `host`, whose lookup failed
+/// with `u`.
+fn source_unresolved(m: &PlannedMount, host: &Path, u: Unresolved<'_>) -> Box<SourceUnresolved> {
+    Box::new(SourceUnresolved {
+        provider: m.provider.clone(),
+        mode: m.mode,
+        host: host.to_owned(),
+        sandbox: m.sandbox.clone(),
+        link: u
+            .untrusted
+            .first()
+            .map(|l| (l.link.clone(), l.root.clone())),
+        error: u.error,
+    })
+}
+
 /// What a kept mount puts underneath the sandbox paths below it, for
 /// [`check_destination_links`].
 enum Underneath {
@@ -1044,8 +1260,9 @@ enum Underneath {
     },
     /// A tree whose contents are not checked: a masked directory (an empty
     /// directory nothing written persists in), an ephemeral directory (not
-    /// checkable yet), or a host source that cannot be resolved (rejected by
-    /// [`check_host_sources`] anyway).
+    /// checkable yet), or a restrictive mount's host source that cannot be
+    /// resolved (rejected by [`check_host_sources`] anyway, or dropped there
+    /// inside a masked directory).
     Unchecked,
 }
 
@@ -1068,8 +1285,15 @@ enum Underneath {
 /// host's (a home-manager link under an `ro ~`, say) and bwrap follows it
 /// within the sandbox's tree, where the rest of the way is not checked
 /// (DESIGN.md §11). A missing component is fine: bwrap creates the mount
-/// point. A path on the way that exists but cannot be inspected is an error
-/// for a restrictive mount and drops an `rw` one with a warning. A
+/// point. A path on the way that exists but cannot be inspected drops an
+/// `rw` mount with a warning. A restrictive mount is never skipped: the
+/// directory containing that path, which cannot be searched, is masked
+/// instead, replacing the ancestor if it is the ancestor's own source (with
+/// [`SpecWarning::GrantHidden`] as well; `ws_sandbox`, the workspace mount,
+/// tells whether that is the workspace), and the mount is kept on top of
+/// the mask, with [`SpecWarning::DestinationMasked`] (DESIGN.md §1.5). That holds for
+/// `ephemeral` too: its mount shows nothing of the host, and the mask hides
+/// what the unsearchable directory held around it. A
 /// destination with no ancestor mount lies on bwrap's own root `tmpfs`;
 /// one inside a masked directory, nothing the sandbox writes persists in;
 /// neither has anything to check. One inside an ephemeral mount is not
@@ -1085,6 +1309,12 @@ enum Underneath {
 /// an untrusted root is dropped here too, with [`SpecWarning::SourceLink`]:
 /// that is [`check_host_sources`]'s rule (which refuses such a restrictive
 /// mount), applied here so that the dropped mount is never an ancestor.
+/// Likewise an `rw` mount whose host source cannot be resolved is dropped
+/// with [`SpecWarning::SourceUnresolved`]. Before its destination is even
+/// checked, a mount (of any mode but `masked`, which shows nothing of its
+/// source) whose source cannot be resolved because a final link's target
+/// is missing is dropped the same way: it mounts nothing, as for a missing
+/// path, even if the link lies inside an untrusted root.
 ///
 /// Before any of that, a mount of a link matched by a glob that lies inside
 /// an untrusted root is dropped with [`SpecWarning::GlobLink`], whatever its
@@ -1104,6 +1334,7 @@ enum Underneath {
 /// links, never fewer.
 fn check_destination_links(
     mounts: Vec<PlannedMount>,
+    ws_sandbox: &Path,
     roots: &UntrustedRoots,
     warnings: &mut Vec<SpecWarning>,
 ) -> Result<Vec<PlannedMount>, SpecError> {
@@ -1116,18 +1347,44 @@ fn check_destination_links(
                 continue;
             }
         }
+        // The canonical host source of a mount that shows one. A masked
+        // mount shows nothing of its source; `check_host_sources` resolves
+        // it.
+        let resolved = match &m.source {
+            MountSource::Host { path, .. } if m.mode != PathMode::Masked => {
+                match resolve_host_source(path, roots) {
+                    // A final link whose target is missing has nothing to
+                    // show or hide, as for a missing path, whatever the mode
+                    // and wherever the link lies (a planted dangling link
+                    // too). Skipped before its destination is checked: it
+                    // mounts nothing there.
+                    Err(u) if is_missing(u.error.kind()) => {
+                        let found = source_unresolved(&m, path, u);
+                        warnings.push(SpecWarning::SourceUnresolved(found));
+                        continue;
+                    }
+                    other => Some(other),
+                }
+            }
+            _ => None,
+        };
         let ancestor = m
             .sandbox
             .ancestors()
             .skip(1)
-            .find_map(|a| underneath.get_key_value(a));
-        if let Some((ancestor, Underneath::Host { mode, source })) = ancestor {
+            .find_map(|a| match underneath.get_key_value(a)? {
+                (a, Underneath::Host { mode, source }) => Some(Some((a, *mode, source))),
+                (_, Underneath::Unchecked) => Some(None),
+            })
+            .flatten()
+            .map(|(a, mode, source)| (a.clone(), mode, source.clone()));
+        if let Some((ancestor, mode, source)) = ancestor {
             let rel = m
                 .sandbox
-                .strip_prefix(ancestor)
+                .strip_prefix(&ancestor)
                 .expect("an ancestor is a prefix");
             let refused = m.mode != PathMode::Rw;
-            match find_destination_link(source, rel, roots) {
+            match find_destination_link(&source, rel, roots) {
                 Ok(()) => {}
                 Err(DestinationProblem::Link { link, root }) => {
                     let found = Box::new(DestinationLink {
@@ -1136,9 +1393,9 @@ fn check_destination_links(
                         sandbox: m.sandbox.clone(),
                         host: source.join(rel),
                         link,
-                        ancestor: ancestor.clone(),
-                        ancestor_mode: *mode,
-                        ancestor_source: source.clone(),
+                        ancestor,
+                        ancestor_mode: mode,
+                        ancestor_source: source,
                         root: root.clone(),
                     });
                     if refused {
@@ -1147,16 +1404,7 @@ fn check_destination_links(
                     warnings.push(SpecWarning::DestinationLink(found));
                     continue;
                 }
-                Err(DestinationProblem::Unchecked { path, error }) => {
-                    if refused {
-                        return Err(SpecError::DestinationUnchecked {
-                            provider: m.provider.clone(),
-                            mode: m.mode,
-                            sandbox: m.sandbox.clone(),
-                            path,
-                            kind: error.kind(),
-                        });
-                    }
+                Err(DestinationProblem::Unchecked { path, error }) if !refused => {
                     warnings.push(SpecWarning::DestinationUnchecked {
                         provider: m.provider.clone(),
                         sandbox: m.sandbox.clone(),
@@ -1165,44 +1413,115 @@ fn check_destination_links(
                     });
                     continue;
                 }
-            }
-        }
-        let under = match &m.source {
-            MountSource::Host { path, .. } if m.mode != PathMode::Masked => {
-                match resolve_host_source(path, roots) {
-                    Ok(resolved) => {
-                        // An `rw` source through a link inside a root is
-                        // dropped here rather than by `check_host_sources`,
-                        // so that it is never an ancestor: the mounts below
-                        // it are checked against what is really underneath.
-                        // A restrictive one is kept, and refused there.
-                        if m.mode == PathMode::Rw {
-                            if let Some(followed) = resolved.untrusted.first() {
-                                let found = link_followed(&m, path, &resolved.path, followed);
-                                warnings.push(SpecWarning::SourceLink(found));
-                                continue;
-                            }
-                        }
-                        Underneath::Host {
+                Err(DestinationProblem::Unchecked { path, error }) => {
+                    // The walk inspects every directory before passing
+                    // through it, so the one containing `path` can be
+                    // inspected but not searched. Masking it hides `path`
+                    // and the rest of the way, and bwrap reaches the mask's
+                    // own mount point without searching it.
+                    let masked_host = path
+                        .parent()
+                        .expect("the walk starts below the ancestor's source")
+                        .to_owned();
+                    let below = masked_host
+                        .strip_prefix(&source)
+                        .expect("the walk stays below the ancestor's source");
+                    let masked = join_rel(&ancestor, below);
+                    warnings.push(SpecWarning::DestinationMasked(Box::new(
+                        DestinationMasked {
+                            provider: m.provider.clone(),
                             mode: m.mode,
-                            source: resolved.path,
-                        }
+                            sandbox: m.sandbox.clone(),
+                            path,
+                            error,
+                            masked: masked.clone(),
+                            masked_host: masked_host.clone(),
+                        },
+                    )));
+                    // Nothing kept lies below `masked` yet: every mount
+                    // there would have met the same directory first. If it
+                    // is the ancestor's own path (its source cannot be
+                    // searched), the mask replaces the ancestor, which is
+                    // reported louder: the whole grant is gone.
+                    if let Some(i) = kept.iter().position(|k: &PlannedMount| k.sandbox == masked) {
+                        let hidden = kept.remove(i);
+                        warnings.push(SpecWarning::GrantHidden(Box::new(GrantHidden {
+                            workspace: hidden.sandbox == ws_sandbox,
+                            provider: hidden.provider,
+                            mode: hidden.mode,
+                            sandbox: hidden.sandbox,
+                            dir: masked_host.clone(),
+                        })));
                     }
-                    // `check_host_sources` rejects this mount, which is kept.
-                    Err(_) => Underneath::Unchecked,
+                    kept.push(PlannedMount {
+                        sandbox: masked.clone(),
+                        source: MountSource::Host {
+                            path: masked_host,
+                            kind: EntryKind::Dir,
+                        },
+                        mode: PathMode::Masked,
+                        provider: m.provider.clone(),
+                        glob_link: false,
+                    });
+                    underneath.insert(masked, Underneath::Unchecked);
+                    // `m` now lies inside the masked directory, where
+                    // nothing needs checking, and is kept on top of it.
                 }
             }
-            MountSource::Host { .. } => Underneath::Unchecked,
+        }
+        let under = match (resolved, &m.source) {
+            (Some(Ok(resolved)), MountSource::Host { path, .. }) => {
+                // An `rw` source through a link inside a root is dropped
+                // here rather than by `check_host_sources`, so that it is
+                // never an ancestor: the mounts below it are checked against
+                // what is really underneath. A restrictive one is kept, and
+                // refused there.
+                if m.mode == PathMode::Rw {
+                    if let Some(followed) = resolved.untrusted.first() {
+                        let found = link_followed(&m, path, &resolved.path, followed);
+                        warnings.push(SpecWarning::SourceLink(found));
+                        continue;
+                    }
+                }
+                Underneath::Host {
+                    mode: m.mode,
+                    source: resolved.path,
+                }
+            }
+            // Dropping an `rw` grant only removes access. Dropped here, so
+            // that it is never an ancestor.
+            (Some(Err(u)), MountSource::Host { path, .. }) if m.mode == PathMode::Rw => {
+                warnings.push(SpecWarning::SourceUnresolved(source_unresolved(
+                    &m, path, u,
+                )));
+                continue;
+            }
+            // `check_host_sources` rejects this mount (or drops it inside a
+            // masked directory), which is kept.
+            (Some(Err(_)), _) => Underneath::Unchecked,
+            (Some(Ok(_)), MountSource::Ephemeral) => {
+                unreachable!("only a host source is resolved")
+            }
+            // A masked one.
+            (None, MountSource::Host { .. }) => Underneath::Unchecked,
             // TODO(ephemeral backing directories, DESIGN.md §2.1, §11): an
             // ephemeral mount is backed by a session directory the sandbox
             // writes, so links in it are untrusted too, but it does not exist
             // yet. Once it does, check below it like a host tree inside a
             // root.
-            MountSource::Ephemeral => Underneath::Unchecked,
+            (None, MountSource::Ephemeral) => Underneath::Unchecked,
         };
         underneath.insert(m.sandbox.clone(), under);
         kept.push(m);
     }
+    // Masks synthesized over directories that cannot be searched were added
+    // after deeper mounts; restore the plan's order.
+    kept.sort_by(|a, b| {
+        let depth = |p: &Path| p.components().count();
+        depth(&a.sandbox)
+            .cmp(&depth(&b.sandbox))
+            .then_with(|| a.sandbox.cmp(&b.sandbox))
+    });
     Ok(kept)
 }
 
@@ -1272,14 +1591,7 @@ fn find_destination_link<'r>(
         path.push(c);
         let meta = match path.symlink_metadata() {
             Ok(meta) => meta,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-                ) =>
-            {
-                return Ok(());
-            }
+            Err(error) if is_missing(error.kind()) => return Ok(()),
             Err(error) => return Err(DestinationProblem::Unchecked { path, error }),
         };
         if meta.is_symlink() {
@@ -1324,6 +1636,20 @@ struct UntrustedLink<'r> {
     root: &'r UntrustedRoot,
 }
 
+/// Why [`resolve_host_source`] failed.
+#[derive(Debug)]
+struct Unresolved<'r> {
+    /// The lookup's error.
+    error: io::Error,
+    /// The path the lookup failed at: the entry it could not inspect or
+    /// read, the link past the limit, or the non-directory it had to pass
+    /// through.
+    path: PathBuf,
+    /// Every symlink inside an untrusted root the lookup followed before it
+    /// failed, in order (see [`ResolvedSource::untrusted`]).
+    untrusted: Vec<UntrustedLink<'r>>,
+}
+
 /// Resolves the absolute host path `path` as the kernel would, one
 /// component at a time, following every symlink (the final one included).
 /// Returns the canonical path and every symlink followed that lies inside
@@ -1337,7 +1663,9 @@ struct UntrustedLink<'r> {
 /// costs one `lstat` per component and one `readlink` per link, the
 /// components of link targets included. Errors are those of the lookup
 /// (`ENOTDIR` for a component below a non-directory or a trailing `/` or
-/// `/.` after one, `ELOOP` past [`MAX_SYMLINKS`] links).
+/// `/.` after one, `ELOOP` past [`MAX_SYMLINKS`] links), with the untrusted
+/// links followed until then ([`Unresolved`]), so that a planted link the
+/// lookup failed after is still known.
 ///
 /// Links are followed by their text, so `/proc` magic links
 /// (`/proc/<pid>/root`, `/proc/self/fd/N`), which the kernel follows to the
@@ -1346,7 +1674,7 @@ struct UntrustedLink<'r> {
 fn resolve_host_source<'r>(
     path: &Path,
     roots: &'r UntrustedRoots,
-) -> io::Result<ResolvedSource<'r>> {
+) -> Result<ResolvedSource<'r>, Unresolved<'r>> {
     /// Pushes `path`'s components onto `pending` so they pop in order.
     /// `Path::components` drops a trailing `/` or `/.`, which requires a
     /// directory, so it is kept as a final `.`.
@@ -1366,13 +1694,18 @@ fn resolve_host_source<'r>(
     push(&mut pending, path);
     let mut links = 0;
     let mut untrusted = Vec::new();
+    let fail = |error: io::Error, path: PathBuf, untrusted| Unresolved {
+        error,
+        path,
+        untrusted,
+    };
     while let Some(name) = pending.pop() {
         if name == "/" {
             (resolved, is_dir) = (PathBuf::from("/"), true);
             continue;
         }
         if !is_dir {
-            return Err(Errno::NOTDIR.into());
+            return Err(fail(Errno::NOTDIR.into(), resolved, untrusted));
         }
         // `resolved` is canonical, so `..` is its lexical parent. A `Normal`
         // component is never `/`, `.` or `..`.
@@ -1383,16 +1716,22 @@ fn resolve_host_source<'r>(
             continue;
         }
         let next = resolved.join(&name);
-        let meta = next.symlink_metadata()?;
+        let meta = match next.symlink_metadata() {
+            Ok(meta) => meta,
+            Err(error) => return Err(fail(error, next, untrusted)),
+        };
         if !meta.is_symlink() {
             (resolved, is_dir) = (next, meta.is_dir());
             continue;
         }
         links += 1;
         if links > MAX_SYMLINKS {
-            return Err(Errno::LOOP.into());
+            return Err(fail(Errno::LOOP.into(), next, untrusted));
         }
-        let target = fs::read_link(&next)?;
+        let target = match fs::read_link(&next) {
+            Ok(target) => target,
+            Err(error) => return Err(fail(error, next, untrusted)),
+        };
         if let Some(root) = roots.containing(&resolved) {
             untrusted.push(UntrustedLink { link: next, root });
         }
@@ -1414,7 +1753,7 @@ fn resolve_host_source<'r>(
 /// [`plan_mounts`]).
 pub(crate) fn first_link_inside(path: &Path, root: &Path) -> io::Result<Option<PathBuf>> {
     let roots = UntrustedRoots::new(root);
-    let resolved = resolve_host_source(path, &roots)?;
+    let resolved = resolve_host_source(path, &roots).map_err(|u| u.error)?;
     Ok(resolved.untrusted.into_iter().next().map(|l| l.link))
 }
 
@@ -1524,8 +1863,9 @@ fn finish_profile(
 ) -> Result<CompiledProfile, SpecError> {
     let PlannedProfile { home, plan } = planned;
     let mut warnings: Vec<SpecWarning> = plan.warnings.into_iter().map(Into::into).collect();
-    let mounts = check_destination_links(plan.mounts, roots, &mut warnings)?;
-    check_host_sources(&mounts, ctx, roots, &mut warnings)?;
+    let mounts =
+        check_destination_links(plan.mounts, ctx.workspace_sandbox(), roots, &mut warnings)?;
+    let mounts = check_host_sources(mounts, ctx, roots, &mut warnings)?;
     let inherited_domains = parent.map(|p| &p.network.allow_domains);
     let network = network_spec(&grants.network, inherited_domains, &mut warnings);
     let spec = SandboxSpec {
@@ -3132,6 +3472,7 @@ mod tests {
         let roots = UntrustedRoots::new(ws);
         resolve_host_source(path, &roots)
             .map(|s| (s.path, s.untrusted.first().map(|l| l.link.clone())))
+            .map_err(|u| u.error)
     }
 
     #[test]
@@ -3433,54 +3774,543 @@ mod tests {
         assert_eq!(exposure(&f, e).3, PathBuf::from("/home/user"));
     }
 
+    /// Each `SourceUnresolved` warning of `profile` as `(mode, host, sandbox,
+    /// error kind, untrusted link followed)`; panics on any other warning.
+    #[allow(clippy::type_complexity)]
+    fn unresolved_warnings(
+        s: &CompiledSession,
+        profile: &str,
+    ) -> Vec<(PathMode, PathBuf, PathBuf, io::ErrorKind, Option<PathBuf>)> {
+        get(s, profile)
+            .warnings
+            .iter()
+            .map(|w| match w {
+                SpecWarning::SourceUnresolved(u) => (
+                    u.mode,
+                    u.host.clone(),
+                    u.sandbox.clone(),
+                    u.error.kind(),
+                    u.link.as_ref().map(|(l, _)| l.clone()),
+                ),
+                other => panic!("unexpected warning {other:?}"),
+            })
+            .collect()
+    }
+
     #[test]
-    fn unresolvable_host_sources_fail_closed() {
+    fn dangling_host_sources_are_skipped_for_every_mode() {
+        // A final link whose target is missing has nothing to show or hide,
+        // as for a missing path: the mount is skipped with a warning.
         let f = Fixture::new();
-        symlink(f.root.join("missing"), f.root.join("home/dangling")).unwrap();
-        let e = compile_body(&f, "fs.ro = [\"~/dangling\"]").unwrap_err();
-        let CompileError::Profile { error, .. } = &e else {
-            panic!("expected a profile error, got {e:?}");
-        };
-        assert_eq!(
-            **error,
-            SpecError::HostSourceUnresolved {
-                provider: "p".parse().unwrap(),
-                mode: Ro,
-                host: f.root.join("home/dangling"),
-                sandbox: PathBuf::from("/home/user/dangling"),
-                kind: std::io::ErrorKind::NotFound,
-            }
-        );
-        // Mounts below it are not checked against it (it has no host tree to
-        // walk): the ancestor itself is refused, by the host-source check.
+        let dangling = f.root.join("home/dangling");
+        symlink(f.root.join("missing"), &dangling).unwrap();
         f.file("home/cfg");
-        for mode in ["ro", "rw"] {
-            let e = compile_body(
+        for mode in [Protected, Ro, Rw] {
+            let s = compile_body(&f, &format!("fs.{mode} = [\"~/dangling\"]")).unwrap();
+            assert!(spec(&s, "main").mounts.is_empty(), "{mode}");
+            assert_eq!(
+                unresolved_warnings(&s, "main"),
+                [(
+                    mode,
+                    dangling.clone(),
+                    PathBuf::from("/home/user/dangling"),
+                    io::ErrorKind::NotFound,
+                    None
+                )],
+                "{mode}"
+            );
+            let [SpecWarning::SourceUnresolved(u)] = get(&s, "main").warnings.as_slice() else {
+                unreachable!("checked above");
+            };
+            assert_eq!(
+                get(&s, "main").warnings[0].to_string(),
+                format!(
+                    "provider \"p\": cannot resolve the host source {dangling:?} of the {mode} \
+                     mount at \"/home/user/dangling\": {}, so the mount is skipped",
+                    u.error
+                ),
+                "{mode}"
+            );
+            // Mounts below it are not under it, so they are kept on bwrap's
+            // root tmpfs.
+            let s = compile_body(
                 &f,
                 &format!(
-                    "fs.ro = [\"~/dangling\"]\n\
+                    "fs.{mode} = [\"~/dangling\"]\n\
                      fs.bind = [{{ host = \"~/cfg\", sandbox = \"/home/user/dangling/cfg\", \
-                     mode = \"{mode}\" }}]"
+                     mode = \"ro\" }}]"
                 ),
             )
-            .unwrap_err();
-            let CompileError::Profile { error, .. } = &e else {
-                panic!("expected a profile error, got {e:?}");
-            };
-            assert!(
-                matches!(
-                    **error,
-                    SpecError::HostSourceUnresolved { ref sandbox, .. }
-                        if sandbox == Path::new("/home/user/dangling")
-                ),
-                "{mode}: {e:?}"
+            .unwrap();
+            assert_eq!(
+                mounts(spec(&s, "main")),
+                [row("/home/user/dangling/cfg", Ro, "p")],
+                "{mode}"
             );
         }
         // A masked dangling link is dropped by the planner (with a warning)
         // before it is ever resolved here.
-        if let Err(e) = compile_body(&f, "fs.masked = [\"~/dangling\"]") {
-            panic!("masked: {e}");
+        let s = compile_body(&f, "fs.masked = [\"~/dangling\"]").unwrap();
+        assert!(spec(&s, "main").mounts.is_empty());
+    }
+
+    #[test]
+    fn looping_host_sources_drop_rw_and_fail_restrictive_mounts() {
+        // A final link that loops cannot be inspected: an `rw` mount is
+        // dropped, while a restrictive one has no known shape to be masked
+        // as, and stays an error (DESIGN.md §11).
+        let f = Fixture::new();
+        let looping = f.root.join("home/loop");
+        symlink("loop", &looping).unwrap();
+        let eloop = io::Error::from(Errno::LOOP).kind();
+        let s = compile_body(&f, "fs.rw = [\"~/loop\"]").unwrap();
+        assert!(spec(&s, "main").mounts.is_empty());
+        assert_eq!(
+            unresolved_warnings(&s, "main"),
+            [(
+                Rw,
+                looping.clone(),
+                PathBuf::from("/home/user/loop"),
+                eloop,
+                None
+            )]
+        );
+        for mode in [Protected, Ro] {
+            let e = compile_body(&f, &format!("fs.{mode} = [\"~/loop\"]")).unwrap_err();
+            let CompileError::Profile { error, .. } = &e else {
+                panic!("expected a profile error, got {e:?}");
+            };
+            assert_eq!(
+                **error,
+                SpecError::HostSourceUnresolved {
+                    provider: "p".parse().unwrap(),
+                    mode,
+                    host: looping.clone(),
+                    sandbox: PathBuf::from("/home/user/loop"),
+                    kind: eloop,
+                },
+                "{mode}"
+            );
         }
+        // A masked one fails while planning, its target's shape unknown.
+        let e = compile_body(&f, "fs.masked = [\"~/loop\"]").unwrap_err();
+        let CompileError::Profile { error, .. } = &e else {
+            panic!("expected a profile error, got {e:?}");
+        };
+        assert!(
+            matches!(
+                **error,
+                SpecError::Mounts(PathPlanError::Inaccessible { mode: Masked, ref path, kind, .. })
+                    if *path == looping && kind == eloop
+            ),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn planted_dangling_links_drop_grants_rather_than_fail() {
+        // A sandbox planted dangling links in the workspace and in an `rw`
+        // grant. With nothing mounted underneath, only the host-source check
+        // sees them; a grant through one is dropped with a warning naming
+        // the link, and a restrictive rule is skipped like a missing path.
+        let f = Fixture::new();
+        let home = f.root.join("home");
+        f.mkdir("home/.cache/tool");
+        symlink("nowhere", f.ws().join("link")).unwrap();
+        symlink("nowhere", home.join(".cache/tool/cfg")).unwrap();
+        let src = |mode: &str| {
+            format!(
+                "base = \"none\"\n[profiles.agent]\ninherit = \"none\"\n{}{}",
+                prov("w", "main", "fs.rw = [\"~/.cache/tool\"]"),
+                prov(
+                    "p",
+                    "agent",
+                    &format!(
+                        "fs.{mode} = [\"{{workspace}}/link\"]\nfs.bind = [{{ host = \
+                         \"~/.cache/tool/cfg\", sandbox = \"/opt/cfg\", mode = \"{mode}\" }}]"
+                    ),
+                ),
+            )
+        };
+        for mode in [Rw, Ro] {
+            let s = f.compile(&src(mode.as_str()));
+            assert!(spec(&s, "agent").mounts.is_empty(), "{mode}");
+            assert_eq!(
+                unresolved_warnings(&s, "agent"),
+                [
+                    (
+                        mode,
+                        home.join(".cache/tool/cfg"),
+                        PathBuf::from("/opt/cfg"),
+                        io::ErrorKind::NotFound,
+                        Some(home.join(".cache/tool/cfg"))
+                    ),
+                    (
+                        mode,
+                        f.ws().join("link"),
+                        PathBuf::from("/workspace/link"),
+                        io::ErrorKind::NotFound,
+                        Some(f.ws().join("link"))
+                    ),
+                ],
+                "{mode}"
+            );
+            let [SpecWarning::SourceUnresolved(u), ..] = get(&s, "agent").warnings.as_slice()
+            else {
+                unreachable!("checked above");
+            };
+            let root = rw_root(
+                home.join(".cache/tool"),
+                "w",
+                Some("main"),
+                home.join(".cache/tool"),
+            );
+            assert_eq!(u.link.as_ref().map(|(_, r)| r), Some(&root), "{mode}");
+            assert_eq!(
+                get(&s, "agent").warnings[0].to_string(),
+                format!(
+                    "provider \"p\": cannot resolve the host source {:?} of the {mode} mount at \
+                     \"/opt/cfg\": {} (after following the symlink {:?} inside {root}), so the \
+                     mount is skipped",
+                    home.join(".cache/tool/cfg"),
+                    u.error,
+                    home.join(".cache/tool/cfg"),
+                ),
+                "{mode}"
+            );
+        }
+        // Under the workspace mount too: a dangling source mounts nothing,
+        // so it is skipped before its destination (the same link) is
+        // checked.
+        for (mode, body) in [
+            (Rw, "fs.rw = [\"{workspace}\", \"{workspace}/link\"]"),
+            (
+                Ro,
+                "fs.rw = [\"{workspace}\"]\nfs.ro = [\"{workspace}/link\"]",
+            ),
+        ] {
+            let s = compile_body(&f, body).unwrap();
+            assert_eq!(
+                mounts(spec(&s, "main")),
+                [row("/workspace", Rw, "p")],
+                "{mode}"
+            );
+            assert_eq!(
+                unresolved_warnings(&s, "main"),
+                [(
+                    mode,
+                    f.ws().join("link"),
+                    PathBuf::from("/workspace/link"),
+                    io::ErrorKind::NotFound,
+                    Some(f.ws().join("link"))
+                )],
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn masks_whose_source_cannot_be_resolved_are_kept() {
+        // `~/docs` is a host link to a directory below one that cannot be
+        // searched, so a masked rule below it masks `~/docs` itself, whose
+        // source then cannot be resolved: the mask is kept with a warning.
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipping: permission checks do not apply to root");
+            return;
+        }
+        let f = Fixture::new();
+        f.file("outside/sub/secret");
+        let outside = f.root.join("outside");
+        let docs = f.root.join("home/docs");
+        symlink(outside.join("sub"), &docs).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o000)).unwrap();
+        let s = compile_body(&f, "fs.masked = [\"~/docs/secret\"]");
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+        let s = s.unwrap();
+        assert_eq!(
+            spec(&s, "main").mounts,
+            [PlannedMount {
+                sandbox: "/home/user/docs".into(),
+                source: MountSource::Host {
+                    path: docs.clone(),
+                    kind: EntryKind::Dir
+                },
+                mode: Masked,
+                provider: "p".parse().unwrap(),
+                glob_link: false,
+            }]
+        );
+        match get(&s, "main").warnings.as_slice() {
+            [
+                SpecWarning::Mount(PlanWarning {
+                    kind: PlanWarningKind::InaccessibleMasked { path, dir, .. },
+                    ..
+                }),
+                w @ SpecWarning::MaskSourceUnresolved(u),
+            ] => {
+                assert_eq!((path, dir), (&docs.join("secret"), &docs));
+                assert_eq!(
+                    (u.mode, &u.host, u.error.kind(), &u.link),
+                    (Masked, &docs, io::ErrorKind::PermissionDenied, &None)
+                );
+                assert_eq!(
+                    w.to_string(),
+                    format!(
+                        "provider \"p\": cannot resolve the host source {docs:?} of the masked \
+                         mount at \"/home/user/docs\": {}; the mask is kept, but whether the \
+                         content it covers is visible at another sandbox path is not checked",
+                        u.error
+                    )
+                );
+            }
+            other => panic!("unexpected warnings {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_directory_a_sandbox_made_unreadable_no_longer_blocks_startup() {
+        // DESIGN.md §1.4: a sandbox can `chmod 000` a directory it owns, or
+        // `chmod 600` it (readable but not searchable: the walk lists its
+        // entries, none of which can be inspected). The default base's
+        // workspace rules then mask it as a whole, once per restrictive
+        // rule that could not inspect something there.
+        let globs_masked = 6; // `**/.env`, `**/.env.*`, … in `fs.masked`.
+        let literals_protected = 6; // `flake.lock`, `.envrc`, … in `fs.protected`.
+        // Each case: the files, the directory made inaccessible and its
+        // mode, and the rules expected to mask it (by mode, in rule order).
+        let all_globs: Vec<PathMode> = [vec![Masked; globs_masked], vec![Protected]].concat();
+        let globs_and_literals: Vec<PathMode> =
+            [all_globs.clone(), vec![Protected; literals_protected]].concat();
+        let nix_and_literals: Vec<PathMode> = vec![Protected; 1 + literals_protected];
+        let cases: [(&[&str], &str, u32, Vec<PathMode>); 4] = [
+            // Every `**` glob fails to read it.
+            (
+                &["ws/locked/.env", "ws/a/.env"],
+                "ws/locked",
+                0o000,
+                all_globs,
+            ),
+            // Only `**/*.nix` lists a match in it.
+            (
+                &["ws/d/foo.nix", "ws/a/.env"],
+                "ws/d",
+                0o600,
+                vec![Protected],
+            ),
+            // The workspace root: every glob and every literal rule below it.
+            (
+                &["ws/flake.nix", "ws/a/.env"],
+                "ws",
+                0o000,
+                globs_and_literals,
+            ),
+            // `**/*.nix` lists `flake.nix`; the literals cannot be inspected.
+            (&["ws/flake.nix"], "ws", 0o600, nix_and_literals),
+        ];
+        for (files, dir, mode, want) in cases {
+            let f = Fixture::new();
+            for file in files {
+                f.file(file);
+            }
+            let host = f.root.join(dir);
+            let sandbox = join_rel(Path::new("/workspace"), host.strip_prefix(f.ws()).unwrap());
+            let Some(s) = with_mode(std::slice::from_ref(&host), mode, || f.try_compile("")) else {
+                return;
+            };
+            let s = s.unwrap_or_else(|e| panic!("{dir} {mode:o}: {e}"));
+            let main = mounts(spec(&s, "main"));
+            let at = |path: &Path| {
+                main.iter()
+                    .find(|(p, ..)| Path::new(p) == path)
+                    .map(|(_, mode, _)| *mode)
+            };
+            assert_eq!(at(&sandbox), Some(Masked), "{dir} {mode:o}");
+            let root = dir == "ws";
+            if !root {
+                // The rest of the workspace is mounted and masked as usual.
+                assert_eq!(at(Path::new("/workspace")), Some(Rw), "{dir} {mode:o}");
+                assert_eq!(
+                    at(Path::new("/workspace/a/.env")),
+                    Some(Masked),
+                    "{dir} {mode:o}"
+                );
+            }
+            let mut masked = Vec::new();
+            let mut hidden = Vec::new();
+            for w in &get(&s, "main").warnings {
+                match w {
+                    SpecWarning::Mount(PlanWarning {
+                        provider,
+                        kind:
+                            PlanWarningKind::InaccessibleMasked {
+                                mode, dir, sandbox, ..
+                            },
+                        ..
+                    }) => masked.push((provider.to_string(), *mode, dir.clone(), sandbox.clone())),
+                    SpecWarning::Mount(PlanWarning {
+                        provider,
+                        pattern,
+                        kind:
+                            PlanWarningKind::GrantHidden {
+                                mode,
+                                dir,
+                                workspace,
+                                ..
+                            },
+                    }) => hidden.push((
+                        provider.to_string(),
+                        pattern.clone(),
+                        *mode,
+                        dir.clone(),
+                        *workspace,
+                    )),
+                    _ => {}
+                }
+            }
+            let want: Vec<_> = want
+                .into_iter()
+                .map(|m| ("base".to_owned(), m, host.clone(), sandbox.clone()))
+                .collect();
+            assert_eq!(masked, want, "{dir} {mode:o}");
+            // Masking the workspace root hides the workspace mount, loudly.
+            let want_hidden = if root {
+                vec![(
+                    "base".to_owned(),
+                    "{workspace}".to_owned(),
+                    Rw,
+                    host.clone(),
+                    true,
+                )]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(hidden, want_hidden, "{dir} {mode:o}");
+        }
+    }
+
+    #[test]
+    fn restrictive_sources_that_cannot_be_inspected_under_a_mask_are_dropped() {
+        // Belt and braces for the planner: a protected file whose source
+        // cannot be inspected (its directory was made unsearchable after
+        // planning, say) inside a masked directory is dropped, since the
+        // mask hides it anyway. Elsewhere it stays an error.
+        let f = Fixture::new();
+        f.file("ws/d/foo.nix");
+        let d = f.ws().join("d");
+        let foo = d.join("foo.nix");
+        let mount = |sandbox: &str, path: &Path, kind, mode| PlannedMount {
+            sandbox: sandbox.into(),
+            source: MountSource::Host {
+                path: path.to_owned(),
+                kind,
+            },
+            mode,
+            provider: "p".parse().unwrap(),
+            glob_link: false,
+        };
+        let ws = mount("/workspace", &f.ws(), EntryKind::Dir, Rw);
+        let mask = mount("/workspace/d", &d, EntryKind::Dir, Masked);
+        let protected = mount("/workspace/d/foo.nix", &foo, EntryKind::File, Protected);
+        let roots = UntrustedRoots::new(&f.ws());
+        let Some((under, alone)) = with_mode(std::slice::from_ref(&d), 0o600, || {
+            let mut warnings = Vec::new();
+            let under = check_host_sources(
+                vec![ws.clone(), mask.clone(), protected.clone()],
+                &f.ctx,
+                &roots,
+                &mut warnings,
+            )
+            .map(|kept| (kept, warnings));
+            let alone = check_host_sources(
+                vec![ws.clone(), protected.clone()],
+                &f.ctx,
+                &roots,
+                &mut Vec::new(),
+            );
+            (under, alone)
+        }) else {
+            return;
+        };
+        let (kept, warnings) = under.unwrap();
+        assert_eq!(kept, [ws, mask]);
+        match warnings.as_slice() {
+            [w @ SpecWarning::SourceUnderMask(u, at)] => {
+                assert_eq!(
+                    (u.mode, &u.host, u.error.kind(), &u.link, at.as_path()),
+                    (
+                        Protected,
+                        &foo,
+                        io::ErrorKind::PermissionDenied,
+                        &None,
+                        Path::new("/workspace/d")
+                    )
+                );
+                assert_eq!(
+                    w.to_string(),
+                    format!(
+                        "provider \"p\": cannot resolve the host source {foo:?} of the protected \
+                         mount at \"/workspace/d/foo.nix\": {}; it lies inside the directory \
+                         masked at \"/workspace/d\", which hides everything there, so the mount \
+                         is skipped",
+                        u.error
+                    )
+                );
+            }
+            other => panic!("unexpected warnings {other:?}"),
+        }
+        assert_eq!(
+            alone.unwrap_err(),
+            SpecError::HostSourceUnresolved {
+                provider: "p".parse().unwrap(),
+                mode: Protected,
+                host: foo,
+                sandbox: "/workspace/d/foo.nix".into(),
+                kind: io::ErrorKind::PermissionDenied,
+            }
+        );
+    }
+
+    #[test]
+    fn masked_links_whose_way_fails_after_a_planted_link_are_refused_for_it() {
+        // A masked glob match kept as a link (its target could not be
+        // inspected while planning) whose parent directory cannot be
+        // resolved after following a link inside the workspace (planted,
+        // dangling) is refused for that link, not as unresolvable.
+        let f = Fixture::new();
+        let planted = f.ws().join("planted");
+        symlink("nowhere", &planted).unwrap();
+        let host = planted.join("x");
+        let m = PlannedMount {
+            sandbox: "/workspace/planted/x".into(),
+            source: MountSource::Host {
+                path: host.clone(),
+                kind: EntryKind::Symlink,
+            },
+            mode: Masked,
+            provider: "p".parse().unwrap(),
+            glob_link: true,
+        };
+        let roots = UntrustedRoots::new(&f.ws());
+        let e = check_host_sources(vec![m], &f.ctx, &roots, &mut Vec::new()).unwrap_err();
+        let SpecError::UntrustedLinkFollowed(found) = &e else {
+            panic!("expected an untrusted link, got {e:?}");
+        };
+        assert_eq!(
+            **found,
+            LinkFollowed {
+                provider: "p".parse().unwrap(),
+                mode: Masked,
+                host,
+                link: planted.clone(),
+                resolved: f.ws().join("nowhere"),
+                sandbox: "/workspace/planted/x".into(),
+                root: UntrustedRoot {
+                    path: f.ws(),
+                    kind: UntrustedKind::Workspace,
+                },
+            }
+        );
     }
 
     /// The untrusted root of an `rw` grant of `host` by `provider` in
@@ -5169,27 +5999,80 @@ mod tests {
                  sandbox = \"/home/user/.cache/locked/sub/x\", mode = \"{mode}\" }}]"
             )
         };
+        // An ephemeral rule's destination is checked alike (it has no host
+        // source for the planner to resolve).
+        let ephemeral = "fs.rw = [\"~/.cache\"]\nfs.ephemeral = [\"~/.cache/locked/sub/tmp\"]";
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-        let err = compile_body(&f, &bind("ro"));
+        let masked = compile_body(&f, &bind("ro"));
+        let masked_ephemeral = compile_body(&f, ephemeral);
         let warned = compile_body(&f, &bind("rw"));
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
-        let e = err.unwrap_err();
-        let CompileError::Profile { error, .. } = &e else {
-            panic!("expected a profile error, got {e:?}");
-        };
-        assert_eq!(
-            **error,
-            SpecError::DestinationUnchecked {
-                provider: "p".parse().unwrap(),
-                mode: Ro,
-                sandbox: "/home/user/.cache/locked/sub/x".into(),
-                path: locked.join("sub"),
-                kind: io::ErrorKind::PermissionDenied,
-            }
-        );
-        let msg = e.to_string();
-        assert!(msg.contains("cannot check the destination"), "{msg}");
-        assert!(msg.contains("ro mount is never skipped"), "{msg}");
+        // A restrictive mount is never skipped: the directory that cannot
+        // be searched is masked, and the mount is kept on top of the mask.
+        for (s, mode, dest) in [
+            (masked, Ro, "/home/user/.cache/locked/sub/x"),
+            (
+                masked_ephemeral,
+                Ephemeral,
+                "/home/user/.cache/locked/sub/tmp",
+            ),
+        ] {
+            let s = s.unwrap();
+            let spec = spec(&s, "main");
+            assert_eq!(
+                mounts(spec),
+                [
+                    row("/home/user/.cache", Rw, "p"),
+                    row("/home/user/.cache/locked", Masked, "p"),
+                    row(dest, mode, "p"),
+                ],
+                "{mode}"
+            );
+            assert_eq!(
+                spec.mounts[1].source,
+                MountSource::Host {
+                    path: locked.clone(),
+                    kind: EntryKind::Dir
+                },
+                "{mode}"
+            );
+            let [SpecWarning::DestinationMasked(dm)] = get(&s, "main").warnings.as_slice() else {
+                panic!("{mode}: {:?}", get(&s, "main").warnings);
+            };
+            assert_eq!(
+                (
+                    dm.provider.as_str(),
+                    dm.mode,
+                    dm.sandbox.as_path(),
+                    &dm.path,
+                    dm.error.kind(),
+                    dm.masked.as_path(),
+                    &dm.masked_host,
+                ),
+                (
+                    "p",
+                    mode,
+                    Path::new(dest),
+                    &locked.join("sub"),
+                    io::ErrorKind::PermissionDenied,
+                    Path::new("/home/user/.cache/locked"),
+                    &locked,
+                ),
+                "{mode}"
+            );
+            assert_eq!(
+                dm.to_string(),
+                format!(
+                    "provider \"p\": cannot check the destination \"{dest}\" of the {mode} mount \
+                     for symlinks: inspecting {:?} failed: {}; a {mode} mount is never skipped, \
+                     so the directory {locked:?} is masked at \"/home/user/.cache/locked\", \
+                     hiding everything in it, and the mount is kept on top",
+                    locked.join("sub"),
+                    dm.error,
+                ),
+            );
+        }
+        // An `rw` one is skipped.
         let s = warned.unwrap();
         assert_eq!(
             mounts(spec(&s, "main")),
@@ -5205,6 +6088,152 @@ mod tests {
             "{:?}",
             get(&s, "main").warnings
         );
+    }
+
+    #[test]
+    fn an_unsearchable_ancestor_source_is_replaced_by_the_mask() {
+        // The sandbox made the `rw` grant's own directory unsearchable. An
+        // ephemeral rule below it (whose destination the planner does not
+        // resolve) masks that directory, replacing the grant's mount.
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipping: permission checks do not apply to root");
+            return;
+        }
+        let f = Fixture::new();
+        f.mkdir("home/.cache/sub");
+        let cache = f.root.join("home/.cache");
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o000)).unwrap();
+        let s = compile_body(
+            &f,
+            "fs.rw = [\"~/.cache\"]\nfs.ephemeral = [\"~/.cache/sub/tmp\", \"~/.cache/eph\"]",
+        );
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).unwrap();
+        let s = s.unwrap();
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [
+                row("/home/user/.cache", Masked, "p"),
+                row("/home/user/.cache/eph", Ephemeral, "p"),
+                row("/home/user/.cache/sub/tmp", Ephemeral, "p"),
+            ]
+        );
+        // The first mount below it meets the directory; the next one lies
+        // inside the mask, where nothing is checked. The grant it replaced
+        // is reported, louder.
+        match get(&s, "main").warnings.as_slice() {
+            [
+                SpecWarning::DestinationMasked(dm),
+                w @ SpecWarning::GrantHidden(hidden),
+            ] => {
+                assert_eq!(
+                    (dm.sandbox.as_path(), &dm.path, dm.masked.as_path()),
+                    (
+                        Path::new("/home/user/.cache/eph"),
+                        &cache.join("eph"),
+                        Path::new("/home/user/.cache")
+                    )
+                );
+                assert_eq!(
+                    **hidden,
+                    GrantHidden {
+                        provider: "p".parse().unwrap(),
+                        mode: Rw,
+                        sandbox: "/home/user/.cache".into(),
+                        dir: cache.clone(),
+                        workspace: false,
+                    }
+                );
+                assert_eq!(
+                    w.to_string(),
+                    format!(
+                        "provider \"p\": this rw grant is hidden this session: its mount at \
+                         \"/home/user/.cache\" is replaced by an empty masked directory, because \
+                         {cache:?} cannot be inspected (a sandbox may have removed its \
+                         permissions); restore them (e.g. `chmod u+rwx {cache:?}`) to get it back"
+                    )
+                );
+            }
+            other => panic!("unexpected warnings {other:?}"),
+        }
+    }
+
+    /// Runs `body` with the directories `dirs` set to `mode`, restoring them
+    /// (to 0755) even if `body` panics, so that the temp dir can be
+    /// removed. Returns `None`, skipping `body`, when running as root, where
+    /// permissions do not apply.
+    fn with_mode<T>(dirs: &[PathBuf], mode: u32, body: impl FnOnce() -> T) -> Option<T> {
+        use std::os::unix::fs::PermissionsExt;
+        struct Restore(Vec<PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for dir in &self.0 {
+                    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o755));
+                }
+            }
+        }
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipping: permission checks do not apply to root");
+            return None;
+        }
+        let _restore = Restore(dirs.to_vec());
+        for dir in dirs {
+            fs::set_permissions(dir, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        Some(body())
+    }
+
+    #[test]
+    fn an_unsearchable_workspace_replaced_by_a_destination_mask_is_reported() {
+        // The sandbox made the workspace unsearchable. An ephemeral rule
+        // below the workspace mount (whose destination the planner does not
+        // resolve) masks the workspace, replacing its mount: the warning
+        // says the workspace is hidden.
+        let f = Fixture::new();
+        let ws = f.ws();
+        let Some(s) = with_mode(std::slice::from_ref(&ws), 0o000, || {
+            compile_body(
+                &f,
+                "fs.rw = [\"{workspace}\"]\nfs.ephemeral = [\"{workspace}/tmp\"]",
+            )
+        }) else {
+            return;
+        };
+        let s = s.unwrap();
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [
+                row("/workspace", Masked, "p"),
+                row("/workspace/tmp", Ephemeral, "p"),
+            ]
+        );
+        match get(&s, "main").warnings.as_slice() {
+            [
+                SpecWarning::DestinationMasked(_),
+                w @ SpecWarning::GrantHidden(hidden),
+            ] => {
+                assert_eq!(
+                    **hidden,
+                    GrantHidden {
+                        provider: "p".parse().unwrap(),
+                        mode: Rw,
+                        sandbox: "/workspace".into(),
+                        dir: ws.clone(),
+                        workspace: true,
+                    }
+                );
+                assert_eq!(
+                    w.to_string(),
+                    format!(
+                        "provider \"p\": the workspace is hidden this session: its rw mount at \
+                         \"/workspace\" is replaced by an empty masked directory, because {ws:?} \
+                         cannot be inspected (a sandbox may have removed its permissions); \
+                         restore them (e.g. `chmod u+rwx {ws:?}`) to get it back"
+                    )
+                );
+            }
+            other => panic!("unexpected warnings {other:?}"),
+        }
     }
 
     #[test]

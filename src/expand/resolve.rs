@@ -23,6 +23,7 @@ use thiserror::Error;
 use walkdir::WalkDir;
 
 use super::{ExpandError, ExpandedPattern, join};
+use crate::error::is_missing;
 use crate::manifest::{compile_glob, has_glob};
 
 /// What kind of filesystem entry a resolved path is, as reported by
@@ -105,14 +106,13 @@ impl Resolution {
     /// a missing path, or one that runs through a non-directory, is
     /// `Missing`; anything else is `Io`.
     fn warn_io(&mut self, original: PathBuf, failing: PathBuf, error: io::Error) {
-        self.warnings.push(match error.kind() {
-            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => {
-                ResolveWarning::Missing { path: original }
-            }
-            _ => ResolveWarning::Io {
+        self.warnings.push(if is_missing(error.kind()) {
+            ResolveWarning::Missing { path: original }
+        } else {
+            ResolveWarning::Io {
                 path: failing,
                 error,
-            },
+            }
         });
     }
 

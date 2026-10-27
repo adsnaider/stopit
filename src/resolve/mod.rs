@@ -19,6 +19,7 @@ pub use merge::{
     EffectiveEnv, EffectiveGrants, EffectiveNetwork, EffectiveSandbox, EffectiveSystem,
     EnvSetConflict, FsRule, FsRuleKind, MergeError, MergedProfiles, merge_profiles,
 };
+pub(crate) use paths::hidden_note;
 pub use paths::{
     MountConflict, MountPlan, MountSource, PathPlanError, PlanWarning, PlanWarningKind,
     PlannedMount, WalkRootLink, plan_mounts,

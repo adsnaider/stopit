@@ -28,8 +28,14 @@
 //!
 //! Likewise, a restrictive rule that cannot be resolved because a path
 //! cannot be inspected or a directory cannot be read (anything but a
-//! missing path) is an error rather than skipped: the sandbox could
-//! `chmod 000` a directory it owns to switch a mask off at the next start.
+//! missing path) is not skipped: the sandbox could `chmod 000` a directory
+//! it owns to switch a mask off at the next start. Instead the directory
+//! that cannot be searched or read is masked as a whole (DESIGN.md §1.5),
+//! which hides everything the rule could have applied to there, and more.
+//! Such a synthesized mask outranks every other candidate at its sandbox
+//! path. That includes `chmod a-x`: a glob walk lists the entries of a
+//! directory that can be read but not searched without inspecting them, so
+//! every match of a restrictive glob is inspected.
 //!
 //! Redundant nested mounts (a child with the same mode as its parent and the
 //! host content the parent already shows) are kept; pruning them is a
@@ -45,6 +51,7 @@ use thiserror::Error;
 
 use super::merge::{FsRule, FsRuleKind};
 use crate::config::ProviderName;
+use crate::error::is_missing;
 use crate::expand::{
     EntryKind, ExpandError, ExpandedPattern, ExpansionContext, ResolveWarning, ResolvedPath,
     expand_bind, expand_pattern, resolve,
@@ -133,6 +140,47 @@ pub enum PlanWarningKind {
     /// cannot be inspected.
     #[error(transparent)]
     Resolve(#[from] ResolveWarning),
+    /// A restrictive rule (any mode but `rw`) could not inspect `path` (a
+    /// directory on the way to it cannot be searched, or a glob walk cannot
+    /// read it). A restrictive rule is never skipped, so the directory
+    /// `dir` is masked instead: the deepest directory on the way that can
+    /// be inspected, or the directory the walk cannot read. That hides
+    /// everything in it, including whatever the rule would have applied to
+    /// there, which is stricter than the rule (DESIGN.md §1.5).
+    #[error(
+        "cannot inspect {path:?} ({error}), and a {mode} rule is never skipped, so the directory \
+         {dir:?} is masked at {sandbox:?} instead, hiding everything in it"
+    )]
+    InaccessibleMasked {
+        /// The rule's mode.
+        mode: PathMode,
+        /// The host path that could not be inspected or read.
+        path: PathBuf,
+        /// The error inspecting or reading it.
+        #[source]
+        error: io::Error,
+        /// The host directory masked, as written in the rule.
+        dir: PathBuf,
+        /// Where `dir` is masked in the sandbox.
+        sandbox: PathBuf,
+    },
+    /// A mask synthesized over a directory a restrictive rule could not
+    /// inspect ([`PlanWarningKind::InaccessibleMasked`]) outranks this
+    /// rule's mount at the same sandbox path, so the grant is hidden
+    /// entirely this session. Louder than the masking itself: with the
+    /// workspace made unsearchable (`chmod 000`), say, the workspace mount
+    /// is an empty directory.
+    #[error("{}", hidden_note(*.workspace, *.mode, .sandbox, .dir))]
+    GrantHidden {
+        /// The hidden rule's mode.
+        mode: PathMode,
+        /// The sandbox path of the hidden mount, where the mask is.
+        sandbox: PathBuf,
+        /// The host directory that could not be inspected and is masked.
+        dir: PathBuf,
+        /// Whether `sandbox` is the workspace mount.
+        workspace: bool,
+    },
     /// A `masked` rule matched a symlink whose target is missing (a
     /// dangling link), so whether to show an empty file or an empty
     /// directory is unknown; there is no content to hide either.
@@ -164,6 +212,23 @@ pub enum PlanWarningKind {
     },
 }
 
+/// The message for a mount of a grant (`mode` at `sandbox`) hidden entirely
+/// by a mask over the host directory `dir`, which cannot be inspected
+/// (DESIGN.md §1.5): says what is lost this session and how to fix it.
+/// `workspace` if `sandbox` is the workspace mount.
+pub(crate) fn hidden_note(workspace: bool, mode: PathMode, sandbox: &Path, dir: &Path) -> String {
+    let what = if workspace {
+        format!("the workspace is hidden this session: its {mode} mount at {sandbox:?}")
+    } else {
+        format!("this {mode} grant is hidden this session: its mount at {sandbox:?}")
+    };
+    format!(
+        "{what} is replaced by an empty masked directory, because {dir:?} cannot be inspected (a \
+         sandbox may have removed its permissions); restore them (e.g. `chmod u+rwx {dir:?}`) to \
+         get it back"
+    )
+}
+
 /// Error planning the mounts of a profile.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PathPlanError {
@@ -171,11 +236,12 @@ pub enum PathPlanError {
     /// sandbox path. Boxed to keep `PathPlanError` small.
     #[error(transparent)]
     Conflict(Box<MountConflict>),
-    /// Resolving a restrictive rule failed on a path that exists but cannot
-    /// be inspected, or a directory that cannot be read during a glob walk
-    /// (or, for a literal `masked` symlink, its target cannot be
-    /// inspected). Skipping it would let the sandbox switch the rule off by
-    /// making a directory it owns unreadable.
+    /// A literal `masked` symlink's target exists but cannot be inspected,
+    /// so the mask's shape (an empty file or an empty directory) is unknown,
+    /// and a masked rule is never skipped. (Other paths a restrictive rule
+    /// cannot inspect mask the directory that cannot be searched or read
+    /// instead, [`PlanWarningKind::InaccessibleMasked`]; this is also the
+    /// defensive fallback should that directory not be found.)
     #[error(
         "provider {:?}, rule {:?}: cannot inspect {path:?} ({kind}), and a {mode} rule is never \
          skipped",
@@ -297,13 +363,25 @@ struct Candidate<'a> {
     /// Whether the host entry is a symlink matched by a glob (see
     /// [`PlannedMount::glob_link`]).
     glob_link: bool,
+    /// Whether this is a mask synthesized over a directory a restrictive
+    /// rule could not inspect ([`PlanWarningKind::InaccessibleMasked`]).
+    synthesized: bool,
     rule: &'a FsRule,
 }
 
 impl Candidate<'_> {
     /// Precedence; greater wins (§3.5 rules 1–3 at one sandbox path).
-    fn rank(&self) -> (bool, Reverse<u32>, PathMode) {
-        (self.literal, Reverse(self.rule.depth), self.mode)
+    ///
+    /// A synthesized mask outranks everything: it stands in for restrictive
+    /// rules below its path that cannot be applied, so a less strict
+    /// candidate winning there would lift them.
+    fn rank(&self) -> (bool, bool, Reverse<u32>, PathMode) {
+        (
+            self.synthesized,
+            self.literal,
+            Reverse(self.rule.depth),
+            self.mode,
+        )
     }
 
     fn into_mount(self) -> PlannedMount {
@@ -324,8 +402,18 @@ impl Candidate<'_> {
 /// Path rules are resolved against the host filesystem as it is now (see
 /// [`resolve`]): a missing path is skipped with a warning. A path that
 /// exists but cannot be inspected, or a directory a glob walk cannot read,
-/// is an error for a restrictive rule (any mode but `rw`) and skipped with
-/// a warning for an `rw` rule. A bind's host side is resolved like a
+/// is skipped with a warning for an `rw` rule. A restrictive rule (any mode
+/// but `rw`) is never skipped: the directory that cannot be searched or
+/// read is masked instead, with a warning
+/// ([`PlanWarningKind::InaccessibleMasked`]), and the rest of a glob's
+/// matches still apply. Every match of a restrictive glob is inspected, so
+/// that the entries the walk lists in a directory that can be read but not
+/// searched mask it too. That mask outranks every other candidate at its
+/// sandbox path, and one that hides a rule's mount there entirely (the
+/// workspace mount, say) is reported louder
+/// ([`PlanWarningKind::GrantHidden`]); mounts below it are kept (they show other host content,
+/// since nothing below an unsearchable directory can be resolved, as they
+/// would below any masked directory). A bind's host side is resolved like a
 /// literal `rw` path rule whatever its mode, so a missing or inaccessible
 /// host skips the bind with a warning. `fs.ephemeral` rules have no host
 /// source and always produce a candidate.
@@ -356,7 +444,7 @@ pub fn plan_mounts(fs: &[FsRule], ctx: &ExpansionContext) -> Result<MountPlan, P
     }
     let mut mounts = Vec::with_capacity(by_path.len());
     for candidates in by_path.into_values() {
-        mounts.push(pick(candidates)?.into_mount());
+        mounts.push(pick(candidates, ctx, &mut warnings)?.into_mount());
     }
     mounts.sort_by(|a, b| {
         depth(&a.sandbox)
@@ -394,13 +482,6 @@ fn plan_warning(rule: &FsRule, kind: PlanWarningKind) -> PlanWarning {
     }
 }
 
-/// Whether an error inspecting a path means it is missing (it, or a
-/// component on the way, does not exist or is not a directory), which
-/// skips a rule with a warning whatever its mode.
-fn is_missing(kind: io::ErrorKind) -> bool {
-    matches!(kind, io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
-}
-
 /// Expands and resolves one rule into its candidates, recording warnings.
 fn rule_candidates<'a>(
     rule: &'a FsRule,
@@ -413,6 +494,7 @@ fn rule_candidates<'a>(
         mode,
         literal,
         glob_link,
+        synthesized: false,
         rule,
     };
     match &rule.kind {
@@ -438,11 +520,24 @@ fn rule_candidates<'a>(
             let expanded = expand_pattern(pattern, ctx);
             let literal = !expanded.has_glob();
             let refused = unskippable(*mode);
-            let Some(paths) = resolve_host(rule, pattern, &expanded, refused, ctx, warnings)?
+            let Some(HostResolution { paths, masks }) =
+                resolve_host(rule, pattern, &expanded, refused, ctx, warnings)?
             else {
                 return Ok(Vec::new());
             };
-            let mut out = Vec::with_capacity(paths.len());
+            let mut out = Vec::with_capacity(paths.len() + masks.len());
+            for d in masks {
+                out.push(Candidate {
+                    synthesized: true,
+                    ..candidate(
+                        d.sandbox,
+                        host_source(d.host, d.kind),
+                        PathMode::Masked,
+                        true,
+                        false,
+                    )
+                });
+            }
             for p in paths {
                 // A matched link is kept as it is, whatever the anchor; the
                 // spec compiler refuses it, or for a glob skips it, if it
@@ -500,9 +595,12 @@ fn rule_candidates<'a>(
             // mounted, so a path that cannot be inspected only skips it. A
             // final link is kept: the bind follows it, as the spec compiler
             // does when checking the source.
-            let Some(paths) = resolve_host(rule, pattern, &expanded, None, ctx, warnings)? else {
+            let Some(HostResolution { paths, masks }) =
+                resolve_host(rule, pattern, &expanded, None, ctx, warnings)?
+            else {
                 return Ok(Vec::new());
             };
+            debug_assert!(masks.is_empty(), "only restrictive rules synthesize masks");
             let mut out = Vec::with_capacity(paths.len());
             for p in paths {
                 out.push(candidate(
@@ -522,10 +620,21 @@ fn host_source(path: PathBuf, kind: EntryKind) -> MountSource {
     MountSource::Host { path, kind }
 }
 
+/// What [`resolve_host`] found for a rule.
+struct HostResolution {
+    /// The matching paths.
+    paths: Vec<ResolvedPath>,
+    /// The directories to mask because a restrictive rule could not inspect
+    /// something on the way or read them (see [`unreadable_dir`]).
+    masks: Vec<ResolvedPath>,
+}
+
 /// Resolves `expanded` (the expansion of `rule`'s `pattern`), recording its
 /// warnings. A path that cannot be inspected or read for any reason but
-/// being missing is an error if `refused` (the rule's mode, see
-/// [`unskippable`]).
+/// being missing is skipped with a warning, unless `refused` (the rule's
+/// mode, see [`unskippable`]): then the directory that cannot be searched
+/// or read is to be masked instead ([`HostResolution::masks`], see
+/// [`unreadable_dir`]), with a warning.
 ///
 /// A glob whose walk root runs through a symlink inside the host workspace
 /// is not walked (see [`check_walk_root`]): an error if `refused`, and
@@ -537,7 +646,7 @@ fn resolve_host(
     refused: Option<PathMode>,
     ctx: &ExpansionContext,
     warnings: &mut Vec<PlanWarning>,
-) -> Result<Option<Vec<ResolvedPath>>, PathPlanError> {
+) -> Result<Option<HostResolution>, PathPlanError> {
     if let Some((root, link)) = check_walk_root(expanded, ctx) {
         let workspace = ctx.workspace_host().to_owned();
         return match refused {
@@ -567,21 +676,43 @@ fn resolve_host(
         pattern: pattern.clone(),
         error,
     })?;
+    let mut masks = Vec::new();
+    // Masks the directory a restrictive rule cannot inspect `path` below,
+    // once per directory (a directory that can be read but not searched
+    // fails every entry below it), with a warning.
+    let mut mask = |mode, path: PathBuf, error: io::Error, warnings: &mut Vec<PlanWarning>| {
+        let Some(dir) = unreadable_dir(expanded, &path) else {
+            return Err(PathPlanError::Inaccessible {
+                provider: rule.provider.clone(),
+                pattern: rule_pattern(rule),
+                mode,
+                path,
+                kind: error.kind(),
+            });
+        };
+        if masks.iter().any(|m: &ResolvedPath| m.host == dir.host) {
+            return Ok(());
+        }
+        warnings.push(plan_warning(
+            rule,
+            PlanWarningKind::InaccessibleMasked {
+                mode,
+                path,
+                error,
+                dir: dir.host.clone(),
+                sandbox: dir.sandbox.clone(),
+            },
+        ));
+        masks.push(dir);
+        Ok(())
+    };
     for w in res.warnings {
         match w {
             // The resolver reports a missing path, including an entry that
             // vanished during a glob walk, as `Missing`, so this is
             // anything else (e.g. `EACCES`).
             ResolveWarning::Io { path, error } => match refused {
-                Some(mode) => {
-                    return Err(PathPlanError::Inaccessible {
-                        provider: rule.provider.clone(),
-                        pattern: rule_pattern(rule),
-                        mode,
-                        path,
-                        kind: error.kind(),
-                    });
-                }
+                Some(mode) => mask(mode, path, error, warnings)?,
                 None => warnings.push(plan_warning(
                     rule,
                     ResolveWarning::Io { path, error }.into(),
@@ -592,7 +723,73 @@ fn resolve_host(
             }
         }
     }
-    Ok(Some(res.paths))
+    let mut paths = res.paths;
+    // A glob walk takes its matches' kinds from the directory listing, which
+    // needs read permission only: the entries of a directory that can be
+    // read but not searched (`chmod a-x`) are listed, but cannot be
+    // inspected or mounted. So every match of a restrictive glob is
+    // inspected, and one that cannot be is handled like a directory the
+    // walk cannot read (a literal path has been inspected already).
+    if let (Some(mode), true) = (refused, expanded.has_glob()) {
+        let mut kept = Vec::with_capacity(paths.len());
+        for p in paths {
+            match p.host.symlink_metadata() {
+                Ok(_) => kept.push(p),
+                Err(error) if is_missing(error.kind()) => warnings.push(plan_warning(
+                    rule,
+                    ResolveWarning::Missing { path: p.host }.into(),
+                )),
+                Err(error) => mask(mode, p.host, error, warnings)?,
+            }
+        }
+        paths = kept;
+    }
+    Ok(Some(HostResolution { paths, masks }))
+}
+
+/// The directory to mask when a restrictive rule cannot inspect `path`, a
+/// host path (as written) at or below `expanded`'s host anchor, and where
+/// it appears in the sandbox.
+///
+/// That is the deepest directory on the way to `path`, as written, that can
+/// itself be inspected: the next component cannot, so this directory
+/// cannot be searched (or, for a host symlink on the way, what it leads to
+/// cannot be resolved). If `path` itself can be inspected (a directory a
+/// glob walk could not read), it is `path`. Either way it is a directory
+/// position on the way to everything the rule could match below it, so
+/// masking it as an empty directory hides all of that, and more: stricter
+/// than the rule, never less strict. If nothing below the anchor can be
+/// inspected, the anchor itself is masked.
+///
+/// `None` if `path` is not below the anchor, or if a component is now
+/// missing (the layout changed during resolution): the caller fails closed.
+fn unreadable_dir(expanded: &ExpandedPattern, path: &Path) -> Option<ResolvedPath> {
+    let anchor = expanded.host_anchor();
+    let rel = path.strip_prefix(anchor).ok()?;
+    let mut dir = anchor.to_owned();
+    let mut depth = 0;
+    for c in rel.components() {
+        let next = dir.join(c);
+        match next.symlink_metadata() {
+            Ok(_) => {
+                dir = next;
+                depth += 1;
+            }
+            Err(error) if is_missing(error.kind()) => return None,
+            Err(_) => break,
+        }
+    }
+    let rel: PathBuf = rel.components().take(depth).collect();
+    let sandbox = if rel.as_os_str().is_empty() {
+        expanded.sandbox_anchor().to_owned()
+    } else {
+        expanded.sandbox_anchor().join(rel)
+    };
+    Some(ResolvedPath {
+        host: dir,
+        sandbox,
+        kind: EntryKind::Dir,
+    })
 }
 
 /// For a glob, the `(walk root, link)` if its walk root (as written) runs
@@ -625,12 +822,52 @@ fn check_walk_root(
 
 /// Picks the winner among the candidates for one sandbox path (non-empty,
 /// in rule order).
-fn pick(candidates: Vec<Candidate<'_>>) -> Result<Candidate<'_>, PathPlanError> {
+///
+/// A synthesized mask that wins over a rule showing something at the same
+/// path (any mode but `masked`) hides that rule's mount entirely, which
+/// [`PlanWarningKind::GrantHidden`] reports (the workspace mount, say, when
+/// a sandbox made the workspace itself unsearchable).
+fn pick<'a>(
+    candidates: Vec<Candidate<'a>>,
+    ctx: &ExpansionContext,
+    warnings: &mut Vec<PlanWarning>,
+) -> Result<Candidate<'a>, PathPlanError> {
     let best = candidates
         .iter()
         .map(Candidate::rank)
         .max()
         .expect("every sandbox path has at least one candidate");
+    // Synthesized masks show an empty directory whatever their source (two
+    // anchors may name different host paths at one sandbox path), so they
+    // never conflict: the first of the best stands for all.
+    if best.0 {
+        let mut winner = None;
+        let mut hidden = Vec::new();
+        for c in candidates {
+            if c.rank() == best {
+                winner.get_or_insert(c);
+            } else if !c.synthesized && c.mode != PathMode::Masked {
+                hidden.push(c);
+            }
+        }
+        let winner = winner.expect("the best rank is attained");
+        let MountSource::Host { path: dir, .. } = &winner.source else {
+            unreachable!("a synthesized mask has a host source");
+        };
+        for c in hidden {
+            let workspace = c.sandbox == ctx.workspace_sandbox();
+            warnings.push(plan_warning(
+                c.rule,
+                PlanWarningKind::GrantHidden {
+                    mode: c.mode,
+                    sandbox: c.sandbox,
+                    dir: dir.clone(),
+                    workspace,
+                },
+            ));
+        }
+        return Ok(winner);
+    }
     let mut top = candidates.into_iter().filter(|c| c.rank() == best);
     let winner = top.next().expect("the best rank is attained");
     if let Some(other) = top.find(|c| c.source != winner.source) {
@@ -1439,20 +1676,31 @@ mod tests {
     /// `None`, skipping `body`, when running as root, where permissions do
     /// not apply.
     fn with_locked<T>(f: &Fixture, rels: &[&str], body: impl FnOnce() -> T) -> Option<T> {
+        with_mode(f, rels, 0o000, body)
+    }
+
+    /// Like [`with_locked`], with the directories set to `mode`. They are
+    /// restored even if `body` panics, so that the temp dir can be removed.
+    fn with_mode<T>(f: &Fixture, rels: &[&str], mode: u32, body: impl FnOnce() -> T) -> Option<T> {
         use std::os::unix::fs::PermissionsExt;
+        struct Restore(Vec<PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for dir in &self.0 {
+                    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o755));
+                }
+            }
+        }
         if rustix::process::geteuid().is_root() {
             eprintln!("skipping: permission checks do not apply to root");
             return None;
         }
-        let set = |mode| {
-            for rel in rels {
-                fs::set_permissions(f.root.join(rel), fs::Permissions::from_mode(mode)).unwrap();
-            }
-        };
-        set(0o000);
-        let out = body();
-        set(0o755);
-        Some(out)
+        let dirs: Vec<PathBuf> = rels.iter().map(|rel| f.root.join(rel)).collect();
+        let _restore = Restore(dirs.clone());
+        for dir in &dirs {
+            fs::set_permissions(dir, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        Some(body())
     }
 
     /// The `(mode, path, kind)` of an `Inaccessible` error.
@@ -1465,34 +1713,121 @@ mod tests {
         }
     }
 
+    /// Each `InaccessibleMasked` warning of `plan` as `(provider, mode, path,
+    /// error kind, dir, sandbox)`; skips `GrantHidden` ones (see
+    /// [`hidden_grants`]) and panics on any other warning.
+    #[allow(clippy::type_complexity)]
+    fn masked_instead(
+        plan: &MountPlan,
+    ) -> Vec<(String, PathMode, PathBuf, io::ErrorKind, PathBuf, PathBuf)> {
+        plan.warnings
+            .iter()
+            .filter_map(|w| match &w.kind {
+                PlanWarningKind::InaccessibleMasked {
+                    mode,
+                    path,
+                    error,
+                    dir,
+                    sandbox,
+                } => Some((
+                    w.provider.to_string(),
+                    *mode,
+                    path.clone(),
+                    error.kind(),
+                    dir.clone(),
+                    sandbox.clone(),
+                )),
+                PlanWarningKind::GrantHidden { .. } => None,
+                other => panic!("unexpected warning {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Each `GrantHidden` warning of `plan` as `(provider, rule, mode,
+    /// sandbox, dir, workspace)`.
+    #[allow(clippy::type_complexity)]
+    fn hidden_grants(plan: &MountPlan) -> Vec<(String, String, PathMode, PathBuf, PathBuf, bool)> {
+        plan.warnings
+            .iter()
+            .filter_map(|w| match &w.kind {
+                PlanWarningKind::GrantHidden {
+                    mode,
+                    sandbox,
+                    dir,
+                    workspace,
+                } => Some((
+                    w.provider.to_string(),
+                    w.pattern.clone(),
+                    *mode,
+                    sandbox.clone(),
+                    dir.clone(),
+                    *workspace,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn unreadable_paths_fail_restrictive_rules_closed() {
+    fn unreadable_paths_mask_the_directory_under_restrictive_rules() {
         let f = Fixture::new();
         f.file("ws/a/.env");
         f.file("ws/locked/.env");
         f.file("home/locked/secret");
         f.symlink(f.home().join("locked/secret"), "home/link");
         let locked = f.ws().join("locked");
-        // Each pattern with the path it cannot inspect: a directory the walk
-        // cannot read, or a literal path below an unsearchable directory.
+        let home_locked = f.home().join("locked");
+        // Each pattern with the path it cannot inspect (a directory the walk
+        // cannot read, or a literal path below an unsearchable directory),
+        // the directory masked instead and where, and the other match the
+        // walk still finds.
         let cases = [
-            ("{workspace}/**/.env", locked.clone()),
-            ("{workspace}/locked/.env", locked.join(".env")),
-            ("{workspace}/locked/*", locked.clone()),
-            ("~/locked/secret", f.home().join("locked/secret")),
-            ("~/locked/**", f.home().join("locked")),
+            (
+                "{workspace}/**/.env",
+                locked.clone(),
+                locked.clone(),
+                "/workspace/locked",
+                Some("a/.env"),
+            ),
+            (
+                "{workspace}/locked/.env",
+                locked.join(".env"),
+                locked.clone(),
+                "/workspace/locked",
+                None,
+            ),
+            (
+                "{workspace}/locked/*",
+                locked.clone(),
+                locked.clone(),
+                "/workspace/locked",
+                None,
+            ),
+            (
+                "~/locked/secret",
+                home_locked.join("secret"),
+                home_locked.clone(),
+                "/home/user/locked",
+                None,
+            ),
+            (
+                "~/locked/**",
+                home_locked.clone(),
+                home_locked.clone(),
+                "/home/user/locked",
+                None,
+            ),
         ];
-        let Some((errors, warned)) = with_locked(&f, &["ws/locked", "home/locked"], || {
-            let mut errors = Vec::new();
-            for mode in [Masked, Protected, Ro] {
-                for (pattern, want) in &cases {
-                    let res = plan_mounts(&[rule(mode, pattern, "p", 0)], &f.ctx);
-                    errors.push((mode, *pattern, want.clone(), res));
+        let modes = [Masked, Protected, Ro];
+        let Some((plans, link, warned)) = with_locked(&f, &["ws/locked", "home/locked"], || {
+            let mut plans = Vec::new();
+            for mode in modes {
+                for (pattern, ..) in &cases {
+                    plans.push(plan_mounts(&[rule(mode, pattern, "p", 0)], &f.ctx));
                 }
             }
             // A masked `~` link whose target cannot be inspected.
-            let res = plan_mounts(&[rule(Masked, "~/link", "p", 0)], &f.ctx);
-            errors.push((Masked, "~/link", f.home().join("link"), res));
+            let link = plan_mounts(&[rule(Masked, "~/link", "p", 0)], &f.ctx);
             let warned = plan_mounts(
                 &[
                     rule(Rw, "{workspace}/**/.env", "a", 0),
@@ -1501,26 +1836,68 @@ mod tests {
                 ],
                 &f.ctx,
             );
-            (errors, warned)
+            (plans, link, warned)
         }) else {
             return;
         };
-        for (mode, pattern, want, res) in errors {
-            let e = res.unwrap_err();
-            let msg = e.to_string();
-            let (got_mode, path, kind) = inaccessible(e);
-            assert_eq!(got_mode, mode, "{pattern}");
-            assert_eq!(kind, io::ErrorKind::PermissionDenied, "{mode} {pattern}");
-            assert_eq!(path, want, "{mode} {pattern}");
-            for part in [
-                format!(r#"provider "p", rule "{pattern}": "#),
-                format!("{want:?}"),
-                format!("{mode} rule is never skipped"),
-                io::ErrorKind::PermissionDenied.to_string(),
-            ] {
-                assert!(msg.contains(&part), "{part}: {msg}");
+        let mut plans = plans.into_iter();
+        for mode in modes {
+            for (pattern, path, dir, sandbox, other) in &cases {
+                let plan = plans
+                    .next()
+                    .unwrap()
+                    .unwrap_or_else(|e| panic!("{mode} {pattern}: {e}"));
+                let mut want = vec![host(sandbox, dir.clone(), EntryKind::Dir, Masked, "p")];
+                if let Some(other) = other {
+                    want.push(host(
+                        &format!("/workspace/{other}"),
+                        f.ws().join(other),
+                        EntryKind::File,
+                        mode,
+                        "p",
+                    ));
+                }
+                assert_eq!(plan.mounts, want, "{mode} {pattern}");
+                assert_eq!(
+                    masked_instead(&plan),
+                    [(
+                        "p".to_owned(),
+                        mode,
+                        path.clone(),
+                        io::ErrorKind::PermissionDenied,
+                        dir.clone(),
+                        PathBuf::from(sandbox),
+                    )],
+                    "{mode} {pattern}"
+                );
+                let PlanWarningKind::InaccessibleMasked { error, .. } = &plan.warnings[0].kind
+                else {
+                    unreachable!("checked above");
+                };
+                assert_eq!(
+                    plan.warnings[0].to_string(),
+                    format!(
+                        "provider \"p\", rule \"{pattern}\": cannot inspect {path:?} ({error}), \
+                         and a {mode} rule is never skipped, so the directory {dir:?} is masked \
+                         at \"{sandbox}\" instead, hiding everything in it"
+                    ),
+                    "{mode} {pattern}"
+                );
             }
         }
+        // A masked link whose target cannot be inspected has no known shape,
+        // and stays an error.
+        let e = link.unwrap_err();
+        let msg = e.to_string();
+        assert_eq!(
+            inaccessible(e),
+            (
+                Masked,
+                f.home().join("link"),
+                io::ErrorKind::PermissionDenied
+            )
+        );
+        assert!(msg.contains("masked rule is never skipped"), "{msg}");
         // rw rules and binds skip what they cannot read, and the rest of
         // the walk still applies.
         let plan = warned.unwrap();
@@ -1550,6 +1927,298 @@ mod tests {
                     io::ErrorKind::PermissionDenied
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn masks_of_unreadable_directories_outrank_every_candidate() {
+        let f = Fixture::new();
+        f.file("ws/locked/.env");
+        f.file("home/x");
+        let locked = f.ws().join("locked");
+        let Some(plan) = with_locked(&f, &["ws/locked"], || {
+            f.plan(&[
+                rule(Rw, "{workspace}", "base", 1),
+                // An own literal grant of the directory itself loses.
+                rule(Rw, "{workspace}/locked", "own", 0),
+                rule(Ro, "{workspace}/**/.env", "env", 1),
+                // A second rule masking the same directory collapses into
+                // one mount, credited by the usual precedence (an own rule
+                // beats an inherited one).
+                rule(Masked, "{workspace}/locked/.env", "lit", 0),
+                // Mounts below it are kept: they show other content.
+                bind("~/x", "/workspace/locked/x", BindMode::Ro, "b", 0),
+                rule(Ephemeral, "{workspace}/locked/tmp", "e", 0),
+            ])
+        }) else {
+            return;
+        };
+        assert_eq!(
+            plan.mounts,
+            vec![
+                host("/workspace", f.ws(), EntryKind::Dir, Rw, "base"),
+                host(
+                    "/workspace/locked",
+                    locked.clone(),
+                    EntryKind::Dir,
+                    Masked,
+                    "lit"
+                ),
+                eph("/workspace/locked/tmp", "e"),
+                host(
+                    "/workspace/locked/x",
+                    f.home().join("x"),
+                    EntryKind::File,
+                    Ro,
+                    "b"
+                ),
+            ]
+        );
+        let denied = io::ErrorKind::PermissionDenied;
+        let sandbox = p("/workspace/locked");
+        assert_eq!(
+            masked_instead(&plan),
+            [
+                (
+                    "env".to_owned(),
+                    Ro,
+                    locked.clone(),
+                    denied,
+                    locked.clone(),
+                    sandbox.clone()
+                ),
+                (
+                    "lit".to_owned(),
+                    Masked,
+                    locked.join(".env"),
+                    denied,
+                    locked.clone(),
+                    sandbox.clone()
+                ),
+            ]
+        );
+        // The grant it replaced is reported, louder.
+        assert_eq!(
+            hidden_grants(&plan),
+            [(
+                "own".to_owned(),
+                "{workspace}/locked".to_owned(),
+                Rw,
+                sandbox,
+                locked.clone(),
+                false
+            )]
+        );
+        let hidden = plan
+            .warnings
+            .iter()
+            .find(|w| matches!(w.kind, PlanWarningKind::GrantHidden { .. }))
+            .unwrap();
+        assert_eq!(
+            hidden.to_string(),
+            format!(
+                "provider \"own\", rule \"{{workspace}}/locked\": this rw grant is hidden this \
+                 session: its mount at \"/workspace/locked\" is replaced by an empty masked \
+                 directory, because {locked:?} cannot be inspected (a sandbox may have removed \
+                 its permissions); restore them (e.g. `chmod u+rwx {locked:?}`) to get it back"
+            )
+        );
+    }
+
+    #[test]
+    fn an_unsearchable_workspace_hides_the_workspace_mount_loudly() {
+        // A sandbox made the workspace itself unsearchable (`chmod 000`, or
+        // `chmod 600`: readable but not searchable). The workspace rules
+        // mask it as a whole, replacing the workspace mount, which is
+        // reported as such.
+        for mode in [0o000, 0o600] {
+            let f = Fixture::new();
+            f.file("ws/flake.nix");
+            f.file("ws/.env");
+            let Some(plan) = with_mode(&f, &["ws"], mode, || {
+                f.plan(&[
+                    rule(Rw, "{workspace}", "base", 0),
+                    rule(Masked, "{workspace}/**/.env", "base", 0),
+                    rule(Protected, "{workspace}/**/*.nix", "base", 0),
+                    rule(Protected, "{workspace}/flake.lock", "base", 0),
+                ])
+            }) else {
+                return;
+            };
+            assert_eq!(
+                plan.mounts,
+                vec![host("/workspace", f.ws(), EntryKind::Dir, Masked, "base")],
+                "{mode:o}"
+            );
+            // Every restrictive rule masks the workspace once.
+            let dirs: Vec<_> = masked_instead(&plan)
+                .into_iter()
+                .map(|(_, mode, _, _, dir, sandbox)| (mode, dir, sandbox))
+                .collect();
+            assert_eq!(
+                dirs,
+                [Masked, Protected, Protected].map(|m| (m, f.ws(), p("/workspace"))),
+                "{mode:o}"
+            );
+            assert_eq!(
+                hidden_grants(&plan),
+                [(
+                    "base".to_owned(),
+                    "{workspace}".to_owned(),
+                    Rw,
+                    p("/workspace"),
+                    f.ws(),
+                    true
+                )],
+                "{mode:o}"
+            );
+            let hidden = plan
+                .warnings
+                .iter()
+                .find(|w| matches!(w.kind, PlanWarningKind::GrantHidden { .. }))
+                .unwrap();
+            assert_eq!(
+                hidden.to_string(),
+                format!(
+                    "provider \"base\", rule \"{{workspace}}\": the workspace is hidden this \
+                     session: its rw mount at \"/workspace\" is replaced by an empty masked \
+                     directory, because {:?} cannot be inspected (a sandbox may have removed its \
+                     permissions); restore them (e.g. `chmod u+rwx {:?}`) to get it back",
+                    f.ws(),
+                    f.ws()
+                ),
+                "{mode:o}"
+            );
+        }
+    }
+
+    #[test]
+    fn entries_of_a_readable_but_unsearchable_directory_mask_it() {
+        // `chmod 600`: the walk lists the directory's entries (from the
+        // listing alone), but none can be inspected or mounted. Each
+        // restrictive glob masks the directory once, rather than mounting
+        // its entries.
+        let f = Fixture::new();
+        f.file("ws/d/foo.nix");
+        f.file("ws/d/bar.nix");
+        f.file("ws/d/sub/baz.nix");
+        f.file("ws/top.nix");
+        let d = f.ws().join("d");
+        let Some(plan) = with_mode(&f, &["ws/d"], 0o600, || {
+            f.plan(&[
+                rule(Rw, "{workspace}", "base", 0),
+                rule(Protected, "{workspace}/**/*.nix", "base", 0),
+            ])
+        }) else {
+            return;
+        };
+        assert_eq!(
+            plan.mounts,
+            vec![
+                host("/workspace", f.ws(), EntryKind::Dir, Rw, "base"),
+                host("/workspace/d", d.clone(), EntryKind::Dir, Masked, "base"),
+                host(
+                    "/workspace/top.nix",
+                    f.ws().join("top.nix"),
+                    EntryKind::File,
+                    Protected,
+                    "base"
+                ),
+            ]
+        );
+        match masked_instead(&plan).as_slice() {
+            [(provider, Protected, path, kind, dir, sandbox)] => {
+                assert_eq!(provider, "base");
+                assert!(path.starts_with(&d) && *path != d, "{path:?}");
+                assert_eq!(*kind, io::ErrorKind::PermissionDenied);
+                assert_eq!((dir, sandbox.as_path()), (&d, Path::new("/workspace/d")));
+            }
+            other => panic!("unexpected warnings {other:?}"),
+        }
+        assert!(hidden_grants(&plan).is_empty());
+    }
+
+    #[test]
+    fn an_unsearchable_anchor_is_masked_itself() {
+        let f = Fixture::new();
+        f.file("home/x");
+        let Some(plan) = with_locked(&f, &["home"], || f.plan(&[rule(Ro, "~/x", "p", 0)])) else {
+            return;
+        };
+        assert_eq!(
+            plan.mounts,
+            vec![host("/home/user", f.home(), EntryKind::Dir, Masked, "p")]
+        );
+        assert_eq!(
+            masked_instead(&plan),
+            [(
+                "p".to_owned(),
+                Ro,
+                f.home().join("x"),
+                io::ErrorKind::PermissionDenied,
+                f.home(),
+                p("/home/user"),
+            )]
+        );
+    }
+
+    #[test]
+    fn a_link_loop_on_the_way_is_masked_under_restrictive_rules() {
+        // A loop cannot be inspected either: the link on the way is masked
+        // as a directory (the spec compiler refuses it if it lies inside an
+        // untrusted root). An `rw` rule is skipped, and a masked rule for
+        // the loop itself has no shape and stays an error.
+        let f = Fixture::new();
+        f.symlink("loop", "home/loop");
+        let eloop = io::Error::from_raw_os_error(rustix::io::Errno::LOOP.raw_os_error()).kind();
+        let plan = f.plan(&[rule(Ro, "~/loop/x", "p", 0), rule(Rw, "~/loop/y", "q", 0)]);
+        assert_eq!(
+            plan.mounts,
+            vec![host(
+                "/home/user/loop",
+                f.home().join("loop"),
+                EntryKind::Dir,
+                Masked,
+                "p"
+            )]
+        );
+        match plan.warnings.as_slice() {
+            [
+                PlanWarning {
+                    provider: p1,
+                    kind:
+                        PlanWarningKind::InaccessibleMasked {
+                            mode: Ro,
+                            path: masked_path,
+                            error: masked_error,
+                            dir,
+                            sandbox,
+                        },
+                    ..
+                },
+                PlanWarning {
+                    provider: p2,
+                    kind: PlanWarningKind::Resolve(ResolveWarning::Io { path, error }),
+                    ..
+                },
+            ] => {
+                assert_eq!((p1.as_str(), p2.as_str()), ("p", "q"));
+                assert_eq!(
+                    (masked_path, masked_error.kind(), dir, sandbox.as_path()),
+                    (
+                        &f.home().join("loop/x"),
+                        eloop,
+                        &f.home().join("loop"),
+                        Path::new("/home/user/loop")
+                    )
+                );
+                assert_eq!((path, error.kind()), (&f.home().join("loop/y"), eloop));
+            }
+            other => panic!("unexpected warnings {other:?}"),
+        }
+        assert_eq!(
+            inaccessible(f.plan_err(&[rule(Masked, "~/loop", "p", 0)])),
+            (Masked, f.home().join("loop"), eloop)
         );
     }
 
