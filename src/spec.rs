@@ -244,12 +244,31 @@ pub enum SpecWarning {
     /// A mount shows host content that a `masked` mount of the profile
     /// covers, or lets the sandbox write content that a `protected` mount
     /// covers, at another sandbox path, where that restriction does not
-    /// apply (DESIGN.md §6.2, "Restricted content exposure"). A warning
-    /// rather than an error: such content is commonly host-controlled (a
-    /// home-manager file masked at `~/.config/foo` whose `/nix/store` target
-    /// is mounted too), and the warning names where it is still visible.
+    /// apply (DESIGN.md §6.2, "Restricted content exposure"), so stopit
+    /// covers it there too, with a `masked` or `protected` mount of that
+    /// content added to the spec (DESIGN.md §1.5). Not an error: such
+    /// content is commonly host-controlled (a home-manager file masked at
+    /// `~/.config/foo` whose `/nix/store` target is mounted too), and the
+    /// warning names where it was shown and how to fix the configuration.
     #[error(transparent)]
     RestrictedContentExposed(Box<Exposure>),
+    /// A `masked` or `protected` rule matches the host workspace itself
+    /// (`~/Projects/*` masked while the workspace is `~/Projects/stopit`),
+    /// which the workspace mount shows at another sandbox path. The
+    /// workspace's identity wins (DESIGN.md §6.2, "Restricted content
+    /// exposure"): the workspace mount is never covered, and the rule
+    /// applies only at its own path; restricted content inside the
+    /// workspace is still covered at the workspace mount.
+    #[error(transparent)]
+    WorkspaceRestricted(Box<WorkspaceRestricted>),
+    /// A mount's host source reaches, through a host symlink, into content
+    /// a `masked` mount of the profile hides (or a `protected` one, for an
+    /// `rw` mount), although the source as written lies outside it. A
+    /// grant strictly inside restricted content is the more specific rule
+    /// and is not covered (DESIGN.md §3.5), but the user may not realize
+    /// that it lies under the restriction.
+    #[error(transparent)]
+    LinkedIntoRestricted(Box<LinkedIntoRestricted>),
     /// The profile itself granted `network.allow_domains` but its network
     /// mode is not `proxy`, the only mode that uses them, so the domains
     /// were dropped. Domains inherited from the parent are dropped without
@@ -596,20 +615,26 @@ pub struct GlobLink {
 /// A mount shows host content that a `masked` mount of the same profile
 /// covers, or shows writable content that a `protected` mount covers, at a
 /// sandbox path where that restriction does not apply (DESIGN.md §6.2,
-/// "Restricted content exposure"). Masks and protected files apply to
-/// sandbox paths, not to host content.
+/// "Restricted content exposure"), so stopit covers it there with a mount
+/// of mode [`Exposure::covered`]. Masks and protected files apply to
+/// sandbox paths, not to host content. Only a grant of the restricted
+/// content itself or of an ancestor counts: one strictly inside it is a
+/// more specific grant (DESIGN.md §3.5).
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error(
-    "provider {:?}: {mode} mount of {host:?}{} at {sandbox:?} shows {shown:?} at {shown_at:?}, \
-     where the {restricted_mode} mount of {restricted_host:?} by provider {:?} at \
-     {restricted_sandbox:?} does not apply, so it is still {} there; narrow this grant to leave \
-     it out, add a rule for {shown:?} if this mount shows it at its own host path, or cover \
-     {shown_at:?} with an ephemeral rule (an absolute rule names a host path, so one for a bind \
-     destination would be skipped as missing)",
+    "provider {:?}: {mode} mount of {host:?}{} at {sandbox:?} shows {restricted_host:?} at \
+     {shown_at:?}, where the {restricted_mode} mount of it by provider {:?} at \
+     {restricted_sandbox:?} does not apply, so it would be {} there; stopit {} at {shown_at:?} \
+     this session{}; to fix the configuration, narrow this grant to leave it out, add a rule for \
+     {restricted_host:?} if this mount shows it at its own host path, or cover {shown_at:?} with \
+     an ephemeral rule (an absolute rule names a host path, so one for a bind destination would \
+     be skipped as missing)",
     .provider.as_str(),
     resolved_note(.host, .resolved),
     .restricted_provider.as_str(),
-    if *.restricted_mode == PathMode::Protected { "writable" } else { "visible" }
+    if *.restricted_mode == PathMode::Protected { "writable" } else { "visible" },
+    if *.covered == PathMode::Masked { "masks it" } else { "mounts it protected" },
+    if .shown_at == .sandbox { ", replacing this mount" } else { "" }
 )]
 pub struct Exposure {
     /// The provider whose rule produced the exposing mount.
@@ -622,11 +647,81 @@ pub struct Exposure {
     pub resolved: PathBuf,
     /// The exposing mount's sandbox destination.
     pub sandbox: PathBuf,
-    /// The restricted host content it shows (canonical): the restricted
-    /// path itself, or the exposing mount's source inside it.
-    pub shown: PathBuf,
-    /// Where in the sandbox it shows `shown`.
+    /// Where in the sandbox it shows `restricted_host`: `sandbox` joined
+    /// with `restricted_host`'s path below `resolved`.
     pub shown_at: PathBuf,
+    /// The provider whose rule produced the restrictive mount.
+    pub restricted_provider: ProviderName,
+    /// The restrictive mount's mode (`masked` or `protected`).
+    pub restricted_mode: PathMode,
+    /// The restrictive mount's host source, resolved to its canonical path.
+    pub restricted_host: PathBuf,
+    /// The restrictive mount's sandbox destination.
+    pub restricted_sandbox: PathBuf,
+    /// The mode of the mount stopit adds at `shown_at` to cover it:
+    /// `masked`, or `protected` for protected content, unless a mask of the
+    /// same content lands there too.
+    pub covered: PathMode,
+}
+
+/// A `masked` or `protected` rule matches the host workspace itself, which
+/// the workspace mount shows elsewhere (see
+/// [`SpecWarning::WorkspaceRestricted`]). The workspace's identity wins:
+/// the workspace mount is kept, and the rule applies only at its own path.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "provider {:?}: the {restricted_mode} rule for {restricted_host:?}{} at \
+     {restricted_sandbox:?} matches the host workspace itself, so it does not apply to the \
+     workspace mount at {workspace_mount:?} this session: the workspace stays mounted there \
+     (restricted content inside it is still covered); exclude the workspace from the rule, \
+     narrowing the path or glob, to silence this",
+    .restricted_provider.as_str(),
+    resolved_note(.restricted_host, .workspace)
+)]
+pub struct WorkspaceRestricted {
+    /// The provider whose rule produced the restrictive mount.
+    pub restricted_provider: ProviderName,
+    /// The restrictive mount's mode (`masked` or `protected`).
+    pub restricted_mode: PathMode,
+    /// The restrictive mount's host source, as planned.
+    pub restricted_host: PathBuf,
+    /// The restrictive mount's sandbox destination.
+    pub restricted_sandbox: PathBuf,
+    /// The host workspace (canonical), which `restricted_host` resolves to.
+    pub workspace: PathBuf,
+    /// The workspace mount.
+    pub workspace_mount: PathBuf,
+}
+
+/// A mount's host source, as written, lies outside a `masked` or
+/// `protected` path, but resolves through a host symlink to content
+/// strictly inside it (see [`SpecWarning::LinkedIntoRestricted`]). As a
+/// grant of part of the restricted content it is the more specific rule
+/// and is mounted as configured, but the user may not have meant to reach
+/// under the restriction.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "provider {:?}: {mode} mount of {host:?} (resolving to {resolved:?}) at {sandbox:?} \
+     reaches, through a host symlink, into {restricted_host:?}, which the {restricted_mode} \
+     mount by provider {:?} at {restricted_sandbox:?} restricts; as a narrower grant of part of \
+     it, it is mounted as configured, so that content is {} at {sandbox:?}; if that is not \
+     intended, remove this grant or the link",
+    .provider.as_str(),
+    .restricted_provider.as_str(),
+    if *.restricted_mode == PathMode::Protected { "writable" } else { "visible" }
+)]
+pub struct LinkedIntoRestricted {
+    /// The provider whose rule produced the mount.
+    pub provider: ProviderName,
+    /// The mount's mode.
+    pub mode: PathMode,
+    /// The mount's host source, as planned.
+    pub host: PathBuf,
+    /// `host` with every symlink resolved: strictly inside
+    /// `restricted_host`.
+    pub resolved: PathBuf,
+    /// The mount's sandbox destination.
+    pub sandbox: PathBuf,
     /// The provider whose rule produced the restrictive mount.
     pub restricted_provider: ProviderName,
     /// The restrictive mount's mode (`masked` or `protected`).
@@ -898,7 +993,8 @@ fn check_mount_destinations(mounts: &[PlannedMount]) -> Result<(), SpecError> {
 /// (DESIGN.md §3.4, Symlinks; §6.2, "Untrusted links"), the host workspace
 /// (§6.2, "Workspace exposure") and the profile's masked and protected
 /// mounts (§6.2, "Restricted content exposure"; see
-/// [`check_restricted_exposure`]).
+/// [`cover_restricted_exposure`], which adds the mounts covering such
+/// content where another mount shows it).
 ///
 /// The planner keeps host sources as written: `~` and absolute rules follow
 /// symlinks on the way and binds follow a final symlink, as bwrap does when
@@ -912,7 +1008,8 @@ fn check_mount_destinations(mounts: &[PlannedMount]) -> Result<(), SpecError> {
 /// one inside a masked directory of `mounts` is dropped instead, with
 /// [`SpecWarning::SourceUnderMask`], since the mask hides it anyway (the
 /// planner masks a directory a restrictive rule cannot inspect below, so
-/// that is for a layout that changed since). Returns the mounts kept. A
+/// that is for a layout that changed since). Returns the mounts kept, plus
+/// those covering restricted content shown elsewhere, in plan order. A
 /// `masked` mount is kept even if its source cannot be resolved (it shows
 /// nothing of it, and its shape was decided while planning), with
 /// [`SpecWarning::MaskSourceUnresolved`], unless the lookup followed such a
@@ -991,7 +1088,8 @@ fn check_host_sources(
         .map(|m| m.sandbox.clone())
         .collect();
     let mut kept = Vec::with_capacity(mounts.len());
-    // The canonical source of each kept mount, `None` for an ephemeral one.
+    // The canonical source of each kept mount and its kind, `None` for an
+    // ephemeral one (or a mask whose source cannot be resolved).
     let mut sources = Vec::with_capacity(mounts.len());
     for m in mounts {
         let MountSource::Host { path: host, kind } = &m.source else {
@@ -1081,7 +1179,7 @@ fn check_host_sources(
                 followed,
             )));
         }
-        let resolved = source.path;
+        let (resolved, resolved_kind) = (source.path, source.kind);
         let exposed = m.mode != PathMode::Masked
             && match resolved.strip_prefix(ws_host) {
                 // Inside the workspace (or the workspace itself): only the
@@ -1100,11 +1198,10 @@ fn check_host_sources(
                 workspace: ws_host.to_owned(),
             });
         }
-        sources.push(Some(resolved));
+        sources.push(Some((resolved, resolved_kind)));
         kept.push(m);
     }
-    check_restricted_exposure(&kept, &sources, warnings);
-    Ok(kept)
+    Ok(cover_restricted_exposure(kept, &sources, ws_host, warnings))
 }
 
 /// `base` joined with the relative path `rel`, or `base` itself if `rel` is
@@ -1117,44 +1214,168 @@ fn join_rel(base: &Path, rel: &Path) -> PathBuf {
     }
 }
 
-/// Warns about host content a `masked` or `protected` mount covers that is
-/// shown at another sandbox path (DESIGN.md §6.2, "Restricted content
-/// exposure"), one [`SpecWarning::RestrictedContentExposed`] per pair of
-/// mounts. `sources` holds each mount's canonical host source (`None` for
-/// an ephemeral mount), as [`check_host_sources`] resolved it.
+/// Covers host content a `masked` or `protected` mount covers that another
+/// mount shows at another sandbox path (DESIGN.md §6.2, "Restricted content
+/// exposure"), returning `mounts` with the covering mounts added, in plan
+/// order, and one [`SpecWarning::RestrictedContentExposed`] per pair of
+/// mounts. `sources` holds each mount's canonical host source and its kind
+/// (`None` for an ephemeral mount, or a mask whose source cannot be
+/// resolved), as [`check_host_sources`] resolved it.
 ///
-/// A warning rather than an error: such content is commonly controlled by
-/// the host (a home-manager file masked at `~/.config/foo` whose
-/// `/nix/store` target is mounted too), and the warning says where it is
-/// still visible and how to cover it there.
+/// The safe outcome (DESIGN.md §1.5) rather than an error: such content is
+/// commonly controlled by the host (a home-manager file masked at
+/// `~/.config/foo` whose `/nix/store` target is mounted too), and the
+/// warning says where it was shown and how to fix the configuration.
 ///
 /// Masks and protected files apply to sandbox paths, not to host content.
 /// So for every such mount R, of the canonical host path P at the sandbox
 /// path T_R, every other mount M that shows something (any mode but
 /// `masked`; for a `protected` R only `rw` mounts count, since protected
 /// content is readable anyway), of the canonical source S at T_M, should
-/// show none of P away from T_R:
+/// not show P away from T_R through a grant at least as broad as P: if S
+/// is P or an ancestor of it, M shows P at X, T_M joined with P's path
+/// below S. That is fine if X is T_R (R covers it there), or if another
+/// mount lies between T_M (exclusive) and X (inclusive): it is mounted on
+/// top and hides what M shows there (that mount is compared in turn).
+/// Otherwise P is exposed: masked `~/.config/tool/token` with `~/.config`
+/// also mounted at `/opt/cfg` shows the token at `/opt/cfg/tool/token`.
 ///
-/// * If S is P or an ancestor of it, M shows P at T_M joined with P's path
-///   below S. That is fine if it is T_R (R covers it there), or if another
-///   mount lies between T_M (exclusive) and that path (inclusive): it is
-///   mounted on top and hides what M shows there (that mount is checked in
-///   turn). Otherwise P is exposed: masked `~/.config/tool/token` with
-///   `~/.config` also mounted at `/opt/cfg` shows the token at
-///   `/opt/cfg/tool/token`.
-/// * If S lies inside P (a directory), M shows that part of P at T_M, which
-///   is fine only at its aligned path inside R's, T_R joined with S's path
-///   below P: a deeper rule granting part of a masked directory where the
-///   directory is masked.
+/// A source S strictly inside P (a directory) does not expose P: the most
+/// specific rule wins (DESIGN.md §3.5), and a grant of part of a masked or
+/// protected directory is a narrower, explicit grant of that part,
+/// wherever it is mounted. Masking `~/Projects` to hide other projects
+/// leaves the workspace `~/Projects/stopit` at its mount. Specificity is
+/// decided on canonical paths, so a source written outside P (and outside
+/// R's source as written) that reaches strictly inside P through a host
+/// link (`ro ~/.toolrc` with `~/.toolrc -> .ssh/id_ed25519` and `~/.ssh`
+/// masked) is not covered either, but is reported with
+/// [`SpecWarning::LinkedIntoRestricted`]: the user may not realize it lies
+/// under the restriction.
 ///
-/// Only one profile's mounts are compared: each sandbox is one profile. A
-/// mount dropped earlier is not among `mounts`, so it neither exposes nor
-/// covers anything.
-fn check_restricted_exposure(
-    mounts: &[PlannedMount],
-    sources: &[Option<PathBuf>],
+/// The workspace mount itself is never covered: if P is the host workspace
+/// (`~/Projects/*` masked, matching the workspace `~/Projects/stopit`), the
+/// workspace's identity wins, the workspace mount is kept and R applies
+/// only at T_R, with [`SpecWarning::WorkspaceRestricted`]. Restricted
+/// content inside the workspace, shown through the workspace mount, is
+/// still covered there.
+///
+/// So M shows P at X, and no other mount shows anything at X: one at X
+/// itself, other than M, or between M and X would be mounted on top. So X
+/// is covered by a mount of P there, attributed to R's provider: `masked`
+/// (of P's kind) for a masked R, `protected` for a protected one (a
+/// read-only bind of P until protected files are served by FUSE, which
+/// serves the same content). Restricted mounts of the same content (masked
+/// `~/.config/foo` and `~/.config/bar` linking to one store path) meet at
+/// the same X, which gets one mount, the stricter: `masked` over
+/// `protected`. If X is M's own path (S is P), the cover replaces M, being
+/// stricter: a mask hides it, and a protected mount shows the same content
+/// read-only. An exposure through M below a cover that
+/// already hides it (inside a masked directory X, or inside a protected one
+/// for protected content) needs no mount of its own and is not reported.
+/// Planned mounts deeper than X are kept on top of the cover, as below any
+/// mount: they show what their own rules configure (and are compared in
+/// turn).
+///
+/// The covers need none of the earlier checks. Their sources are canonical
+/// paths, so they run through no link (§3.4, Symlinks), and lie inside M's
+/// canonical source, which passed the workspace check (a protected cover
+/// shows part of what M shows, at its aligned path within M). Their
+/// destinations lie at or below T_M: bwrap reaches X through M's tree, at
+/// S joined with X's path below T_M, which is P, canonical, so with no link
+/// on the way (§6.2, "Untrusted links"); and a path at or below a valid
+/// destination is valid too (§6.2, "Reserved paths", checked again in debug
+/// builds).
+///
+/// Only one profile's mounts are compared, and covered: each sandbox is one
+/// profile. A mount dropped earlier is not among `mounts`, so it neither
+/// exposes nor covers anything.
+fn cover_restricted_exposure(
+    mut mounts: Vec<PlannedMount>,
+    sources: &[Option<(PathBuf, EntryKind)>],
+    ws_host: &Path,
     warnings: &mut Vec<SpecWarning>,
-) {
+) -> Vec<PlannedMount> {
+    // Every exposure, with the kind of the content it shows.
+    let found = find_restricted_exposure(&mounts, sources, ws_host, warnings);
+    // The mount covering each exposed sandbox path.
+    let covers = |found: &[(Exposure, EntryKind)]| {
+        let mut covers: BTreeMap<PathBuf, PlannedMount> = BTreeMap::new();
+        for (x, kind) in found {
+            let mode = match x.restricted_mode {
+                PathMode::Masked => PathMode::Masked,
+                _ => PathMode::Protected,
+            };
+            let cover = || PlannedMount {
+                sandbox: x.shown_at.clone(),
+                source: MountSource::Host {
+                    path: x.restricted_host.clone(),
+                    kind: *kind,
+                },
+                mode,
+                provider: x.restricted_provider.clone(),
+                glob_link: false,
+            };
+            let c = covers.entry(x.shown_at.clone()).or_insert_with(cover);
+            // One host path shows at X, so only the mode can differ.
+            debug_assert_eq!(c.source, cover().source);
+            if mode == PathMode::Masked && c.mode != PathMode::Masked {
+                *c = cover();
+            }
+        }
+        covers
+    };
+    let all = covers(&found);
+    // An exposure through M below a cover that hides it already: at most up
+    // to M's own path, where nothing else is mounted, so that cover is M's.
+    let hidden = |x: &Exposure| {
+        x.shown_at
+            .ancestors()
+            .skip(1)
+            .take_while(|a| a.starts_with(&x.sandbox))
+            .filter_map(|a| all.get(a))
+            .any(|c| c.mode == PathMode::Masked || x.restricted_mode == PathMode::Protected)
+    };
+    let found: Vec<_> = found.into_iter().filter(|(x, _)| !hidden(x)).collect();
+    let covers = covers(&found);
+    for (mut x, _) in found {
+        x.covered = covers[&x.shown_at].mode;
+        warnings.push(SpecWarning::RestrictedContentExposed(Box::new(x)));
+    }
+    let covers: Vec<PlannedMount> = covers.into_values().collect();
+    debug_assert!(check_mount_destinations(&covers).is_ok());
+    // Only an exposing mount can lie at a covered path: its own.
+    mounts.retain(|m| covers.iter().all(|c| c.sandbox != m.sandbox));
+    mounts.extend(covers);
+    sort_plan(&mut mounts);
+    mounts
+}
+
+/// Sorts mounts as the planner orders them (see
+/// [`MountPlan::mounts`](crate::resolve::MountPlan::mounts)): by depth, so
+/// that every mount comes after its ancestors, then by path.
+fn sort_plan(mounts: &mut [PlannedMount]) {
+    mounts.sort_by(|a, b| {
+        let depth = |p: &Path| p.components().count();
+        depth(&a.sandbox)
+            .cmp(&depth(&b.sandbox))
+            .then_with(|| a.sandbox.cmp(&b.sandbox))
+    });
+}
+
+/// Every exposure [`cover_restricted_exposure`] covers, not yet attributed
+/// a cover (its [`Exposure::covered`] is the restrictive mount's mode), with
+/// the kind of the content it shows. Pushes the warnings for what is not
+/// covered: a restrictive rule matching the host workspace `ws_host`
+/// ([`SpecWarning::WorkspaceRestricted`]) and a grant reaching strictly
+/// inside restricted content through a host link
+/// ([`SpecWarning::LinkedIntoRestricted`]).
+fn find_restricted_exposure(
+    mounts: &[PlannedMount],
+    sources: &[Option<(PathBuf, EntryKind)>],
+    ws_host: &Path,
+    warnings: &mut Vec<SpecWarning>,
+) -> Vec<(Exposure, EntryKind)> {
+    let mut found = Vec::new();
     let at: BTreeSet<&Path> = mounts.iter().map(|m| m.sandbox.as_path()).collect();
     // Whether a mount lies strictly below `top` and at or above `path` (a
     // path below `top`), hiding what the mount at `top` shows at `path`.
@@ -1164,12 +1385,12 @@ fn check_restricted_exposure(
             .any(|a| at.contains(a))
     };
     for (i, (r, p)) in mounts.iter().zip(sources).enumerate() {
-        let Some(p) = p else { continue };
+        let Some((p, p_kind)) = p else { continue };
         if !matches!(r.mode, PathMode::Masked | PathMode::Protected) {
             continue;
         }
         for (j, (m, s)) in mounts.iter().zip(sources).enumerate() {
-            let Some(s) = s else { continue };
+            let Some((s, _)) = s else { continue };
             // A read-only view of protected content exposes nothing
             // protected: it is readable at its own path too.
             let shows = match r.mode {
@@ -1179,38 +1400,69 @@ fn check_restricted_exposure(
             if i == j || !shows {
                 continue;
             }
-            let (shown, shown_at) = if let Ok(rel) = p.strip_prefix(s) {
-                let shown_at = join_rel(&m.sandbox, rel);
-                if shown_at == r.sandbox || overmounted(&m.sandbox, &shown_at) {
-                    continue;
-                }
-                (p.clone(), shown_at)
-            } else if let Ok(rel) = s.strip_prefix(p) {
-                if m.sandbox == join_rel(&r.sandbox, rel) {
-                    continue;
-                }
-                (s.clone(), m.sandbox.clone())
-            } else {
-                continue;
-            };
-            let MountSource::Host { path: host, .. } = &m.source else {
+            let (MountSource::Host { path: host, .. }, MountSource::Host { path: r_host, .. }) =
+                (&m.source, &r.source)
+            else {
                 unreachable!("a mount with a canonical source has a host source");
             };
-            warnings.push(SpecWarning::RestrictedContentExposed(Box::new(Exposure {
+            let Ok(rel) = p.strip_prefix(s) else {
+                // A source strictly inside P is a more specific grant of
+                // that part of P, and exposes nothing (DESIGN.md §3.5); but
+                // one written outside P that reaches there through a host
+                // link is reported.
+                if s.starts_with(p) && !host.starts_with(p) && !host.starts_with(r_host) {
+                    warnings.push(SpecWarning::LinkedIntoRestricted(Box::new(
+                        LinkedIntoRestricted {
+                            provider: m.provider.clone(),
+                            mode: m.mode,
+                            host: host.clone(),
+                            resolved: s.clone(),
+                            sandbox: m.sandbox.clone(),
+                            restricted_provider: r.provider.clone(),
+                            restricted_mode: r.mode,
+                            restricted_host: p.clone(),
+                            restricted_sandbox: r.sandbox.clone(),
+                        },
+                    )));
+                }
+                continue;
+            };
+            let shown_at = join_rel(&m.sandbox, rel);
+            if shown_at == r.sandbox || overmounted(&m.sandbox, &shown_at) {
+                continue;
+            }
+            // The workspace's identity wins: the workspace mount (the only
+            // mount whose source is the workspace) is never covered.
+            if p == ws_host {
+                warnings.push(SpecWarning::WorkspaceRestricted(Box::new(
+                    WorkspaceRestricted {
+                        restricted_provider: r.provider.clone(),
+                        restricted_mode: r.mode,
+                        restricted_host: r_host.clone(),
+                        restricted_sandbox: r.sandbox.clone(),
+                        workspace: ws_host.to_owned(),
+                        workspace_mount: m.sandbox.clone(),
+                    },
+                )));
+                continue;
+            }
+            let exposure = Exposure {
                 provider: m.provider.clone(),
                 mode: m.mode,
                 host: host.clone(),
                 resolved: s.clone(),
                 sandbox: m.sandbox.clone(),
-                shown,
                 shown_at,
                 restricted_provider: r.provider.clone(),
                 restricted_mode: r.mode,
                 restricted_host: p.clone(),
                 restricted_sandbox: r.sandbox.clone(),
-            })));
+                covered: r.mode,
+            };
+            found.push((exposure, *p_kind));
         }
     }
+    found
 }
 
 /// The [`LinkFollowed`] for the mount `m` of `host`, resolving to
@@ -1516,12 +1768,7 @@ fn check_destination_links(
     }
     // Masks synthesized over directories that cannot be searched were added
     // after deeper mounts; restore the plan's order.
-    kept.sort_by(|a, b| {
-        let depth = |p: &Path| p.components().count();
-        depth(&a.sandbox)
-            .cmp(&depth(&b.sandbox))
-            .then_with(|| a.sandbox.cmp(&b.sandbox))
-    });
+    sort_plan(&mut kept);
     Ok(kept)
 }
 
@@ -1618,6 +1865,8 @@ const MAX_SYMLINKS: usize = 40;
 struct ResolvedSource<'r> {
     /// The canonical path.
     path: PathBuf,
+    /// The kind of entry at `path` (never [`EntryKind::Symlink`]).
+    kind: EntryKind,
     /// Every symlink followed that lies inside an untrusted root, in the
     /// order the lookup followed them.
     untrusted: Vec<UntrustedLink<'r>>,
@@ -1687,9 +1936,9 @@ fn resolve_host_source<'r>(
     }
     debug_assert!(path.is_absolute(), "{path:?} is not absolute");
     let mut resolved = PathBuf::from("/");
-    // Whether `resolved` is a directory, which any component after it
-    // requires.
-    let mut is_dir = true;
+    // The kind of entry at `resolved`; any component after it requires a
+    // directory.
+    let mut kind = EntryKind::Dir;
     let mut pending = Vec::new();
     push(&mut pending, path);
     let mut links = 0;
@@ -1701,10 +1950,10 @@ fn resolve_host_source<'r>(
     };
     while let Some(name) = pending.pop() {
         if name == "/" {
-            (resolved, is_dir) = (PathBuf::from("/"), true);
+            (resolved, kind) = (PathBuf::from("/"), EntryKind::Dir);
             continue;
         }
-        if !is_dir {
+        if kind != EntryKind::Dir {
             return Err(fail(Errno::NOTDIR.into(), resolved, untrusted));
         }
         // `resolved` is canonical, so `..` is its lexical parent. A `Normal`
@@ -1712,6 +1961,7 @@ fn resolve_host_source<'r>(
         if name == "." {
             continue;
         } else if name == ".." {
+            // Every ancestor of a canonical path is a directory.
             resolved.pop();
             continue;
         }
@@ -1721,7 +1971,7 @@ fn resolve_host_source<'r>(
             Err(error) => return Err(fail(error, next, untrusted)),
         };
         if !meta.is_symlink() {
-            (resolved, is_dir) = (next, meta.is_dir());
+            (resolved, kind) = (next, EntryKind::from_file_type(meta.file_type()));
             continue;
         }
         links += 1;
@@ -1739,6 +1989,7 @@ fn resolve_host_source<'r>(
     }
     Ok(ResolvedSource {
         path: resolved,
+        kind,
         untrusted,
     })
 }
@@ -3550,6 +3801,13 @@ mod tests {
             resolve_in(&ws.join("dangling"), &ws).unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
+        // The kind is that of the canonical entry, after every link.
+        let roots = UntrustedRoots::new(&ws);
+        let kind = |p: &Path| resolve_host_source(p, &roots).unwrap().kind;
+        assert_eq!(kind(&root.join("chain2")), EntryKind::Dir);
+        assert_eq!(kind(&root.join("file-link")), EntryKind::File);
+        assert_eq!(kind(Path::new("/")), EntryKind::Dir);
+        assert_eq!(kind(&root.join("ws/a/b/..")), EntryKind::Dir);
     }
 
     #[test]
@@ -5556,8 +5814,8 @@ mod tests {
             .collect()
     }
 
-    /// The only `Exposure` of `body` (see [`exposures`]), which must still
-    /// mount everything it was given: an exposure is a warning.
+    /// The only `Exposure` of `body` (see [`exposures`]), which must have
+    /// exactly one.
     fn exposed(f: &Fixture, body: &str) -> Exposure {
         match exposures(f, body).as_slice() {
             [x] => x.clone(),
@@ -5565,8 +5823,27 @@ mod tests {
         }
     }
 
+    /// The host source of `main`'s mount at `sandbox` in `s`, which must
+    /// exist.
+    fn source_at(s: &CompiledSession, sandbox: &str) -> MountSource {
+        spec(s, "main")
+            .mounts
+            .iter()
+            .find(|m| m.sandbox == Path::new(sandbox))
+            .unwrap_or_else(|| panic!("no mount at {sandbox:?}"))
+            .source
+            .clone()
+    }
+
+    fn host(path: &Path, kind: EntryKind) -> MountSource {
+        MountSource::Host {
+            path: path.to_owned(),
+            kind,
+        }
+    }
+
     #[test]
-    fn masked_content_shown_elsewhere_is_a_warning() {
+    fn masked_content_shown_elsewhere_is_masked_there_too() {
         let f = Fixture::new();
         f.file("home/.config/tool/token");
         f.file("home/.config/other");
@@ -5577,13 +5854,19 @@ mod tests {
             "fs.bind = [{ host = \"~/.config\", sandbox = \"/opt/cfg\", mode = \"ro\" }]";
         let body = format!("{mask}{elsewhere}");
         let s = compile_body(&f, &body).unwrap();
-        // Both mounts are kept.
+        // Both mounts are kept, and the token is masked where the bind shows
+        // it, in plan order.
         assert_eq!(
             mounts(spec(&s, "main")),
             [
                 row("/opt/cfg", Ro, "p"),
+                row("/opt/cfg/tool/token", Masked, "p"),
                 row("/home/user/.config/tool/token", Masked, "p"),
             ]
+        );
+        assert_eq!(
+            source_at(&s, "/opt/cfg/tool/token"),
+            host(&token, EntryKind::File)
         );
         let msg = get(&s, "main").warnings[0].to_string();
         assert_eq!(
@@ -5594,25 +5877,40 @@ mod tests {
                 host: cfg.clone(),
                 resolved: cfg.clone(),
                 sandbox: "/opt/cfg".into(),
-                shown: token.clone(),
                 shown_at: "/opt/cfg/tool/token".into(),
                 restricted_provider: "p".parse().unwrap(),
                 restricted_mode: Masked,
                 restricted_host: token.clone(),
                 restricted_sandbox: "/home/user/.config/tool/token".into(),
+                covered: Masked,
             }
         );
         assert_eq!(
             msg,
             format!(
                 "provider \"p\": ro mount of {cfg:?} at \"/opt/cfg\" shows {token:?} at \
-                 \"/opt/cfg/tool/token\", where the masked mount of {token:?} by provider \"p\" at \
-                 \"/home/user/.config/tool/token\" does not apply, so it is still visible there; \
-                 narrow this grant to leave it out, add a rule for {token:?} if this mount shows \
-                 it at its own host path, or cover \"/opt/cfg/tool/token\" with an ephemeral rule \
-                 (an absolute rule names a host path, so one for a bind destination would be \
-                 skipped as missing)"
+                 \"/opt/cfg/tool/token\", where the masked mount of it by provider \"p\" at \
+                 \"/home/user/.config/tool/token\" does not apply, so it would be visible there; \
+                 stopit masks it at \"/opt/cfg/tool/token\" this session; to fix the \
+                 configuration, narrow this grant to leave it out, add a rule for {token:?} if \
+                 this mount shows it at its own host path, or cover \"/opt/cfg/tool/token\" with \
+                 an ephemeral rule (an absolute rule names a host path, so one for a bind \
+                 destination would be skipped as missing)"
             )
+        );
+        // The cover is attributed to the masking rule's provider.
+        let s = f.compile(&format!(
+            "base = \"none\"\n{}{}",
+            prov("m", "main", mask),
+            prov("b", "main", elsewhere)
+        ));
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [
+                row("/opt/cfg", Ro, "b"),
+                row("/opt/cfg/tool/token", Masked, "m"),
+                row("/home/user/.config/tool/token", Masked, "m"),
+            ]
         );
         // At its aligned path, the mask covers what the grant shows there.
         for ok in [
@@ -5630,41 +5928,433 @@ mod tests {
         }
         // A link to the grant is resolved first.
         symlink(&cfg, f.root.join("home/cfg-link")).unwrap();
-        let x = exposed(&f, &format!("{mask}fs.ro = [\"~/cfg-link\"]"));
+        let body = format!("{mask}fs.ro = [\"~/cfg-link\"]");
+        let x = exposed(&f, &body);
         assert_eq!(
             (x.resolved, x.shown_at),
             (cfg.clone(), PathBuf::from("/home/user/cfg-link/tool/token"))
         );
-        // A source inside a masked directory is part of what it hides: fine
-        // at its aligned path, where the deeper rule wins, but not elsewhere.
+        let s = compile_body(&f, &body).unwrap();
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [
+                row("/home/user/cfg-link", Ro, "p"),
+                row("/home/user/.config/tool/token", Masked, "p"),
+                row("/home/user/cfg-link/tool/token", Masked, "p"),
+            ]
+        );
+        assert_eq!(
+            source_at(&s, "/home/user/cfg-link/tool/token"),
+            host(&token, EntryKind::File)
+        );
+        // A source strictly inside a masked directory is a more specific
+        // grant of that part (the most specific rule wins), at its aligned
+        // path or elsewhere: nothing is exposed or added.
         let dir_mask = "fs.masked = [\"~/.config/tool\"]\n";
         assert_eq!(
             exposures(&f, &format!("{dir_mask}fs.ro = [\"~/.config/tool/token\"]")),
             []
         );
-        let x = exposed(
+        let body = format!(
+            "{dir_mask}fs.bind = [{{ host = \"~/.config/tool/token\", sandbox = \"/opt/token\", \
+             mode = \"ro\" }}]"
+        );
+        assert_eq!(exposures(&f, &body), []);
+        let s = compile_body(&f, &body).unwrap();
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [
+                row("/opt/token", Ro, "p"),
+                row("/home/user/.config/tool", Masked, "p"),
+            ]
+        );
+        assert_eq!(source_at(&s, "/opt/token"), host(&token, EntryKind::File));
+        // A grant of the masked path itself elsewhere is not more specific:
+        // it is replaced by a mask.
+        let body = format!(
+            "{mask}fs.bind = [{{ host = \"~/.config/tool/token\", sandbox = \"/opt/token\", mode \
+             = \"ro\" }}]"
+        );
+        let x = exposed(&f, &body);
+        assert_eq!(
+            (x.shown_at, x.restricted_host, x.covered),
+            (PathBuf::from("/opt/token"), token.clone(), Masked)
+        );
+        let s = compile_body(&f, &body).unwrap();
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [
+                row("/opt/token", Masked, "p"),
+                row("/home/user/.config/tool/token", Masked, "p"),
+            ]
+        );
+        assert_eq!(source_at(&s, "/opt/token"), host(&token, EntryKind::File));
+    }
+
+    #[test]
+    fn a_workspace_inside_a_masked_directory_keeps_its_mount() {
+        // Masking `~/Projects` to hide the other projects: the workspace
+        // `~/Projects/stopit` lies strictly inside it, so its mount is a more
+        // specific grant and is kept, with no warning.
+        let f = Fixture::with_workspace("home/Projects/stopit", "/workspace");
+        f.file("home/Projects/stopit/src/main.rs");
+        f.file("home/Projects/other/secret");
+        let s = compile_body(
             &f,
-            &format!(
-                "{dir_mask}fs.bind = [{{ host = \"~/.config/tool/token\", sandbox = \
-                 \"/opt/token\", mode = \"ro\" }}]"
-            ),
+            "fs.rw = [\"{workspace}\"]\nfs.masked = [\"~/Projects\"]",
+        )
+        .unwrap();
+        assert!(
+            get(&s, "main").warnings.is_empty(),
+            "{:?}",
+            get(&s, "main").warnings
         );
         assert_eq!(
-            (x.shown, x.shown_at, x.restricted_host),
-            (token.clone(), PathBuf::from("/opt/token"), cfg.join("tool"))
+            mounts(spec(&s, "main")),
+            [
+                row("/workspace", Rw, "p"),
+                row("/home/user/Projects", Masked, "p"),
+            ]
         );
     }
 
     #[test]
-    fn masked_host_link_whose_target_is_mounted_too_is_a_warning() {
+    fn a_rule_restricting_the_workspace_itself_keeps_the_workspace_mount() {
+        // A shared "hide other projects" config also matching the workspace:
+        // the workspace's identity wins, its mount is kept (never covered),
+        // and a distinct warning says the rule does not apply there.
+        let f = Fixture::with_workspace("home/Projects/stopit", "/workspace");
+        f.file("home/Projects/stopit/src/main.rs");
+        f.file("home/Projects/stopit/.env");
+        f.file("home/Projects/other/secret");
+        let ws = f.root.join("home/Projects/stopit");
+        for (rule, extra) in [
+            ("\"~/Projects/stopit\"", vec![]),
+            (
+                "\"~/Projects/*\"",
+                vec![row("/home/user/Projects/other", Masked, "p")],
+            ),
+        ] {
+            let body = format!("fs.rw = [\"{{workspace}}\"]\nfs.masked = [{rule}]");
+            let s = compile_body(&f, &body).unwrap();
+            let mut want = vec![row("/workspace", Rw, "p")];
+            want.extend(extra);
+            want.push(row("/home/user/Projects/stopit", Masked, "p"));
+            assert_eq!(mounts(spec(&s, "main")), want, "{rule}");
+            assert_eq!(
+                source_at(&s, "/workspace"),
+                host(&ws, EntryKind::Dir),
+                "{rule}"
+            );
+            match get(&s, "main").warnings.as_slice() {
+                [w @ SpecWarning::WorkspaceRestricted(x)] => {
+                    assert_eq!(
+                        **x,
+                        WorkspaceRestricted {
+                            restricted_provider: "p".parse().unwrap(),
+                            restricted_mode: Masked,
+                            restricted_host: ws.clone(),
+                            restricted_sandbox: "/home/user/Projects/stopit".into(),
+                            workspace: ws.clone(),
+                            workspace_mount: "/workspace".into(),
+                        }
+                    );
+                    assert_eq!(
+                        w.to_string(),
+                        format!(
+                            "provider \"p\": the masked rule for {ws:?} at \
+                             \"/home/user/Projects/stopit\" matches the host workspace itself, so \
+                             it does not apply to the workspace mount at \"/workspace\" this \
+                             session: the workspace stays mounted there (restricted content \
+                             inside it is still covered); exclude the workspace from the rule, \
+                             narrowing the path or glob, to silence this"
+                        )
+                    );
+                }
+                other => panic!("{rule}: {other:?}"),
+            }
+        }
+        // Restricted content inside the workspace, shown through the
+        // workspace mount, is still covered there.
+        let s = compile_body(
+            &f,
+            "fs.rw = [\"{workspace}\"]\nfs.masked = [\"~/Projects/stopit\", \
+             \"~/Projects/stopit/.env\"]",
+        )
+        .unwrap();
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [
+                row("/workspace", Rw, "p"),
+                row("/workspace/.env", Masked, "p"),
+                row("/home/user/Projects/stopit", Masked, "p"),
+                row("/home/user/Projects/stopit/.env", Masked, "p"),
+            ]
+        );
+        let warnings = &get(&s, "main").warnings;
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| matches!(w, SpecWarning::WorkspaceRestricted(_)))
+        );
+        assert!(warnings.iter().any(|w| matches!(
+            w,
+            SpecWarning::RestrictedContentExposed(x) if x.shown_at == Path::new("/workspace/.env")
+        )));
+    }
+
+    #[test]
+    fn masked_content_inside_a_workspace_inside_a_masked_directory_is_masked_at_the_workspace() {
+        // `~/Projects` masked to hide the other projects, and the
+        // workspace's `.env` masked at its host path: the workspace is a
+        // more specific grant and is kept, and the `.env` it shows is
+        // masked there.
+        let f = Fixture::with_workspace("home/Projects/stopit", "/workspace");
+        f.file("home/Projects/stopit/.env");
+        f.file("home/Projects/other/secret");
+        let env = f.root.join("home/Projects/stopit/.env");
+        let body = "fs.rw = [\"{workspace}\"]\nfs.masked = [\"~/Projects\", \
+                    \"~/Projects/stopit/.env\"]";
+        let s = compile_body(&f, body).unwrap();
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [
+                row("/workspace", Rw, "p"),
+                row("/workspace/.env", Masked, "p"),
+                row("/home/user/Projects", Masked, "p"),
+                row("/home/user/Projects/stopit/.env", Masked, "p"),
+            ]
+        );
+        assert_eq!(
+            source_at(&s, "/workspace/.env"),
+            host(&env, EntryKind::File)
+        );
+        let x = exposed(&f, body);
+        assert_eq!(
+            (x.sandbox, x.shown_at, x.restricted_host, x.covered),
+            (
+                PathBuf::from("/workspace"),
+                PathBuf::from("/workspace/.env"),
+                env,
+                Masked
+            )
+        );
+    }
+
+    #[test]
+    fn a_grant_linking_into_restricted_content_is_kept_with_a_warning() {
+        // `~/.toolrc -> .ssh/id_ed25519` with `~/.ssh` masked: the grant's
+        // canonical source lies strictly inside the masked directory, so it
+        // is the more specific rule and is not covered, but it reaches
+        // there through a host link, which the user may not realize.
+        let f = Fixture::new();
+        f.file("home/.ssh/id_ed25519");
+        symlink(".ssh/id_ed25519", f.root.join("home/.toolrc")).unwrap();
+        let ssh = f.root.join("home/.ssh");
+        let key = ssh.join("id_ed25519");
+        let toolrc = f.root.join("home/.toolrc");
+        let s = compile_body(&f, "fs.masked = [\"~/.ssh\"]\nfs.ro = [\"~/.toolrc\"]").unwrap();
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [
+                row("/home/user/.ssh", Masked, "p"),
+                row("/home/user/.toolrc", Ro, "p"),
+            ]
+        );
+        match get(&s, "main").warnings.as_slice() {
+            [w @ SpecWarning::LinkedIntoRestricted(x)] => {
+                assert_eq!(
+                    **x,
+                    LinkedIntoRestricted {
+                        provider: "p".parse().unwrap(),
+                        mode: Ro,
+                        host: toolrc.clone(),
+                        resolved: key.clone(),
+                        sandbox: "/home/user/.toolrc".into(),
+                        restricted_provider: "p".parse().unwrap(),
+                        restricted_mode: Masked,
+                        restricted_host: ssh.clone(),
+                        restricted_sandbox: "/home/user/.ssh".into(),
+                    }
+                );
+                assert_eq!(
+                    w.to_string(),
+                    format!(
+                        "provider \"p\": ro mount of {toolrc:?} (resolving to {key:?}) at \
+                         \"/home/user/.toolrc\" reaches, through a host symlink, into {ssh:?}, \
+                         which the masked mount by provider \"p\" at \"/home/user/.ssh\" \
+                         restricts; as a narrower grant of part of it, it is mounted as \
+                         configured, so that content is visible at \"/home/user/.toolrc\"; if \
+                         that is not intended, remove this grant or the link"
+                    )
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // Written inside the restricted path, it is silent.
+        let s = compile_body(
+            &f,
+            "fs.masked = [\"~/.ssh\"]\nfs.bind = [{ host = \"~/.ssh/id_ed25519\", sandbox = \
+             \"/opt/key\", mode = \"ro\" }]",
+        )
+        .unwrap();
+        assert!(get(&s, "main").warnings.is_empty());
+        // So is one written inside the restricted rule's own link, which
+        // resolves inside it.
+        symlink(".ssh", f.root.join("home/ssh-link")).unwrap();
+        let s = compile_body(
+            &f,
+            "fs.masked = [\"~/ssh-link\"]\nfs.bind = [{ host = \"~/ssh-link/id_ed25519\", \
+             sandbox = \"/opt/key\", mode = \"ro\" }]",
+        )
+        .unwrap();
+        assert!(
+            get(&s, "main").warnings.is_empty(),
+            "{:?}",
+            get(&s, "main").warnings
+        );
+        // A read-only view of protected content is not reported.
+        let s = compile_body(&f, "fs.protected = [\"~/.ssh\"]\nfs.ro = [\"~/.toolrc\"]").unwrap();
+        assert!(get(&s, "main").warnings.is_empty());
+        // A writable one is.
+        let s = compile_body(&f, "fs.protected = [\"~/.ssh\"]\nfs.rw = [\"~/.toolrc\"]").unwrap();
+        assert!(matches!(
+            get(&s, "main").warnings.as_slice(),
+            [SpecWarning::LinkedIntoRestricted(x)] if x.restricted_mode == Protected && x.mode == Rw
+        ));
+    }
+
+    #[test]
+    fn a_cover_takes_its_kind_from_a_host_link_to_a_file() {
+        // `~/.toolrc -> .config/tool/rc` masked, with `~/.config` bound
+        // elsewhere: the mask over the link is a file mask, and so is the
+        // cover where the bind shows the target.
+        let f = Fixture::new();
+        f.file("home/.config/tool/rc");
+        symlink(".config/tool/rc", f.root.join("home/.toolrc")).unwrap();
+        let rc = f.root.join("home/.config/tool/rc");
+        let body = "fs.masked = [\"~/.toolrc\"]\nfs.bind = [{ host = \"~/.config\", sandbox = \
+                    \"/opt/cfg\", mode = \"ro\" }]";
+        let s = compile_body(&f, body).unwrap();
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [
+                row("/opt/cfg", Ro, "p"),
+                row("/home/user/.toolrc", Masked, "p"),
+                row("/opt/cfg/tool/rc", Masked, "p"),
+            ]
+        );
+        assert_eq!(
+            source_at(&s, "/opt/cfg/tool/rc"),
+            host(&rc, EntryKind::File)
+        );
+        let x = exposed(&f, body);
+        assert_eq!(
+            (x.restricted_host, x.shown_at),
+            (rc, PathBuf::from("/opt/cfg/tool/rc"))
+        );
+    }
+
+    #[test]
+    fn masked_directory_shown_elsewhere_is_masked_there_with_deeper_mounts_on_top() {
+        let f = Fixture::new();
+        f.file("home/.config/tool/token");
+        f.file("home/.config/other");
+        let cfg = f.root.join("home/.config");
+        let mask = "fs.masked = [\"~/.config/tool\"]\n";
+        let elsewhere =
+            "fs.bind = [{ host = \"~/.config\", sandbox = \"/opt/cfg\", mode = \"ro\" }]";
+        let x = exposed(&f, &format!("{mask}{elsewhere}"));
+        assert_eq!(
+            (x.restricted_host, x.shown_at, x.covered),
+            (cfg.join("tool"), PathBuf::from("/opt/cfg/tool"), Masked)
+        );
+        // A planned mount below the cover stays on top of it, in plan
+        // order: it shows what its own rule configures.
+        let both = "fs.bind = [{ host = \"~/.config\", sandbox = \"/opt/cfg\", mode = \"ro\" }, \
+                    { host = \"~/.config/other\", sandbox = \"/opt/cfg/tool/other\", mode = \
+                    \"ro\" }]";
+        let s = compile_body(&f, &format!("{mask}{both}")).unwrap();
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [
+                row("/opt/cfg", Ro, "p"),
+                row("/opt/cfg/tool", Masked, "p"),
+                row("/home/user/.config/tool", Masked, "p"),
+                row("/opt/cfg/tool/other", Ro, "p"),
+            ]
+        );
+        assert_eq!(
+            source_at(&s, "/opt/cfg/tool"),
+            host(&cfg.join("tool"), EntryKind::Dir)
+        );
+        assert_eq!(get(&s, "main").warnings.len(), 1);
+        // A mask inside the masked directory, shown inside the directory's
+        // cover, is hidden by it already: one cover, one warning.
+        let s = compile_body(
+            &f,
+            &format!("fs.masked = [\"~/.config/tool\", \"~/.config/tool/token\"]\n{elsewhere}"),
+        )
+        .unwrap();
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [
+                row("/opt/cfg", Ro, "p"),
+                row("/opt/cfg/tool", Masked, "p"),
+                row("/home/user/.config/tool", Masked, "p"),
+                row("/home/user/.config/tool/token", Masked, "p"),
+            ]
+        );
+        let xs = exposures(
+            &f,
+            &format!("fs.masked = [\"~/.config/tool\", \"~/.config/tool/token\"]\n{elsewhere}"),
+        );
+        assert_eq!(
+            xs.iter().map(|x| x.shown_at.clone()).collect::<Vec<_>>(),
+            [PathBuf::from("/opt/cfg/tool")]
+        );
+    }
+
+    #[test]
+    fn covers_belong_to_the_profile_whose_mask_is_exposed() {
+        let f = Fixture::new();
+        f.file("home/.config/tool/token");
+        let elsewhere =
+            "fs.bind = [{ host = \"~/.config\", sandbox = \"/opt/cfg\", mode = \"ro\" }]";
+        let s = f.compile(&format!(
+            "base = \"none\"\n[profiles.agent]\ninherit = \"none\"\n{}{}",
+            prov(
+                "p",
+                "main",
+                &format!("fs.masked = [\"~/.config/tool/token\"]\n{elsewhere}")
+            ),
+            prov("q", "agent", elsewhere),
+        ));
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [
+                row("/opt/cfg", Ro, "p"),
+                row("/opt/cfg/tool/token", Masked, "p"),
+                row("/home/user/.config/tool/token", Masked, "p"),
+            ]
+        );
+        assert_eq!(mounts(spec(&s, "agent")), [row("/opt/cfg", Ro, "q")]);
+        assert!(get(&s, "agent").warnings.is_empty());
+    }
+
+    #[test]
+    fn masked_host_link_whose_target_is_mounted_too_is_masked_in_the_store() {
         // A home-manager file masked at `~/.config/foo`, linking into a
-        // store that is mounted read-only as well: the target stays
-        // visible in the store, which only the host controls.
+        // store that is mounted read-only as well: the target would stay
+        // visible in the store, which only the host controls, so it is
+        // masked there too.
         let f = Fixture::new();
         f.file("store/abc-foo/config");
         f.mkdir("home/.config");
         let target = f.root.join("store/abc-foo");
         symlink(&target, f.root.join("home/.config/foo")).unwrap();
+        symlink(&target, f.root.join("home/.config/bar")).unwrap();
         let store = f.root.join("store");
         let body = format!(
             "fs.masked = [\"~/.config/foo\"]\nfs.ro = [\"{}\"]",
@@ -5672,14 +6362,91 @@ mod tests {
         );
         let x = exposed(&f, &body);
         assert_eq!(
-            (x.mode, x.shown, x.shown_at, x.restricted_sandbox),
+            (
+                x.mode,
+                x.restricted_host,
+                x.shown_at,
+                x.restricted_sandbox,
+                x.covered
+            ),
             (
                 Ro,
                 target.clone(),
                 target.clone(),
-                PathBuf::from("/home/user/.config/foo")
+                PathBuf::from("/home/user/.config/foo"),
+                Masked
             )
         );
+        let s = compile_body(&f, &body).unwrap();
+        let at = |p: &Path| p.to_str().unwrap().to_owned();
+        let sorted = |mut v: Vec<(String, PathMode, String)>| {
+            v.sort_by_key(|(p, ..)| (Path::new(p).components().count(), p.clone()));
+            v
+        };
+        let want = sorted(vec![
+            row(&at(&store), Ro, "p"),
+            row(&at(&target), Masked, "p"),
+            row("/home/user/.config/foo", Masked, "p"),
+        ]);
+        assert_eq!(mounts(spec(&s, "main")), want);
+        assert_eq!(source_at(&s, &at(&target)), host(&target, EntryKind::Dir));
+        // Two masks of the same content meet at one path there, which gets
+        // one mask; each is reported.
+        let two = format!(
+            "fs.masked = [\"~/.config/foo\", \"~/.config/bar\"]\nfs.ro = [\"{}\"]",
+            store.display()
+        );
+        let s = compile_body(&f, &two).unwrap();
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            sorted(vec![
+                row(&at(&store), Ro, "p"),
+                row(&at(&target), Masked, "p"),
+                row("/home/user/.config/bar", Masked, "p"),
+                row("/home/user/.config/foo", Masked, "p"),
+            ])
+        );
+        let xs = exposures(&f, &two);
+        assert_eq!(
+            xs.iter()
+                .map(|x| (x.shown_at.clone(), x.restricted_sandbox.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (target.clone(), PathBuf::from("/home/user/.config/bar")),
+                (target.clone(), PathBuf::from("/home/user/.config/foo")),
+            ]
+        );
+        // A mask and a protected mount of the same content, shown writable
+        // in the store: the stricter, the mask, covers it there, for both.
+        // The protected mount shows the masked content too, so it is
+        // replaced by a mask as well.
+        let mixed = format!(
+            "fs.masked = [\"~/.config/foo\"]\nfs.protected = [\"~/.config/bar\"]\nfs.rw = \
+             [\"{}\"]",
+            store.display()
+        );
+        let s = compile_body(&f, &mixed).unwrap();
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            sorted(vec![
+                row(&at(&store), Rw, "p"),
+                row(&at(&target), Masked, "p"),
+                row("/home/user/.config/bar", Masked, "p"),
+                row("/home/user/.config/foo", Masked, "p"),
+            ])
+        );
+        let mut xs: Vec<_> = exposures(&f, &mixed)
+            .into_iter()
+            .map(|x| (x.restricted_mode, x.shown_at, x.covered))
+            .collect();
+        xs.sort();
+        let mut want = vec![
+            (Protected, target.clone(), Masked),
+            (Masked, target.clone(), Masked),
+            (Masked, PathBuf::from("/home/user/.config/bar"), Masked),
+        ];
+        want.sort();
+        assert_eq!(xs, want);
         // Masking the target at its host path, where the aligned store mount
         // shows it, covers it.
         assert_eq!(
@@ -5708,23 +6475,124 @@ mod tests {
             )
         };
         // A read-only view of protected content exposes nothing protected:
-        // it is readable at its own path too.
-        assert_eq!(exposures(&f, &bind("ro")), []);
-        assert_eq!(exposures(&f, &bind("protected")), []);
-        // A writable one does.
+        // it is readable at its own path too, and nothing is added.
+        for (mode, want) in [("ro", Ro), ("protected", Protected)] {
+            assert_eq!(exposures(&f, &bind(mode)), []);
+            let s = compile_body(&f, &bind(mode)).unwrap();
+            assert_eq!(
+                mounts(spec(&s, "main")),
+                [
+                    row("/src", want, "p"),
+                    row("/home/user/proj2/flake.nix", Protected, "p"),
+                ]
+            );
+        }
+        // A writable one does, and the file is protected there too.
         let body = bind("rw");
         let x = exposed(&f, &body);
         let msg = x.to_string();
         assert_eq!(
-            (x.mode, x.restricted_mode, x.shown_at, x.shown),
+            (
+                x.mode,
+                x.restricted_mode,
+                x.shown_at,
+                x.restricted_host,
+                x.covered
+            ),
             (
                 Rw,
                 Protected,
                 PathBuf::from("/src/flake.nix"),
-                proj.join("flake.nix")
+                proj.join("flake.nix"),
+                Protected
             )
         );
-        assert!(msg.contains("so it is still writable there"), "{msg}");
+        assert!(
+            msg.contains(
+                "so it would be writable there; stopit mounts it protected at \"/src/flake.nix\" \
+                 this session;"
+            ),
+            "{msg}"
+        );
+        let s = compile_body(&f, &body).unwrap();
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [
+                row("/src", Rw, "p"),
+                row("/src/flake.nix", Protected, "p"),
+                row("/home/user/proj2/flake.nix", Protected, "p"),
+            ]
+        );
+        assert_eq!(
+            source_at(&s, "/src/flake.nix"),
+            host(&proj.join("flake.nix"), EntryKind::File)
+        );
+        // An `rw` grant strictly inside a protected directory, elsewhere,
+        // is a more specific grant: kept, with no warning.
+        f.file("home/proj2/sub/x");
+        let inside = "fs.protected = [\"~/proj2\"]\nfs.bind = [{ host = \"~/proj2/sub\", \
+                      sandbox = \"/sub\", mode = \"rw\" }]";
+        assert_eq!(exposures(&f, inside), []);
+        let s = compile_body(&f, inside).unwrap();
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [
+                row("/sub", Rw, "p"),
+                row("/home/user/proj2", Protected, "p"),
+            ]
+        );
+        // An `rw` grant of the protected directory itself, elsewhere, is
+        // replaced by a protected mount of it.
+        let itself = "fs.protected = [\"~/proj2\"]\nfs.bind = [{ host = \"~/proj2\", sandbox = \
+                      \"/src\", mode = \"rw\" }]";
+        let s = compile_body(&f, itself).unwrap();
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [
+                row("/src", Protected, "p"),
+                row("/home/user/proj2", Protected, "p"),
+            ]
+        );
+        assert_eq!(source_at(&s, "/src"), host(&proj, EntryKind::Dir));
+        let msg = exposed(&f, itself).to_string();
+        assert!(
+            msg.contains(
+                "stopit mounts it protected at \"/src\" this session, replacing this mount;"
+            ),
+            "{msg}"
+        );
+        // A masked file inside it still gets its own mask under the
+        // protected cover that replaces the `rw` mount: a protected cover
+        // does not hide masked content.
+        f.file("home/proj2/secret");
+        let body = "fs.protected = [\"~/proj2\"]\nfs.masked = [\"~/proj2/secret\"]\nfs.bind = [{ \
+                    host = \"~/proj2\", sandbox = \"/src\", mode = \"rw\" }]";
+        let s = compile_body(&f, body).unwrap();
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [
+                row("/src", Protected, "p"),
+                row("/src/secret", Masked, "p"),
+                row("/home/user/proj2", Protected, "p"),
+                row("/home/user/proj2/secret", Masked, "p"),
+            ]
+        );
+        assert_eq!(
+            source_at(&s, "/src/secret"),
+            host(&proj.join("secret"), EntryKind::File)
+        );
+        let mut xs: Vec<_> = exposures(&f, body)
+            .into_iter()
+            .map(|x| (x.shown_at, x.covered))
+            .collect();
+        xs.sort();
+        assert_eq!(
+            xs,
+            [
+                (PathBuf::from("/src"), Protected),
+                (PathBuf::from("/src/secret"), Masked),
+            ]
+        );
         // At its aligned path, the protection applies.
         assert_eq!(
             exposures(&f, &format!("{protect}fs.rw = [\"~/proj2\"]")),
