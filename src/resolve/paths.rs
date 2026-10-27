@@ -75,17 +75,94 @@ pub enum MountSource {
         kind: EntryKind,
     },
     /// A fresh, empty, session-scoped directory (`fs.ephemeral`), with no
-    /// host source.
-    Ephemeral,
+    /// host source. Its backing directory is named by `key`.
+    Ephemeral {
+        /// Names the session's backing directory, shared by every sandbox.
+        key: EphemeralKey,
+    },
+}
+
+impl MountSource {
+    /// Whether two rules of equal precedence at one sandbox path may share
+    /// it without conflict: the same source, or any two ephemeral ones,
+    /// since every ephemeral source is empty at startup. Which key the mount
+    /// then keeps is the first rule's (an ephemeral tie, see [`pick`]), so it
+    /// depends on rule order.
+    fn interchangeable(&self, other: &MountSource) -> bool {
+        match (self, other) {
+            (MountSource::Ephemeral { .. }, MountSource::Ephemeral { .. }) => true,
+            _ => self == other,
+        }
+    }
 }
 
 impl fmt::Display for MountSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             MountSource::Host { path, .. } => write!(f, "{path:?}"),
-            MountSource::Ephemeral => f.write_str("an ephemeral directory"),
+            MountSource::Ephemeral { .. } => f.write_str("an ephemeral directory"),
         }
     }
+}
+
+/// Identifies the session-wide backing directory of an `ephemeral` rule: the
+/// rule's pattern as written, before `~` or `{workspace}` expansion
+/// (`/tmp`, `~`, `{workspace}/target`).
+///
+/// Every sandbox of a session shares one backing directory per key, so `~`
+/// is the same directory in profiles with different `system.home`; an
+/// absolute pattern keeps a profile's HOME separate. An ephemeral rule is
+/// never a glob, so the pattern names exactly one path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EphemeralKey(String);
+
+impl EphemeralKey {
+    /// The longest pattern, in bytes, whose directory name is its hex
+    /// encoding; longer ones are named by a hash (see [`Self::dir_name`]).
+    const MAX_HEX_PATTERN: usize = 100;
+
+    /// The key of an ephemeral rule's `pattern`.
+    pub fn new(pattern: &PathPattern) -> EphemeralKey {
+        EphemeralKey(pattern.as_str().to_owned())
+    }
+
+    /// The pattern as written.
+    #[cfg(test)]
+    fn pattern(&self) -> &str {
+        &self.0
+    }
+
+    /// The name of the key's backing directory under the session's
+    /// `ephemeral/`: a single path component that is safe to create there
+    /// (no `/`, no NUL, never `.` or `..`), deterministic, and at most 200
+    /// bytes.
+    ///
+    /// A pattern of up to [`Self::MAX_HEX_PATTERN`] bytes is named by the
+    /// lowercase hex of its bytes, which is injective. A longer one is named
+    /// `h-` plus the 128-bit FNV-1a hash of its bytes in hex (34 bytes); the
+    /// `-` cannot occur in a hex name, so the two forms never collide, and
+    /// two distinct long patterns collide only by a hash collision (see
+    /// [`fnv1a_128`]).
+    pub fn dir_name(&self) -> String {
+        let bytes = self.0.as_bytes();
+        if bytes.len() <= Self::MAX_HEX_PATTERN {
+            return bytes.iter().map(|b| format!("{b:02x}")).collect();
+        }
+        format!("h-{:032x}", fnv1a_128(bytes))
+    }
+}
+
+/// The 128-bit FNV-1a hash of `bytes`.
+///
+/// Not collision-resistant against adversaries, which is fine here: only
+/// the config's authors choose ephemeral patterns, and they gain nothing by
+/// making two of them share a directory.
+fn fnv1a_128(bytes: &[u8]) -> u128 {
+    const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+    bytes
+        .iter()
+        .fold(OFFSET, |h, &b| (h ^ u128::from(b)).wrapping_mul(PRIME))
 }
 
 /// One mount of the plan.
@@ -510,7 +587,9 @@ fn rule_candidates<'a>(
             })?;
             Ok(vec![candidate(
                 sandbox,
-                MountSource::Ephemeral,
+                MountSource::Ephemeral {
+                    key: EphemeralKey::new(pattern),
+                },
                 PathMode::Ephemeral,
                 true,
                 false,
@@ -868,9 +947,10 @@ fn pick<'a>(
         }
         return Ok(winner);
     }
+    // Ephemeral ties (`~` and `/home/user`) never conflict: the first wins.
     let mut top = candidates.into_iter().filter(|c| c.rank() == best);
     let winner = top.next().expect("the best rank is attained");
-    if let Some(other) = top.find(|c| c.source != winner.source) {
+    if let Some(other) = top.find(|c| !c.source.interchangeable(&winner.source)) {
         return Err(PathPlanError::Conflict(Box::new(MountConflict {
             sandbox: winner.sandbox,
             mode: winner.mode,
@@ -1019,10 +1099,13 @@ mod tests {
         }
     }
 
-    fn eph(sandbox: &str, p: &str) -> PlannedMount {
+    /// An ephemeral mount whose rule was written as `pattern`.
+    fn eph(sandbox: &str, pattern: &str, p: &str) -> PlannedMount {
         PlannedMount {
             sandbox: sandbox.into(),
-            source: MountSource::Ephemeral,
+            source: MountSource::Ephemeral {
+                key: EphemeralKey::new(&pattern.parse().unwrap()),
+            },
             mode: Ephemeral,
             provider: pn(p),
             glob_link: false,
@@ -1050,7 +1133,7 @@ mod tests {
     fn kind_of(m: &PlannedMount) -> EntryKind {
         match &m.source {
             MountSource::Host { kind, .. } => *kind,
-            MountSource::Ephemeral => panic!("unexpected ephemeral mount"),
+            MountSource::Ephemeral { .. } => panic!("unexpected ephemeral mount"),
         }
     }
 
@@ -1287,10 +1370,14 @@ mod tests {
         assert_eq!(
             plan.mounts,
             vec![
-                eph("/tmp", "base"),
-                eph("/home/user", "base"),
-                eph("/workspace/target", "rust"),
-                eph("/stopit-test/does/not/exist", "base"),
+                eph("/tmp", "/tmp", "base"),
+                eph("/home/user", "~", "base"),
+                eph("/workspace/target", "{workspace}/target", "rust"),
+                eph(
+                    "/stopit-test/does/not/exist",
+                    "/stopit-test/does/not/exist",
+                    "base"
+                ),
             ]
         );
     }
@@ -1300,7 +1387,7 @@ mod tests {
         let f = Fixture::new();
         // Same depth: ephemeral is stricter than rw, looser than ro.
         let mounts = f.clean(&[rule(Rw, "~", "a", 0), rule(Ephemeral, "~", "b", 0)]);
-        assert_eq!(mounts, vec![eph("/home/user", "b")]);
+        assert_eq!(mounts, vec![eph("/home/user", "~", "b")]);
         let mounts = f.clean(&[rule(Ephemeral, "~", "b", 0), rule(Ro, "~", "a", 0)]);
         assert_eq!(
             mounts,
@@ -1318,7 +1405,95 @@ mod tests {
             rule(Ro, "{workspace}/*", "a", 0),
             rule(Ephemeral, "{workspace}/target", "b", 1),
         ]);
-        assert_eq!(mounts, vec![eph("/workspace/target", "b")]);
+        assert_eq!(
+            mounts,
+            vec![eph("/workspace/target", "{workspace}/target", "b")]
+        );
+    }
+
+    #[test]
+    fn ephemeral_rules_at_one_path_keep_the_first_rules_key() {
+        let f = Fixture::new();
+        // `~` and `/home/user` are one sandbox path with different keys: no
+        // conflict, and the first rule's key stands for both.
+        let mounts = f.clean(&[
+            rule(Ephemeral, "~", "a", 0),
+            rule(Ephemeral, "/home/user", "b", 0),
+        ]);
+        assert_eq!(mounts, vec![eph("/home/user", "~", "a")]);
+        let mounts = f.clean(&[
+            rule(Ephemeral, "/home/user", "b", 0),
+            rule(Ephemeral, "~", "a", 0),
+        ]);
+        assert_eq!(mounts, vec![eph("/home/user", "/home/user", "b")]);
+        // A profile's own absolute rule beats an inherited `~` and keeps its
+        // own key, so its HOME is separate from the inherited one's.
+        let mounts = f.clean(&[
+            rule(Ephemeral, "~", "parent", 1),
+            rule(Ephemeral, "/home/user", "own", 0),
+        ]);
+        assert_eq!(mounts, vec![eph("/home/user", "/home/user", "own")]);
+    }
+
+    #[test]
+    fn fnv1a_128_known_answers() {
+        assert_eq!(fnv1a_128(b""), 0x6c62272e07bb014262b821756295c58d);
+        assert_eq!(fnv1a_128(b"a"), 0xd228cb696f1a8caf78912b704e4a8964);
+    }
+
+    #[test]
+    fn ephemeral_key_names_are_safe_and_distinct() {
+        let key = |s: &str| EphemeralKey::new(&PathPattern::new_unchecked(s));
+        assert_eq!(key("~").dir_name(), "7e");
+        assert_eq!(key("/tmp").dir_name(), "2f746d70");
+        assert_eq!(key("~").pattern(), "~");
+        let long = format!("/{}", "a".repeat(EphemeralKey::MAX_HEX_PATTERN - 1));
+        assert_eq!(
+            key(&long).dir_name().len(),
+            2 * EphemeralKey::MAX_HEX_PATTERN
+        );
+        let patterns = [
+            "~",
+            "/tmp",
+            // `"/tmp/"`, `"/."` and `"/.."` are invalid patterns, included
+            // for robustness.
+            "/tmp/",
+            "/Tmp",
+            "{workspace}/target",
+            "{workspace}",
+            "~/.cache/x",
+            "~/.cache_x",
+            "/.",
+            "/..",
+            "/a/b",
+            "/a\\b",
+            "/é",
+            "/e\u{301}",
+            "/\u{1F980}",
+            "/\n",
+            &long,
+            &format!("{long}b"),
+            &format!("{long}c"),
+            &format!("/{}", "a".repeat(5000)),
+            &format!("/{}", "a".repeat(5001)),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for p in patterns {
+            let name = key(p).dir_name();
+            assert_eq!(name, key(p).dir_name(), "{p:?} is deterministic");
+            assert!(
+                !name.is_empty() && name.len() <= 200,
+                "{p:?} -> {} bytes",
+                name.len()
+            );
+            assert!(
+                name.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                "{p:?} -> {name:?}"
+            );
+            assert!(name != "." && name != "..");
+            assert!(seen.insert(name.clone()), "{p:?} collides: {name:?}");
+        }
     }
 
     #[test]
@@ -1463,7 +1638,7 @@ mod tests {
             mounts,
             vec![
                 host("/c", f.home().join("c"), EntryKind::File, Ro, "a"),
-                eph("/tmp", "a"),
+                eph("/tmp", "/tmp", "a"),
                 host(
                     "/workspace/.env",
                     f.ws().join(".env"),
@@ -1964,7 +2139,7 @@ mod tests {
                     Masked,
                     "lit"
                 ),
-                eph("/workspace/locked/tmp", "e"),
+                eph("/workspace/locked/tmp", "{workspace}/locked/tmp", "e"),
                 host(
                     "/workspace/locked/x",
                     f.home().join("x"),

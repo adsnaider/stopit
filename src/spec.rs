@@ -1755,7 +1755,7 @@ fn check_destination_links(
             // `check_host_sources` rejects this mount (or drops it inside a
             // masked directory), which is kept.
             (Some(Err(_)), _) => Underneath::Unchecked,
-            (Some(Ok(_)), MountSource::Ephemeral) => {
+            (Some(Ok(_)), MountSource::Ephemeral { .. }) => {
                 unreachable!("only a host source is resolved")
             }
             // A masked one.
@@ -1765,7 +1765,7 @@ fn check_destination_links(
             // writes, so links in it are untrusted too, but it does not exist
             // yet. Once it does, check below it like a host tree inside a
             // root.
-            (None, MountSource::Ephemeral) => Underneath::Unchecked,
+            (None, MountSource::Ephemeral { .. }) => Underneath::Unchecked,
         };
         underneath.insert(m.sandbox.clone(), under);
         kept.push(m);
@@ -2297,7 +2297,14 @@ mod tests {
     use crate::expand::ResolveWarning;
     use crate::policy::PathMode::{self, Ephemeral, Masked, Protected, Ro, Rw};
     use crate::provider::{ProviderContext, session_providers};
-    use crate::resolve::{MountSource, PlanWarningKind};
+    use crate::resolve::{EphemeralKey, MountSource, PlanWarningKind};
+
+    /// The source of an ephemeral mount whose rule was written as `pattern`.
+    fn eph_source(pattern: &str) -> MountSource {
+        MountSource::Ephemeral {
+            key: EphemeralKey::new(&pattern.parse().unwrap()),
+        }
+    }
 
     /// A temporary workspace and host home, with an expansion context
     /// mapping them to the workspace mount (`/workspace` by default) and
@@ -2484,7 +2491,8 @@ mod tests {
                 kind: EntryKind::Dir
             }
         );
-        assert_eq!(spec.mounts[0].source, MountSource::Ephemeral);
+        assert_eq!(spec.mounts[0].source, eph_source("/tmp"));
+        assert_eq!(spec.mounts[2].source, eph_source("~"));
         assert!(spec.mask_sockets);
         assert!(spec.system.proc);
         assert_eq!(spec.system.dev, Some(DevMode::Minimal));
@@ -2881,6 +2889,10 @@ mod tests {
             }
         );
         assert_eq!(harness.system.home.as_str(), "/home/agent");
+        // Both HOMEs share one backing directory: the key is the pattern as
+        // written, not its expansion.
+        assert_eq!(main.mounts[1].source, eph_source("~"));
+        assert_eq!(harness.mounts[1].source, main.mounts[1].source);
         assert!(harness.system.proc);
         assert_eq!(
             harness.network,
@@ -7139,7 +7151,7 @@ mod tests {
                 mount(root.join("a/b"), Rw, "inner"),
                 PlannedMount {
                     sandbox: "/tmp".into(),
-                    source: MountSource::Ephemeral,
+                    source: eph_source("/tmp"),
                     mode: Rw,
                     provider: "e".parse().unwrap(),
                     glob_link: false,

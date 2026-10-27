@@ -41,7 +41,7 @@ These are the guarantees of `base = "default"`. Under `base = "none"` the same m
 This fixes what a reviewer may assume the attacker can do, so that a failure within these capabilities is a bug and one outside them is an accepted limit.
 
 **In scope.** The sandboxed program runs arbitrary code with everything its profile grants, and:
-* **Leaves state behind.** Anything it writes to a sandbox-writable location persists: in the workspace and any `rw` grant, to later sandboxes of the same session (other profiles, brokered commands) and to later sessions; in ephemeral `HOME` and `/tmp`, to later sandboxes of the same session. That includes planted symlinks, renamed or deleted directories, `chmod` (e.g. `chmod 000` on a directory it owns), files replaced by directories and vice versa, hard links it can create (within one mount), and socket files. Every decision stopit makes at startup must stay safe whatever the sandbox left behind (§3.4, Symlinks and Pinned parent directories; §6.2, Untrusted links; known gaps: §11, Ephemeral backing directories and Literal restrictive rules rely on pinned parents).
+* **Leaves state behind.** Anything it writes to a sandbox-writable location persists: in the workspace and any `rw` grant, to later sandboxes of the same session (other profiles, brokered commands) and to later sessions; in ephemeral `HOME` (dotfiles included, which another profile of the session may share, §3.4) and `/tmp`, to later sandboxes of the same session. That includes planted symlinks, renamed or deleted directories, `chmod` (e.g. `chmod 000` on a directory it owns), files replaced by directories and vice versa, hard links it can create (within one mount), and socket files. Every decision stopit makes at startup must stay safe whatever the sandbox left behind (§3.4, Symlinks and Pinned parent directories; §6.2, Untrusted links; known gaps: §11, Ephemeral backing directories and Literal restrictive rules rely on pinned parents).
 * **Emits terminal output**, including any escape sequence (§5.3), and draws anything on its own screen (§5.4).
 * **Talks to the broker and the approval flow** directly, with any request, argument or file descriptor, and as often as it likes (§4, §5.4, §7.1).
 * **Runs concurrently** with other sandboxes of the same session, which may act on the same writable locations at the same time, including while a brokered command's sandbox is being mounted (known gap: §11, Path resolution is path-based).
@@ -94,7 +94,7 @@ All per-session state lives under `$XDG_RUNTIME_DIR/stopit/<session-id>/` on the
 | `lib/` | `/run/stopit/lib` (RO) | Its program interpreter (0500) and shared libraries (0400); empty for a static build |
 | `bin/` | `/run/stopit/bin` (RO) | Shim symlinks |
 | `protected/` | bind-mounted per file (§4) | Narrow FUSE mount holding protected-file shadows |
-| `ephemeral/` | per `ephemeral` rule (§3.4) | Session-scoped scratch (e.g. `/tmp`, sandbox `HOME`) |
+| `ephemeral/` | per `ephemeral` rule, keyed by pattern as written (§3.4) | Session-scoped scratch (e.g. `/tmp`, sandbox `HOME`) |
 
 `$XDG_RUNTIME_DIR` must be set to an absolute path of a directory owned by the user and not writable by group or others; stopit never falls back to `/tmp`. `stopit/` and every session directory below it are mode 0700, and an existing `stopit/` must be a real directory (not a link) owned by the user with no group or other access. A session directory is created fresh under a random 128-bit id, never reused, and removed when the session ends (best effort, after its sandboxes exit and its mounts are unmounted).
 
@@ -247,6 +247,7 @@ Profiles come from two places:
 
 Semantics:
 * **Masked ≠ absent.** A bind mount cannot remove a name from a bind-mounted directory; a true `ENOENT` would need overlay whiteouts or FUSE. Paths that are simply never granted (e.g. host `HOME`) are absent. A masked stub also prevents the sandbox from *creating* that name (e.g. a top-level `.git`).
+* **Ephemeral backing directories are keyed by pattern.** Each `ephemeral` rule gets one backing directory under `ephemeral/` per session, keyed by the rule's pattern as written (`~`, `/tmp`, `{workspace}/target`), not its expansion, and shared by every sandbox of the session. So `~` is one directory across profiles even with different `system.home`: a profile's own `system.home` does not isolate an ephemeral `~`; to keep a profile's HOME separate, write its ephemeral rule as an absolute path (`ephemeral = ["/home/agent"]`). Ephemeral rules of equal precedence at one sandbox path never conflict; the first in rule order names the backing directory, so a later one's pattern is not backed there in that profile.
 * All mounts carry `nosuid,nodev`. Execute permission is **not** restricted by mount flags: `noexec` is not a security boundary (`bash script`, `ld.so ./bin`) and would break `cargo run`, test runners and scripts.
 * `chmod` on a protected file counts as a change and goes through approval (the diff shows the mode change). `ro`/`masked` reject it with `EROFS`.
 * **Deleting or renaming a protected file away** fails with `EBUSY` (it is a mount point). This is intended.
