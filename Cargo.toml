@@ -3,6 +3,7 @@ name = "stopit"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
+default-run = "stopit"
 description = "A Linux sandbox tool"
 
 [lib]
@@ -11,6 +12,11 @@ path = "src/lib.rs"
 [[bin]]
 name = "stopit"
 path = "src/main.rs"
+
+# Test-only: observes what a sandboxed process can see and do (tests/probe.rs).
+[[bin]]
+name = "stopit-probe"
+path = "src/bin/stopit-probe/main.rs"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
