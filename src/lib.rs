@@ -10,6 +10,7 @@ pub mod policy;
 pub mod provider;
 pub mod resolve;
 mod serde_util;
+pub mod session;
 pub mod spec;
 
 /// The version of the `stopit` crate.
