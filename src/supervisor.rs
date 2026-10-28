@@ -5,7 +5,8 @@
 //! 1. finds the workspace and its `.stopit.toml` ([`discover_workspace`],
 //!    §3.1), reads it, refuses it unless the user allowed exactly that
 //!    content ([`check_allowed`], the trust store of [`crate::trust`]), and
-//!    loads the configuration (the default one if there is no file);
+//!    loads the configuration (the default one if there is no file, unless
+//!    a configuration allowed where it looked is gone, [`check_missing`]);
 //! 2. creates the session directory (§2.1), which the providers are told
 //!    about;
 //! 3. runs the providers, compiles every profile of the session
@@ -42,6 +43,7 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -55,7 +57,7 @@ use thiserror::Error;
 
 use crate::bwrap::{BwrapCommand, BwrapError, TerminalSession, working_dir};
 use crate::config::{Base, Config, ConfigError, ProfileRef};
-use crate::escape::escape_message;
+use crate::escape::{escape_message, shell_quote};
 use crate::expand::{ExpandError, ExpansionContext, ResolveWarning};
 use crate::manifest::SandboxHome;
 use crate::provider::{
@@ -66,7 +68,9 @@ use crate::provision::{ProvisionError, provision_self};
 use crate::resolve::{PlanWarning, PlanWarningKind};
 use crate::session::{SessionDir, SessionError};
 use crate::spec::{CompileError, CompiledSession, SpecWarning, compile_session, static_rw_roots};
-use crate::state::{StateDirs, StateError, data_dirs_from_host, runtime_dir};
+use crate::state::{
+    StateDirs, StateError, data_dirs_from_host, resolve_allowing_missing, runtime_dir,
+};
 use crate::trust::{Allowed, Decision, TrustError, TrustStore};
 
 /// The name of the configuration file that marks a workspace (§3.1).
@@ -146,6 +150,26 @@ pub enum RunError {
         /// The workspace, if `--workspace` named it, for the hint.
         workspace: Option<PathBuf>,
     },
+
+    /// No configuration file was found, but the trust store has an entry
+    /// for one where discovery looked, or past a link on the way there
+    /// ([`check_missing`]).
+    #[error("{}", missing_config_message(path, via.as_deref()))]
+    MissingConfig {
+        /// The configuration file allowed, now missing.
+        path: PathBuf,
+        /// The symbolic link on the way to the workspace that `path` lies
+        /// at or below, if that is why: it was a directory when `path` was
+        /// allowed.
+        via: Option<PathBuf>,
+    },
+
+    /// `stopit revoke PATH` was given a directory.
+    #[error(
+        "{0:?} is a directory: give the path of a configuration file, as `stopit allowed` lists \
+         it, or run `stopit revoke --workspace` with the directory"
+    )]
+    RevokeDir(PathBuf),
 
     /// The trust store cannot be used.
     #[error(transparent)]
@@ -330,13 +354,20 @@ pub fn allow(workspace: Option<PathBuf>) -> ExitCode {
 
 /// `stopit revoke [--workspace DIR]`: removes the workspace's configuration
 /// file from the trust store, so that runs refuse it until it is allowed
-/// again. Nothing to remove is not an error.
-pub fn revoke(workspace: Option<PathBuf>) -> ExitCode {
-    report(revoke_config(workspace.as_deref()))
+/// again. `stopit revoke PATH`: removes the entry of the configuration file
+/// `PATH`, found without discovery, so that the entry of a workspace that
+/// is gone can be removed too ([`config_keys`]). Nothing to remove is not
+/// an error.
+pub fn revoke(workspace: Option<PathBuf>, config: Option<PathBuf>) -> ExitCode {
+    report(match config {
+        Some(config) => revoke_file(&config),
+        None => revoke_config(workspace.as_deref()),
+    })
 }
 
 /// `stopit allowed`: lists the trust store, one configuration a line, with
-/// the start of the hash allowed.
+/// the start of the hash allowed, and `(missing)` after a file that is
+/// gone.
 pub fn allowed() -> ExitCode {
     report(list_allowed())
 }
@@ -358,7 +389,7 @@ fn report(result: Result<Vec<String>, RunError>) -> ExitCode {
     }
 }
 
-/// How many hex digits of a hash `allow` and `allowed` print.
+/// How many hex digits of a hash `allowed` prints.
 const SHORT_HASH: usize = 12;
 
 fn allow_config(workspace: Option<&Path>) -> Result<Vec<String>, RunError> {
@@ -373,11 +404,16 @@ fn allow_config(workspace: Option<&Path>) -> Result<Vec<String>, RunError> {
     file.parse()?;
     let store = TrustStore::open(&data_dirs_from_host()?.store.path)?;
     let hash = store.update(|allowed| allowed.allow(file.path.clone(), &file.bytes))?;
-    Ok(vec![format!(
-        "allowed {:?} (sha256 {})",
-        file.path,
-        &hash[..SHORT_HASH]
-    )])
+    Ok(vec![allowed_line(&file.path, file.bytes.len(), &hash)])
+}
+
+/// What `stopit allow` prints for the configuration file `path`, allowed
+/// with `len` bytes hashing to `hash`: all of the hash, and the size, so
+/// that the user can check that the version they reviewed is the one
+/// allowed (`sha256sum`).
+fn allowed_line(path: &Path, len: usize, hash: &str) -> String {
+    let unit = if len == 1 { "byte" } else { "bytes" };
+    format!("allowed {path:?} ({len} {unit}, sha256 {hash})")
 }
 
 fn revoke_config(workspace: Option<&Path>) -> Result<Vec<String>, RunError> {
@@ -394,13 +430,61 @@ fn revoke_config(workspace: Option<&Path>) -> Result<Vec<String>, RunError> {
     }])
 }
 
+fn revoke_file(given: &Path) -> Result<Vec<String>, RunError> {
+    let cwd = std::env::current_dir().map_err(RunError::Cwd)?;
+    let path = cwd.join(given);
+    if fs::metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+        return Err(RunError::RevokeDir(path));
+    }
+    let keys = config_keys(&path);
+    let store = TrustStore::open(&data_dirs_from_host()?.store.path)?;
+    let revoked = store.update(|allowed| keys.iter().find(|key| allowed.revoke(key)).cloned())?;
+    Ok(vec![match revoked {
+        Some(key) => format!("revoked {key:?}"),
+        None => format!("{:?} was not allowed: nothing to revoke", keys[0]),
+    }])
+}
+
+/// The trust store entries the absolute configuration path `path` may
+/// stand for, in the order tried: `path` as written, as `stopit allowed`
+/// lists it (an entry whose directory is gone, or was replaced by a link
+/// since, is only found so), then its directory resolved as far as it
+/// exists ([`resolve_allowing_missing`]) joined with its file name, as
+/// `allow` would have recorded it (canonical; the file itself is never a
+/// link, so it is not followed).
+pub fn config_keys(path: &Path) -> Vec<PathBuf> {
+    let mut keys = vec![path.to_path_buf()];
+    if let (Some(dir), Some(name)) = (path.parent(), path.file_name()) {
+        if let Ok(dir) = resolve_allowing_missing(dir) {
+            let resolved = dir.path.join(name);
+            if resolved != path {
+                keys.push(resolved);
+            }
+        }
+    }
+    keys
+}
+
 fn list_allowed() -> Result<Vec<String>, RunError> {
     let store = TrustStore::open(&data_dirs_from_host()?.store.path)?;
     Ok(store
         .read()?
         .iter()
-        .map(|(path, hash)| format!("{} {path:?}", &hash[..SHORT_HASH]))
+        .map(|(path, hash)| allowed_entry_line(path, hash, is_gone(path)))
         .collect())
+}
+
+/// Whether nothing is at `path` any more (an error other than its absence
+/// does not count).
+fn is_gone(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+}
+
+/// What `stopit allowed` prints for the entry of `path` with `hash`, whose
+/// file is `missing` or not.
+fn allowed_entry_line(path: &Path, hash: &str, missing: bool) -> String {
+    let note = if missing { " (missing)" } else { "" };
+    format!("{} {path:?}{note}", &hash[..SHORT_HASH])
 }
 
 fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
@@ -415,16 +499,26 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     let data_dirs = data_dirs_from_host()?;
     let store = TrustStore::open(&data_dirs.store.path)?;
     // Before anything runs or is created: only a configuration the user
-    // allowed, in the exact bytes read, which are the bytes parsed.
+    // allowed, in the exact bytes read, which are the bytes parsed; and not
+    // the default one in place of an allowed one that is gone.
+    let allowed = store.read()?;
+    drop(store);
+    let explicit = invocation.workspace.is_some().then_some(&workspace.dir);
     let config = match &file {
-        None => Config::default(),
+        None => {
+            let links = discovery_links(
+                &cwd,
+                invocation.workspace.as_deref(),
+                std::env::var_os("PWD"),
+            );
+            check_missing(&allowed, &workspace.dir, explicit.is_some(), &links)?;
+            Config::default()
+        }
         Some(file) => {
-            let explicit = invocation.workspace.is_some().then_some(&workspace.dir);
-            check_allowed(&store.read()?, file, explicit.map(PathBuf::as_path))?;
+            check_allowed(&allowed, file, explicit.map(PathBuf::as_path))?;
             file.parse()?
         }
     };
-    drop(store);
     // TODO(§3): layer `.stopit.toml` over the user-global configuration.
     let home = host_home(std::env::var_os("HOME"))?;
     let mount = config.workspace.mount.clone();
@@ -940,12 +1034,104 @@ fn not_allowed_message(path: &Path, changed: bool, workspace: Option<&Path>) -> 
     };
     let command = match workspace {
         None => "stopit allow".to_owned(),
-        Some(dir) => format!("stopit allow --workspace {}", dir.display()),
+        Some(dir) => format!("stopit allow --workspace {}", quote_path(dir)),
     };
     format!(
         "refusing to use {path:?}: {what}. stopit only uses a configuration you allowed, as it \
          was when you allowed it, since it decides what the sandbox may do and which scripts \
          run on the host; review it, then run `{command}`"
+    )
+}
+
+/// `path` quoted for the shell, for a command a message suggests
+/// ([`shell_quote`]).
+fn quote_path(path: &Path) -> String {
+    shell_quote(path.as_os_str().as_bytes())
+}
+
+/// Refuses to run the default configuration in the workspace `dir`, which
+/// has no configuration file, if `allowed` (the trust store) has an entry
+/// for a `.stopit.toml` where discovery looked for one: in `dir` itself if
+/// `--workspace` named it (`explicit`), else in `dir` (the current
+/// directory) or any directory above it ([`RunError::MissingConfig`]).
+/// Such a configuration was allowed, and is gone: deleted, or moved away
+/// with a directory on its path (a sandbox can rename what its writable
+/// grants contain), and the default configuration in its place may grant
+/// what the user's did not. Revoking the entry (`stopit revoke PATH`) is
+/// how the defaults are chosen there.
+///
+/// Also if an entry lies at or below one of `links`, the symbolic links
+/// followed on the way to the workspace ([`discovery_links`]): entries are
+/// canonical, so that path was a directory when it was allowed, and a
+/// sandbox that can write the directory holding it can move the directory
+/// away and put a link to one without a configuration in its place, so
+/// that discovery, which resolves links, finds none. Such an entry may
+/// also be stale (the user moved the project and left a link), and
+/// refusing is the safe direction: the user allows the configuration again
+/// at its new path, or revokes the entry.
+pub fn check_missing(
+    allowed: &Allowed,
+    dir: &Path,
+    explicit: bool,
+    links: &[PathBuf],
+) -> Result<(), RunError> {
+    let searched = dir.ancestors().take(if explicit { 1 } else { usize::MAX });
+    if let Some(path) = searched
+        .map(|d| d.join(CONFIG_FILE))
+        .find(|path| allowed.contains(path))
+    {
+        return Err(RunError::MissingConfig { path, via: None });
+    }
+    for (path, _) in allowed.iter() {
+        if let Some(link) = links.iter().find(|link| path.starts_with(link)) {
+            return Err(RunError::MissingConfig {
+                path: path.to_path_buf(),
+                via: Some(link.clone()),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The symbolic links followed on the way to the workspace, as the user
+/// named it, for [`check_missing`]: resolving (with
+/// [`resolve_allowing_missing`]) `--workspace` (`explicit`) against the
+/// current directory `cwd`, or else the current directory as the shell
+/// tracks it, `PWD` (`pwd`), if it is absolute and is the current directory
+/// (the kernel's `cwd` has every link resolved already). None if neither
+/// can be told, or resolving fails (discovery has resolved the same path
+/// by then, so that is a race, which the trust store's checks cover).
+pub fn discovery_links(cwd: &Path, explicit: Option<&Path>, pwd: Option<OsString>) -> Vec<PathBuf> {
+    let start = match (explicit, pwd) {
+        (Some(explicit), _) => cwd.join(explicit),
+        (None, Some(pwd)) => {
+            let pwd = PathBuf::from(pwd);
+            let resolved = fs::canonicalize(&pwd).ok();
+            if !pwd.is_absolute() || resolved.is_none() || resolved != fs::canonicalize(cwd).ok() {
+                return Vec::new();
+            }
+            pwd
+        }
+        (None, None) => return Vec::new(),
+    };
+    resolve_allowing_missing(&start)
+        .map(|resolved| resolved.links)
+        .unwrap_or_default()
+}
+
+/// The message of [`RunError::MissingConfig`].
+fn missing_config_message(path: &Path, via: Option<&Path>) -> String {
+    let why = match via {
+        None => format!("{path:?} was allowed but is missing"),
+        Some(link) => format!(
+            "{path:?} was allowed, but {link:?}, on the way to it, is now a symbolic link, so it \
+             is not where it was allowed"
+        ),
+    };
+    format!(
+        "refusing to run the default configuration: {why}, and the defaults may grant what it \
+         did not; restore it, or run `stopit revoke {}` to use the defaults there",
+        quote_path(path)
     )
 }
 
@@ -996,8 +1182,15 @@ fn read_trusted(path: &Path) -> Result<Vec<u8>, RunError> {
 /// its directory is opened, then the file in it without following a
 /// symlink (a symlink is refused, as the file it leads to could be
 /// anyone's, anywhere).
+///
+/// `path` is canonical (discovery resolved it), and it is the trust
+/// store's key for the file, so the directory is opened with
+/// `openat2(RESOLVE_NO_SYMLINKS)`: a link swapped in on the way since
+/// discovery would make the file read another than the one the key names,
+/// and is refused (`ELOOP`). That needs Linux 5.6 (`ENOSYS` before it, and
+/// `EPERM` under a seccomp profile that blocks it, both reported as such).
 fn open_trusted(path: &Path) -> Result<rustix::fd::OwnedFd, RunError> {
-    use rustix::fs::{Mode, OFlags, fstat, open, openat};
+    use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, fstat, openat, openat2};
     let read_error = |source: io::Error| RunError::ReadConfig {
         path: path.to_path_buf(),
         source,
@@ -1009,12 +1202,33 @@ fn open_trusted(path: &Path) -> Result<rustix::fd::OwnedFd, RunError> {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(read_error(io::ErrorKind::InvalidInput.into()));
     };
-    let dir_fd = open(
+    let dir_fd = match openat2(
+        CWD,
         dir,
         OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
-    )
-    .map_err(|e| read_error(e.into()))?;
+        ResolveFlags::NO_SYMLINKS,
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::LOOP) => {
+            return Err(untrusted(format!(
+                "the way to it, {dir:?}, runs through a symbolic link, though it was resolved \
+                 without one: one was put there since, and the file it leads to is not the one \
+                 its path names"
+            )));
+        }
+        // `EPERM` is what seccomp profiles that block it return.
+        Err(e @ (Errno::NOSYS | Errno::PERM)) => {
+            return Err(read_error(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "openat2 failed ({e}); stopit needs it: Linux 5.6 or later, without a \
+                     seccomp profile that blocks it"
+                ),
+            )));
+        }
+        Err(e) => return Err(read_error(e.into())),
+    };
     // Non-blocking, so that a FIFO does not hang the open; it is refused as
     // not a regular file.
     let fd = match openat(
@@ -1081,7 +1295,7 @@ pub fn check_config_trust(file: Ownership, dir: Ownership, uid: u32) -> Result<(
 /// The message of [`RunError::NestedConfig`]: it suggests `--workspace`
 /// with the outer configuration's directory only if that one would load.
 fn nested_config_message(inner: &Path, outer: &Path, outer_unusable: Option<&str>) -> String {
-    let dir = |p: &Path| p.parent().unwrap_or(Path::new("/")).display().to_string();
+    let dir = |p: &Path| quote_path(p.parent().unwrap_or(Path::new("/")));
     let head = format!(
         "refusing to use {inner:?}: {outer:?} is in a directory above it, so it lies inside that \
          configuration's workspace, where a sandbox could have written it, and nested \
@@ -1549,6 +1763,228 @@ mod tests {
             matches!(&e, RunError::NotAllowed { changed: false, .. }),
             "{e:?}"
         );
+    }
+
+    #[test]
+    fn suggested_commands_quote_their_paths_for_the_shell() {
+        let path = PathBuf::from("/my ws/.stopit.toml");
+        let file = ConfigFile {
+            path: path.clone(),
+            bytes: b"x".to_vec(),
+        };
+        let msg = check_allowed(&Allowed::default(), &file, Some(Path::new("/my ws")))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.ends_with("review it, then run `stopit allow --workspace '/my ws'`"),
+            "{msg}"
+        );
+        let msg = check_allowed(&Allowed::default(), &file, Some(Path::new("/a\x1bb")))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.ends_with("run `stopit allow --workspace $'/a\\x1bb'`"),
+            "{msg}"
+        );
+        let msg = RunError::MissingConfig { path, via: None }.to_string();
+        assert!(
+            msg.contains("run `stopit revoke '/my ws/.stopit.toml'`"),
+            "{msg}"
+        );
+        let msg = nested_config_message(
+            Path::new("/o'k/in/.stopit.toml"),
+            Path::new("/o'k/.stopit.toml"),
+            None,
+        );
+        assert!(msg.contains("`--workspace '/o'\\''k'`"), "{msg}");
+        assert!(msg.contains("`--workspace '/o'\\''k/in'`"), "{msg}");
+    }
+
+    #[test]
+    fn a_missing_allowed_config_is_not_replaced_by_the_defaults() {
+        let mut allowed = Allowed::default();
+        allowed.allow("/a/.stopit.toml".into(), b"x");
+        // Nothing allowed where it looked.
+        check_missing(&allowed, Path::new("/b/c"), false, &[]).unwrap();
+        check_missing(&Allowed::default(), Path::new("/a"), false, &[]).unwrap();
+        // In the workspace, or in a directory above it when walking up.
+        for (dir, explicit) in [("/a", false), ("/a/b/c", false), ("/a", true)] {
+            let e = check_missing(&allowed, Path::new(dir), explicit, &[]).unwrap_err();
+            let RunError::MissingConfig { path, via: None } = &e else {
+                panic!("{dir}: {e:?}");
+            };
+            assert_eq!(path, Path::new("/a/.stopit.toml"), "{dir}");
+        }
+        // `--workspace` does not look up.
+        check_missing(&allowed, Path::new("/a/b"), true, &[]).unwrap();
+        // The nearest one is named.
+        allowed.allow("/a/b/.stopit.toml".into(), b"y");
+        let e = check_missing(&allowed, Path::new("/a/b/c"), false, &[]).unwrap_err();
+        assert!(
+            matches!(&e, RunError::MissingConfig { path, .. } if path == Path::new("/a/b/.stopit.toml")),
+            "{e:?}"
+        );
+        assert_eq!(
+            e.to_string(),
+            "refusing to run the default configuration: \"/a/b/.stopit.toml\" was allowed but is \
+             missing, and the defaults may grant what it did not; restore it, or run `stopit \
+             revoke /a/b/.stopit.toml` to use the defaults there"
+        );
+    }
+
+    #[test]
+    fn an_allowed_config_past_a_link_on_the_way_is_missing_too() {
+        // `/p/sub` was a directory when its configuration was allowed; a
+        // sandbox with `rw /p` moved it away and put a link to `/x` in its
+        // place, so discovery (which resolves links) finds no configuration.
+        let mut allowed = Allowed::default();
+        allowed.allow("/p/sub/.stopit.toml".into(), b"x");
+        allowed.allow("/q/.stopit.toml".into(), b"x");
+        let links = [PathBuf::from("/p/sub")];
+        for (dir, explicit) in [("/x", false), ("/x", true), ("/x/deeper", false)] {
+            let e = check_missing(&allowed, Path::new(dir), explicit, &links).unwrap_err();
+            let RunError::MissingConfig { path, via } = &e else {
+                panic!("{e:?}");
+            };
+            assert_eq!(
+                (path.as_path(), via.as_deref()),
+                (Path::new("/p/sub/.stopit.toml"), Some(Path::new("/p/sub")))
+            );
+            assert_eq!(
+                e.to_string(),
+                "refusing to run the default configuration: \"/p/sub/.stopit.toml\" was \
+                 allowed, but \"/p/sub\", on the way to it, is now a symbolic link, so it is not \
+                 where it was allowed, and the defaults may grant what it did not; restore it, or \
+                 run `stopit revoke /p/sub/.stopit.toml` to use the defaults there"
+            );
+        }
+        // Deeper below the link too.
+        let links = [PathBuf::from("/p")];
+        assert!(check_missing(&allowed, Path::new("/x"), false, &links).is_err());
+        // Not for a link elsewhere, nor one that only shares a prefix.
+        for link in ["/r", "/p/su", "/p/sub/.stopit.toml/x"] {
+            check_missing(&allowed, Path::new("/x"), false, &[PathBuf::from(link)]).unwrap();
+        }
+    }
+
+    #[test]
+    fn discovery_links_are_those_on_the_way_the_user_named() {
+        let (_d, root) = tmp();
+        fs::create_dir_all(root.join("x/deeper")).unwrap();
+        symlink(root.join("x"), root.join("sub")).unwrap();
+        let cwd = root.join("x/deeper");
+        // `PWD` through the link, which is the current directory.
+        let pwd = Some(root.join("sub/deeper").into_os_string());
+        assert_eq!(discovery_links(&cwd, None, pwd), [root.join("sub")]);
+        // Not if it is another directory, relative, missing or unset.
+        for pwd in [
+            Some(root.join("sub").into_os_string()),
+            Some("sub/deeper".into()),
+            Some(root.join("gone").into_os_string()),
+            None,
+        ] {
+            assert_eq!(
+                discovery_links(&cwd, None, pwd.clone()),
+                [] as [PathBuf; 0],
+                "{pwd:?}"
+            );
+        }
+        // `--workspace`, against the current directory, whatever `PWD`.
+        assert_eq!(
+            discovery_links(&root, Some(Path::new("sub/deeper")), None),
+            [root.join("sub")]
+        );
+        assert_eq!(
+            discovery_links(&cwd, Some(&root.join("sub")), Some("junk".into())),
+            [root.join("sub")]
+        );
+        assert!(discovery_links(&root, Some(Path::new("x")), None).is_empty());
+    }
+
+    #[test]
+    fn revoking_a_path_tries_it_as_written_then_resolved() {
+        let (_d, root) = tmp();
+        fs::create_dir(root.join("real")).unwrap();
+        symlink(root.join("real"), root.join("link")).unwrap();
+        // Through a link: as written (a stale entry, from before the link
+        // was there), then resolved as `allow` would record it.
+        let given = root.join("link/./.stopit.toml");
+        assert_eq!(
+            config_keys(&given),
+            [given.clone(), root.join("real/.stopit.toml")]
+        );
+        // Canonical already: once.
+        let canonical = root.join("real/.stopit.toml");
+        assert_eq!(config_keys(&canonical), std::slice::from_ref(&canonical));
+        // A directory that is gone resolves as far as it exists.
+        let gone = root.join("link/gone/.stopit.toml");
+        assert_eq!(
+            config_keys(&gone),
+            [gone.clone(), root.join("real/gone/.stopit.toml")]
+        );
+        // The file itself is not followed, being never a link in the store.
+        symlink(root.join("elsewhere"), &canonical).unwrap();
+        assert_eq!(config_keys(&canonical), std::slice::from_ref(&canonical));
+    }
+
+    #[test]
+    fn allow_prints_the_whole_hash_and_the_size() {
+        let hash = crate::trust::sha256_hex(b"abc");
+        assert_eq!(
+            allowed_line(Path::new("/ws/.stopit.toml"), 3, &hash),
+            format!("allowed \"/ws/.stopit.toml\" (3 bytes, sha256 {hash})")
+        );
+        assert!(allowed_line(Path::new("/x"), 1, &hash).contains("(1 byte, "));
+        assert_eq!(
+            allowed_entry_line(Path::new("/ws/.stopit.toml"), &hash, false),
+            format!("{} \"/ws/.stopit.toml\"", &hash[..12])
+        );
+        assert_eq!(
+            allowed_entry_line(Path::new("/ws/.stopit.toml"), &hash, true),
+            format!("{} \"/ws/.stopit.toml\" (missing)", &hash[..12])
+        );
+        let (_d, root) = tmp();
+        assert!(is_gone(&root.join("nothing")));
+        assert!(!is_gone(&root));
+        // A dangling link is there.
+        symlink(root.join("nothing"), root.join("dangling")).unwrap();
+        assert!(!is_gone(&root.join("dangling")));
+    }
+
+    #[test]
+    fn a_link_on_the_way_to_a_config_is_refused() {
+        // Discovery resolves the workspace, so its path has no link; one
+        // there was swapped in since, and the file read would not be the
+        // one the trust store's key names.
+        let (_d, root) = tmp();
+        let ws = workspace_with_modes(&root, 0o755, 0o644);
+        symlink(&ws.dir, root.join("link")).unwrap();
+        for dir in [root.join("link"), root.join("link/../link")] {
+            let swapped = Workspace {
+                dir: dir.clone(),
+                config: Some(dir.join(CONFIG_FILE)),
+            };
+            let e = swapped.read_config().unwrap_err();
+            assert!(matches!(e, RunError::UntrustedConfig { .. }), "{e}");
+            assert!(
+                e.to_string().contains("runs through a symbolic link"),
+                "{e}"
+            );
+        }
+        // A link further up too.
+        fs::create_dir(root.join("up")).unwrap();
+        fs::rename(&ws.dir, root.join("up/ws")).unwrap();
+        fs::remove_file(root.join("link")).unwrap();
+        symlink(root.join("up"), root.join("link")).unwrap();
+        let swapped = Workspace {
+            dir: root.join("link/ws"),
+            config: Some(root.join("link/ws").join(CONFIG_FILE)),
+        };
+        let e = swapped.read_config().unwrap_err();
+        assert!(matches!(e, RunError::UntrustedConfig { .. }), "{e}");
+        // Through the real path, it reads.
+        let real = root.join("up/ws").join(CONFIG_FILE);
+        assert_eq!(read_trusted(&real).unwrap(), b"base = \"none\"");
     }
 
     #[test]

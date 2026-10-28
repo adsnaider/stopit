@@ -287,7 +287,8 @@ pub enum SpecWarning {
     /// holds other sessions' sockets and ephemeral data, or an existing data
     /// directory, whose trust store lists the user's projects. So stopit
     /// masks that directory where the mount shows it (DESIGN.md §6.2,
-    /// "Reserved host paths").
+    /// "Reserved host paths"). Not raised for the directory of the store in
+    /// use, which is masked silently.
     #[error(transparent)]
     StateDirMasked(Box<StateDirMasked>),
     /// The profile itself granted `network.allow_domains` but its network
@@ -1438,17 +1439,22 @@ fn check_host_sources(
 ///   files are served by FUSE, whose writes will each need approval.
 /// * A read-only (`ro` or `protected`) source containing the runtime
 ///   directory, or a data directory that exists, gets a mask over it where
-///   the mount shows it, attributed to stopit's own provider name, with a
-///   [`SpecWarning::StateDirMasked`] (DESIGN.md §1.5): the runtime
-///   directory holds other sessions' data, and the trust store lists the
-///   user's projects. That is sound: no sandbox can write any directory on
-///   the way to it (every `rw` grant containing it is refused), so what the
-///   mask covers stays where it is. Unless another mount lies between the
-///   mount's destination (exclusive) and that path (inclusive), mounted on
-///   top: it is checked in turn. A data directory that does not exist (the
-///   default location while `STOPIT_STATE_DIR` is used) shows nothing, and
-///   a mask would need a mount point the read-only view cannot get. A
-///   `masked` source shows nothing either.
+///   the mount shows it, attributed to stopit's own provider name: the
+///   runtime directory holds other sessions' data, and the trust store
+///   lists the user's projects. The mask over the store's directory
+///   (`state.data.store`) is silent, since it always exists and `ro ~`, the
+///   recommended way to show the home directory, contains it; the others
+///   come with a [`SpecWarning::StateDirMasked`] (DESIGN.md §1.5): a
+///   session seldom needs to see the runtime directory, and the default
+///   location while `STOPIT_STATE_DIR` is set is another store, which a
+///   session started without it would use. That is sound: no sandbox can
+///   write any directory on the way to it (every `rw` grant containing it
+///   is refused), so what the mask covers stays where it is. Unless another
+///   mount lies between the mount's destination (exclusive) and that path
+///   (inclusive), mounted on top: it is checked in turn. A data directory
+///   that does not exist (the default location while `STOPIT_STATE_DIR` is
+///   used) shows nothing, and a mask would need a mount point the read-only
+///   view cannot get. A `masked` source shows nothing either.
 fn check_state_dirs(
     mut mounts: Vec<PlannedMount>,
     canonical: &BTreeMap<PathBuf, PathBuf>,
@@ -1515,16 +1521,22 @@ fn check_state_dirs(
                 if overmounted || masks.contains_key(&x) {
                     continue;
                 }
-                warnings.push(SpecWarning::StateDirMasked(Box::new(StateDirMasked {
-                    provider: m.provider.clone(),
-                    mode: m.mode,
-                    host: host.clone(),
-                    resolved: resolved.clone(),
-                    sandbox: m.sandbox.clone(),
-                    dir,
-                    reserved: reserved.to_owned(),
-                    masked_at: x.clone(),
-                })));
+                // The store's own directory is masked quietly: `ro ~` is
+                // the recommended way to show the home directory, and it
+                // always contains it.
+                let quiet = dir == StateDir::Data && state_path.path == state.data.store.path;
+                if !quiet {
+                    warnings.push(SpecWarning::StateDirMasked(Box::new(StateDirMasked {
+                        provider: m.provider.clone(),
+                        mode: m.mode,
+                        host: host.clone(),
+                        resolved: resolved.clone(),
+                        sandbox: m.sandbox.clone(),
+                        dir,
+                        reserved: reserved.to_owned(),
+                        masked_at: x.clone(),
+                    })));
+                }
                 masks.insert(
                     x.clone(),
                     PlannedMount {
@@ -7742,7 +7754,8 @@ mod tests {
                         "provider \"p\": this rw grant is hidden this session: its mount at \
                          \"/home/user/.cache\" is replaced by an empty masked directory, because \
                          {cache:?} cannot be inspected (a sandbox may have removed its \
-                         permissions); restore them (e.g. `chmod u+rwx {cache:?}`) to get it back"
+                         permissions); restore them (e.g. `chmod u+rwx {}`) to get it back",
+                        cache.display()
                     )
                 );
             }
@@ -7820,7 +7833,8 @@ mod tests {
                         "provider \"p\": the workspace is hidden this session: its rw mount at \
                          \"/workspace\" is replaced by an empty masked directory, because {ws:?} \
                          cannot be inspected (a sandbox may have removed its permissions); \
-                         restore them (e.g. `chmod u+rwx {ws:?}`) to get it back"
+                         restore them (e.g. `chmod u+rwx {}`) to get it back",
+                        ws.display()
                     )
                 );
             }
@@ -8476,37 +8490,69 @@ mod tests {
                 "{body}"
             );
             assert_eq!(main.spec.mounts[1].source, host(&data, EntryKind::Dir));
-            let [SpecWarning::StateDirMasked(w)] = main.warnings.as_slice() else {
-                panic!("{body}: {:?}", main.warnings);
-            };
-            assert_eq!(
-                **w,
-                StateDirMasked {
-                    provider: "u".parse().unwrap(),
-                    mode: Ro,
-                    host: source.clone(),
-                    resolved: source.clone(),
-                    sandbox: sandbox.clone(),
-                    dir: StateDir::Data,
-                    reserved: data.clone(),
-                    masked_at: masked_at.clone(),
-                }
-            );
-            let msg = w.to_string();
-            assert!(
-                msg.contains(&format!(
-                    "contains stopit's data directory {data:?}, which holds stopit's persistent \
-                     state, such as which configurations you allowed, so it is masked at \
-                     {masked_at:?}"
-                )),
-                "{msg}"
-            );
+            // Silently: the store's directory always exists, and `ro ~` is
+            // how a sandbox is meant to see the home directory.
+            assert!(main.warnings.is_empty(), "{body}: {:?}", main.warnings);
         }
         // A masked grant shows nothing.
         let s = f.compile(&none_with("fs.masked = [\"~/.local\"]"));
         let main = get(&s, "main");
         assert!(main.warnings.is_empty(), "{:?}", main.warnings);
         assert_eq!(main.spec.mounts.len(), 1);
+    }
+
+    #[test]
+    fn the_default_data_directory_is_masked_with_a_warning_while_the_store_is_elsewhere() {
+        // With `STOPIT_STATE_DIR`, the default location holds another store,
+        // the one sessions started without the override use: masking it is
+        // worth a warning, masking the store in use is not.
+        let mut f = Fixture::new();
+        f.mkdir("var/state");
+        f.mkdir("home/.local/share/stopit");
+        let home = f.root.join("home");
+        let state = f.root.join("var/state");
+        let default = home.join(".local/share/stopit");
+        f.state.data = crate::state::data_dirs(&home, Some(state.as_os_str())).unwrap();
+        let s = f.compile(&none_with(&format!(
+            "fs.ro = [\"~\", {:?}]",
+            f.root.join("var")
+        )));
+        let main = get(&s, "main");
+        assert_eq!(
+            mounts(&main.spec),
+            [
+                row("/home/user", Ro, "u"),
+                row(f.root.join("var").to_str().unwrap(), Ro, "u"),
+                row(state.to_str().unwrap(), Masked, "stopit"),
+                row("/home/user/.local/share/stopit", Masked, "stopit"),
+            ]
+        );
+        let [SpecWarning::StateDirMasked(w)] = main.warnings.as_slice() else {
+            panic!("{:?}", main.warnings);
+        };
+        let masked_at = PathBuf::from("/home/user/.local/share/stopit");
+        assert_eq!(
+            **w,
+            StateDirMasked {
+                provider: "u".parse().unwrap(),
+                mode: Ro,
+                host: home.clone(),
+                resolved: home.clone(),
+                sandbox: "/home/user".into(),
+                dir: StateDir::Data,
+                reserved: default.clone(),
+                masked_at: masked_at.clone(),
+            }
+        );
+        let msg = w.to_string();
+        assert!(
+            msg.contains(&format!(
+                "contains stopit's data directory {default:?}, which holds stopit's persistent \
+                 state, such as which configurations you allowed, so it is masked at \
+                 {masked_at:?}"
+            )),
+            "{msg}"
+        );
     }
 
     #[test]

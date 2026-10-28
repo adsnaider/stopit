@@ -50,6 +50,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::session::{SessionError, check_private_dir, create_private_dir};
+use crate::state::STATE_DIR_ENV;
 use crate::supervisor::Ownership;
 
 /// The name of the store file in the data directory.
@@ -72,8 +73,14 @@ pub enum TrustError {
     #[error("stopit's data directory: {0}")]
     Dir(#[source] SessionError),
 
-    /// The data directory, or a directory above it, cannot be created.
-    #[error("cannot create stopit's data directory {path:?}: {source}")]
+    /// The data directory, or a directory above it, cannot be created: in
+    /// the default location, when the home directory in the password
+    /// database is missing or not the user's to write (`/nonexistent`,
+    /// `/var/empty`), so the message says how to put it elsewhere.
+    #[error(
+        "cannot create stopit's data directory {path:?}: {source}; if your home directory cannot \
+         hold it, set {STATE_DIR_ENV} to the absolute path of a directory you own"
+    )]
     CreateDir {
         /// The directory.
         path: PathBuf,
@@ -173,6 +180,11 @@ impl Allowed {
             Some(hash) if *hash == sha256_hex(bytes) => Decision::Allowed,
             Some(_) => Decision::Changed,
         }
+    }
+
+    /// Whether `path` has an entry, whatever its hash.
+    pub fn contains(&self, path: &Path) -> bool {
+        self.entries.contains_key(path)
     }
 
     /// Allows the configuration at the canonical `path` with the content
@@ -502,8 +514,11 @@ mod tests {
         let mut allowed = Allowed::default();
         let path = Path::new("/ws/.stopit.toml");
         assert_eq!(allowed.decide(path, b"x"), Decision::Unknown);
+        assert!(!allowed.contains(path));
         let hash = allowed.allow(path.to_path_buf(), b"x");
         assert_eq!(hash, sha256_hex(b"x"));
+        assert!(allowed.contains(path));
+        assert!(!allowed.contains(Path::new("/ws")));
         assert_eq!(allowed.decide(path, b"x"), Decision::Allowed);
         assert_eq!(allowed.decide(path, b"x\n"), Decision::Changed);
         // Another path with the same content is not allowed.
@@ -803,6 +818,15 @@ mod tests {
         // A parent that cannot be created.
         let e = TrustStore::open(&root.join("stopit/sub/stopit")).unwrap_err();
         assert!(matches!(e, TrustError::CreateDir { .. }), "{e}");
+        // The message says how to keep the store elsewhere, for a home
+        // directory that cannot hold it (`/nonexistent`, `/var/empty`).
+        assert!(
+            e.to_string().ends_with(
+                "if your home directory cannot hold it, set STOPIT_STATE_DIR to the absolute \
+                 path of a directory you own"
+            ),
+            "{e}"
+        );
     }
 
     #[test]

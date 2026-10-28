@@ -57,11 +57,16 @@ pub enum CliCommand {
         #[command(flatten)]
         workspace: WorkspaceArg,
     },
-    /// Stop allowing the workspace's `.stopit.toml`.
+    /// Stop allowing the workspace's `.stopit.toml`, or the configuration
+    /// file PATH.
     Revoke {
         /// Which workspace.
         #[command(flatten)]
         workspace: WorkspaceArg,
+        /// The configuration file to stop allowing, as `stopit allowed`
+        /// lists it, without looking for a workspace: it may be gone.
+        #[arg(value_name = "PATH", conflicts_with = "workspace")]
+        config: Option<PathBuf>,
     },
     /// List the configurations you allowed.
     Allowed,
@@ -220,7 +225,36 @@ mod tests {
     }
 
     #[test]
-    fn allow_and_revoke_take_only_the_workspace() {
+    fn revoke_takes_the_workspace_or_a_configuration_path() {
+        let revoke = |dir: Option<&str>, config: Option<&str>| CliCommand::Revoke {
+            workspace: WorkspaceArg {
+                workspace: dir.map(PathBuf::from),
+            },
+            config: config.map(PathBuf::from),
+        };
+        assert_eq!(parse(&["revoke"]).unwrap(), revoke(None, None));
+        assert_eq!(
+            parse(&["revoke", "/gone/.stopit.toml"]).unwrap(),
+            revoke(None, Some("/gone/.stopit.toml"))
+        );
+        // A path that looks like an option goes after `--`.
+        assert_eq!(
+            parse(&["revoke", "--", "--x"]).unwrap(),
+            revoke(None, Some("--x"))
+        );
+        for args in [
+            &["revoke", "--workspace", "w", "p"][..],
+            &["revoke", "p", "--workspace", "w"],
+        ] {
+            let e = parse(args).unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::ArgumentConflict, "{args:?}");
+            assert_eq!(e.exit_code(), 2, "{args:?}");
+        }
+        assert_eq!(parse(&["revoke", "a", "b"]).unwrap_err().exit_code(), 2);
+    }
+
+    #[test]
+    fn allow_takes_only_the_workspace_and_revoke_takes_it_too() {
         let ws = |dir: Option<&str>| WorkspaceArg {
             workspace: dir.map(PathBuf::from),
         };
@@ -239,7 +273,8 @@ mod tests {
         assert_eq!(
             parse(&["revoke", "--workspace=w"]).unwrap(),
             CliCommand::Revoke {
-                workspace: ws(Some("w"))
+                workspace: ws(Some("w")),
+                config: None,
             }
         );
         assert_eq!(parse(&["allowed"]).unwrap(), CliCommand::Allowed);

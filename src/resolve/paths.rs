@@ -45,6 +45,7 @@ use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -52,6 +53,7 @@ use thiserror::Error;
 use super::merge::{FsRule, FsRuleKind};
 use crate::config::ProviderName;
 use crate::error::is_missing;
+use crate::escape::shell_quote;
 use crate::expand::{
     EntryKind, ExpandError, ExpandedPattern, ExpansionContext, ResolveWarning, ResolvedPath,
     expand_bind, expand_pattern, resolve,
@@ -301,8 +303,9 @@ pub(crate) fn hidden_note(workspace: bool, mode: PathMode, sandbox: &Path, dir: 
     };
     format!(
         "{what} is replaced by an empty masked directory, because {dir:?} cannot be inspected (a \
-         sandbox may have removed its permissions); restore them (e.g. `chmod u+rwx {dir:?}`) to \
-         get it back"
+         sandbox may have removed its permissions); restore them (e.g. `chmod u+rwx {}`) to get \
+         it back",
+        shell_quote(dir.as_os_str().as_bytes())
     )
 }
 
@@ -2195,7 +2198,8 @@ mod tests {
                 "provider \"own\", rule \"{{workspace}}/locked\": this rw grant is hidden this \
                  session: its mount at \"/workspace/locked\" is replaced by an empty masked \
                  directory, because {locked:?} cannot be inspected (a sandbox may have removed \
-                 its permissions); restore them (e.g. `chmod u+rwx {locked:?}`) to get it back"
+                 its permissions); restore them (e.g. `chmod u+rwx {}`) to get it back",
+                locked.display()
             )
         );
     }
@@ -2258,9 +2262,9 @@ mod tests {
                     "provider \"base\", rule \"{{workspace}}\": the workspace is hidden this \
                      session: its rw mount at \"/workspace\" is replaced by an empty masked \
                      directory, because {:?} cannot be inspected (a sandbox may have removed its \
-                     permissions); restore them (e.g. `chmod u+rwx {:?}`) to get it back",
+                     permissions); restore them (e.g. `chmod u+rwx {}`) to get it back",
                     f.ws(),
-                    f.ws()
+                    f.ws().display()
                 ),
                 "{mode:o}"
             );

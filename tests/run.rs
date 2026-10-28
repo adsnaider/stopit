@@ -465,9 +465,13 @@ fn a_configuration_runs_only_once_allowed_and_as_allowed() {
     // Allowed, it runs.
     let bytes = fs::read(&config).unwrap();
     let hash = stopit::trust::sha256_hex(&bytes);
+    // The whole hash and the size, to check against the version reviewed.
     assert_eq!(
         s.allow(&[]),
-        format!("allowed {config:?} (sha256 {})\n", &hash[..12])
+        format!(
+            "allowed {config:?} ({} bytes, sha256 {hash})\n",
+            bytes.len()
+        )
     );
     assert_eq!(mode(&s.state_dir()), 0o700);
     assert_eq!(mode(&s.store_file()), 0o600);
@@ -624,8 +628,152 @@ fn a_configuration_planted_outside_any_workspace_is_refused() {
 }
 
 #[test]
-fn a_read_only_grant_containing_the_trust_store_masks_it() {
-    // It lists the user's projects.
+fn a_deleted_allowed_configuration_is_not_replaced_by_the_defaults() {
+    // The user's configuration may grant less than the default one: once
+    // allowed, its absence is refused until the user says otherwise.
+    let s = Setup::with_config("");
+    let config = s.config_path();
+    fs::create_dir(s.ws().join("sub")).unwrap();
+    fs::remove_file(&config).unwrap();
+    let refused = format!(
+        "stopit: error: refusing to run the default configuration: {config:?} was allowed but \
+         is missing, and the defaults may grant what it did not; restore it, or run `stopit \
+         revoke {}` to use the defaults there\n",
+        config.display()
+    );
+    // From the workspace, from below it, and with `--workspace`.
+    for (cwd, options) in [
+        (s.ws(), &[][..]),
+        (s.ws().join("sub"), &[]),
+        (s.root.join("home"), &["--workspace", "../ws"]),
+    ] {
+        let mut command = s.run_probe_command(options);
+        command.current_dir(&cwd);
+        let out = output(command, b"[]");
+        assert_eq!(code(&out), 125, "{cwd:?} {options:?}: {out:?}");
+        assert_eq!(stderr(&out), refused, "{cwd:?} {options:?}");
+        assert!(out.stdout.is_empty(), "{out:?}");
+        assert!(!s.runtime().join("stopit").exists());
+    }
+    // `--workspace` does not look up: `sub` was never configured.
+    let out = output(s.run_probe_command(&["--workspace", "sub"]), b"[]");
+    assert_default_base_ran(&out);
+    // `allowed` marks it.
+    let out = output(s.stopit(&["allowed"]), b"");
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).ends_with(&format!("{config:?} (missing)\n")),
+        "{out:?}"
+    );
+    // Revoked by its path, the defaults run.
+    let out = output(
+        s.stopit(&[OsString::from("revoke"), config.clone().into()]),
+        b"",
+    );
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("revoked {config:?}\n")
+    );
+    let out = output(s.run_probe_command(&[]), b"[]");
+    assert_default_base_ran(&out);
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn a_link_swapped_in_for_an_allowed_workspace_does_not_run_the_defaults() {
+    // A sandbox with `rw` on the directory holding the workspace moves the
+    // workspace away and puts a link to a directory without configuration
+    // in its place: discovery resolves the link, and finds none.
+    let s = Setup::with_config("");
+    let config = s.config_path();
+    let ws = s.ws();
+    let elsewhere = s.root.join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    fs::rename(&ws, s.root.join("ws.old")).unwrap();
+    symlink(&elsewhere, &ws).unwrap();
+    let refused = format!(
+        "stopit: error: refusing to run the default configuration: {config:?} was allowed, but \
+         {ws:?}, on the way to it, is now a symbolic link, so it is not where it was allowed, \
+         and the defaults may grant what it did not; restore it, or run `stopit revoke {}` to \
+         use the defaults there\n",
+        config.display()
+    );
+    // From the workspace as the shell names it (`PWD`), or with
+    // `--workspace`.
+    let mut from_ws = s.run_probe_command(&[]);
+    from_ws.env("PWD", &ws);
+    let mut named = s.run_probe_command(&["--workspace", "../ws"]);
+    named.current_dir(s.root.join("home"));
+    for command in [from_ws, named] {
+        let what = format!("{command:?}");
+        let out = output(command, b"[]");
+        assert_eq!(code(&out), 125, "{what}: {out:?}");
+        assert_eq!(stderr(&out), refused, "{what}");
+        assert!(!s.runtime().join("stopit").exists());
+    }
+    // Revoked, the defaults run there.
+    let out = output(
+        s.stopit(&[OsString::from("revoke"), config.clone().into()]),
+        b"",
+    );
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("revoked {config:?}\n")
+    );
+    let mut command = s.run_probe_command(&[]);
+    command.env("PWD", &ws);
+    assert_default_base_ran(&output(command, b"[]"));
+}
+
+#[test]
+fn the_entry_of_a_workspace_that_is_gone_can_be_revoked_by_its_path() {
+    // No discovery: the workspace, and the directory above it, are gone.
+    let s = Setup::new();
+    let gone = s.root.join("gone/ws");
+    fs::create_dir_all(&gone).unwrap();
+    fs::set_permissions(&gone, fs::Permissions::from_mode(0o755)).unwrap();
+    let config = gone.join(".stopit.toml");
+    fs::write(&config, "").unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+    s.allow(&["--workspace", gone.to_str().unwrap()]);
+    fs::remove_dir_all(s.root.join("gone")).unwrap();
+    let revoke = |path: &Path| output(s.stopit(&[Path::new("revoke"), path]), b"");
+    // A path that does not name the entry has nothing to revoke.
+    let other = s.root.join("gone/other/.stopit.toml");
+    let out = revoke(&other);
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{other:?} was not allowed: nothing to revoke\n")
+    );
+    // As `allowed` lists it, relative to the current directory too.
+    let out = revoke(Path::new("../gone/./ws/.stopit.toml"));
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("revoked {config:?}\n")
+    );
+    let out = output(s.stopit(&["allowed"]), b"");
+    assert_eq!(
+        (code(&out), out.stdout.as_slice()),
+        (0, &b""[..]),
+        "{out:?}"
+    );
+    // A directory is not a configuration file; neither option goes with a
+    // path.
+    let out = revoke(&s.ws());
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert!(stderr(&out).contains("is a directory"), "{out:?}");
+    let out = output(s.stopit(&["revoke", "--workspace", ".", "x"]), b"");
+    assert_eq!(code(&out), 2, "{out:?}");
+}
+
+#[test]
+fn a_read_only_grant_containing_the_trust_store_masks_it_silently() {
+    // It lists the user's projects; but `ro ~` is the recommended way to
+    // show the home directory, and always contains it, so no warning.
     let s = Setup::new();
     let state = s.state_dir().parent().unwrap().to_path_buf();
     fs::create_dir(&state).unwrap();
@@ -642,15 +790,7 @@ fn a_read_only_grant_containing_the_trust_store_masks_it() {
     let results = probe_results(&what, &out, &ops);
     assert_eq!(ok(&results[0]), &Data::List(vec!["stopit".into()]));
     assert_eq!(ok(&results[1]), &Data::List(vec![]));
-    assert_eq!(
-        stderr(&out),
-        format!(
-            "stopit: warning: provider \"state\": ro mount of {state:?} at {state:?} contains \
-             stopit's data directory {store:?}, which holds stopit's persistent state, such as \
-             which configurations you allowed, so it is masked at {store:?}; grant narrower \
-             paths that leave it out to silence this\n"
-        )
-    );
+    assert_eq!(stderr(&out), "");
     assert!(s.no_session_left());
 }
 

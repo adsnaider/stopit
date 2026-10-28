@@ -44,7 +44,9 @@ fn main() -> ExitCode {
             }
         }
         CliCommand::Allow { workspace } => return supervisor::allow(workspace.workspace),
-        CliCommand::Revoke { workspace } => return supervisor::revoke(workspace.workspace),
+        CliCommand::Revoke { workspace, config } => {
+            return supervisor::revoke(workspace.workspace, config);
+        }
         CliCommand::Allowed => return supervisor::allowed(),
     };
     supervisor::run(invocation)

@@ -15,6 +15,10 @@
 //!   use for layout (a script's stderr spans lines). Safe, not unambiguous:
 //!   a message is no single value to recover anyway.
 //!
+//! [`shell_quote`] is for a value inside a command a message suggests
+//! (`stopit allow --workspace <dir>`): quoted for bash and zsh, so that the
+//! command can be pasted as printed, and as safe as [`escape_bytes`].
+//!
 //! Both escape exactly the characters `char::escape_debug` escapes, but for
 //! the exceptions named: control characters (C0, DEL and C1, as `\u{1b}`),
 //! format characters such as the bidi override U+202E and the zero-width
@@ -65,6 +69,55 @@ pub fn escape_message(message: &str) -> String {
     out
 }
 
+/// `arg` (a path, say) quoted for bash or zsh, for a command that a message
+/// suggests, so that it can be pasted as it is printed: unchanged if every
+/// character is one neither treats specially (`A-Z`, `a-z`, `0-9` and
+/// `_@%+=:,./-`, but not `=` first, which zsh expands), else in single
+/// quotes, each `'` written `'\''`.
+///
+/// Single quotes cannot hold what [`escape_bytes`] escapes (control
+/// characters, and deceptive ones such as bidi overrides and zero-width
+/// spaces, which must not reach the terminal) nor bytes that are not UTF-8,
+/// so an `arg` with any of these is ANSI-C quoted instead (`$'…'`, which
+/// POSIX sh and fish lack), each such byte as `\xHH`, and `\` and `'` as
+/// `\\` and `\'`. The result is the same argument, and safe to print:
+/// [`escape_message`] leaves it unchanged.
+pub fn shell_quote(arg: &[u8]) -> String {
+    let plain = |b: u8| b.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&b);
+    if arg.first().is_some_and(|&b| b != b'=') && arg.iter().all(|&b| plain(b)) {
+        return String::from_utf8_lossy(arg).into_owned();
+    }
+    // Whether `c` cannot be shown as it is.
+    let escaped = |c: char| !matches!(c, '\\' | '\'' | '"') && c.escape_debug().nth(1).is_some();
+    let printable = arg
+        .utf8_chunks()
+        .all(|chunk| chunk.invalid().is_empty() && !chunk.valid().chars().any(escaped));
+    if printable {
+        let text = String::from_utf8_lossy(arg);
+        return format!("'{}'", text.replace('\'', "'\\''"));
+    }
+    let mut out = String::from("$'");
+    for chunk in arg.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '\'' => out.push_str("\\'"),
+                c if escaped(c) => {
+                    for b in c.encode_utf8(&mut [0; 4]).bytes() {
+                        let _ = write!(out, "\\x{b:02x}");
+                    }
+                }
+                c => out.push(c),
+            }
+        }
+        for b in chunk.invalid() {
+            let _ = write!(out, "\\x{b:02x}");
+        }
+    }
+    out.push('\'');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,6 +156,89 @@ mod tests {
             assert_eq!(f("a\u{2029}b".as_bytes()), "a\\u{2029}b");
             // Quotes are kept, as plain text.
             assert_eq!(f(b"it's \"x\""), "it's \"x\"");
+        }
+    }
+
+    #[test]
+    fn shell_quoting_quotes_only_what_needs_it() {
+        // Plain paths print as they are.
+        assert_eq!(shell_quote(b"/home/u/proj-1.2/a_b"), "/home/u/proj-1.2/a_b");
+        assert_eq!(shell_quote(b"/a/b@c%d+e=f:g,h"), "/a/b@c%d+e=f:g,h");
+        // Anything else in single quotes, `'` closed, escaped and reopened;
+        // `=` first too, which zsh would expand (`=ls` is `/bin/ls`).
+        assert_eq!(shell_quote(b"=ls"), "'=ls'");
+        assert_eq!(shell_quote(b""), "''");
+        assert_eq!(shell_quote(b"/a b"), "'/a b'");
+        assert_eq!(shell_quote(b"/it's"), "'/it'\\''s'");
+        assert_eq!(
+            shell_quote(b"/$x;`y`*?~!\\\"&|<>(){}[]#"),
+            "'/$x;`y`*?~!\\\"&|<>(){}[]#'"
+        );
+        assert_eq!(shell_quote("/héllo ✓".as_bytes()), "'/héllo ✓'");
+        // Control characters, deceptive ones and bytes that are not UTF-8
+        // are written as `\xHH` in ANSI-C quotes, the rest kept.
+        assert_eq!(shell_quote(b"/a\x1b[2Jb"), "$'/a\\x1b[2Jb'");
+        assert_eq!(shell_quote(b"/a\nb"), "$'/a\\x0ab'");
+        assert_eq!(shell_quote(b"/x\xff'\\"), "$'/x\\xff\\'\\\\'");
+        assert_eq!(shell_quote("/é\u{202e}".as_bytes()), "$'/é\\xe2\\x80\\xae'");
+        // What is printed is safe, and left alone by message escaping.
+        for b in 0u8..=255 {
+            let quoted = shell_quote(&[b'/', b]);
+            assert!(!quoted.chars().any(char::is_control), "{b:#x}: {quoted:?}");
+            assert_eq!(escape_message(&quoted), quoted, "{b:#x}");
+        }
+    }
+
+    #[test]
+    fn shell_quoting_round_trips_through_bash() {
+        // Every byte but NUL (which no path or argument holds), alone and
+        // inside a path, and some multibyte and awkward strings: bash reads
+        // each back as the original.
+        let mut args: Vec<Vec<u8>> = (1u8..=255)
+            .flat_map(|b| [vec![b], vec![b'/', b, b'x', b]])
+            .collect();
+        for s in [
+            "",
+            "=ls",
+            "/héllo ✓",
+            "/a\u{202e}b\u{200b}c",
+            "/\u{9b}2J",
+            "/it's \"x\" \\n $HOME `id` $(id)",
+            "/日本語/\u{1f600}",
+        ] {
+            args.push(s.as_bytes().to_vec());
+        }
+        args.push(b"/x\xe2\x80/\xff\xfe'\\".to_vec());
+        let script = std::iter::once("printf '%s\\0'".to_owned())
+            .chain(args.iter().map(|a| shell_quote(a)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let out = match std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("LC_ALL", "C")
+            .output()
+        {
+            Ok(out) => out,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping: bash is not on PATH");
+                return;
+            }
+            Err(e) => panic!("cannot run bash: {e}"),
+        };
+        assert!(out.status.success(), "{out:?}");
+        let mut back: Vec<&[u8]> = out.stdout.split(|&b| b == 0).collect();
+        // After the last NUL.
+        assert_eq!(back.pop(), Some(&b""[..]));
+        assert_eq!(back.len(), args.len());
+        for (arg, back) in args.iter().zip(back) {
+            assert_eq!(
+                back,
+                arg.as_slice(),
+                "{:?} as {}",
+                escape_bytes(arg),
+                shell_quote(arg)
+            );
         }
     }
 
