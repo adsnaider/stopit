@@ -129,16 +129,46 @@ mod tests {
             ["passwd", "group", "hosts", "nsswitch.conf"]
         );
         assert_eq!(strs(&g.fs.rw, |p| p.as_str()), ["{workspace}"]);
-        assert_eq!(g.fs.masked.len(), 6);
+        assert_eq!(g.fs.masked.len(), 13);
         let masked = strs(&g.fs.masked, |p| p.as_str());
-        assert!(masked.contains(&"{workspace}/**/.env".to_owned()));
-        assert!(masked.contains(&"{workspace}/**/.pypirc".to_owned()));
+        for want in [
+            "{workspace}/**/.env",
+            "{workspace}/**/.pypirc",
+            "{workspace}/**/.netrc",
+            "{workspace}/**/*.p12",
+            "{workspace}/**/*.pfx",
+            "{workspace}/**/*credentials*.json",
+            "{workspace}/**/id_rsa",
+            "{workspace}/**/id_ed25519",
+            "{workspace}/**/.terraformrc",
+        ] {
+            assert!(masked.contains(&want.to_owned()), "{want}");
+        }
         assert_eq!(g.fs.mask_sockets, Some(true));
-        assert_eq!(g.fs.protected.len(), 8);
+        assert_eq!(g.fs.protected.len(), 23);
         let protected = strs(&g.fs.protected, |p| p.as_str());
-        assert!(protected.contains(&"{workspace}/.stopit.toml".to_owned()));
-        assert!(protected.contains(&"{workspace}/**/.stopit.toml".to_owned()));
-        assert!(protected.contains(&"{workspace}/.github/workflows".to_owned()));
+        for want in [
+            "{workspace}/.stopit.toml",
+            "{workspace}/**/.stopit.toml",
+            "{workspace}/.github/workflows",
+            "{workspace}/.git",
+            "{workspace}/.jj",
+            "{workspace}/.gitmodules",
+            "{workspace}/.cargo/config.toml",
+            "{workspace}/.cargo/config",
+            "{workspace}/.bazelrc",
+            "{workspace}/.claude",
+            "{workspace}/.gemini",
+            "{workspace}/.cursor",
+            "{workspace}/.mcp.json",
+            "{workspace}/.zed",
+            "{workspace}/**/.nvim.lua",
+            "{workspace}/**/.exrc",
+            "{workspace}/.gdbinit",
+            "{workspace}/.lldbinit",
+        ] {
+            assert!(protected.contains(&want.to_owned()), "{want}");
+        }
         assert_eq!(strs(&g.fs.ephemeral, |p| p.as_str()), ["/tmp", "~"]);
         assert!(g.fs.ro.is_empty() && g.fs.bind.is_empty());
         assert_eq!(

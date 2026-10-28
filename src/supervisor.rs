@@ -353,6 +353,10 @@ fn unprotected_providers(config: &Config) -> Vec<&ProviderName> {
 pub fn run(invocation: Invocation) -> ExitCode {
     match supervise(invocation) {
         Ok(code) => code,
+        Err(RunError::Provider(ProviderError::Interrupted { signal, .. })) => {
+            let _ = take_signal();
+            ExitCode::from(signal_exit_code(signal))
+        }
         Err(e) => {
             print_error(&e.to_string());
             match take_signal() {
@@ -670,16 +674,70 @@ const CAUGHT: [libc::c_int; 4] = [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, li
 /// The last caught signal not yet handled, or 0.
 static RECEIVED: AtomicI32 = AtomicI32::new(0);
 
-/// The handler of [`CAUGHT`]: records the signal for the main thread.
+/// Non-blocking self-pipe waking threads blocked in `poll` when a caught
+/// signal arrives.
+static SIGNAL_READ_FD: AtomicI32 = AtomicI32::new(-1);
+static SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+static SIGNAL_PIPE_INIT: std::sync::OnceLock<Result<(), i32>> = std::sync::OnceLock::new();
+
+/// Signal handler for [`CAUGHT`] that records the signal and wakes [`signal_poll_fd`].
 extern "C" fn record_signal(signal: libc::c_int) {
     RECEIVED.store(signal, Ordering::SeqCst);
+    let wfd = SIGNAL_WRITE_FD.load(Ordering::Relaxed);
+    if wfd >= 0 {
+        let byte: u8 = 1;
+        // SAFETY: `write` is async-signal-safe, and `wfd` is non-blocking.
+        unsafe {
+            let _ = libc::write(wfd, (&raw const byte).cast(), 1);
+        }
+    }
+}
+
+/// The last caught signal not yet handled, without consuming it.
+pub(crate) fn pending_signal() -> Option<libc::c_int> {
+    match RECEIVED.load(Ordering::SeqCst) {
+        0 => None,
+        signal => Some(signal),
+    }
+}
+
+/// Read end of the signal wakeup pipe, if [`catch_signals`] has installed it.
+pub(crate) fn signal_poll_fd() -> Option<libc::c_int> {
+    let fd = SIGNAL_READ_FD.load(Ordering::Acquire);
+    (fd >= 0).then_some(fd)
 }
 
 /// The last caught signal not yet handled, if any, now handled.
 fn take_signal() -> Option<libc::c_int> {
+    let rfd = SIGNAL_READ_FD.load(Ordering::Acquire);
+    if rfd >= 0 {
+        let mut buf = [0u8; 64];
+        // SAFETY: `rfd` is a valid non-blocking pipe descriptor owned for the
+        // life of the process.
+        while unsafe { libc::read(rfd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+    }
     match RECEIVED.swap(0, Ordering::SeqCst) {
         0 => None,
         signal => Some(signal),
+    }
+}
+
+fn init_signal_pipe() -> io::Result<()> {
+    match *SIGNAL_PIPE_INIT.get_or_init(|| {
+        let mut raw = [0 as libc::c_int; 2];
+        // SAFETY: `raw` holds two integers. `O_CLOEXEC | O_NONBLOCK` stops
+        // child inheritance and keeps writes in `record_signal` from blocking.
+        if unsafe { libc::pipe2(raw.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+            return Err(io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO));
+        }
+        SIGNAL_WRITE_FD.store(raw[1], Ordering::Release);
+        SIGNAL_READ_FD.store(raw[0], Ordering::Release);
+        Ok(())
+    }) {
+        Ok(()) => Ok(()),
+        Err(errno) => Err(io::Error::from_raw_os_error(errno)),
     }
 }
 
@@ -692,6 +750,7 @@ fn take_signal() -> Option<libc::c_int> {
 /// stopit started (`nohup`'s `SIGHUP`) stays ignored, as shells leave it,
 /// and is then inherited ignored.
 fn catch_signals() -> io::Result<()> {
+    init_signal_pipe()?;
     for signal in CAUGHT {
         // SAFETY: `sigaction` on a zeroed, then filled, local struct. The
         // handler only stores to an atomic, which is async-signal-safe.
@@ -822,7 +881,7 @@ fn wait_foreground(command: BwrapCommand) -> Result<u8, RunError> {
     if let Some(signal) = take_signal() {
         return Ok(signal_exit_code(signal));
     }
-    let mut command = command.into_command();
+    let (mut command, status_reader) = command.into_command_with_status()?;
     let old = mask.old;
     // SAFETY: `pthread_sigmask` is async-signal-safe, and `old` a copy.
     unsafe {
@@ -840,6 +899,9 @@ fn wait_foreground(command: BwrapCommand) -> Result<u8, RunError> {
             RunError::Spawn(e)
         }
     })?;
+    // Close our copy of the status pipe's write end so `status_reader` sees EOF
+    // when bwrap finishes or execs `__init`.
+    drop(command);
     let pid = Pid::from_child(&child);
     // Waiting through a pidfd lets `ppoll` wait for the child and the
     // signals at once. Without one (impossible on the kernels stopit
@@ -859,7 +921,56 @@ fn wait_foreground(command: BwrapCommand) -> Result<u8, RunError> {
         }
     }
     let status = child.wait().map_err(RunError::Spawn)?;
-    Ok(exit_code(status))
+    let json_status = read_nonblocking_status(status_reader);
+    Ok(bwrap_exit_code(status, &json_status))
+}
+
+fn read_nonblocking_status(mut reader: File) -> String {
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 512];
+    while raw.len() < 4096 {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
+/// Computes the exit status for bwrap given its process `status` and the JSON
+/// lines read from `--json-status-fd`. When bwrap exits non-zero without
+/// emitting both `"child-pid"` and `"exit-code"`, bwrap itself failed during
+/// setup and we return [`EXIT_SUPERVISOR_FAILED`].
+fn bwrap_exit_code(status: ExitStatus, json_status: &str) -> u8 {
+    match status.code() {
+        None => exit_code(status),
+        Some(0) => 0,
+        Some(_) => {
+            let mut has_child_pid = false;
+            let mut has_exit_code = false;
+            for line in json_status.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                    if val.get("child-pid").is_some() {
+                        has_child_pid = true;
+                    }
+                    if val.get("exit-code").is_some() {
+                        has_exit_code = true;
+                    }
+                }
+            }
+            if has_child_pid && has_exit_code {
+                exit_code(status)
+            } else {
+                EXIT_SUPERVISOR_FAILED
+            }
+        }
+    }
 }
 
 /// [`CAUGHT`] blocked, until dropped.
@@ -2306,5 +2417,35 @@ mod tests {
         assert!(lines[0].contains("\"/b\" does not exist"), "{lines:?}");
         // Under `base = "none"` nothing is quiet.
         assert_eq!(distinct_messages(&warnings, Base::None).len(), 4);
+    }
+
+    #[test]
+    fn bwrap_exit_code_distinguishes_setup_failures_from_target_exits() {
+        let exited = |code: i32| ExitStatus::from_raw(code << 8);
+        assert_eq!(bwrap_exit_code(exited(0), ""), 0);
+        // Pre-clone setup failure emits nothing and maps to 125.
+        assert_eq!(bwrap_exit_code(exited(1), ""), EXIT_SUPERVISOR_FAILED);
+        // Post-clone setup failure emits only child-pid without exit-code and maps to 125.
+        assert_eq!(
+            bwrap_exit_code(exited(1), "{ \"child-pid\": 42 }\n"),
+            EXIT_SUPERVISOR_FAILED
+        );
+        // Normal target exit emits both child-pid and exit-code and preserves the exit status.
+        assert_eq!(
+            bwrap_exit_code(exited(1), "{ \"child-pid\": 42 }\n{ \"exit-code\": 1 }\n"),
+            1
+        );
+        assert_eq!(
+            bwrap_exit_code(
+                exited(42),
+                "{ \"child-pid\": 42, \"mnt-namespace\": 1 }\n{ \"exit-code\": 42 }\n"
+            ),
+            42
+        );
+        // Signal termination preserves 128 + signal.
+        assert_eq!(
+            bwrap_exit_code(ExitStatus::from_raw(libc::SIGTERM), ""),
+            143
+        );
     }
 }

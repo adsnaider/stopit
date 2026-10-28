@@ -34,18 +34,20 @@
 //! bwrap leaves its root tmpfs writable; the last option remounts it
 //! read-only (step 2), so the sandbox writes only where a mount lets it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{CString, OsStr, OsString};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use rustix::fs::{MemfdFlags, Mode, OFlags, SealFlags, fcntl_add_seals, memfd_create};
-use rustix::io::fcntl_dupfd_cloexec;
+use rustix::fs::{
+    CWD, MemfdFlags, Mode, OFlags, ResolveFlags, SealFlags, fcntl_add_seals, memfd_create, openat2,
+};
+use rustix::io::{Errno, FdFlags, fcntl_dupfd_cloexec, fcntl_setfd};
 use thiserror::Error;
 
 use crate::config::ProviderName;
@@ -98,6 +100,9 @@ pub const BWRAP_MAX_ARGS: usize = 9000;
 
 /// The arguments on bwrap's argv besides the command: `--args FD --`.
 const ARGV_OVERHEAD: usize = 3;
+
+/// Argument count added to bwrap's argv for `--json-status-fd FD`.
+const STATUS_ARGV_OVERHEAD: usize = 2;
 
 /// The lowest descriptor number handed to bwrap. Lower ones are stdio, which
 /// the child's standard streams replace before the descriptors are
@@ -155,6 +160,68 @@ pub enum BwrapError {
         #[source]
         error: SessionError,
     },
+
+    /// A mount destination below an ephemeral mount traverses a symlink inside
+    /// the session's ephemeral backing directory.
+    #[error(
+        "refusing mount at {sandbox:?} below ephemeral {ephemeral:?} because {link:?} in the \
+         session ephemeral directory is a symbolic link"
+    )]
+    EphemeralDestinationLink {
+        /// The sandbox path of the nested mount.
+        sandbox: PathBuf,
+        /// The sandbox path of the ancestor ephemeral mount.
+        ephemeral: PathBuf,
+        /// The symlink found in the ephemeral backing directory.
+        link: PathBuf,
+    },
+
+    /// An entry inside an ephemeral backing directory on the way to a nested
+    /// mount destination could not be inspected.
+    #[error(
+        "cannot inspect {path:?} in the ephemeral directory for {ephemeral:?} on the way to \
+         {sandbox:?}: {error}"
+    )]
+    EphemeralDestinationInspect {
+        /// The sandbox path of the nested mount.
+        sandbox: PathBuf,
+        /// The sandbox path of the ancestor ephemeral mount.
+        ephemeral: PathBuf,
+        /// The uninspectable host path.
+        path: PathBuf,
+        /// What went wrong.
+        #[source]
+        error: io::Error,
+    },
+
+    /// `openat2` with `RESOLVE_NO_SYMLINKS` rejected a symbolic link inside an
+    /// untrusted root.
+    #[error(
+        "refusing mount of {path:?} at {sandbox:?} because a component inside an untrusted \
+         directory is a symbolic link"
+    )]
+    UntrustedSymlink {
+        /// The sandbox destination of the mount.
+        sandbox: PathBuf,
+        /// The host path being opened.
+        path: PathBuf,
+    },
+
+    /// Opening a mount source descriptor failed.
+    #[error("cannot open mount source {path:?} for {sandbox:?}: {error}")]
+    MountOpen {
+        /// The sandbox destination of the mount.
+        sandbox: PathBuf,
+        /// The host path being opened.
+        path: PathBuf,
+        /// What went wrong.
+        #[source]
+        error: io::Error,
+    },
+
+    /// Creating a status pipe for bwrap failed.
+    #[error("cannot create a status pipe for bwrap: {0}")]
+    StatusPipe(#[source] io::Error),
 
     /// The sandbox needs more arguments than bwrap accepts, because it has
     /// too many mounts.
@@ -240,9 +307,14 @@ pub struct BwrapCommand {
     args_fd: OwnedFd,
     /// One memfd per data argument, in the order `args` names them.
     data_fds: Vec<OwnedFd>,
+    /// One `O_PATH` descriptor per `--bind-fd` or `--ro-bind-fd` argument, in
+    /// the order `args` names them.
+    bind_fds: Vec<OwnedFd>,
     /// The memfd holding the target's environment for `__init`, if the
     /// command runs it ([`for_init`](Self::for_init)).
     env_fd: Option<OwnedFd>,
+    /// Mount count and largest provider for [`BwrapError::TooManyArgs`].
+    mounts_summary: (usize, Option<ProviderName>, usize),
 }
 
 impl BwrapCommand {
@@ -302,14 +374,31 @@ impl BwrapCommand {
             bin: session.bin(),
             prefix: provisioned.command_prefix(Path::new(SANDBOX_RUNTIME_DIR)),
         };
+        let mut untrusted_roots = spec.untrusted_roots.clone();
+        untrusted_roots.insert(session.ephemeral());
+        for mount in &spec.mounts {
+            if mount.mode == PathMode::Rw
+                && let MountSource::Host { path, .. } = &mount.source
+            {
+                let canon = spec
+                    .canonical_sources
+                    .get(&mount.sandbox)
+                    .cloned()
+                    .or_else(|| fs::canonicalize(path).ok())
+                    .unwrap_or_else(|| path.clone());
+                untrusted_roots.insert(canon);
+            }
+        }
         let plan = plan(
             spec,
+            &untrusted_roots,
             &runtime,
             SandboxIds::current(),
             cwd,
             argv_after_prefix,
             terminal,
             &|path| path.symlink_metadata().is_ok(),
+            &|path| Some(fs::symlink_metadata(path)),
             &mut |sandbox, key| {
                 session
                     .ephemeral_dir(key)
@@ -326,22 +415,27 @@ impl BwrapCommand {
             .map(|data| sealed_memfd("stopit-bwrap-data", data))
             .collect::<io::Result<Vec<_>>>()
             .map_err(BwrapError::DataFd)?;
+        let bind_fds = open_bind_fds(&plan.binds)?;
         let args: Vec<OsString> = plan
             .args
             .into_iter()
             .map(|arg| match arg {
                 Arg::Text(text) => text,
                 Arg::Data(index) => data_fds[index].as_raw_fd().to_string().into(),
+                Arg::Bind(index) => bind_fds[index].as_raw_fd().to_string().into(),
             })
             .collect();
         let args_fd = sealed_memfd("stopit-bwrap-args", &serialize_args(&args))
             .map_err(BwrapError::DataFd)?;
+        let (provider, provider_mounts) = largest_provider(&spec.mounts);
         Ok(BwrapCommand {
             args,
             command: plan.command,
             args_fd,
             data_fds,
+            bind_fds,
             env_fd: None,
+            mounts_summary: (spec.mounts.len(), provider, provider_mounts),
         })
     }
 
@@ -368,10 +462,12 @@ impl BwrapCommand {
 
     /// Every descriptor bwrap inherits: [`args_fd`](Self::args_fd), then
     /// the data descriptors in the order the arguments name them, then
+    /// the bind descriptors in the order the arguments name them, then
     /// [`env_fd`](Self::env_fd) if any.
     pub fn inherited_fds(&self) -> Vec<RawFd> {
         std::iter::once(&self.args_fd)
             .chain(&self.data_fds)
+            .chain(&self.bind_fds)
             .chain(&self.env_fd)
             .map(AsRawFd::as_raw_fd)
             .collect()
@@ -387,14 +483,43 @@ impl BwrapCommand {
     /// arguments: bwrap reads its descriptors to the end, so each child
     /// gets fresh ones, opened anew on the same memfds after the fork.
     pub fn into_command(self) -> Command {
+        self.build_command(None)
+    }
+
+    /// Builds the `bwrap` command with `--json-status-fd <fd>` and returns the
+    /// non-blocking read end of the status pipe. Drop the returned `Command`
+    /// after spawning so the parent's write end closes.
+    pub fn into_command_with_status(self) -> Result<(Command, File), BwrapError> {
+        let count = self.args.len() + ARGV_OVERHEAD + STATUS_ARGV_OVERHEAD + self.command.len();
+        if count > BWRAP_MAX_ARGS {
+            let (mounts, provider, provider_mounts) = self.mounts_summary;
+            return Err(BwrapError::TooManyArgs {
+                count,
+                max: BWRAP_MAX_ARGS,
+                mounts,
+                provider,
+                provider_mounts,
+            });
+        }
+        let (read_fd, write_fd) = cloexec_pipe().map_err(BwrapError::StatusPipe)?;
+        let command = self.build_command(Some(write_fd));
+        Ok((command, File::from(read_fd)))
+    }
+
+    fn build_command(self, status_write_fd: Option<OwnedFd>) -> Command {
         let mut command = Command::new(BWRAP);
+        if let Some(ref sfd) = status_write_fd {
+            command
+                .arg("--json-status-fd")
+                .arg(sfd.as_raw_fd().to_string());
+        }
         command
             .arg("--args")
             .arg(self.args_fd.as_raw_fd().to_string())
             .arg("--")
             .args(&self.command);
         // Built before the fork: the child must not allocate.
-        let mut fds: Vec<(OwnedFd, CString)> = std::iter::once(self.args_fd)
+        let mut reopen_fds: Vec<(OwnedFd, CString)> = std::iter::once(self.args_fd)
             .chain(self.data_fds)
             .chain(self.env_fd)
             .map(|fd| {
@@ -403,26 +528,29 @@ impl BwrapCommand {
                 (fd, path)
             })
             .collect();
+        let mut keep_fds = self.bind_fds;
+        if let Some(sfd) = status_write_fd {
+            keep_fds.push(sfd);
+        }
         // SAFETY: the closure runs in the forked child before `exec`, where
         // only async-signal-safe operations are allowed. It allocates
-        // nothing and takes no locks: it walks a vector built before the
-        // fork and makes raw syscalls through rustix (`open` of a prepared
-        // C string, `dup2`, `close`); an error becomes an `io::Error` from
-        // its raw errno, which does not allocate either. Each descriptor is
-        // reopened through `/proc/self/fd/N`, which gives the child a new
-        // open file description of the same memfd at offset 0 (the parent's
-        // is shared and would be at its end after a first spawn), and moved
-        // onto `N` with `dup2`, which leaves close-on-exec clear there, so
-        // bwrap inherits it at the number its arguments name. The temporary
-        // descriptor is close-on-exec and closed right away. The originals
-        // are owned by the closure, so they stay open for as long as the
-        // `Command` does; they are close-on-exec in the parent and at least
-        // `MIN_FD`, so the child's stdio setup, which runs before this,
-        // leaves them alone, and no other child of this process inherits
-        // them.
+        // nothing and takes no locks. First `close_range` marks every open
+        // descriptor above stdio close-on-exec so descriptors leaked into the
+        // supervisor never reach bwrap or the sandbox. Then the loop reopens
+        // each memfd through `/proc/self/fd/N` at offset 0 and moves it onto
+        // `N` with `dup2`, and clears close-on-exec on each `O_PATH` bind
+        // descriptor and any status pipe descriptor.
         unsafe {
             command.pre_exec(move || {
-                for (fd, path) in &mut fds {
+                if libc::close_range(
+                    MIN_FD as libc::c_uint,
+                    libc::c_uint::MAX,
+                    libc::CLOSE_RANGE_CLOEXEC as libc::c_int,
+                ) != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                for (fd, path) in &mut reopen_fds {
                     let fresh = rustix::fs::open(
                         path.as_c_str(),
                         OFlags::RDONLY | OFlags::CLOEXEC,
@@ -430,11 +558,129 @@ impl BwrapCommand {
                     )?;
                     rustix::io::dup2(&fresh, fd)?;
                 }
+                for fd in &keep_fds {
+                    fcntl_setfd(fd, FdFlags::empty())?;
+                }
                 Ok(())
             });
         }
         command
     }
+}
+
+/// Creates a close-on-exec pipe with a non-blocking read end and a write end at
+/// least [`MIN_FD`].
+fn cloexec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut raw = [0 as RawFd; 2];
+    // SAFETY: `raw` points to two writable integers, and `O_CLOEXEC` sets
+    // close-on-exec atomically on both ends.
+    let rc = unsafe { libc::pipe2(raw.as_mut_ptr(), libc::O_CLOEXEC) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `pipe2` initialized both descriptors and transferred ownership.
+    let read_fd = unsafe { OwnedFd::from_raw_fd(raw[0]) };
+    let write_fd = unsafe { OwnedFd::from_raw_fd(raw[1]) };
+    // Mark only `read_fd` non-blocking so `write_fd` stays blocking for bwrap,
+    // while reading after `child.wait()` never blocks even if a child in a
+    // shared PID namespace inherited `write_fd`.
+    let flags = unsafe { libc::fcntl(read_fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(read_fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let write_fd = if write_fd.as_raw_fd() < MIN_FD {
+        fcntl_dupfd_cloexec(&write_fd, MIN_FD).map_err(io::Error::from)?
+    } else {
+        write_fd
+    };
+    Ok((read_fd, write_fd))
+}
+
+/// Opens each untrusted host mount source with `openat2(O_PATH | O_CLOEXEC,
+/// RESOLVE_NO_SYMLINKS)` relative to its canonical untrusted root.
+fn open_bind_fds(binds: &[BindOpen]) -> Result<Vec<OwnedFd>, BwrapError> {
+    let mut root_fds: BTreeMap<PathBuf, OwnedFd> = BTreeMap::new();
+    let mut out = Vec::with_capacity(binds.len());
+    for b in binds {
+        let full = if b.rel.as_os_str().is_empty() {
+            b.root.clone()
+        } else {
+            b.root.join(&b.rel)
+        };
+        let map_err = |err: Errno| {
+            if err == Errno::LOOP {
+                BwrapError::UntrustedSymlink {
+                    sandbox: b.sandbox.clone(),
+                    path: full.clone(),
+                }
+            } else {
+                BwrapError::MountOpen {
+                    sandbox: b.sandbox.clone(),
+                    path: full.clone(),
+                    error: io::Error::from(err),
+                }
+            }
+        };
+        let fd = if b.rel.as_os_str().is_empty() {
+            openat2(
+                CWD,
+                &b.root,
+                OFlags::PATH | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::NO_SYMLINKS,
+            )
+            .map_err(map_err)?
+        } else {
+            let root_fd = match root_fds.get(&b.root) {
+                Some(fd) => fd,
+                None => {
+                    let fd = openat2(
+                        CWD,
+                        &b.root,
+                        OFlags::PATH | OFlags::CLOEXEC | OFlags::DIRECTORY,
+                        Mode::empty(),
+                        ResolveFlags::NO_SYMLINKS,
+                    )
+                    .map_err(|err| {
+                        if err == Errno::LOOP {
+                            BwrapError::UntrustedSymlink {
+                                sandbox: b.sandbox.clone(),
+                                path: b.root.clone(),
+                            }
+                        } else {
+                            BwrapError::MountOpen {
+                                sandbox: b.sandbox.clone(),
+                                path: b.root.clone(),
+                                error: io::Error::from(err),
+                            }
+                        }
+                    })?;
+                    root_fds.entry(b.root.clone()).or_insert(fd)
+                }
+            };
+            openat2(
+                root_fd,
+                &b.rel,
+                OFlags::PATH | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::NO_SYMLINKS,
+            )
+            .map_err(map_err)?
+        };
+        let fd = if fd.as_raw_fd() < MIN_FD {
+            fcntl_dupfd_cloexec(&fd, MIN_FD).map_err(|err| BwrapError::MountOpen {
+                sandbox: b.sandbox.clone(),
+                path: full,
+                error: io::Error::from(err),
+            })?
+        } else {
+            fd
+        };
+        out.push(fd);
+    }
+    Ok(out)
 }
 
 /// Creates a memfd holding `data`, positioned at its start and sealed
@@ -477,6 +723,16 @@ enum Arg {
     Text(OsString),
     /// The descriptor number of the `n`th data blob.
     Data(usize),
+    /// The descriptor number of the `n`th `O_PATH` mount source.
+    Bind(usize),
+}
+
+/// An untrusted host mount source to open with `openat2` and `RESOLVE_NO_SYMLINKS`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BindOpen {
+    sandbox: PathBuf,
+    root: PathBuf,
+    rel: PathBuf,
 }
 
 /// The host paths of the provisioned pieces bound into the runtime
@@ -496,6 +752,8 @@ struct Plan {
     args: Vec<Arg>,
     /// The content of each [`Arg::Data`].
     data: Vec<Vec<u8>>,
+    /// The open specification of each [`Arg::Bind`].
+    binds: Vec<BindOpen>,
     /// The command after `--`.
     command: Vec<OsString>,
 }
@@ -546,12 +804,14 @@ fn checked(arg: &OsStr) -> Result<OsString, BwrapError> {
 #[allow(clippy::too_many_arguments)]
 fn plan(
     spec: &SandboxSpec,
+    untrusted_roots: &BTreeSet<PathBuf>,
     runtime: &RuntimeBinds,
     ids: SandboxIds,
     cwd: &Path,
     argv_after_prefix: &[OsString],
     terminal: TerminalSession,
     proc_has: &dyn Fn(&Path) -> bool,
+    host_meta: &dyn Fn(&Path) -> Option<io::Result<fs::Metadata>>,
     ephemeral_dir: &mut dyn FnMut(&Path, &EphemeralKey) -> Result<PathBuf, BwrapError>,
 ) -> Result<Plan, BwrapError> {
     if !cwd.is_absolute() {
@@ -649,16 +909,62 @@ fn plan(
     // Step 5: filesystem mounts, parents first. A masked directory is an
     // empty tmpfs made read-only only after every mount below it, since
     // bwrap creates their mount points in it.
-    // TODO(§3.4): `spec.mask_sockets` (sockets found in `rw` grants).
-    // TODO(§11): mount `O_PATH` descriptors (`--bind-fd`) and pin parent
-    // directories (§3.4, Pinned parent directories).
     debug_assert!(
         parents_first(&spec.mounts),
         "the spec's mounts are not ordered parents first"
     );
+    let mut ephemeral_backs: HashMap<&Path, PathBuf> = HashMap::new();
+    for mount in &spec.mounts {
+        if let (MountSource::Ephemeral { key }, PathMode::Ephemeral) = (&mount.source, mount.mode) {
+            let backing = ephemeral_dir(&mount.sandbox, key)?;
+            ephemeral_backs.insert(mount.sandbox.as_path(), backing);
+        }
+    }
+    let mount_by_sandbox: HashMap<&Path, &PlannedMount> = spec
+        .mounts
+        .iter()
+        .map(|m| (m.sandbox.as_path(), m))
+        .collect();
+    for mount in &spec.mounts {
+        let anc = mount
+            .sandbox
+            .ancestors()
+            .skip(1)
+            .find_map(|a| mount_by_sandbox.get(a).copied());
+        if let Some(anc) = anc
+            && let Some(backing) = ephemeral_backs.get(anc.sandbox.as_path())
+        {
+            let rel = mount
+                .sandbox
+                .strip_prefix(&anc.sandbox)
+                .expect("ancestor is a prefix");
+            check_ephemeral_destination(&mount.sandbox, &anc.sandbox, backing, rel, host_meta)?;
+        }
+    }
+    let mut pinned = collect_pinned_parents(
+        spec,
+        untrusted_roots,
+        &mount_by_sandbox,
+        &ephemeral_backs,
+        host_meta,
+    )?;
     let mut masked_dirs = Vec::new();
     for mount in &spec.mounts {
-        mount_args(&mut plan, mount, &mut masked_dirs, ephemeral_dir)?;
+        let ancestors: Vec<&Path> = mount.sandbox.ancestors().skip(1).collect();
+        for anc in ancestors.into_iter().rev() {
+            if let Some((host_dir, mode)) = pinned.remove(anc) {
+                let rw = mode == PathMode::Rw;
+                push_host_bind(&mut plan, rw, &host_dir, &host_dir, anc, untrusted_roots)?;
+            }
+        }
+        mount_args(
+            &mut plan,
+            spec,
+            mount,
+            untrusted_roots,
+            &ephemeral_backs,
+            &mut masked_dirs,
+        )?;
     }
     // Remounting is not recursive, so the order does not matter; deepest
     // first.
@@ -737,13 +1043,182 @@ fn largest_provider(mounts: &[PlannedMount]) -> (Option<ProviderName>, usize) {
         .map_or((None, 0), |(p, n)| (Some(p.clone()), n))
 }
 
+/// Refuses symlinks or uninspectable entries inside `backing` on the way to a
+/// mount destination `dst` nested below an ephemeral mount `eph_sandbox`.
+fn check_ephemeral_destination(
+    dst: &Path,
+    eph_sandbox: &Path,
+    backing: &Path,
+    rel: &Path,
+    host_meta: &dyn Fn(&Path) -> Option<io::Result<fs::Metadata>>,
+) -> Result<(), BwrapError> {
+    let mut cur = backing.to_path_buf();
+    let mut comps = rel.components().peekable();
+    while let Some(c) = comps.next() {
+        cur.push(c);
+        let Some(res) = host_meta(&cur) else {
+            break;
+        };
+        match res {
+            Err(err) if crate::error::is_missing(err.kind()) => break,
+            Err(error) => {
+                return Err(BwrapError::EphemeralDestinationInspect {
+                    sandbox: dst.to_path_buf(),
+                    ephemeral: eph_sandbox.to_path_buf(),
+                    path: cur,
+                    error,
+                });
+            }
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(BwrapError::EphemeralDestinationLink {
+                    sandbox: dst.to_path_buf(),
+                    ephemeral: eph_sandbox.to_path_buf(),
+                    link: cur,
+                });
+            }
+            Ok(meta) => {
+                if comps.peek().is_some() && !meta.is_dir() {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Collects existing intermediate directories strictly between an
+/// untrusted-root mount and a `masked`, `protected`, `ro`, or `ephemeral`
+/// descendant mount so `plan` can self-bind each into a mount point before
+/// mounting its children.
+fn collect_pinned_parents(
+    spec: &SandboxSpec,
+    untrusted_roots: &BTreeSet<PathBuf>,
+    mount_by_sandbox: &HashMap<&Path, &PlannedMount>,
+    ephemeral_backs: &HashMap<&Path, PathBuf>,
+    host_meta: &dyn Fn(&Path) -> Option<io::Result<fs::Metadata>>,
+) -> Result<BTreeMap<PathBuf, (PathBuf, PathMode)>, BwrapError> {
+    let ancestor_untrusted_dir = |anc: &PlannedMount| -> Option<(PathBuf, PathMode)> {
+        if anc.mode == PathMode::Ephemeral {
+            let backing = ephemeral_backs.get(anc.sandbox.as_path())?;
+            return Some((backing.clone(), PathMode::Rw));
+        }
+        if anc.mode == PathMode::Masked {
+            return None;
+        }
+        let MountSource::Host {
+            path,
+            kind: EntryKind::Dir,
+        } = &anc.source
+        else {
+            return None;
+        };
+        let anc_host = spec.canonical_sources.get(&anc.sandbox).unwrap_or(path);
+        let in_root =
+            anc.mode == PathMode::Rw || untrusted_roots.iter().any(|r| anc_host.starts_with(r));
+        in_root.then(|| (anc_host.clone(), anc.mode))
+    };
+
+    let mut pinned: BTreeMap<PathBuf, (PathBuf, PathMode)> = BTreeMap::new();
+    for mount in &spec.mounts {
+        if !matches!(
+            mount.mode,
+            PathMode::Masked | PathMode::Protected | PathMode::Ro | PathMode::Ephemeral
+        ) {
+            continue;
+        }
+        for p in mount.sandbox.ancestors().skip(1) {
+            if p == Path::new("/") || mount_by_sandbox.contains_key(p) || pinned.contains_key(p) {
+                continue;
+            }
+            let Some(anc) = p
+                .ancestors()
+                .skip(1)
+                .find_map(|a| mount_by_sandbox.get(a).copied())
+            else {
+                continue;
+            };
+            let Some((anc_dir, anc_mode)) = ancestor_untrusted_dir(anc) else {
+                continue;
+            };
+            let rel = p
+                .strip_prefix(&anc.sandbox)
+                .expect("ancestor mount is a prefix");
+            let host_dir = anc_dir.join(rel);
+            let Some(res) = host_meta(&host_dir) else {
+                continue;
+            };
+            match res {
+                Err(err) if crate::error::is_missing(err.kind()) => continue,
+                Err(error) => {
+                    return Err(BwrapError::MountOpen {
+                        sandbox: mount.sandbox.clone(),
+                        path: host_dir,
+                        error,
+                    });
+                }
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(BwrapError::UntrustedSymlink {
+                        sandbox: mount.sandbox.clone(),
+                        path: host_dir,
+                    });
+                }
+                Ok(meta) if meta.is_dir() => {
+                    pinned.insert(p.to_path_buf(), (host_dir, anc_mode));
+                }
+                Ok(_) => {}
+            }
+        }
+    }
+    Ok(pinned)
+}
+
+/// Emits `--bind-fd` / `--ro-bind-fd` when `canonical_host` lies inside one of
+/// `untrusted_roots`, or `--bind` / `--ro-bind` with `planned_host` otherwise.
+fn push_host_bind(
+    plan: &mut Plan,
+    rw: bool,
+    planned_host: &Path,
+    canonical_host: &Path,
+    dst: &Path,
+    untrusted_roots: &BTreeSet<PathBuf>,
+) -> Result<(), BwrapError> {
+    let _ = checked(planned_host.as_os_str())?;
+    let root = untrusted_roots
+        .iter()
+        .filter(|r| canonical_host.starts_with(r.as_path()))
+        .max_by_key(|r| r.components().count());
+    match root {
+        Some(root) => {
+            let rel = canonical_host
+                .strip_prefix(root)
+                .expect("containing root is a prefix");
+            let flag = if rw { "--bind-fd" } else { "--ro-bind-fd" };
+            plan.push([flag])?;
+            let idx = plan.binds.len();
+            plan.args.push(Arg::Bind(idx));
+            plan.binds.push(BindOpen {
+                sandbox: dst.to_path_buf(),
+                root: root.clone(),
+                rel: rel.to_path_buf(),
+            });
+            plan.push([dst])
+        }
+        None => {
+            let flag = if rw { "--bind" } else { "--ro-bind" };
+            plan.push([OsStr::new(flag), planned_host.as_os_str(), dst.as_os_str()])
+        }
+    }
+}
+
 /// Appends the arguments of one filesystem mount, recording a masked
 /// directory in `masked_dirs` to be made read-only later.
 fn mount_args(
     plan: &mut Plan,
+    spec: &SandboxSpec,
     mount: &PlannedMount,
+    untrusted_roots: &BTreeSet<PathBuf>,
+    ephemeral_backs: &HashMap<&Path, PathBuf>,
     masked_dirs: &mut Vec<PathBuf>,
-    ephemeral_dir: &mut dyn FnMut(&Path, &EphemeralKey) -> Result<PathBuf, BwrapError>,
 ) -> Result<(), BwrapError> {
     let dst = mount.sandbox.as_path();
     let inconsistent = || BwrapError::Inconsistent {
@@ -753,12 +1228,14 @@ fn mount_args(
     };
     match (&mount.source, mount.mode) {
         (MountSource::Host { path, .. }, PathMode::Rw) => {
-            plan.push([OsStr::new("--bind"), path.as_os_str(), dst.as_os_str()])
+            let canonical = spec.canonical_sources.get(dst).unwrap_or(path);
+            push_host_bind(plan, true, path, canonical, dst, untrusted_roots)
         }
         // TODO(Phase 4): `protected` is served by the FUSE shadow (§4); it
         // is read-only until then.
         (MountSource::Host { path, .. }, PathMode::Ro | PathMode::Protected) => {
-            plan.push([OsStr::new("--ro-bind"), path.as_os_str(), dst.as_os_str()])
+            let canonical = spec.canonical_sources.get(dst).unwrap_or(path);
+            push_host_bind(plan, false, path, canonical, dst, untrusted_roots)
         }
         (MountSource::Host { path, kind }, PathMode::Masked) => match kind {
             EntryKind::Dir => {
@@ -777,9 +1254,9 @@ fn mount_args(
             }),
         },
         (MountSource::Host { .. }, PathMode::Ephemeral) => Err(inconsistent()),
-        (MountSource::Ephemeral { key }, PathMode::Ephemeral) => {
-            let backing = ephemeral_dir(dst, key)?;
-            plan.push([OsStr::new("--bind"), backing.as_os_str(), dst.as_os_str()])
+        (MountSource::Ephemeral { .. }, PathMode::Ephemeral) => {
+            let backing = &ephemeral_backs[dst];
+            push_host_bind(plan, true, backing, backing, dst, untrusted_roots)
         }
         (MountSource::Ephemeral { .. }, _) => Err(inconsistent()),
     }
@@ -870,12 +1347,14 @@ mod tests {
     ) -> Result<Plan, BwrapError> {
         plan(
             spec,
+            &spec.untrusted_roots,
             &runtime(),
             IDS,
             Path::new("/"),
             &["arg".into()],
             terminal,
             proc_has,
+            &|_| None,
             &mut |_, key| Ok(Path::new("/eph").join(key.dir_name())),
         )
     }
@@ -886,6 +1365,7 @@ mod tests {
             .map(|arg| match arg {
                 Arg::Text(text) => text.to_str().unwrap().to_owned(),
                 Arg::Data(n) => format!("<data {n}>"),
+                Arg::Bind(n) => format!("<bind {n}>"),
             })
             .collect()
     }
@@ -1334,12 +1814,14 @@ mod tests {
         let ids = SandboxIds { uid: 4242, gid: 77 };
         let plan = plan(
             &spec,
+            &spec.untrusted_roots,
             &runtime(),
             ids,
             Path::new("/"),
             &[],
             TerminalSession::Keep,
             &|_| true,
+            &|_| None,
             &mut |_, _| unreachable!(),
         )
         .unwrap();
@@ -1504,12 +1986,14 @@ mod tests {
     fn chdir_is_the_given_directory() {
         let plan = plan(
             &SandboxSpec::default(),
+            &BTreeSet::new(),
             &runtime(),
             IDS,
             Path::new("/workspace"),
             &[],
             TerminalSession::Keep,
             &|_| true,
+            &|_| None,
             &mut |_, _| unreachable!(),
         )
         .unwrap();
@@ -1522,12 +2006,14 @@ mod tests {
     fn relative_cwd_is_an_error() {
         let err = plan(
             &SandboxSpec::default(),
+            &BTreeSet::new(),
             &runtime(),
             IDS,
             Path::new("workspace"),
             &[],
             TerminalSession::Keep,
             &|_| true,
+            &|_| None,
             &mut |_, _| unreachable!(),
         )
         .unwrap_err();
@@ -1565,12 +2051,14 @@ mod tests {
         let run = |cwd: &Path, argv: &[OsString]| {
             plan(
                 &SandboxSpec::default(),
+                &BTreeSet::new(),
                 &runtime(),
                 IDS,
                 cwd,
                 argv,
                 TerminalSession::Keep,
                 &|_| true,
+                &|_| None,
                 &mut |_, _| unreachable!(),
             )
         };
@@ -1580,12 +2068,14 @@ mod tests {
         rt.exe = path.clone();
         nul_err(plan(
             &SandboxSpec::default(),
+            &BTreeSet::new(),
             &rt,
             IDS,
             Path::new("/"),
             &[],
             TerminalSession::Keep,
             &|_| true,
+            &|_| None,
             &mut |_, _| unreachable!(),
         ));
     }
@@ -1821,12 +2311,14 @@ mod tests {
         exact_spec.mounts[1].provider = "big".parse().unwrap();
         let err = plan(
             &exact_spec,
+            &exact_spec.untrusted_roots,
             &runtime(),
             IDS,
             Path::new("/"),
             &["arg".into(), "more".into()],
             TerminalSession::Keep,
             &|_| true,
+            &|_| None,
             &mut |_, _| unreachable!(),
         )
         .unwrap_err();
@@ -1905,8 +2397,9 @@ mod tests {
         }
         let bind = |cmd: &BwrapCommand, dst: &str| {
             let at = cmd.args().iter().position(|a| a == dst).unwrap();
-            assert_eq!(cmd.args()[at - 2], "--bind");
-            PathBuf::from(&cmd.args()[at - 1])
+            assert_eq!(cmd.args()[at - 2], "--bind-fd");
+            let fd: RawFd = cmd.args()[at - 1].to_str().unwrap().parse().unwrap();
+            fs::read_link(format!("/proc/self/fd/{fd}")).unwrap()
         };
         assert_eq!(bind(&first, "/tmp"), tmp);
         assert_eq!(bind(&first, "/home/user"), home);
@@ -2084,5 +2577,267 @@ mod tests {
             init_command(&f, &[], &[]),
             Err(BwrapError::NoCommand)
         ));
+    }
+
+    #[test]
+    fn ephemeral_destination_refuses_symlinks_and_uninspectable_entries() {
+        let f = Fixture::new();
+        let mut s = spec(vec![
+            eph("/tmp", "/tmp"),
+            host("/tmp/sub/leaf", "/etc/hosts", EntryKind::File, Ro),
+        ]);
+        s.untrusted_roots.insert(f.session.ephemeral());
+
+        // Normal missing or directory components inside the ephemeral backing pass.
+        assert!(
+            BwrapCommand::new(
+                &s,
+                &f.session,
+                &f.provisioned,
+                Path::new("/"),
+                &[],
+                TerminalSession::Keep,
+            )
+            .is_ok()
+        );
+
+        let backing = f.session.ephemeral().join(key("/tmp").dir_name());
+        std::os::unix::fs::symlink("/etc", backing.join("sub")).unwrap();
+        let err = BwrapCommand::new(
+            &s,
+            &f.session,
+            &f.provisioned,
+            Path::new("/"),
+            &[],
+            TerminalSession::Keep,
+        )
+        .unwrap_err();
+        match err {
+            BwrapError::EphemeralDestinationLink {
+                sandbox,
+                ephemeral,
+                link,
+            } => {
+                assert_eq!(sandbox, Path::new("/tmp/sub/leaf"));
+                assert_eq!(ephemeral, Path::new("/tmp"));
+                assert_eq!(link, backing.join("sub"));
+            }
+            other => panic!("expected EphemeralDestinationLink, got {other:?}"),
+        }
+
+        // A symlink at the leaf component itself is refused too.
+        fs::remove_file(backing.join("sub")).unwrap();
+        fs::create_dir(backing.join("sub")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", backing.join("sub/leaf")).unwrap();
+        let err = BwrapCommand::new(
+            &s,
+            &f.session,
+            &f.provisioned,
+            Path::new("/"),
+            &[],
+            TerminalSession::Keep,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, BwrapError::EphemeralDestinationLink { .. }),
+            "{err:?}"
+        );
+
+        // An unsearchable parent directory inside the ephemeral backing fails closed.
+        fs::remove_file(backing.join("sub/leaf")).unwrap();
+        fs::set_permissions(backing.join("sub"), fs::Permissions::from_mode(0o000)).unwrap();
+        let err = BwrapCommand::new(
+            &s,
+            &f.session,
+            &f.provisioned,
+            Path::new("/"),
+            &[],
+            TerminalSession::Keep,
+        )
+        .unwrap_err();
+        fs::set_permissions(backing.join("sub"), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(err, BwrapError::EphemeralDestinationInspect { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn pinned_parents_self_bind_intermediate_directories_once_parents_first() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path().canonicalize().unwrap().join("ws");
+        fs::create_dir_all(ws.join("a/b")).unwrap();
+        fs::create_dir_all(ws.join("a/c")).unwrap();
+        fs::write(ws.join("a/b/.env"), "secret").unwrap();
+        fs::write(ws.join("a/b/flake.nix"), "{}").unwrap();
+        fs::write(ws.join("a/c/ro.txt"), "ro").unwrap();
+
+        let mut s = spec(vec![
+            host("/nix/store/pkg", "/nix/store/pkg", EntryKind::Dir, Ro),
+            host("/workspace", ws.to_str().unwrap(), EntryKind::Dir, Rw),
+            host(
+                "/workspace/a/b/.env",
+                ws.join("a/b/.env").to_str().unwrap(),
+                EntryKind::File,
+                Masked,
+            ),
+            host(
+                "/workspace/a/b/flake.nix",
+                ws.join("a/b/flake.nix").to_str().unwrap(),
+                EntryKind::File,
+                Protected,
+            ),
+            host(
+                "/workspace/a/c/ro.txt",
+                ws.join("a/c/ro.txt").to_str().unwrap(),
+                EntryKind::File,
+                Ro,
+            ),
+            eph(
+                "/workspace/missing_parent/scratch",
+                "{workspace}/missing_parent/scratch",
+            ),
+        ]);
+        s.untrusted_roots.insert(ws.clone());
+        let eph_back = dir.path().canonicalize().unwrap().join("eph");
+        fs::create_dir_all(&eph_back).unwrap();
+        s.untrusted_roots.insert(eph_back.clone());
+
+        let planned = plan(
+            &s,
+            &s.untrusted_roots,
+            &runtime(),
+            IDS,
+            Path::new("/workspace"),
+            &["arg".into()],
+            TerminalSession::Keep,
+            &|_| true,
+            &|p| Some(fs::symlink_metadata(p)),
+            &mut |_, key| Ok(eph_back.join(key.dir_name())),
+        )
+        .unwrap();
+
+        let rendered = strings(&planned);
+        // Outside untrusted roots, `--ro-bind` uses path strings without pinning `/nix`.
+        assert!(
+            rendered
+                .windows(3)
+                .any(|w| w == ["--ro-bind", "/nix/store/pkg", "/nix/store/pkg"]),
+            "{rendered:?}"
+        );
+        assert!(
+            !rendered.iter().any(|a| a == "/nix" || a == "/nix/store"),
+            "{rendered:?}"
+        );
+        // Missing intermediate directory `/workspace/missing_parent` is not pinned.
+        assert!(
+            !rendered.iter().any(|a| a == "/workspace/missing_parent"),
+            "{rendered:?}"
+        );
+
+        let pos = |dst: &str| {
+            rendered
+                .iter()
+                .position(|a| a == dst)
+                .unwrap_or_else(|| panic!("missing {dst} in {rendered:?}"))
+        };
+        let count_dst = |dst: &str| rendered.iter().filter(|a| a.as_str() == dst).count();
+        assert_eq!(count_dst("/workspace/a"), 1, "{rendered:?}");
+        assert_eq!(count_dst("/workspace/a/b"), 1, "{rendered:?}");
+        assert_eq!(count_dst("/workspace/a/c"), 1, "{rendered:?}");
+        assert!(pos("/workspace") < pos("/workspace/a"));
+        assert!(pos("/workspace/a") < pos("/workspace/a/b"));
+        assert!(pos("/workspace/a/b") < pos("/workspace/a/b/.env"));
+        assert!(pos("/workspace/a/b") < pos("/workspace/a/b/flake.nix"));
+        assert!(pos("/workspace/a") < pos("/workspace/a/c"));
+        assert!(pos("/workspace/a/c") < pos("/workspace/a/c/ro.txt"));
+
+        // Swapping an intermediate directory for a symlink fails closed.
+        fs::remove_dir_all(ws.join("a/c")).unwrap();
+        std::os::unix::fs::symlink("/etc", ws.join("a/c")).unwrap();
+        let err = plan(
+            &s,
+            &s.untrusted_roots,
+            &runtime(),
+            IDS,
+            Path::new("/workspace"),
+            &["arg".into()],
+            TerminalSession::Keep,
+            &|_| true,
+            &|p| Some(fs::symlink_metadata(p)),
+            &mut |_, key| Ok(eph_back.join(key.dir_name())),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, BwrapError::UntrustedSymlink { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn open_bind_fds_rejects_symlinks_inside_untrusted_roots() {
+        let f = Fixture::new();
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path().canonicalize().unwrap().join("ws");
+        fs::create_dir_all(ws.join("sub")).unwrap();
+        fs::write(ws.join("sub/file"), "ok").unwrap();
+
+        let mut s = spec(vec![
+            host("/workspace", ws.to_str().unwrap(), EntryKind::Dir, Rw),
+            host(
+                "/workspace/sub/file",
+                ws.join("sub/file").to_str().unwrap(),
+                EntryKind::File,
+                Ro,
+            ),
+        ]);
+        s.untrusted_roots.insert(ws.clone());
+
+        assert!(
+            BwrapCommand::new(
+                &s,
+                &f.session,
+                &f.provisioned,
+                Path::new("/workspace"),
+                &[],
+                TerminalSession::Keep,
+            )
+            .is_ok()
+        );
+
+        // Swap the leaf file for a symlink before `BwrapCommand::new`.
+        fs::remove_file(ws.join("sub/file")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", ws.join("sub/file")).unwrap();
+        let err = BwrapCommand::new(
+            &s,
+            &f.session,
+            &f.provisioned,
+            Path::new("/workspace"),
+            &[],
+            TerminalSession::Keep,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, BwrapError::UntrustedSymlink { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn into_command_with_status_passes_json_status_fd_and_checks_arg_limit() {
+        let f = Fixture::new();
+        let cmd = f.command(&SandboxSpec::default());
+        let args_fd = cmd.args_fd().to_string();
+        let (command, _status_reader) = cmd.into_command_with_status().unwrap();
+        let argv: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(argv[0], "--json-status-fd");
+        let status_fd: RawFd = argv[1].parse().unwrap();
+        assert!(status_fd >= MIN_FD);
+        assert_eq!(argv[2], "--args");
+        assert_eq!(argv[3], args_fd);
+        assert_eq!(argv[4], "--");
     }
 }

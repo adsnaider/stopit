@@ -21,6 +21,7 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -28,7 +29,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
 use std::thread;
 
-use rustix::process::{Pid, Signal, kill_process_group};
+use rustix::process::{Pid, PidfdFlags, Signal, kill_process_group, pidfd_open};
 use serde_json::{Map, Number, Value};
 
 use super::{Provider, ProviderContext, ProviderError, ProviderOutput};
@@ -59,10 +60,9 @@ pub const STDERR_LIMIT: usize = 64 * 1024;
 /// is killed.
 ///
 /// Because the script is not in the terminal's foreground process group,
-/// Ctrl-C (SIGINT) reaches only the supervisor. Once the supervisor handles
-/// SIGINT/SIGTERM, it must kill the script's process group itself (tracked
-/// follow-up); until then an interrupted supervisor leaves a running script
-/// behind.
+/// Ctrl-C sends `SIGINT` only to the supervisor. When the supervisor catches
+/// `SIGINT`, `SIGQUIT`, `SIGTERM`, or `SIGHUP` while a script is running, it
+/// kills the script's process group and aborts startup.
 ///
 /// There is deliberately no timeout: a first `nix` evaluation can
 /// legitimately take minutes. A script that never exits blocks startup, and
@@ -270,10 +270,19 @@ impl ScriptProvider {
             script: self.source.clone(),
             error,
         };
+        if let Some(signal) = crate::supervisor::pending_signal() {
+            return Err(ProviderError::Interrupted {
+                name: self.name.clone(),
+                script: self.source.clone(),
+                signal,
+            });
+        }
         // The canonical path is absolute. A relative `current_dir` would make
         // a relative program path ambiguous; it is made absolute anyway.
         let program = self.canonical_source()?;
         let cwd = std::path::absolute(&self.base_dir).map_err(spawn_err)?;
+        let (out_done_r, out_done_w) = notify_pipe().map_err(io_err)?;
+        let (err_done_r, err_done_w) = notify_pipe().map_err(io_err)?;
         let mut cmd = Command::new(program);
         cmd.current_dir(&cwd)
             .stdin(Stdio::piped())
@@ -289,13 +298,15 @@ impl ScriptProvider {
             cmd.pre_exec(|| rustix::process::setsid().map(drop).map_err(io::Error::from));
         }
         let mut child = cmd.spawn().map_err(spawn_err)?;
+        let pidfd = pidfd_open(Pid::from_child(&child), PidfdFlags::empty()).ok();
         let mut stdin = child.stdin.take().expect("stdin is piped");
         let mut stdout = child.stdout.take().expect("stdout is piped");
         let mut stderr = child.stderr.take().expect("stderr is piped");
 
-        // stdin is written and stderr drained on their own threads, so a
-        // script that ignores stdin, or fills one pipe while we wait on
-        // another, cannot deadlock the supervisor.
+        // Worker threads handle stdin, stdout, and stderr so pipes cannot
+        // deadlock. This thread polls completion alongside caught signals
+        // before reaping `child` so `kill_group` can signal a live process
+        // group.
         thread::scope(|s| {
             let writer = s.spawn(move || {
                 // `stdin` is dropped (closed) when this closure returns. A
@@ -307,14 +318,41 @@ impl ScriptProvider {
                     r => r,
                 }
             });
-            let err_reader = s.spawn(move || read_stderr(&mut stderr));
+            let out_reader = s.spawn(move || {
+                let _done = out_done_w;
+                read_capped(&mut stdout, STDOUT_LIMIT)
+            });
+            let err_reader = s.spawn(move || {
+                let _done = err_done_w;
+                read_stderr(&mut stderr)
+            });
 
-            let out = read_capped(&mut stdout, STDOUT_LIMIT);
-            drop(stdout);
+            let abort_on_signal = |signal: libc::c_int, child: &mut Child| -> ProviderError {
+                kill_group(child);
+                let _ = child.wait();
+                ProviderError::Interrupted {
+                    name: self.name.clone(),
+                    script: self.source.clone(),
+                    signal,
+                }
+            };
+
+            if let Err(signal) = wait_fd_or_signal(out_done_r.as_raw_fd()) {
+                return Err(abort_on_signal(signal, &mut child));
+            }
+            let out = out_reader.join().expect("stdout reader panicked");
             if !matches!(out, Ok(Some(_))) {
                 // Too much output or a read error: stop the script and
                 // anything it started.
                 kill_group(&child);
+            }
+            if let Err(signal) = wait_fd_or_signal(err_done_r.as_raw_fd()) {
+                return Err(abort_on_signal(signal, &mut child));
+            }
+            if let Some(ref pidfd) = pidfd
+                && let Err(signal) = wait_fd_or_signal(pidfd.as_raw_fd())
+            {
+                return Err(abort_on_signal(signal, &mut child));
             }
             let status = child.wait();
             let written = writer.join().expect("stdin writer panicked");
@@ -407,6 +445,55 @@ fn read_capped(r: &mut impl Read, limit: usize) -> io::Result<Option<Vec<u8>>> {
 /// already be gone.
 fn kill_group(child: &Child) {
     let _ = kill_process_group(Pid::from_child(child), Signal::KILL);
+}
+
+/// Creates a close-on-exec pipe used to signal completion of a reader thread.
+fn notify_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut raw = [0 as RawFd; 2];
+    // SAFETY: `raw` is a two-element buffer and `O_CLOEXEC` sets close-on-exec
+    // atomically.
+    if unsafe { libc::pipe2(raw.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `pipe2` initialized both descriptors.
+    unsafe { Ok((OwnedFd::from_raw_fd(raw[0]), OwnedFd::from_raw_fd(raw[1]))) }
+}
+
+/// Waits until `fd` becomes readable or hangs up, or returns `Err(signal)` as
+/// soon as a caught supervisor signal arrives.
+fn wait_fd_or_signal(fd: RawFd) -> Result<(), libc::c_int> {
+    loop {
+        if let Some(signal) = crate::supervisor::pending_signal() {
+            return Err(signal);
+        }
+        let mut pfds = [
+            libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: crate::supervisor::signal_poll_fd().unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let nfds: libc::nfds_t = if pfds[1].fd >= 0 { 2 } else { 1 };
+        // SAFETY: `pfds` holds `nfds` initialized `pollfd` entries.
+        let rc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, -1) };
+        if let Some(signal) = crate::supervisor::pending_signal() {
+            return Err(signal);
+        }
+        if rc < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Ok(());
+        }
+        if pfds[0].revents != 0 {
+            return Ok(());
+        }
+    }
 }
 
 /// Reads stderr to the end, keeping the first [`STDERR_LIMIT`] bytes, as

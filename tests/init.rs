@@ -216,29 +216,53 @@ fn only_stdio_and_the_listing_are_open_in_the_target() {
     assert_eq!(ok(&results[0]), &names(&["0", "1", "2", "3"]));
 }
 
+/// `command` made to pass `fd` open across `exec`, after `BwrapCommand`'s
+/// `pre_exec` marks inherited descriptors close-on-exec.
+fn leaking_fd(mut command: Command, fd: std::os::fd::RawFd) -> Command {
+    // SAFETY: `fcntl` with `F_SETFD` is async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    command
+}
+
 #[test]
 fn descriptors_leaked_to_bwrap_reach_init_but_not_the_target() {
-    // A descriptor without close-on-exec in this process is inherited by
-    // bwrap, which passes it through to its command: the probe run directly
-    // sees it (so the environment descriptor reaches `__init` the same
-    // way), the probe run through `__init` does not. Every child spawned by
-    // this test binary inherits it meanwhile; all other tests here run
-    // through `__init`, which closes it.
+    // A descriptor left open past `BwrapCommand` reaches bwrap, which passes
+    // it through to its command. The probe run directly sees it, while `__init`
+    // closes it before running the target.
     let init = Init::new();
-    let leaked = memfd_create("stopit-test-leak", MemfdFlags::empty()).unwrap();
-    let number = leaked.as_raw_fd().to_string();
+    let mem = memfd_create("stopit-test-leak", MemfdFlags::CLOEXEC).unwrap();
+    let leaked = rustix::io::fcntl_dupfd_cloexec(&mem, 64).unwrap();
+    let raw = leaked.as_raw_fd();
+    let number = raw.to_string();
+
+    let ops = [list("/proc/self/fd")];
+    let input = serde_json::to_vec(&ops).unwrap();
 
     let direct = init.f.session();
     let spec = init.f.compile(&config_none("system.proc = true"));
-    let seen = direct.run_one(&spec, list("/proc/self/fd"));
-    let Data::List(fds) = ok(&seen) else {
+    let out = run_bwrap(
+        leaking_fd(direct.command(&spec).into_command(), raw),
+        Some(&input),
+    );
+    let seen = probe_results("direct leaked fd", &out, &ops);
+    let Data::List(fds) = ok(&seen[0]) else {
         panic!("{seen:?}")
     };
     assert!(fds.contains(&number), "{number} not in {fds:?}");
 
-    let results = init.probe(&[], &[], &[list("/proc/self/fd")]);
+    let cmd = init.session.command(&init.spec, &[], &init.probe);
+    let out = run_bwrap(leaking_fd(cmd.into_command(), raw), Some(&input));
+    let results = probe_results("init leaked fd", &out, &ops);
     assert_eq!(ok(&results[0]), &names(&["0", "1", "2", "3"]));
-    drop(leaked);
+    drop((leaked, mem));
 }
 
 #[test]

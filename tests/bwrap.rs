@@ -1156,3 +1156,186 @@ fn default_base_end_to_end() {
         "{ }"
     );
 }
+
+#[test]
+fn default_base_masks_new_secret_patterns_and_protects_new_config_paths() {
+    let f = SpecFixture::new();
+    for rel in [
+        "ws/.netrc",
+        "ws/certs/client.p12",
+        "ws/certs/client.pfx",
+        "ws/config/gcp_credentials.json",
+        "ws/keys/id_rsa",
+        "ws/keys/id_ed25519",
+        "ws/.terraformrc",
+    ] {
+        f.file(rel, "secret");
+    }
+    for rel in [
+        "ws/.gitmodules",
+        "ws/.cargo/config.toml",
+        "ws/.cargo/config",
+        "ws/.bazelrc",
+        "ws/.mcp.json",
+        "ws/sub/.nvim.lua",
+        "ws/.exrc",
+        "ws/.gdbinit",
+        "ws/.lldbinit",
+    ] {
+        f.file(rel, "cfg");
+    }
+    for dir in [
+        "ws/.git",
+        "ws/.jj",
+        "ws/.claude",
+        "ws/.gemini",
+        "ws/.cursor",
+        "ws/.zed",
+    ] {
+        fs::create_dir_all(f.root().join(dir)).unwrap();
+    }
+
+    let (spec, _) = f.compile_with_warnings("");
+    let session = f.session();
+    let results = session.run(
+        &spec,
+        &[
+            read("/workspace/.netrc"),
+            read("/workspace/certs/client.p12"),
+            read("/workspace/certs/client.pfx"),
+            read("/workspace/config/gcp_credentials.json"),
+            read("/workspace/keys/id_rsa"),
+            read("/workspace/keys/id_ed25519"),
+            read("/workspace/.terraformrc"),
+            read("/workspace/.cargo/config.toml"),
+            write("/workspace/.cargo/config.toml", "tamper"),
+            write("/workspace/sub/.nvim.lua", "tamper"),
+            write("/workspace/.exrc", "tamper"),
+            write("/workspace/.gdbinit", "tamper"),
+            write("/workspace/.lldbinit", "tamper"),
+            mkdir("/workspace/.git/hooks"),
+            mkdir("/workspace/.jj/repo"),
+            mkdir("/workspace/.claude/commands"),
+        ],
+    );
+    for r in &results[0..7] {
+        assert_eq!(errno(r), "EACCES");
+    }
+    assert_eq!(contents(&results[7]), "cfg");
+    for r in &results[8..16] {
+        assert_eq!(errno(r), "EROFS");
+    }
+}
+
+#[test]
+fn mask_sockets_blocks_connect_when_enabled_and_allows_it_when_disabled() {
+    use std::os::unix::net::UnixListener;
+
+    let f = SpecFixture::new();
+    fs::create_dir_all(f.workspace().join("sub")).unwrap();
+    let sock_host = f.workspace().join("sub/daemon.sock");
+    let _listener = UnixListener::bind(&sock_host).unwrap();
+
+    let spec_masked = f.compile(&ws_rw("fs.mask_sockets = true"));
+    let session = f.session();
+    let results = session.run(
+        &spec_masked,
+        &[
+            stat("/workspace/sub/daemon.sock"),
+            connect("/workspace/sub/daemon.sock"),
+        ],
+    );
+    let st = stat_data(&results[0]);
+    assert_eq!(st.kind, FileKind::File);
+    assert_eq!(st.size, 0);
+    assert_eq!(st.mode & 0o777, 0);
+    assert_eq!(errno(&results[1]), "EACCES");
+
+    let spec_open = f.compile(&ws_rw("fs.mask_sockets = false"));
+    let res_open = session.run_one(&spec_open, connect("/workspace/sub/daemon.sock"));
+    assert_eq!(ok(&res_open), &Data::Done);
+}
+
+#[test]
+fn pinned_parents_block_rename_and_rmdir_while_allowing_sibling_edits() {
+    let f = SpecFixture::new();
+    f.file("ws/a/b/.env", "SECRET=1");
+    f.file("ws/a/b/keep.txt", "before");
+    f.file("ws/only_mask/.env", "SECRET=2");
+
+    let spec = f.compile(&ws_rw(
+        "fs.masked = [\"{workspace}/a/b/.env\", \"{workspace}/only_mask/.env\"]",
+    ));
+    let session = f.session();
+    let results = session.run(
+        &spec,
+        &[
+            rename("/workspace/a", "/workspace/a_moved"),
+            rename("/workspace/a/b", "/workspace/a/b_moved"),
+            remove("/workspace/only_mask"),
+            write("/workspace/a/new.txt", "created"),
+            write("/workspace/a/b/keep.txt", "after"),
+            rename("/workspace/a/b/keep.txt", "/workspace/a/b/moved.txt"),
+            read("/workspace/a/b/moved.txt"),
+            remove("/workspace/a/new.txt"),
+            read("/workspace/a/b/.env"),
+        ],
+    );
+    assert_eq!(errno(&results[0]), "EBUSY");
+    assert_eq!(errno(&results[1]), "EBUSY");
+    assert_eq!(errno(&results[2]), "EBUSY");
+    assert_eq!(ok(&results[3]), &Data::Done);
+    assert_eq!(ok(&results[4]), &Data::Done);
+    assert_eq!(ok(&results[5]), &Data::Done);
+    assert_eq!(contents(&results[6]), "after");
+    assert_eq!(ok(&results[7]), &Data::Done);
+    assert_eq!(errno(&results[8]), "EACCES");
+    assert_eq!(
+        fs::read_to_string(f.workspace().join("a/b/moved.txt")).unwrap(),
+        "after"
+    );
+    assert!(!f.workspace().join("a/new.txt").exists());
+}
+
+#[test]
+fn ephemeral_planted_symlink_is_refused_for_nested_mount_in_next_sandbox() {
+    let f = SpecFixture::new();
+    let host_ro = f.file("ro.txt", "public");
+    let session = f.session();
+
+    let first_spec = f.compile(&ws_rw("fs.ephemeral = [\"/tmp\"]"));
+    let planted = session.run_one(&first_spec, symlink("/workspace", "/tmp/sub"));
+    assert_eq!(ok(&planted), &Data::Done);
+
+    let second_spec = f.compile(&ws_rw(&format!(
+        "fs.ephemeral = [\"/tmp\"]\n\
+         fs.bind = [{{ host = \"{}\", sandbox = \"/tmp/sub/ro.txt\", mode = \"ro\" }}]",
+        host_ro.to_str().unwrap()
+    )));
+    let err = BwrapCommand::new(
+        &second_spec,
+        &session.session,
+        &session.provisioned,
+        Path::new(WORKSPACE_MOUNT),
+        &[],
+        TerminalSession::Keep,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, BwrapError::EphemeralDestinationLink { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn parent_non_cloexec_descriptor_does_not_leak_into_bwrap() {
+    use rustix::fs::{MemfdFlags, memfd_create};
+
+    let f = SpecFixture::new();
+    let spec = f.compile(&config_none("system.proc = true"));
+    let session = f.session();
+    let leaked = memfd_create("stopit-parent-non-cloexec", MemfdFlags::empty()).unwrap();
+    let result = session.run_one(&spec, list("/proc/self/fd"));
+    drop(leaked);
+    assert_eq!(ok(&result), &names(&["0", "1", "2", "3"]));
+}

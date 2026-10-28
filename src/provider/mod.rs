@@ -234,6 +234,22 @@ pub enum ProviderError {
         error: ManifestError,
     },
 
+    /// A caught signal interrupted a running script provider and killed its
+    /// process group.
+    #[error(
+        "script provider {:?} at {} interrupted by signal {signal}",
+        .name.as_str(),
+        .script.display()
+    )]
+    Interrupted {
+        /// Effective name of the entry.
+        name: ProviderName,
+        /// The script path as declared, joined to the base directory.
+        script: PathBuf,
+        /// Signal number.
+        signal: i32,
+    },
+
     /// A script provider's path runs through a symlink inside the host
     /// workspace or a directory a `config` provider grants `rw`, which a
     /// sandbox can write: it may have planted the link to have its own code

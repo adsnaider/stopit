@@ -1784,3 +1784,101 @@ fn shell_runs_the_hosts_shell() {
     assert_eq!(ok(&results[1]), &Data::Cwd("/workspace".into()));
     assert!(s.no_session_left());
 }
+
+#[test]
+fn bwrap_setup_failure_exits_125_while_target_failure_keeps_its_code() {
+    let s = Setup::with_config(
+        "[[provider]]\ntype = \"config\"\nname = \"bad_mount\"\n[provider.sandbox]\n\
+         fs.ephemeral = [\"{workspace}/not_a_dir/sub\"]\n",
+    );
+    fs::write(s.ws().join("not_a_dir"), "regular file").unwrap();
+
+    // Real bwrap fails after clone when mkdir tries to create `sub` below a
+    // regular file, emitting `child-pid` without `exit-code`.
+    let out = output(s.run_probe_command(&[]), b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert!(s.no_session_left());
+
+    // Once `not_a_dir` is a directory, bwrap succeeds and target exit codes
+    // pass through rather than turning into 125.
+    fs::remove_file(s.ws().join("not_a_dir")).unwrap();
+    fs::create_dir(s.ws().join("not_a_dir")).unwrap();
+    let bad_input_out = output(s.run_probe_command(&[]), b"not valid json");
+    assert_eq!(code(&bad_input_out), 2, "{bad_input_out:?}");
+    assert!(s.no_session_left());
+    let ok_out = output(s.run_probe_command(&[]), b"[]");
+    assert_eq!(code(&ok_out), 0, "{ok_out:?}");
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn signal_during_script_provider_kills_its_process_group_and_cleans_up() {
+    for (sig, use_pgrp, expected_code) in [
+        (libc::SIGTERM, false, 128 + libc::SIGTERM),
+        (libc::SIGINT, true, 128 + libc::SIGINT),
+    ] {
+        let s = Setup::new();
+        let script = s.root.join("provider.sh");
+        let pids_file = s.root.join("pids.txt");
+        let ready_file = s.root.join("ready.txt");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 sleep 60 &\n\
+                 bg=$!\n\
+                 printf '%s\\n%s\\n' \"$$\" \"$bg\" > \"{}\"\n\
+                 printf 'ok' > \"{}\"\n\
+                 wait \"$bg\"\n",
+                pids_file.display(),
+                ready_file.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        s.write_config(&format!(
+            "[[provider]]\ntype = \"script\"\nsource = \"{}\"\n",
+            script.display()
+        ));
+
+        let mut command = s.run_probe_command(&[]);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if use_pgrp {
+            command.process_group(0);
+        }
+        let child = command.spawn().unwrap();
+        let stopit_pid = child.id() as i32;
+
+        let deadline = Instant::now() + BWRAP_DEADLINE;
+        while !ready_file.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "script provider did not start in time"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let pids: Vec<i32> = fs::read_to_string(&pids_file)
+            .unwrap()
+            .lines()
+            .map(|l| l.parse().unwrap())
+            .collect();
+        assert_eq!(pids.len(), 2);
+
+        if use_pgrp {
+            kill(-stopit_pid, sig);
+        } else {
+            kill(stopit_pid, sig);
+        }
+        let out = finish(child);
+        assert_eq!(code(&out), expected_code, "{out:?}");
+        assert_eq!(stderr(&out), "", "{out:?}");
+        assert!(s.no_session_left());
+        for pid in pids {
+            wait_gone(pid);
+        }
+    }
+}

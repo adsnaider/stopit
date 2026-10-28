@@ -991,12 +991,21 @@ rw = ["{workspace}"]
 masked = [
   "{workspace}/**/.env", "{workspace}/**/.env.*", "{workspace}/**/*.pem",
   "{workspace}/**/*.key", "{workspace}/**/.npmrc", "{workspace}/**/.pypirc",
+  "{workspace}/**/.netrc", "{workspace}/**/*.p12", "{workspace}/**/*.pfx",
+  "{workspace}/**/*credentials*.json", "{workspace}/**/id_rsa",
+  "{workspace}/**/id_ed25519", "{workspace}/**/.terraformrc",
 ]
 mask_sockets = true
 protected = [
   "{workspace}/**/*.nix", "{workspace}/flake.lock", "{workspace}/.envrc",
   "{workspace}/.stopit.toml", "{workspace}/**/.stopit.toml", "{workspace}/.vscode",
   "{workspace}/.idea", "{workspace}/.github/workflows",
+  "{workspace}/.git", "{workspace}/.jj", "{workspace}/.gitmodules",
+  "{workspace}/.cargo/config.toml", "{workspace}/.cargo/config",
+  "{workspace}/.bazelrc", "{workspace}/.claude", "{workspace}/.gemini",
+  "{workspace}/.cursor", "{workspace}/.mcp.json", "{workspace}/.zed",
+  "{workspace}/**/.nvim.lua", "{workspace}/**/.exrc",
+  "{workspace}/.gdbinit", "{workspace}/.lldbinit",
 ]
 ephemeral = ["/tmp", "~"]
 [provider.sandbox.env]

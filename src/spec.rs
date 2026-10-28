@@ -33,7 +33,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use rustix::io::Errno;
@@ -66,6 +66,12 @@ pub struct SandboxSpec {
     /// mount comes after the mounts of its ancestors (see
     /// [`MountPlan::mounts`](crate::resolve::MountPlan::mounts)).
     pub mounts: Vec<PlannedMount>,
+    /// Canonical host directories that a sandbox of the session can write.
+    /// Empty when `mounts` is empty.
+    pub untrusted_roots: BTreeSet<PathBuf>,
+    /// Canonical host sources for non-masked host mounts whose planned path
+    /// runs through a host symlink, keyed by sandbox destination.
+    pub canonical_sources: BTreeMap<PathBuf, PathBuf>,
     /// Mask unix sockets found in RW grants at startup (§3.4).
     pub mask_sockets: bool,
     /// System mounts, synthesized files and the sandbox `HOME`.
@@ -1245,14 +1251,16 @@ fn check_mount_destinations(mounts: &[PlannedMount]) -> Result<(), SpecError> {
 ///
 /// `ctx`'s host workspace is canonical by contract, and is one of `roots`.
 /// Paths are compared by component.
+#[allow(clippy::too_many_arguments)]
 fn check_host_sources(
     mounts: Vec<PlannedMount>,
+    mask_sockets: bool,
     ctx: &ExpansionContext,
     roots: &UntrustedRoots,
     protected: &[SourceToProtect<'_>],
     state: &StateDirs,
     warnings: &mut Vec<SpecWarning>,
-) -> Result<Vec<PlannedMount>, SpecError> {
+) -> Result<(Vec<PlannedMount>, BTreeMap<PathBuf, PathBuf>), SpecError> {
     let ws_host = ctx.workspace_host();
     let ws_sandbox = ctx.workspace_sandbox();
     // The sandbox paths of the masked directories, none of which is dropped
@@ -1397,15 +1405,189 @@ fn check_host_sources(
     // next two steps put at one of these paths in place of the kept one has
     // the same canonical source (it covers or protects the content the kept
     // one showed there); one at another path has a canonical source.
-    let canonical: BTreeMap<PathBuf, PathBuf> = kept
+    let canonical_entries: BTreeMap<PathBuf, (PathBuf, EntryKind)> = kept
         .iter()
         .zip(&sources)
-        .filter_map(|(m, s)| Some((m.sandbox.clone(), s.as_ref()?.0.clone())))
+        .filter_map(|(m, s)| Some((m.sandbox.clone(), s.clone()?)))
+        .collect();
+    let canonical: BTreeMap<PathBuf, PathBuf> = canonical_entries
+        .iter()
+        .map(|(k, (p, _))| (k.clone(), p.clone()))
         .collect();
     let mounts = cover_restricted_exposure(kept, &sources, ws_host, warnings);
     let mounts = protect_sources(mounts, &rw_sources, protected, warnings);
     let workspace = (ws_host, ctx.workspace_sandbox());
-    check_state_dirs(mounts, &canonical, workspace, state, warnings)
+    let mounts = check_state_dirs(mounts, &canonical, workspace, state, warnings)?;
+    let mounts = if mask_sockets {
+        mask_rw_sockets(mounts, &canonical_entries)
+    } else {
+        mounts
+    };
+    let mut canonical_sources = BTreeMap::new();
+    for m in &mounts {
+        if m.mode == PathMode::Masked {
+            continue;
+        }
+        if let MountSource::Host { path, .. } = &m.source
+            && let Some((resolved, _)) = canonical_entries.get(&m.sandbox)
+            && resolved != path
+        {
+            canonical_sources.insert(m.sandbox.clone(), resolved.clone());
+        }
+    }
+    Ok((mounts, canonical_sources))
+}
+
+/// Scans every kept `rw` host directory mount for Unix domain sockets without
+/// following symlinks, skips subtrees covered by another mount of the profile,
+/// and emits `masked` mounts attributed to [`SUPERVISOR_PROVIDER_NAME`]. Masks
+/// unreadable or unsearchable directories inside an `rw` mount as directories
+/// so the sandbox cannot uncover sockets hidden inside them.
+fn mask_rw_sockets(
+    mut mounts: Vec<PlannedMount>,
+    canonical: &BTreeMap<PathBuf, (PathBuf, EntryKind)>,
+) -> Vec<PlannedMount> {
+    let stopit: ProviderName = SUPERVISOR_PROVIDER_NAME
+        .parse()
+        .expect("the supervisor's name is a valid provider name");
+    let at: BTreeSet<PathBuf> = mounts.iter().map(|m| m.sandbox.clone()).collect();
+    let mut added: BTreeMap<PathBuf, PlannedMount> = BTreeMap::new();
+    let mut replace_rw: BTreeSet<PathBuf> = BTreeSet::new();
+
+    for m in &mounts {
+        if m.mode != PathMode::Rw {
+            continue;
+        }
+        let MountSource::Host { path: host, kind } = &m.source else {
+            continue;
+        };
+        let (root_host, root_kind) = canonical
+            .get(&m.sandbox)
+            .map(|(p, k)| (p.as_path(), *k))
+            .unwrap_or((host.as_path(), *kind));
+        if root_kind != EntryKind::Dir {
+            continue;
+        }
+        let mut stack = vec![(root_host.to_owned(), m.sandbox.clone())];
+        while let Some((dir_host, dir_sandbox)) = stack.pop() {
+            let entries = match fs::read_dir(&dir_host) {
+                Ok(entries) => entries,
+                Err(err) if is_missing(err.kind()) => continue,
+                Err(_) => {
+                    mask_unreadable_rw_dir(
+                        &dir_sandbox,
+                        &dir_host,
+                        &m.sandbox,
+                        &stopit,
+                        &mut added,
+                        &mut replace_rw,
+                    );
+                    continue;
+                }
+            };
+            let mut dir_failed = false;
+            let mut subdirs = Vec::new();
+            let mut sockets = Vec::new();
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(err) if is_missing(err.kind()) => continue,
+                    Err(_) => {
+                        dir_failed = true;
+                        break;
+                    }
+                };
+                let name = entry.file_name();
+                let child_sandbox = dir_sandbox.join(&name);
+                if at.contains(&child_sandbox) {
+                    continue;
+                }
+                let child_host = dir_host.join(&name);
+                let meta = match fs::symlink_metadata(&child_host) {
+                    Ok(meta) => meta,
+                    Err(err) if is_missing(err.kind()) => continue,
+                    Err(_) => {
+                        dir_failed = true;
+                        break;
+                    }
+                };
+                let ft = meta.file_type();
+                if ft.is_symlink() {
+                    continue;
+                }
+                if ft.is_dir() {
+                    subdirs.push((child_host, child_sandbox));
+                } else if ft.is_socket() {
+                    sockets.push((child_host, child_sandbox));
+                }
+            }
+            if dir_failed {
+                mask_unreadable_rw_dir(
+                    &dir_sandbox,
+                    &dir_host,
+                    &m.sandbox,
+                    &stopit,
+                    &mut added,
+                    &mut replace_rw,
+                );
+                continue;
+            }
+            for (child_host, child_sandbox) in sockets {
+                added
+                    .entry(child_sandbox.clone())
+                    .or_insert_with(|| PlannedMount {
+                        sandbox: child_sandbox,
+                        source: MountSource::Host {
+                            path: child_host,
+                            kind: EntryKind::Socket,
+                        },
+                        mode: PathMode::Masked,
+                        provider: stopit.clone(),
+                        glob_link: false,
+                    });
+            }
+            stack.extend(subdirs);
+        }
+    }
+
+    if added.is_empty() {
+        return mounts;
+    }
+    if !replace_rw.is_empty() {
+        mounts.retain(|m| !replace_rw.contains(&m.sandbox));
+    }
+    let added: Vec<PlannedMount> = added.into_values().collect();
+    debug_assert!(check_mount_destinations(&added).is_ok());
+    mounts.extend(added);
+    sort_plan(&mut mounts);
+    mounts
+}
+
+fn mask_unreadable_rw_dir(
+    dir_sandbox: &Path,
+    dir_host: &Path,
+    mount_sandbox: &Path,
+    stopit: &ProviderName,
+    added: &mut BTreeMap<PathBuf, PlannedMount>,
+    replace_rw: &mut BTreeSet<PathBuf>,
+) {
+    if dir_sandbox == mount_sandbox {
+        replace_rw.insert(mount_sandbox.to_owned());
+    }
+    added.retain(|k, _| !(k.starts_with(dir_sandbox) && k != dir_sandbox));
+    added.insert(
+        dir_sandbox.to_owned(),
+        PlannedMount {
+            sandbox: dir_sandbox.to_owned(),
+            source: MountSource::Host {
+                path: dir_host.to_owned(),
+                kind: EntryKind::Dir,
+            },
+            mode: PathMode::Masked,
+            provider: stopit.clone(),
+            glob_link: false,
+        },
+    );
 }
 
 /// Checks every mount's host source against stopit's own state directories
@@ -2722,11 +2904,26 @@ fn finish_profile(
     let mut warnings: Vec<SpecWarning> = plan.warnings.into_iter().map(Into::into).collect();
     let mounts =
         check_destination_links(plan.mounts, ctx.workspace_sandbox(), roots, &mut warnings)?;
-    let mounts = check_host_sources(mounts, ctx, roots, protected, state, &mut warnings)?;
+    let (mounts, canonical_sources) = check_host_sources(
+        mounts,
+        grants.mask_sockets,
+        ctx,
+        roots,
+        protected,
+        state,
+        &mut warnings,
+    )?;
+    let untrusted_roots = if mounts.is_empty() {
+        BTreeSet::new()
+    } else {
+        roots.roots.iter().map(|r| r.path.clone()).collect()
+    };
     let inherited_domains = parent.map(|p| &p.network.allow_domains);
     let network = network_spec(&grants.network, inherited_domains, &mut warnings);
     let spec = SandboxSpec {
         mounts,
+        untrusted_roots,
+        canonical_sources,
         mask_sockets: grants.mask_sockets,
         system: SystemSpec {
             proc: grants.system.proc,
@@ -3320,6 +3517,19 @@ mod tests {
                 "{workspace}/.vscode",
                 "{workspace}/.idea",
                 "{workspace}/.github/workflows",
+                "{workspace}/.git",
+                "{workspace}/.jj",
+                "{workspace}/.gitmodules",
+                "{workspace}/.cargo/config.toml",
+                "{workspace}/.cargo/config",
+                "{workspace}/.bazelrc",
+                "{workspace}/.claude",
+                "{workspace}/.gemini",
+                "{workspace}/.cursor",
+                "{workspace}/.mcp.json",
+                "{workspace}/.zed",
+                "{workspace}/.gdbinit",
+                "{workspace}/.lldbinit",
             ]
         );
     }
@@ -3351,20 +3561,46 @@ mod tests {
         let f = Fixture::new();
         for file in [
             "ws/.env",
+            "ws/.netrc",
+            "ws/.terraformrc",
             "ws/sub/key.pem",
+            "ws/sub/cert.p12",
+            "ws/sub/cert.pfx",
+            "ws/sub/service_credentials_prod.json",
+            "ws/sub/id_rsa",
+            "ws/sub/id_ed25519",
             "ws/flake.nix",
             "ws/nix/a.nix",
             "ws/.stopit.toml",
             "ws/sub/.stopit.toml",
+            "ws/sub/.nvim.lua",
+            "ws/.exrc",
             "ws/flake.lock",
             "ws/.envrc",
+            "ws/.gitmodules",
+            "ws/.cargo/config.toml",
+            "ws/.cargo/config",
+            "ws/.bazelrc",
+            "ws/.mcp.json",
+            "ws/.gdbinit",
+            "ws/.lldbinit",
             "ws/.github/workflows/ci.yml",
             "ws/src/main.rs",
         ] {
             f.file(file);
         }
-        f.mkdir("ws/.vscode");
-        f.mkdir("ws/.idea");
+        for dir in [
+            "ws/.vscode",
+            "ws/.idea",
+            "ws/.git",
+            "ws/.jj",
+            "ws/.claude",
+            "ws/.gemini",
+            "ws/.cursor",
+            "ws/.zed",
+        ] {
+            f.mkdir(dir);
+        }
         let s = f.compile("");
         let main = get(&s, "main");
         assert!(main.warnings.is_empty(), "{:?}", main.warnings);
@@ -3374,17 +3610,43 @@ mod tests {
                 row("/tmp", Ephemeral, "base"),
                 row("/workspace", Rw, "base"),
                 row("/home/user", Ephemeral, "base"),
+                row("/workspace/.bazelrc", Protected, "base"),
+                row("/workspace/.claude", Protected, "base"),
+                row("/workspace/.cursor", Protected, "base"),
                 row("/workspace/.env", Masked, "base"),
                 row("/workspace/.envrc", Protected, "base"),
+                row("/workspace/.exrc", Protected, "base"),
+                row("/workspace/.gdbinit", Protected, "base"),
+                row("/workspace/.gemini", Protected, "base"),
+                row("/workspace/.git", Protected, "base"),
+                row("/workspace/.gitmodules", Protected, "base"),
                 row("/workspace/.idea", Protected, "base"),
+                row("/workspace/.jj", Protected, "base"),
+                row("/workspace/.lldbinit", Protected, "base"),
+                row("/workspace/.mcp.json", Protected, "base"),
+                row("/workspace/.netrc", Masked, "base"),
                 row("/workspace/.stopit.toml", Protected, "base"),
+                row("/workspace/.terraformrc", Masked, "base"),
                 row("/workspace/.vscode", Protected, "base"),
+                row("/workspace/.zed", Protected, "base"),
                 row("/workspace/flake.lock", Protected, "base"),
                 row("/workspace/flake.nix", Protected, "base"),
+                row("/workspace/.cargo/config", Protected, "base"),
+                row("/workspace/.cargo/config.toml", Protected, "base"),
                 row("/workspace/.github/workflows", Protected, "base"),
                 row("/workspace/nix/a.nix", Protected, "base"),
+                row("/workspace/sub/.nvim.lua", Protected, "base"),
                 row("/workspace/sub/.stopit.toml", Protected, "base"),
+                row("/workspace/sub/cert.p12", Masked, "base"),
+                row("/workspace/sub/cert.pfx", Masked, "base"),
+                row("/workspace/sub/id_ed25519", Masked, "base"),
+                row("/workspace/sub/id_rsa", Masked, "base"),
                 row("/workspace/sub/key.pem", Masked, "base"),
+                row(
+                    "/workspace/sub/service_credentials_prod.json",
+                    Masked,
+                    "base"
+                ),
             ]
         );
     }
@@ -5131,9 +5393,9 @@ mod tests {
         // entries, none of which can be inspected). The default base's
         // workspace rules then mask it as a whole, once per restrictive
         // rule that could not inspect something there.
-        let globs_masked = 6; // `**/.env`, `**/.env.*`, … in `fs.masked`.
-        let globs_protected = 2; // `**/*.nix`, `**/.stopit.toml` in `fs.protected`.
-        let literals_protected = 6; // `flake.lock`, `.envrc`, … in `fs.protected`.
+        let globs_masked = 13; // `**/.env`, `**/.env.*`, … in `fs.masked`.
+        let globs_protected = 4; // `**/*.nix`, `**/.stopit.toml`, `**/.nvim.lua`, `**/.exrc`.
+        let literals_protected = 19; // `flake.lock`, `.envrc`, … in `fs.protected`.
         // Each case: the files, the directory made inaccessible and its
         // mode, and the rules expected to mask it (by mode, in rule order).
         let all_globs: Vec<PathMode> =
@@ -5275,15 +5537,17 @@ mod tests {
             let mut warnings = Vec::new();
             let under = check_host_sources(
                 vec![ws.clone(), mask.clone(), protected.clone()],
+                false,
                 &f.ctx,
                 &roots,
                 &[],
                 &f.state,
                 &mut warnings,
             )
-            .map(|kept| (kept, warnings));
+            .map(|(kept, _)| (kept, warnings));
             let alone = check_host_sources(
                 vec![ws.clone(), protected.clone()],
+                false,
                 &f.ctx,
                 &roots,
                 &[],
@@ -5354,8 +5618,16 @@ mod tests {
             glob_link: true,
         };
         let roots = UntrustedRoots::new(&f.ws());
-        let e = check_host_sources(vec![m], &f.ctx, &roots, &[], &f.state, &mut Vec::new())
-            .unwrap_err();
+        let e = check_host_sources(
+            vec![m],
+            false,
+            &f.ctx,
+            &roots,
+            &[],
+            &f.state,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
         let SpecError::UntrustedLinkFollowed(found) = &e else {
             panic!("expected an untrusted link, got {e:?}");
         };
@@ -8943,5 +9215,132 @@ mod tests {
             );
         }
         f.compile(&none_with("fs.rw = [\"~/sub\"]"));
+    }
+
+    #[test]
+    fn mask_sockets_masks_sockets_in_rw_grants_without_following_symlinks() {
+        use std::os::unix::net::UnixListener;
+
+        let f = Fixture::new();
+        f.mkdir("ws/nested");
+        f.mkdir("ws/hidden");
+        f.mkdir("home/cache");
+        f.mkdir("outside/dir_with_sock");
+
+        let bind_sock = |rel: &str| UnixListener::bind(f.root.join(rel)).unwrap();
+        let _s1 = bind_sock("ws/root.sock");
+        let _s2 = bind_sock("ws/nested/deep.sock");
+        let _s3 = bind_sock("ws/explicit.sock");
+        let _s4 = bind_sock("ws/hidden/in_mask.sock");
+        let _s5 = bind_sock("home/cache/daemon.sock");
+        let _s6 = bind_sock("outside/ext.sock");
+        let _s7 = bind_sock("outside/dir_with_sock/inner.sock");
+
+        symlink(f.root.join("outside/ext.sock"), f.root.join("ws/link.sock")).unwrap();
+        symlink(
+            f.root.join("outside/dir_with_sock"),
+            f.root.join("ws/linkdir"),
+        )
+        .unwrap();
+
+        let body = "\
+fs.mask_sockets = true
+fs.rw = [\"{workspace}\", \"~/cache\"]
+fs.ro = [\"{workspace}/explicit.sock\"]
+fs.masked = [\"{workspace}/hidden\"]
+";
+        let compiled = f.compile(&none_with(body));
+        let sp = spec(&compiled, "main");
+        assert!(sp.mask_sockets);
+        assert_eq!(
+            mounts(sp),
+            [
+                row("/workspace", Rw, "u"),
+                row("/workspace/explicit.sock", Ro, "u"),
+                row("/workspace/hidden", Masked, "u"),
+                row("/workspace/root.sock", Masked, "stopit"),
+                row("/home/user/cache", Rw, "u"),
+                row("/workspace/nested/deep.sock", Masked, "stopit"),
+                row("/home/user/cache/daemon.sock", Masked, "stopit"),
+            ]
+        );
+        for sock_path in [
+            "/workspace/root.sock",
+            "/workspace/nested/deep.sock",
+            "/home/user/cache/daemon.sock",
+        ] {
+            let m = sp
+                .mounts
+                .iter()
+                .find(|m| m.sandbox == Path::new(sock_path))
+                .unwrap();
+            assert!(
+                matches!(
+                    m.source,
+                    MountSource::Host {
+                        kind: EntryKind::Socket,
+                        ..
+                    }
+                ),
+                "{m:?}"
+            );
+        }
+
+        let summary = summary_of(&f, &none_with(body));
+        assert!(
+            !summary.iter().any(|l| l.contains("delegates to host")),
+            "{summary:?}"
+        );
+        assert!(
+            !summary.iter().any(|l| l.contains("root.sock")),
+            "{summary:?}"
+        );
+
+        let unmasked = body.replace("fs.mask_sockets = true", "fs.mask_sockets = false");
+        let compiled_off = f.compile(&none_with(&unmasked));
+        let sp_off = spec(&compiled_off, "main");
+        assert!(!sp_off.mask_sockets);
+        assert_eq!(
+            mounts(sp_off),
+            [
+                row("/workspace", Rw, "u"),
+                row("/workspace/explicit.sock", Ro, "u"),
+                row("/workspace/hidden", Masked, "u"),
+                row("/home/user/cache", Rw, "u"),
+            ]
+        );
+    }
+
+    #[test]
+    fn mask_sockets_masks_unreadable_directories_inside_rw_grants() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        let f = Fixture::new();
+        f.mkdir("ws/locked_zero");
+        f.mkdir("ws/locked_read_only");
+        let _s1 = UnixListener::bind(f.root.join("ws/locked_zero/a.sock")).unwrap();
+        let _s2 = UnixListener::bind(f.root.join("ws/locked_read_only/b.sock")).unwrap();
+
+        let p_zero = f.root.join("ws/locked_zero");
+        let p_ro = f.root.join("ws/locked_read_only");
+        fs::set_permissions(&p_zero, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::set_permissions(&p_ro, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let body = "fs.mask_sockets = true\nfs.rw = [\"{workspace}\"]\n";
+        let compiled = f.compile(&none_with(body));
+
+        fs::set_permissions(&p_zero, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&p_ro, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let sp = spec(&compiled, "main");
+        assert_eq!(
+            mounts(sp),
+            [
+                row("/workspace", Rw, "u"),
+                row("/workspace/locked_read_only", Masked, "stopit"),
+                row("/workspace/locked_zero", Masked, "stopit"),
+            ]
+        );
     }
 }
