@@ -74,8 +74,15 @@ impl Setup {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
     }
 
+    /// stopit's data directory, set with `STOPIT_STATE_DIR`, so that no test
+    /// uses the real one in the user's home directory.
+    fn state_dir(&self) -> PathBuf {
+        self.root.join("state/stopit")
+    }
+
     /// `stopit <args…>` from the workspace, with only `XDG_RUNTIME_DIR`,
-    /// `HOME` and `PATH` (to find bwrap) in its environment.
+    /// `STOPIT_STATE_DIR` ([`state_dir`](Self::state_dir)), `HOME` and
+    /// `PATH` (to find bwrap) in its environment.
     fn stopit<S: AsRef<std::ffi::OsStr>>(&self, args: &[S]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_stopit"));
         command
@@ -83,6 +90,7 @@ impl Setup {
             .current_dir(self.ws())
             .env_clear()
             .env("XDG_RUNTIME_DIR", self.runtime())
+            .env("STOPIT_STATE_DIR", self.state_dir())
             .env("HOME", self.root.join("home"))
             .env("PATH", std::env::var_os("PATH").unwrap_or_default());
         command
@@ -627,6 +635,107 @@ fn a_sandbox_cannot_switch_the_nested_configuration_rule_off() {
 }
 
 // --- Warnings and errors ---
+
+#[test]
+fn a_writable_grant_containing_the_data_directory_is_refused_and_nothing_runs() {
+    // A sandbox could otherwise write stopit's own state, which decides
+    // what the next session trusts. The data directory need not exist.
+    let message = |grant: &PathBuf, sandbox: &str, data: &PathBuf| {
+        format!(
+            "stopit: error: cannot compile profile \"main\": provider \"tools\": rw mount of \
+             {grant:?} at {sandbox:?} contains stopit's data directory {data:?}, which holds \
+             stopit's persistent state, such as which configurations you allowed; a sandbox \
+             could write it there, create it, or replace a directory or link on the way to it, \
+             so no writable mount may contain it or the way to it: grant narrower rw paths that \
+             leave them out, or make this mount ro\n"
+        )
+    };
+    // The data directory is `STOPIT_STATE_DIR`, not in `HOME` (which points
+    // elsewhere): a grant of its parent is refused, whether or not it
+    // exists yet.
+    let s = Setup::new();
+    let data = s.state_dir();
+    let parent = data.parent().unwrap().to_path_buf();
+    fs::create_dir(&parent).unwrap();
+    s.write_config(&format!("fs.rw = [{parent:?}]"));
+    for exists in [false, true] {
+        if exists {
+            fs::create_dir(&data).unwrap();
+        }
+        let out = output(s.run_probe_command(&[]), b"[]");
+        assert_eq!(code(&out), 125, "{out:?}");
+        assert_eq!(
+            stderr(&out),
+            message(&parent, parent.to_str().unwrap(), &data)
+        );
+        assert!(out.stdout.is_empty(), "{out:?}");
+        assert!(s.no_session_left());
+        if exists {
+            assert_eq!(fs::read_dir(&data).unwrap().count(), 0);
+        } else {
+            assert!(!data.exists());
+        }
+    }
+    // `~` is fine: the data directory is never taken from `HOME`. (The
+    // default base's ephemeral `~` would win over it, so without it.)
+    let home = s.root.join("home");
+    s.write_raw_config(&format!(
+        "base = \"none\"\n{}",
+        probe_config("fs.rw = [\"~\"]")
+    ));
+    let results = s.probe(&[], &[write("/home/user/file", "x")]);
+    assert!(matches!(ok(&results[0]), Data::Done), "{results:?}");
+    assert_eq!(fs::read_to_string(home.join("file")).unwrap(), "x");
+    assert!(!home.join(".local").exists());
+}
+
+#[test]
+fn a_relative_state_dir_override_is_refused() {
+    let s = Setup::with_config("");
+    let mut command = s.run_probe_command(&[]);
+    command.env("STOPIT_STATE_DIR", "state");
+    let out = output(command, b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert_eq!(
+        stderr(&out),
+        "stopit: error: STOPIT_STATE_DIR \"state\" is not an absolute path; set it to the \
+         absolute path of stopit's data directory, or unset it\n"
+    );
+    assert!(out.stdout.is_empty(), "{out:?}");
+    // Before any session is created.
+    assert!(!s.runtime().join("stopit").exists());
+}
+
+#[test]
+fn a_read_only_grant_containing_the_runtime_directory_masks_it() {
+    // It holds every session's sockets and ephemeral directories, this
+    // one's included.
+    let s = Setup::new();
+    let runtime = s.runtime();
+    s.write_config(&format!(
+        "[[provider]]\ntype = \"config\"\nname = \"run\"\n[provider.sandbox]\n\
+         fs.ro = [{runtime:?}]"
+    ));
+    let ops = [list(&runtime), list(runtime.join("stopit"))];
+    let command = s.run_probe_command(&[]);
+    let what = format!("{command:?}");
+    let out = output(command, &serde_json::to_vec(&ops).unwrap());
+    let results = probe_results(&what, &out, &ops);
+    assert_eq!(ok(&results[0]), &Data::List(vec!["stopit".into()]));
+    assert_eq!(ok(&results[1]), &Data::List(vec![]));
+    let stopit = runtime.join("stopit");
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "stopit: warning: provider \"run\": ro mount of {runtime:?} at {runtime:?} \
+             contains stopit's session runtime directory {stopit:?}, which holds every \
+             session's sockets, shims and ephemeral directories (other sessions' data \
+             included), so it is masked at {stopit:?}; grant narrower paths that leave it out \
+             to silence this\n"
+        )
+    );
+    assert!(s.no_session_left());
+}
 
 #[test]
 fn a_warning_is_printed_once_and_base_missing_paths_not_at_all() {

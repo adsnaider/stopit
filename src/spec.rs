@@ -21,9 +21,11 @@
 //! and its host sources against those roots (§3.4, Symlinks; §6.2,
 //! "Untrusted links"), against the host workspace (§6.2, "Workspace
 //! exposure") and against the profile's masked and protected mounts (§6.2,
-//! "Restricted content exposure"). Last, the paths providers asked to be
+//! "Restricted content exposure"). Then the paths providers asked to be
 //! protected (script providers' sources, §3.6) are protected wherever the
-//! profile would let the sandbox write them.
+//! profile would let the sandbox write them. Last, every mount's host source
+//! is checked against stopit's own state directories (§6.2, "Reserved host
+//! paths").
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -45,12 +47,13 @@ use crate::manifest::{
     ShimSpec,
 };
 use crate::policy::{NetworkMode, PathMode};
-use crate::provider::{ProtectedSource, ProviderOutput};
+use crate::provider::{ProtectedSource, ProviderOutput, SUPERVISOR_PROVIDER_NAME};
 use crate::resolve::{
     EffectiveEnv, EffectiveGrants, EffectiveNetwork, MergeError, MountPlan, MountSource,
     PathPlanError, PlanWarning, PlannedMount, ProfileError, build_profile_graph, hidden_note,
     merge_profiles, plan_mounts,
 };
+use crate::state::{StateDir, StateDirs};
 
 /// One profile's sandbox, independent of the engine that builds it.
 ///
@@ -279,6 +282,12 @@ pub enum SpecWarning {
     /// protection.
     #[error(transparent)]
     InsideProtectedSource(Box<InsideProtectedSource>),
+    /// A read-only (or `protected`) mount's host source contains stopit's
+    /// session runtime directory, which holds other sessions' sockets and
+    /// ephemeral data, so stopit masks that directory where the mount shows
+    /// it (DESIGN.md §6.2, "Reserved host paths").
+    #[error(transparent)]
+    RuntimeDirMasked(Box<RuntimeDirMasked>),
     /// The profile itself granted `network.allow_domains` but its network
     /// mode is not `proxy`, the only mode that uses them, so the domains
     /// were dropped. Domains inherited from the parent are dropped without
@@ -438,6 +447,11 @@ pub enum SpecError {
         mode = .0.mode
     )]
     DestinationLinkFollowed(Box<DestinationLink>),
+    /// A mount's host source is, or lies inside, one of stopit's own state
+    /// directories, or is a writable mount containing one (§6.2, "Reserved
+    /// host paths"). Boxed to keep `SpecError` small.
+    #[error(transparent)]
+    ReservedHostSource(Box<ReservedHostSource>),
 }
 
 /// A restrictive mount's destination could not be checked for symlinks: a
@@ -768,6 +782,125 @@ pub struct InsideProtectedSource {
     pub protected_provider: ProviderName,
     /// The protected source, canonical.
     pub protected: PathBuf,
+}
+
+/// A mount whose host source is, or lies inside, one of stopit's state
+/// directories, or a writable (`rw`) mount whose source contains one (see
+/// [`SpecError::ReservedHostSource`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservedHostSource {
+    /// The provider whose rule produced the mount.
+    pub provider: ProviderName,
+    /// The mount's mode.
+    pub mode: PathMode,
+    /// The mount's host source, as planned.
+    pub host: PathBuf,
+    /// `host` with every symlink resolved.
+    pub resolved: PathBuf,
+    /// The mount's sandbox destination.
+    pub sandbox: PathBuf,
+    /// Which state directory it collides with.
+    pub dir: StateDir,
+    /// That directory's host path (resolved).
+    pub reserved: PathBuf,
+    /// Whether `resolved` contains `reserved`, or a symlink on the way to it
+    /// (an `rw` mount), rather than being it or lying inside it.
+    pub contains: bool,
+    /// The symlink on the way to `reserved` that `resolved` contains, if
+    /// it does not contain `reserved` itself.
+    pub via: Option<PathBuf>,
+    /// Whether the mount is the workspace's (the host workspace at the
+    /// workspace mount), which no narrower grant can replace: another
+    /// workspace must be picked.
+    pub workspace: bool,
+}
+
+impl fmt::Display for ReservedHostSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ReservedHostSource {
+            provider,
+            mode,
+            host,
+            resolved,
+            sandbox,
+            dir,
+            reserved,
+            contains,
+            via,
+            workspace,
+        } = self;
+        write!(
+            f,
+            "provider {:?}: {mode} mount of {host:?}{} at {sandbox:?} ",
+            provider.as_str(),
+            resolved_note(host, resolved)
+        )?;
+        if let Some(link) = via {
+            write!(f, "contains {link:?}, a symbolic link on the way to ")?;
+        } else if *contains {
+            f.write_str("contains ")?;
+        } else if resolved == reserved {
+            f.write_str("is ")?;
+        } else {
+            f.write_str("lies inside ")?;
+        }
+        write!(
+            f,
+            "stopit's {dir} {reserved:?}, which holds {}; ",
+            dir.holds()
+        )?;
+        f.write_str(match (*contains, *workspace) {
+            (true, false) => {
+                "a sandbox could write it there, create it, or replace a directory or link on the \
+                 way to it, so no writable mount may contain it or the way to it: grant narrower \
+                 rw paths that leave them out, or make this mount ro"
+            }
+            (true, true) => {
+                "a sandbox could write it there, create it, or replace a directory or link on the \
+                 way to it, so no writable mount may contain it or the way to it; this mount is the \
+                 workspace: use a workspace that leaves them out, such as a project directory \
+                 below your home directory or elsewhere"
+            }
+            (false, false) => "no sandbox may see into it or write it: remove the rule",
+            (false, true) => {
+                "no sandbox may see into it or write it, and this mount is the workspace: use a \
+                 workspace outside it"
+            }
+        })
+    }
+}
+
+impl std::error::Error for ReservedHostSource {}
+
+/// A read-only or `protected` mount whose host source contains stopit's
+/// session runtime directory (see [`SpecWarning::RuntimeDirMasked`]): the
+/// directory is masked where the mount shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "provider {:?}: {mode} mount of {host:?}{} at {sandbox:?} contains stopit's {} {runtime:?}, \
+     which holds {}, so it is masked at {masked_at:?}; grant narrower paths that leave it out to \
+     silence this",
+    .provider.as_str(),
+    resolved_note(.host, .resolved),
+    StateDir::Runtime,
+    StateDir::Runtime.holds()
+)]
+pub struct RuntimeDirMasked {
+    /// The provider whose rule produced the mount.
+    pub provider: ProviderName,
+    /// The mount's mode.
+    pub mode: PathMode,
+    /// The mount's host source, as planned.
+    pub host: PathBuf,
+    /// `host` with every symlink resolved: an ancestor of `runtime`.
+    pub resolved: PathBuf,
+    /// The mount's sandbox destination.
+    pub sandbox: PathBuf,
+    /// The session runtime directory, `$XDG_RUNTIME_DIR/stopit`.
+    pub runtime: PathBuf,
+    /// Where it is masked: `sandbox` joined with `runtime`'s path below
+    /// `resolved`.
+    pub masked_at: PathBuf,
 }
 
 /// A host directory that a sandbox of the session can write, so that any
@@ -1103,6 +1236,9 @@ fn check_mount_destinations(mounts: &[PlannedMount]) -> Result<(), SpecError> {
 /// ([`SpecError::MaskTargetUninspectable`]), unless the way to it runs
 /// through a planted link, which is reported instead.
 ///
+/// Last, the mounts, covers and protected sources included, are checked
+/// against stopit's state directories `state` ([`check_state_dirs`]).
+///
 /// `ctx`'s host workspace is canonical by contract, and is one of `roots`.
 /// Paths are compared by component.
 fn check_host_sources(
@@ -1110,6 +1246,7 @@ fn check_host_sources(
     ctx: &ExpansionContext,
     roots: &UntrustedRoots,
     protected: &[SourceToProtect<'_>],
+    state: &StateDirs,
     warnings: &mut Vec<SpecWarning>,
 ) -> Result<Vec<PlannedMount>, SpecError> {
     let ws_host = ctx.workspace_host();
@@ -1252,8 +1389,157 @@ fn check_host_sources(
         .filter(|(m, _)| m.mode == PathMode::Rw)
         .filter_map(|(m, s)| Some((m.sandbox.clone(), s.as_ref()?.0.clone())))
         .collect();
+    // Every kept mount's canonical source, by sandbox path. A mount the
+    // next two steps put at one of these paths in place of the kept one has
+    // the same canonical source (it covers or protects the content the kept
+    // one showed there); one at another path has a canonical source.
+    let canonical: BTreeMap<PathBuf, PathBuf> = kept
+        .iter()
+        .zip(&sources)
+        .filter_map(|(m, s)| Some((m.sandbox.clone(), s.as_ref()?.0.clone())))
+        .collect();
     let mounts = cover_restricted_exposure(kept, &sources, ws_host, warnings);
-    Ok(protect_sources(mounts, &rw_sources, protected, warnings))
+    let mounts = protect_sources(mounts, &rw_sources, protected, warnings);
+    let workspace = (ws_host, ctx.workspace_sandbox());
+    check_state_dirs(mounts, &canonical, workspace, state, warnings)
+}
+
+/// Checks every mount's host source against stopit's own state directories
+/// `state` (DESIGN.md §6.2, "Reserved host paths"), returning `mounts` with
+/// a mask added wherever a read-only view shows the session runtime
+/// directory, in plan order. `canonical` maps sandbox paths to the
+/// canonical source of the mount there; a mount missing from it (a cover,
+/// a protected source, or a mask whose source cannot be resolved) is taken
+/// at its planned source, which is canonical (or, for that mask, shows
+/// nothing anyway). `workspace` is the (canonical) host workspace and its
+/// mount, so that an error about the workspace's own mount says to pick
+/// another workspace.
+///
+/// This runs last, on the mounts as they will be mounted, covers and
+/// protected sources included, whatever their mode:
+///
+/// * A source that is, or lies inside, a state directory is an error
+///   ([`SpecError::ReservedHostSource`]), `masked` included: stopit's state
+///   is no rule's business, and the runtime directory holds other sessions'
+///   sockets and ephemeral data.
+/// * An `rw` source containing one, or a symlink on the way to one (from
+///   the path it was found at, see [`StatePath`](crate::state::StatePath)), is
+///   an error too: the sandbox could write the state, or create the data
+///   directory before stopit does, or rename a directory on the way, or
+///   replace such a link, and plant another one in its place. Masking the
+///   directory inside the grant would not prevent the last two (pinned
+///   parents are still pending, DESIGN.md §11), and what the data directory
+///   holds decides what the next session trusts, so this is refused rather
+///   than covered. `rw` is the only writable mode with a host source:
+///   `ephemeral` has none, and `protected` is read-only until protected
+///   files are served by FUSE, whose writes will each need approval.
+/// * A read-only (`ro` or `protected`) source containing the runtime
+///   directory gets a mask over it where the mount shows it, attributed to
+///   stopit's own provider name, with a [`SpecWarning::RuntimeDirMasked`]
+///   (DESIGN.md §1.5). That is sound: no sandbox can write any directory on
+///   the way to it (every `rw` grant containing it is refused), so what the
+///   mask covers stays where it is. Unless another mount lies between the
+///   mount's destination (exclusive) and that path (inclusive), mounted on
+///   top: it is checked in turn.
+/// * A read-only source containing the data directory is fine: it only
+///   shows stopit's own records, and the sandbox cannot change them. A
+///   `masked` one shows nothing.
+fn check_state_dirs(
+    mut mounts: Vec<PlannedMount>,
+    canonical: &BTreeMap<PathBuf, PathBuf>,
+    (ws_host, ws_sandbox): (&Path, &Path),
+    state: &StateDirs,
+    warnings: &mut Vec<SpecWarning>,
+) -> Result<Vec<PlannedMount>, SpecError> {
+    let mut masks: BTreeMap<PathBuf, PlannedMount> = BTreeMap::new();
+    {
+        let at: BTreeSet<&Path> = mounts.iter().map(|m| m.sandbox.as_path()).collect();
+        for m in &mounts {
+            let MountSource::Host { path: host, .. } = &m.source else {
+                continue;
+            };
+            let resolved = canonical.get(&m.sandbox).unwrap_or(host);
+            let workspace = m.sandbox == ws_sandbox && resolved == ws_host;
+            for (dir, state_path) in state.iter() {
+                let reserved = state_path.path.as_path();
+                let fail = |contains, via: Option<&PathBuf>| {
+                    SpecError::ReservedHostSource(Box::new(ReservedHostSource {
+                        provider: m.provider.clone(),
+                        mode: m.mode,
+                        host: host.clone(),
+                        resolved: resolved.clone(),
+                        sandbox: m.sandbox.clone(),
+                        dir,
+                        reserved: reserved.to_owned(),
+                        contains,
+                        via: via.cloned(),
+                        workspace,
+                    }))
+                };
+                if resolved.starts_with(reserved) {
+                    return Err(fail(false, None));
+                }
+                let rel = reserved.strip_prefix(resolved);
+                if m.mode == PathMode::Rw {
+                    if rel.is_ok() {
+                        return Err(fail(true, None));
+                    }
+                    // Replacing a link on the way moves the directory.
+                    if let Some(link) = state_path.links.iter().find(|l| l.starts_with(resolved)) {
+                        return Err(fail(true, Some(link)));
+                    }
+                }
+                let Ok(rel) = rel else {
+                    continue;
+                };
+                match (m.mode, dir) {
+                    (PathMode::Ro | PathMode::Protected, StateDir::Runtime) => {}
+                    (PathMode::Ro | PathMode::Protected, StateDir::Data)
+                    | (PathMode::Masked | PathMode::Ephemeral | PathMode::Rw, _) => continue,
+                }
+                let x = m.sandbox.join(rel);
+                let overmounted = x
+                    .ancestors()
+                    .take_while(|a| *a != m.sandbox)
+                    .any(|a| at.contains(a));
+                if overmounted || masks.contains_key(&x) {
+                    continue;
+                }
+                warnings.push(SpecWarning::RuntimeDirMasked(Box::new(RuntimeDirMasked {
+                    provider: m.provider.clone(),
+                    mode: m.mode,
+                    host: host.clone(),
+                    resolved: resolved.clone(),
+                    sandbox: m.sandbox.clone(),
+                    runtime: reserved.to_owned(),
+                    masked_at: x.clone(),
+                })));
+                masks.insert(
+                    x.clone(),
+                    PlannedMount {
+                        sandbox: x,
+                        source: MountSource::Host {
+                            path: reserved.to_owned(),
+                            kind: EntryKind::Dir,
+                        },
+                        mode: PathMode::Masked,
+                        provider: SUPERVISOR_PROVIDER_NAME
+                            .parse()
+                            .expect("the supervisor's name is a valid provider name"),
+                        glob_link: false,
+                    },
+                );
+            }
+        }
+    }
+    if masks.is_empty() {
+        return Ok(mounts);
+    }
+    let masks: Vec<PlannedMount> = masks.into_values().collect();
+    debug_assert!(check_mount_destinations(&masks).is_ok());
+    mounts.extend(masks);
+    sort_plan(&mut mounts);
+    Ok(mounts)
 }
 
 /// A host path a provider asked to be protected ([`ProtectedSource`]), with
@@ -2358,11 +2644,12 @@ fn compile_profile(
     grants: &EffectiveGrants,
     parent: Option<&EffectiveGrants>,
     ctx: &ExpansionContext,
+    state: &StateDirs,
 ) -> Result<CompiledProfile, SpecError> {
     let planned = plan_profile(grants, ctx)?;
     let mut roots = UntrustedRoots::new(ctx.workspace_host());
     roots.add_rw_mounts(None, &planned.plan.mounts);
-    finish_profile(planned, grants, parent, ctx, &roots, &[])
+    finish_profile(planned, grants, parent, ctx, &roots, &[], state)
 }
 
 /// A profile whose mounts are planned but not yet checked against the
@@ -2389,7 +2676,9 @@ fn plan_profile(
 /// The second stage of compiling a profile: checks the planned mounts'
 /// destinations, then the host sources of those kept, against `roots`,
 /// protects the `protected` sources wherever the sandbox could write them
-/// (see [`protect_sources`]), and assembles the spec.
+/// (see [`protect_sources`]), checks every host source against stopit's
+/// state directories `state` (see [`check_state_dirs`]), and assembles the
+/// spec.
 ///
 /// Destinations come first because their check settles what is mounted
 /// (it drops glob-matched links inside untrusted roots, and `rw` mounts for
@@ -2404,12 +2693,13 @@ fn finish_profile(
     ctx: &ExpansionContext,
     roots: &UntrustedRoots,
     protected: &[SourceToProtect<'_>],
+    state: &StateDirs,
 ) -> Result<CompiledProfile, SpecError> {
     let PlannedProfile { home, plan } = planned;
     let mut warnings: Vec<SpecWarning> = plan.warnings.into_iter().map(Into::into).collect();
     let mounts =
         check_destination_links(plan.mounts, ctx.workspace_sandbox(), roots, &mut warnings)?;
-    let mounts = check_host_sources(mounts, ctx, roots, protected, &mut warnings)?;
+    let mounts = check_host_sources(mounts, ctx, roots, protected, state, &mut warnings)?;
     let inherited_domains = parent.map(|p| &p.network.allow_domains);
     let network = network_spec(&grants.network, inherited_domains, &mut warnings);
     let spec = SandboxSpec {
@@ -2579,12 +2869,17 @@ pub enum CompileError {
 /// links to files inside a protected directory are not detected (DESIGN.md
 /// §11).
 ///
+/// `state` are stopit's own host state directories, which no mount may
+/// show (see [`check_state_dirs`]); their paths must be resolved (see
+/// [`StateDirs`]).
+///
 /// Stops at the first failing stage, and within each of the two profile
 /// stages at the first failing profile in graph order.
 pub fn compile_session(
     config: &Config,
     outputs: Vec<(ProviderName, ProviderOutput)>,
     protected: &[ProtectedSource],
+    state: &StateDirs,
     ctx: &ExpansionContext,
 ) -> Result<CompiledSession, CompileError> {
     let graph = build_profile_graph(config, outputs)?;
@@ -2635,8 +2930,8 @@ pub fn compile_session(
             .get(profile)
             .and_then(|node| node.parent.as_ref())
             .map(|p| merged.get(p).expect("every parent is a merged profile"));
-        let compiled =
-            finish_profile(p, grants, parent, ctx, &roots, &protected).map_err(fail(profile))?;
+        let compiled = finish_profile(p, grants, parent, ctx, &roots, &protected, state)
+            .map_err(fail(profile))?;
         profiles.insert(profile.clone(), compiled);
     }
     Ok(CompiledSession {
@@ -2658,6 +2953,7 @@ mod tests {
     use crate::policy::PathMode::{self, Ephemeral, Masked, Protected, Ro, Rw};
     use crate::provider::{ProviderContext, session_providers};
     use crate::resolve::{EphemeralKey, MountSource, PlanWarningKind};
+    use crate::state::{DataDirs, StatePath};
 
     /// The source of an ephemeral mount whose rule was written as `pattern`.
     fn eph_source(pattern: &str) -> MountSource {
@@ -2677,6 +2973,10 @@ mod tests {
         /// The workspace mount.
         ws_mount: &'static str,
         ctx: ExpansionContext,
+        /// stopit's state directories: `run/stopit` (created) and the
+        /// data directory at its default location in the fixture's home,
+        /// `home/.local/share/stopit` (not created), with no override.
+        state: StateDirs,
     }
 
     impl Fixture {
@@ -2698,12 +2998,18 @@ mod tests {
                 "/home/user".parse().unwrap(),
             )
             .unwrap();
+            fs::create_dir_all(root.join("run/stopit")).unwrap();
+            let state = StateDirs {
+                runtime: StatePath::canonical(root.join("run/stopit")),
+                data: DataDirs::canonical(root.join("home/.local/share/stopit")),
+            };
             Fixture {
                 _dir: dir,
                 root,
                 ws_rel,
                 ws_mount,
                 ctx,
+                state,
             }
         }
 
@@ -2758,7 +3064,7 @@ mod tests {
                     path: self.root.join(rel),
                 })
                 .collect();
-            compile_session(&cfg, self.outputs(&cfg), &protected, &self.ctx)
+            compile_session(&cfg, self.outputs(&cfg), &protected, &self.state, &self.ctx)
         }
 
         fn compile(&self, src: &str) -> CompiledSession {
@@ -3177,7 +3483,7 @@ mod tests {
         let f = Fixture::new();
         let mut grants = EffectiveGrants::default();
         grants.network.allow_domains = domains(&["crates.io"]);
-        let c = compile_profile(&grants, None, &f.ctx).unwrap();
+        let c = compile_profile(&grants, None, &f.ctx, &f.state).unwrap();
         assert_eq!(c.spec.network, NetworkSpec::None);
         assert!(
             matches!(c.warnings.as_slice(), [SpecWarning::DomainsIgnored { domains: d, .. }] if *d == grants.network.allow_domains),
@@ -3186,7 +3492,7 @@ mod tests {
         );
         // The same grants with that domain inherited: no warning.
         let parent = grants.clone();
-        let c = compile_profile(&grants, Some(&parent), &f.ctx).unwrap();
+        let c = compile_profile(&grants, Some(&parent), &f.ctx, &f.state).unwrap();
         assert!(c.warnings.is_empty(), "{:?}", c.warnings);
     }
 
@@ -4879,6 +5185,7 @@ mod tests {
                 &f.ctx,
                 &roots,
                 &[],
+                &f.state,
                 &mut warnings,
             )
             .map(|kept| (kept, warnings));
@@ -4887,6 +5194,7 @@ mod tests {
                 &f.ctx,
                 &roots,
                 &[],
+                &f.state,
                 &mut Vec::new(),
             );
             (under, alone)
@@ -4953,7 +5261,8 @@ mod tests {
             glob_link: true,
         };
         let roots = UntrustedRoots::new(&f.ws());
-        let e = check_host_sources(vec![m], &f.ctx, &roots, &[], &mut Vec::new()).unwrap_err();
+        let e = check_host_sources(vec![m], &f.ctx, &roots, &[], &f.state, &mut Vec::new())
+            .unwrap_err();
         let SpecError::UntrustedLinkFollowed(found) = &e else {
             panic!("expected an untrusted link, got {e:?}");
         };
@@ -5151,13 +5460,13 @@ mod tests {
         let cfg = Config::from_toml_str(&src).unwrap();
         let graph = build_profile_graph(&cfg, f.outputs(&cfg)).unwrap();
         let merged = merge_profiles(&graph).unwrap();
-        compile_profile(merged.get(&pr("bare")).unwrap(), None, &f.ctx).unwrap();
+        compile_profile(merged.get(&pr("bare")).unwrap(), None, &f.ctx, &f.state).unwrap();
         let mut main = merged.get(&pr("main")).unwrap().clone();
         main.fs
             .extend(merged.get(&pr("bare")).unwrap().fs.iter().cloned());
         // (The rule now lies inside the grant's mount, so the destination
         // check finds the link first.)
-        let e = compile_profile(&main, None, &f.ctx).unwrap_err();
+        let e = compile_profile(&main, None, &f.ctx, &f.state).unwrap_err();
         let SpecError::DestinationLinkFollowed(dl) = e else {
             panic!("expected DestinationLinkFollowed, got {e:?}");
         };
@@ -5708,7 +6017,8 @@ mod tests {
         let cfg = Config::from_toml_str(&src).unwrap();
         let graph = build_profile_graph(&cfg, f.outputs(&cfg)).unwrap();
         let merged = merge_profiles(&graph).unwrap();
-        let child = compile_profile(merged.get(&pr("child")).unwrap(), None, &f.ctx).unwrap();
+        let child =
+            compile_profile(merged.get(&pr("child")).unwrap(), None, &f.ctx, &f.state).unwrap();
         assert_eq!(mounts(&child.spec), [row("/workspace", Rw, "p")]);
         assert!(
             matches!(
@@ -7641,7 +7951,9 @@ mod tests {
 
     #[test]
     fn a_provider_source_is_protected_wherever_an_rw_grant_shows_it() {
-        let f = Fixture::new();
+        let mut f = Fixture::new();
+        // `~` is bound `rw`: keep the data directory out of it.
+        f.state.data = DataDirs::canonical(f.root.join("data/stopit"));
         f.file("home/bin/env.sh");
         f.mkdir("home/other");
         let src = format!(
@@ -7712,7 +8024,8 @@ mod tests {
         // `~/cfg` is masked at its own path and shown through an `rw` bind of
         // `~`, so it is masked at `/opt/home/cfg` too: the script inside
         // must not be shown read-only on top of that cover.
-        let f = Fixture::new();
+        let mut f = Fixture::new();
+        f.state.data = DataDirs::canonical(f.root.join("data/stopit"));
         f.file("home/cfg/env.sh");
         let src = format!(
             "base = \"none\"\n{}",
@@ -7943,5 +8256,509 @@ mod tests {
             e.to_string(),
             r#"cannot merge the profiles' grants: profile "main": conflicting system.home values "/home/a" (provider "a") and "/home/b" (provider "b")"#
         );
+    }
+
+    // --- Reserved host paths ---
+
+    /// `body` for `main` by provider `u` under `base = "none"`.
+    fn none_with(body: &str) -> String {
+        format!("base = \"none\"\n{}", prov("u", "main", body))
+    }
+
+    /// The reserved host source `e` is about.
+    #[track_caller]
+    fn reserved_host(e: CompileError) -> ReservedHostSource {
+        match e {
+            CompileError::Profile { error, .. } => match *error {
+                SpecError::ReservedHostSource(r) => *r,
+                e => panic!("{e:?}"),
+            },
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn rw_grants_containing_the_data_directory_are_refused() {
+        // The data directory need not exist: an `rw` grant above it could
+        // create it.
+        let f = Fixture::new();
+        f.mkdir("home/.local/share");
+        let home = f.root.join("home");
+        for (body, host, sandbox) in [
+            ("fs.rw = [\"~\"]", home.clone(), "/home/user"),
+            (
+                "fs.rw = [\"~/.local/share\"]",
+                home.join(".local/share"),
+                "/home/user/.local/share",
+            ),
+            (
+                "fs.bind = [{ host = \"~/.local\", sandbox = \"/opt/local\", mode = \"rw\" }]",
+                home.join(".local"),
+                "/opt/local",
+            ),
+        ] {
+            let r = reserved_host(f.compile_err(&none_with(body)));
+            assert_eq!(
+                r,
+                ReservedHostSource {
+                    provider: "u".parse().unwrap(),
+                    mode: Rw,
+                    host: host.clone(),
+                    resolved: host.clone(),
+                    sandbox: sandbox.into(),
+                    dir: StateDir::Data,
+                    reserved: f.state.data.store.path.clone(),
+                    contains: true,
+                    via: None,
+                    workspace: false,
+                },
+                "{body}"
+            );
+        }
+        let e = f.compile_err(&none_with("fs.rw = [\"~\"]"));
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "cannot compile profile \"main\": provider \"u\": rw mount of {home:?} at \
+                 \"/home/user\" contains stopit's data directory {:?}, which holds stopit's \
+                 persistent state, such as which configurations you allowed; a sandbox could \
+                 write it there, create it, or replace a directory or link on the way to it, so \
+                 no writable mount may contain it or the way to it: grant narrower rw paths that \
+                 leave them out, or make this mount ro",
+                f.state.data.store.path
+            )
+        );
+    }
+
+    #[test]
+    fn a_workspace_containing_the_data_directory_is_refused() {
+        // A `.stopit.toml` in `~` makes it the workspace, which the default
+        // base grants `rw`.
+        let f = Fixture::with_workspace("home", "/workspace");
+        let r = reserved_host(f.compile_err(""));
+        assert_eq!(
+            (&r.mode, &r.sandbox, r.dir, r.contains, r.workspace),
+            (&Rw, &"/workspace".into(), StateDir::Data, true, true)
+        );
+        // No narrower grant can replace the workspace's own mount: the hint
+        // is to pick another workspace, not to move the store.
+        let msg = r.to_string();
+        assert!(
+            msg.ends_with(
+                "no writable mount may contain it or the way to it; this mount is the workspace: \
+                 use a workspace that leaves them out, such as a project directory below your \
+                 home directory or elsewhere"
+            ),
+            "{msg}"
+        );
+        // A workspace inside the data directory.
+        let f = Fixture::with_workspace("home/.local/share/stopit/ws", "/workspace");
+        let r = reserved_host(f.compile_err(""));
+        assert_eq!(
+            (&r.sandbox, r.dir, r.contains, r.workspace),
+            (&"/workspace".into(), StateDir::Data, false, true)
+        );
+        assert!(
+            r.to_string()
+                .ends_with("and this mount is the workspace: use a workspace outside it"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn sources_inside_a_state_directory_are_refused_whatever_the_mode() {
+        let f = Fixture::new();
+        f.mkdir("home/.local/share/stopit/x");
+        f.mkdir("run/stopit/session");
+        let data = f.state.data.store.path.clone();
+        let runtime = f.state.runtime.path.clone();
+        for (body, mode, host, dir) in [
+            (
+                "fs.rw = [\"~/.local/share/stopit/x\"]",
+                Rw,
+                data.join("x"),
+                StateDir::Data,
+            ),
+            (
+                "fs.ro = [\"~/.local/share/stopit\"]",
+                Ro,
+                data.clone(),
+                StateDir::Data,
+            ),
+            (
+                "fs.masked = [\"~/.local/share/stopit/x\"]",
+                Masked,
+                data.join("x"),
+                StateDir::Data,
+            ),
+            (
+                &format!("fs.ro = [{:?}]", runtime.join("session")),
+                Ro,
+                runtime.join("session"),
+                StateDir::Runtime,
+            ),
+            (
+                &format!(
+                    "fs.bind = [{{ host = {:?}, sandbox = \"/opt/run\", mode = \"ro\" }}]",
+                    runtime
+                ),
+                Ro,
+                runtime.clone(),
+                StateDir::Runtime,
+            ),
+        ] {
+            let r = reserved_host(f.compile_err(&none_with(body)));
+            assert_eq!(
+                (r.mode, &r.resolved, r.dir, r.contains),
+                (mode, &host, dir, false),
+                "{body}"
+            );
+            let msg = r.to_string();
+            let relation = if host == r.reserved {
+                "is"
+            } else {
+                "lies inside"
+            };
+            assert!(
+                msg.contains(&format!("{relation} stopit's {dir} {:?}", r.reserved)),
+                "{msg}"
+            );
+            assert!(msg.ends_with("remove the rule"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn read_only_grants_containing_the_data_directory_are_fine() {
+        let f = Fixture::new();
+        f.mkdir("home/.local/share/stopit");
+        for body in [
+            "fs.ro = [\"~\"]",
+            "fs.masked = [\"~/.local\"]",
+            "fs.bind = [{ host = \"~/.local\", sandbox = \"/opt/local\", mode = \"ro\" }]",
+        ] {
+            let s = f.compile(&none_with(body));
+            let main = get(&s, "main");
+            assert!(main.warnings.is_empty(), "{body}: {:?}", main.warnings);
+            assert_eq!(main.spec.mounts.len(), 1, "{body}");
+        }
+    }
+
+    #[test]
+    fn read_only_grants_containing_the_runtime_directory_mask_it() {
+        let f = Fixture::new();
+        f.mkdir("run/stopit/session");
+        let run = f.root.join("run");
+        let runtime = f.state.runtime.path.clone();
+        // At its own path, and bound elsewhere.
+        for (body, sandbox) in [
+            (format!("fs.ro = [{run:?}]"), run.clone()),
+            (
+                format!("fs.bind = [{{ host = {run:?}, sandbox = \"/opt/run\", mode = \"ro\" }}]"),
+                PathBuf::from("/opt/run"),
+            ),
+        ] {
+            let s = f.compile(&none_with(&body));
+            let main = get(&s, "main");
+            let masked_at = sandbox.join("stopit");
+            assert_eq!(
+                mounts(&main.spec),
+                [
+                    (sandbox.to_string_lossy().into_owned(), Ro, "u".to_owned()),
+                    (
+                        masked_at.to_string_lossy().into_owned(),
+                        Masked,
+                        "stopit".to_owned()
+                    ),
+                ],
+                "{body}"
+            );
+            assert_eq!(
+                main.spec.mounts[1].source,
+                host(&runtime, EntryKind::Dir),
+                "{body}"
+            );
+            let [SpecWarning::RuntimeDirMasked(w)] = main.warnings.as_slice() else {
+                panic!("{body}: {:?}", main.warnings);
+            };
+            assert_eq!(
+                **w,
+                RuntimeDirMasked {
+                    provider: "u".parse().unwrap(),
+                    mode: Ro,
+                    host: run.clone(),
+                    resolved: run.clone(),
+                    sandbox: sandbox.clone(),
+                    runtime: runtime.clone(),
+                    masked_at: masked_at.clone(),
+                }
+            );
+            let msg = w.to_string();
+            assert!(
+                msg.contains(&format!(
+                    "contains stopit's session runtime directory {runtime:?}"
+                )),
+                "{msg}"
+            );
+            assert!(
+                msg.contains(&format!("so it is masked at {masked_at:?}")),
+                "{msg}"
+            );
+        }
+        // A mount on top of it hides it already: nothing to add.
+        let s = f.compile(&none_with(&format!(
+            "fs.ro = [{run:?}]\nfs.ephemeral = [{runtime:?}]"
+        )));
+        let main = get(&s, "main");
+        assert!(main.warnings.is_empty(), "{:?}", main.warnings);
+        assert_eq!(
+            strs(main.spec.mounts.iter().map(|m| m.mode)),
+            strs([Ro, Ephemeral])
+        );
+        // Writable, it is refused.
+        let r = reserved_host(f.compile_err(&none_with(&format!("fs.rw = [{run:?}]"))));
+        assert_eq!((r.mode, r.dir, r.contains), (Rw, StateDir::Runtime, true));
+    }
+
+    #[test]
+    fn host_sources_and_state_directories_are_compared_canonically() {
+        // `~/.local` is a link, so the data directory is not where the home
+        // directory says; an `rw` grant of the link's target, or of a link to the
+        // directory above it, still contains it.
+        let mut f = Fixture::new();
+        f.mkdir("real/local/share");
+        f.mkdir("home/sub");
+        symlink("../real/local", f.root.join("home/.local")).unwrap();
+        symlink("real/local/share", f.root.join("share-link")).unwrap();
+        f.state.data = crate::state::data_dirs(&f.root.join("home"), None).unwrap();
+        assert_eq!(
+            f.state.data.store.path,
+            f.root.join("real/local/share/stopit")
+        );
+        for (rw, resolved) in [
+            (f.root.join("real"), f.root.join("real")),
+            (f.root.join("share-link"), f.root.join("real/local/share")),
+        ] {
+            let r = reserved_host(f.compile_err(&none_with(&format!("fs.rw = [{rw:?}]"))));
+            assert_eq!((&r.host, &r.resolved), (&rw, &resolved));
+            assert_eq!((r.dir, r.contains, r.via), (StateDir::Data, true, None));
+        }
+        let e = f.compile_err(&none_with(&format!(
+            "fs.rw = [{:?}]",
+            f.root.join("share-link")
+        )));
+        assert!(
+            e.to_string().contains(&format!(
+                "(resolving to {:?})",
+                f.root.join("real/local/share")
+            )),
+            "{e}"
+        );
+        // `~` holds the link `~/.local`, which a sandbox could replace by a
+        // directory holding a planted data directory.
+        let r = reserved_host(f.compile_err(&none_with("fs.rw = [\"~\"]")));
+        let link = f.root.join("home/.local");
+        assert_eq!((r.contains, &r.via), (true, &Some(link.clone())));
+        assert!(
+            r.to_string().contains(&format!(
+                "contains {link:?}, a symbolic link on the way to stopit's data directory {:?}",
+                f.state.data.store.path
+            )),
+            "{r}"
+        );
+        // Beside the link, or read-only, it is fine.
+        f.compile(&none_with("fs.rw = [\"~/sub\"]"));
+        f.compile(&none_with("fs.ro = [\"~\"]"));
+        f.compile(&none_with(&format!("fs.ro = [{:?}]", f.root.join("real"))));
+    }
+
+    #[test]
+    fn a_mount_between_a_read_only_grant_and_the_runtime_directory_decides_it() {
+        // The runtime directory two levels below the `ro` grant of `run`, so
+        // that a mount can lie strictly between them.
+        let mut f = Fixture::new();
+        f.mkdir("run/user/stopit");
+        f.mkdir("other");
+        f.state.runtime = StatePath::canonical(f.root.join("run/user/stopit"));
+        let run = f.root.join("run");
+        let user = run.join("user");
+        let other = f.root.join("other");
+        // Mounted on top of `run`, an ephemeral directory, a mask or a grant
+        // of other content hides the runtime directory: nothing to add.
+        for (inner, mode) in [
+            (format!("fs.ephemeral = [{user:?}]"), Ephemeral),
+            (format!("fs.masked = [{user:?}]"), Masked),
+            (
+                format!("fs.bind = [{{ host = {other:?}, sandbox = {user:?}, mode = \"ro\" }}]"),
+                Ro,
+            ),
+        ] {
+            let body = format!("fs.ro = [{run:?}]\n{inner}");
+            let s = f.compile(&none_with(&body));
+            let main = get(&s, "main");
+            assert!(main.warnings.is_empty(), "{body}: {:?}", main.warnings);
+            assert_eq!(
+                mounts(&main.spec),
+                [
+                    row(run.to_str().unwrap(), Ro, "u"),
+                    row(user.to_str().unwrap(), mode, "u"),
+                ],
+                "{body}"
+            );
+        }
+        // A read-only grant of `run/user` on top shows it in turn, so it is
+        // masked there, once.
+        let s = f.compile(&none_with(&format!("fs.ro = [{run:?}, {user:?}]")));
+        let main = get(&s, "main");
+        let masked_at = user.join("stopit");
+        assert_eq!(
+            mounts(&main.spec),
+            [
+                row(run.to_str().unwrap(), Ro, "u"),
+                row(user.to_str().unwrap(), Ro, "u"),
+                row(masked_at.to_str().unwrap(), Masked, "stopit"),
+            ]
+        );
+        let [SpecWarning::RuntimeDirMasked(w)] = main.warnings.as_slice() else {
+            panic!("{:?}", main.warnings);
+        };
+        assert_eq!((&w.sandbox, &w.masked_at), (&user, &masked_at));
+    }
+
+    #[test]
+    fn a_protected_grant_containing_the_runtime_directory_masks_it() {
+        let f = Fixture::new();
+        let run = f.root.join("run");
+        let runtime = f.state.runtime.path.clone();
+        let s = f.compile(&none_with(&format!("fs.protected = [{run:?}]")));
+        let main = get(&s, "main");
+        assert_eq!(
+            mounts(&main.spec),
+            [
+                row(run.to_str().unwrap(), Protected, "u"),
+                row(runtime.to_str().unwrap(), Masked, "stopit"),
+            ]
+        );
+        let [SpecWarning::RuntimeDirMasked(w)] = main.warnings.as_slice() else {
+            panic!("{:?}", main.warnings);
+        };
+        assert_eq!((w.mode, &w.masked_at), (Protected, &runtime));
+        assert!(
+            w.to_string()
+                .starts_with(&format!("provider \"u\": protected mount of {run:?}")),
+            "{w}"
+        );
+    }
+
+    #[test]
+    fn a_cover_inside_a_state_directory_is_refused() {
+        // `x` in the data directory is masked, and shown through a read-only
+        // bind of `~/.local` (which may contain the data directory), so it
+        // is covered at `/a/share/stopit/x`. That cover's source lies in the
+        // data directory too, and it comes first.
+        let f = Fixture::new();
+        f.mkdir("home/.local/share/stopit/x");
+        let data = f.state.data.store.path.clone();
+        let r = reserved_host(f.compile_err(&none_with(
+            "fs.masked = [\"~/.local/share/stopit/x\"]\n\
+             fs.bind = [{ host = \"~/.local\", sandbox = \"/a\", mode = \"ro\" }]",
+        )));
+        assert_eq!(
+            r,
+            ReservedHostSource {
+                provider: "u".parse().unwrap(),
+                mode: Masked,
+                host: data.join("x"),
+                resolved: data.join("x"),
+                sandbox: "/a/share/stopit/x".into(),
+                dir: StateDir::Data,
+                reserved: data.clone(),
+                contains: false,
+                via: None,
+                workspace: false,
+            }
+        );
+    }
+
+    #[test]
+    fn mounts_added_after_planning_are_checked_at_their_source() {
+        // A protected source added by `protect_sources`, or a cover, is not
+        // among the planned mounts' canonical sources: it is checked at its
+        // own (canonical) source.
+        let f = Fixture::new();
+        let runtime = f.state.runtime.path.clone();
+        let data = f.state.data.store.path.clone();
+        let mount = |sandbox: &str, path: PathBuf, kind, mode| PlannedMount {
+            sandbox: sandbox.into(),
+            source: MountSource::Host { path, kind },
+            mode,
+            provider: "s".parse().unwrap(),
+            glob_link: false,
+        };
+        for (m, dir, reserved) in [
+            (
+                mount(
+                    "/src/env.sh",
+                    runtime.join("session/env.sh"),
+                    EntryKind::File,
+                    Protected,
+                ),
+                StateDir::Runtime,
+                &runtime,
+            ),
+            (
+                mount("/opt/x", data.join("x"), EntryKind::Dir, Masked),
+                StateDir::Data,
+                &data,
+            ),
+        ] {
+            let host = match &m.source {
+                MountSource::Host { path, .. } => path.clone(),
+                s => panic!("{s:?}"),
+            };
+            let e = check_state_dirs(
+                vec![m],
+                &BTreeMap::new(),
+                (&f.ws(), Path::new("/workspace")),
+                &f.state,
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+            let SpecError::ReservedHostSource(r) = e else {
+                panic!("{e:?}");
+            };
+            assert_eq!(
+                (&r.resolved, r.dir, &r.reserved, r.contains),
+                (&host, dir, reserved, false)
+            );
+        }
+    }
+
+    #[test]
+    fn with_the_override_both_data_directories_are_reserved() {
+        // `STOPIT_STATE_DIR` puts the store in `state`; the default location
+        // in the (password database's) home stays reserved, so that a
+        // sandbox cannot plant a store for sessions started without it.
+        let mut f = Fixture::new();
+        f.mkdir("var/state");
+        f.mkdir("home/sub");
+        let state = f.root.join("var/state");
+        f.state.data =
+            crate::state::data_dirs(&f.root.join("home"), Some(state.as_os_str())).unwrap();
+        let home = f.root.join("home");
+        for (body, reserved) in [
+            (format!("fs.rw = [{:?}]", f.root.join("var")), state.clone()),
+            (
+                "fs.rw = [\"~\"]".to_owned(),
+                home.join(".local/share/stopit"),
+            ),
+        ] {
+            let r = reserved_host(f.compile_err(&none_with(&body)));
+            assert_eq!(
+                (r.dir, &r.reserved, r.contains),
+                (StateDir::Data, &reserved, true),
+                "{body}"
+            );
+        }
+        f.compile(&none_with("fs.rw = [\"~/sub\"]"));
     }
 }

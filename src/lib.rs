@@ -19,6 +19,7 @@ pub mod resolve;
 mod serde_util;
 pub mod session;
 pub mod spec;
+pub mod state;
 pub mod supervisor;
 
 /// The version of the `stopit` crate.

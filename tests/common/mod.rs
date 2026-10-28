@@ -27,6 +27,7 @@ use stopit::provider::{ProviderContext, protected_sources, session_providers, st
 use stopit::provision::{Provisioned, provision};
 use stopit::session::SessionDir;
 use stopit::spec::{SandboxSpec, compile_session, static_rw_roots};
+use stopit::state::{DataDirs, StateDirs, StatePath};
 use tempfile::TempDir;
 
 #[allow(unused_imports)]
@@ -488,7 +489,13 @@ impl SpecFixture {
             .map(|p| (p.name().clone(), p.manifest(&pctx).unwrap()))
             .collect();
         let protected = protected_sources(&providers).unwrap();
-        let session = compile_session(&config, outputs, &protected, &ctx)
+        // Sessions are created in `runtime` (`session`), and the data
+        // directory is at its default location in the fixture's home.
+        let state = StateDirs {
+            runtime: StatePath::canonical(self.root.join("runtime/stopit")),
+            data: DataDirs::canonical(self.home().join(".local/share/stopit")),
+        };
+        let session = compile_session(&config, outputs, &protected, &state, &ctx)
             .unwrap_or_else(|e| panic!("the configuration does not compile: {e}"));
         let main = session.get(&ProfileRef::main()).expect("main exists");
         let warnings = main.warnings.iter().map(|w| w.to_string()).collect();

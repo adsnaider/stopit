@@ -9,8 +9,9 @@
 //!    about;
 //! 3. runs the providers, compiles every profile of the session
 //!    (`spec::compile_session`), protecting the script providers' sources
-//!    and the configuration file in each (§3, §3.6), and prints its
-//!    warnings ([`warning_lines`]);
+//!    and the configuration file in each (§3, §3.6) and refusing mounts that
+//!    would expose stopit's own state directories (§6.2, Reserved host
+//!    paths), and prints its warnings ([`warning_lines`]);
 //! 4. picks the profile (`main`, or `--profile`, §3.3);
 //! 5. provisions itself into the session directory (§2.1), computes the
 //!    target's environment from its own (§9), and runs bwrap with `__init`
@@ -64,6 +65,7 @@ use crate::provision::{ProvisionError, provision_self};
 use crate::resolve::{PlanWarning, PlanWarningKind};
 use crate::session::{SessionDir, SessionError};
 use crate::spec::{CompileError, CompiledSession, SpecWarning, compile_session, static_rw_roots};
+use crate::state::{StateDirs, StateError, data_dirs_from_host, runtime_dir};
 
 /// The name of the configuration file that marks a workspace (§3.1).
 pub const CONFIG_FILE: &str = ".stopit.toml";
@@ -172,6 +174,10 @@ pub enum RunError {
     /// The workspace or `HOME` cannot be used to expand rules.
     #[error(transparent)]
     Expand(#[from] ExpandError),
+
+    /// stopit's data or runtime directory cannot be found.
+    #[error(transparent)]
+    State(#[from] StateError),
 
     /// `stopit shell` without `SHELL` in the environment.
     #[error("SHELL is not set; run a shell explicitly with `stopit run <shell>`")]
@@ -298,6 +304,10 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     let config = workspace.load_config()?;
     // TODO(§3): layer `.stopit.toml` over the user-global configuration.
     let home = host_home(std::env::var_os("HOME"))?;
+    // No mount may expose them (§6.2, Reserved host paths), even before
+    // they exist. From the password database, not `HOME`, plus
+    // `STOPIT_STATE_DIR` if set.
+    let data_dirs = data_dirs_from_host()?;
     let mount = config.workspace.mount.clone();
     let ctx = ExpansionContext::new(
         workspace.dir.clone(),
@@ -341,7 +351,19 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
             .expect("the supervisor's name is a valid provider name"),
         path: workspace.config.clone(),
     });
-    let compiled = compile_session(&config, outputs, &protected, &ctx)?;
+    // stopit's own state, which no mount may expose (§6.2, Reserved host
+    // paths): the parent of every session directory, and the data
+    // directories. `XDG_RUNTIME_DIR` is set and absolute, or there would be
+    // no session.
+    let runtime = runtime_dir(Path::new(
+        &std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_default(),
+    ))?;
+    debug_assert_eq!(Some(runtime.path.as_path()), session.root().parent());
+    let state = StateDirs {
+        runtime,
+        data: data_dirs,
+    };
+    let compiled = compile_session(&config, outputs, &protected, &state, &ctx)?;
     for line in warning_lines(&compiled, config.base) {
         print_warning(&line);
     }
