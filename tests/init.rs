@@ -527,11 +527,14 @@ fn bad_init_arguments_fail_before_running_anything() {
     let out = run(&["__init", "--env-fd", "3", "--"]);
     assert_eq!(code(&out), i32::from(EXIT_INIT_FAILED), "{out:?}");
     assert!(stderr(&out).contains("no command after --"), "{out:?}");
-    // A number that is not open.
-    let out = run(&["__init", "--env-fd", "42", "--", "/proc"]);
+    // A number that cannot be open: far above any RLIMIT_NOFILE. A small one
+    // such as 42 can be one of the command's own descriptors, which the
+    // spawn moves onto their numbers in the child.
+    let out = run(&["__init", "--env-fd", "2147483647", "--", "/proc"]);
     assert_eq!(code(&out), i32::from(EXIT_INIT_FAILED), "{out:?}");
     assert!(
-        stderr(&out).starts_with("stopit __init: cannot read the environment from descriptor 42"),
+        stderr(&out)
+            .starts_with("stopit __init: cannot read the environment from descriptor 2147483647"),
         "{out:?}"
     );
 }
