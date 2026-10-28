@@ -18,8 +18,10 @@
 //!   show for files owned by other host users and for supplementary groups.
 //!   There is no `root` entry: host root is unmapped and shows as `nobody`,
 //!   so uid 0 does not exist in the sandbox unless stopit runs as root.
-//! * `hosts` maps `localhost` only. stopit sets no hostname (the UTS
-//!   namespace keeps the host's), so there is no line for it.
+//! * `hosts` maps `localhost`, and [`SANDBOX_HOSTNAME`] too when stopit sets
+//!   it as the hostname of the new UTS namespace. With a shared UTS
+//!   namespace the hostname is the host's, which `hosts` does not copy (that
+//!   would leak it as well), so it names `localhost` only.
 //! * `nsswitch.conf` uses the `files` service for every database and `dns`
 //!   after it for `hosts`, both built into glibc (2.34+), so glibc never
 //!   tries to load `systemd`, `sss`, `ldap` or `mymachines` modules, which
@@ -53,8 +55,9 @@ pub const OVERFLOW_GROUP: &str = "nogroup";
 const OVERFLOW_HOME: &str = "/nonexistent";
 const OVERFLOW_SHELL: &str = "/bin/false";
 
-/// The content of `/etc/hosts`.
-pub const HOSTS: &str = "127.0.0.1\tlocalhost\n::1\tlocalhost\n";
+/// The hostname of the sandbox's own UTS namespace (`--hostname`), which
+/// `hosts` also names.
+pub const SANDBOX_HOSTNAME: &str = "stopit";
 
 /// The content of `/etc/nsswitch.conf`.
 pub const NSSWITCH_CONF: &str = "\
@@ -97,14 +100,34 @@ pub fn sandbox_path(file: EtcFile) -> PathBuf {
     PathBuf::from("/etc").join(file.as_str())
 }
 
-/// The content of `file` for the sandbox user `ids` with the `HOME` `home`.
-pub fn contents(file: EtcFile, ids: SandboxIds, home: &SandboxHome) -> String {
+/// The content of `file` for the sandbox user `ids` with the `HOME` `home`,
+/// in a sandbox whose hostname is `hostname` (`None` if stopit does not set
+/// one).
+pub fn contents(
+    file: EtcFile,
+    ids: SandboxIds,
+    home: &SandboxHome,
+    hostname: Option<&str>,
+) -> String {
     match file {
         EtcFile::Passwd => passwd(ids, home),
         EtcFile::Group => group(ids),
-        EtcFile::Hosts => HOSTS.to_owned(),
+        EtcFile::Hosts => hosts(hostname),
         EtcFile::NsswitchConf => NSSWITCH_CONF.to_owned(),
     }
+}
+
+/// `/etc/hosts`: `localhost` for `127.0.0.1` and `::1`, which also name
+/// `hostname` if there is one, so the sandbox's own name resolves.
+///
+/// `hostname` is interpolated as is: it is a constant of stopit's, not
+/// configuration or the host's name.
+pub fn hosts(hostname: Option<&str>) -> String {
+    let names = match hostname {
+        Some(name) => format!("localhost {name}"),
+        None => "localhost".to_owned(),
+    };
+    format!("127.0.0.1\t{names}\n::1\t{names}\n")
 }
 
 /// `/etc/passwd`: the sandbox user, then `nobody` unless the user has its
@@ -214,7 +237,11 @@ mod tests {
 
     #[test]
     fn hosts_golden() {
-        assert_eq!(HOSTS, "127.0.0.1\tlocalhost\n::1\tlocalhost\n");
+        assert_eq!(
+            hosts(Some(SANDBOX_HOSTNAME)),
+            "127.0.0.1\tlocalhost stopit\n::1\tlocalhost stopit\n"
+        );
+        assert_eq!(hosts(None), "127.0.0.1\tlocalhost\n::1\tlocalhost\n");
     }
 
     #[test]
@@ -239,15 +266,17 @@ mod tests {
     #[test]
     fn contents_and_paths_of_every_file() {
         let h = home("/home/user");
-        for file in EtcFile::ALL {
-            let want = match file {
-                EtcFile::Passwd => passwd(IDS, &h),
-                EtcFile::Group => group(IDS),
-                EtcFile::Hosts => HOSTS.to_owned(),
-                EtcFile::NsswitchConf => NSSWITCH_CONF.to_owned(),
-            };
-            assert_eq!(contents(file, IDS, &h), want, "{file}");
-            assert!(want.ends_with('\n'), "{file}");
+        for hostname in [None, Some(SANDBOX_HOSTNAME)] {
+            for file in EtcFile::ALL {
+                let want = match file {
+                    EtcFile::Passwd => passwd(IDS, &h),
+                    EtcFile::Group => group(IDS),
+                    EtcFile::Hosts => hosts(hostname),
+                    EtcFile::NsswitchConf => NSSWITCH_CONF.to_owned(),
+                };
+                assert_eq!(contents(file, IDS, &h, hostname), want, "{file}");
+                assert!(want.ends_with('\n'), "{file}");
+            }
         }
         assert_eq!(
             EtcFile::ALL.map(sandbox_path),

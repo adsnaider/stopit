@@ -537,6 +537,10 @@ fn plan(
         // host localhost services stay unreachable; it shares the host's
         // network namespace until then.
         || matches!(spec.network, NetworkSpec::Full);
+    // A new UTS namespace starts with the host's hostname, so stopit gives it
+    // its own (`hosts` names it too); a shared one is the host's, as chosen.
+    let hostname =
+        (!spec.namespaces.is_shared(ShareableNamespace::Uts)).then_some(etc::SANDBOX_HOSTNAME);
     for (ns, flag) in [
         (ShareableNamespace::Ipc, "--unshare-ipc"),
         (ShareableNamespace::Pid, "--unshare-pid"),
@@ -559,6 +563,10 @@ fn plan(
     //
     // No `--new-session`: `__init` sets up the controlling terminal (§6.3).
     plan.push(["--disable-userns", "--die-with-parent"])?;
+    // bwrap refuses `--hostname` without `--unshare-uts`.
+    if let Some(hostname) = hostname {
+        plan.push(["--hostname", hostname])?;
+    }
 
     // Step 7: environment. bwrap then sets only `PWD`, which `__init`
     // discards; the target's environment reaches `__init` through its own
@@ -594,7 +602,7 @@ fn plan(
     // unaffected: bwrap creates `/etc` and the mount points in its root
     // tmpfs, in whichever order.
     for &file in &spec.system.etc {
-        let data = etc::contents(file, ids, &spec.system.home).into_bytes();
+        let data = etc::contents(file, ids, &spec.system.home, hostname).into_bytes();
         plan.data_file(ETC_FILE_PERMS, data, &etc::sandbox_path(file))?;
     }
     // TODO(§6.2 step 4): the sandbox-`HOME` stubs (`.gitconfig`, …), which
@@ -839,7 +847,9 @@ mod tests {
         strings(&try_golden(spec, &|_| true).unwrap())
     }
 
-    const NAMESPACES: [&str; 8] = [
+    /// The namespace options of a spec that shares nothing: the hostname
+    /// goes with the new UTS namespace.
+    const NAMESPACES: [&str; 10] = [
         "--unshare-user",
         "--unshare-ipc",
         "--unshare-pid",
@@ -848,6 +858,8 @@ mod tests {
         "--unshare-cgroup",
         "--disable-userns",
         "--die-with-parent",
+        "--hostname",
+        "stopit",
     ];
 
     const ENV: [&str; 3] = ["--clearenv", "--chdir", "/"];
@@ -922,7 +934,10 @@ mod tests {
         let shared = |names: &[ShareableNamespace]| {
             let mut spec = SandboxSpec::default();
             spec.namespaces.shared = names.iter().copied().collect::<BTreeSet<_>>();
-            golden(&spec)[..NAMESPACES.len() - names.len()].to_vec()
+            // Each shared namespace takes its flag, and the UTS one the
+            // hostname's two arguments too.
+            let len = NAMESPACES.len() - names.len() - 2 * names.contains(&Uts) as usize;
+            golden(&spec)[..len].to_vec()
         };
         use ShareableNamespace::*;
         assert_eq!(
@@ -935,6 +950,8 @@ mod tests {
                 "--unshare-cgroup",
                 "--disable-userns",
                 "--die-with-parent",
+                "--hostname",
+                "stopit",
             ]
         );
         assert_eq!(
@@ -950,6 +967,46 @@ mod tests {
         assert_eq!(
             shared(&[Net, Pid, Ipc, Uts, Cgroup]),
             ["--unshare-user", "--disable-userns", "--die-with-parent"]
+        );
+    }
+
+    #[test]
+    fn hostname_is_set_only_in_a_new_uts_namespace() {
+        let mut spec = SandboxSpec::default();
+        let args = golden(&spec);
+        assert!(args.contains(&"--unshare-uts".to_owned()));
+        let at = args.iter().position(|a| a == "--hostname").unwrap();
+        assert_eq!(args[at + 1], "stopit");
+        assert_eq!(args[at + 1], etc::SANDBOX_HOSTNAME);
+
+        // A shared one is the host's, as the user chose: nothing to set, and
+        // bwrap would refuse `--hostname` without `--unshare-uts`.
+        spec.namespaces.shared = [ShareableNamespace::Uts].into_iter().collect();
+        let args = golden(&spec);
+        assert!(!args.contains(&"--unshare-uts".to_owned()));
+        assert!(!args.contains(&"--hostname".to_owned()));
+        assert!(!args.contains(&"stopit".to_owned()));
+        // Sharing another namespace leaves it.
+        spec.namespaces.shared = [ShareableNamespace::Ipc].into_iter().collect();
+        assert!(golden(&spec).contains(&"--hostname".to_owned()));
+    }
+
+    #[test]
+    fn hosts_names_the_hostname_only_when_it_is_set() {
+        let hosts = |shared: &[ShareableNamespace]| {
+            let mut spec = SandboxSpec::default();
+            spec.system.etc = [EtcFile::Hosts].into_iter().collect();
+            spec.namespaces.shared = shared.iter().copied().collect();
+            let plan = try_golden(&spec, &|_| true).unwrap();
+            String::from_utf8(plan.data[0].clone()).unwrap()
+        };
+        assert_eq!(
+            hosts(&[]),
+            "127.0.0.1\tlocalhost stopit\n::1\tlocalhost stopit\n"
+        );
+        assert_eq!(
+            hosts(&[ShareableNamespace::Uts]),
+            "127.0.0.1\tlocalhost\n::1\tlocalhost\n"
         );
     }
 
@@ -1141,7 +1198,7 @@ mod tests {
                 "user:x:1000:100::/home/agent:/bin/sh\n\
                  nobody:x:65534:65534::/nonexistent:/bin/false\n",
                 "user:x:100:\nnogroup:x:65534:\n",
-                etc::HOSTS,
+                etc::hosts(Some(etc::SANDBOX_HOSTNAME)).as_str(),
                 etc::NSSWITCH_CONF,
             ]
         );
@@ -1180,7 +1237,7 @@ mod tests {
                 .map(|&f| {
                     (
                         etc::sandbox_path(f).to_str().unwrap().to_owned(),
-                        etc::contents(f, IDS, &home).into_bytes(),
+                        etc::contents(f, IDS, &home, Some(etc::SANDBOX_HOSTNAME)).into_bytes(),
                     )
                 })
                 .collect();

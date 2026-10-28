@@ -533,7 +533,8 @@ fn default_base_synthesizes_read_only_etc_files() {
     // For this process's ids, the sandbox user's (the line format is
     // checked against the probe's ids below, and golden in `stopit::etc`).
     let home = "/home/user".parse().unwrap();
-    let expected = EtcFile::ALL.map(|f| etc::contents(f, SandboxIds::current(), &home));
+    let expected = EtcFile::ALL
+        .map(|f| etc::contents(f, SandboxIds::current(), &home, Some(etc::SANDBOX_HOSTNAME)));
     for (i, (name, want)) in files.iter().zip(&expected).enumerate() {
         let r = &results[1 + i * 7..1 + (i + 1) * 7];
         let st = stat_data(&r[0]);
@@ -628,19 +629,32 @@ fn etc_files_coexist_with_a_grant_inside_etc() {
     );
     assert_eq!(ok(&results[1]), &names(&["certs"]));
     assert_eq!(stat_data(&results[2]).kind, FileKind::Dir);
-    assert_eq!(contents(&results[3]), etc::HOSTS);
+    assert_eq!(
+        contents(&results[3]),
+        etc::hosts(Some(etc::SANDBOX_HOSTNAME))
+    );
     assert_eq!(errno(&results[4]), "EROFS");
 }
 
-/// The host's `id` program as a path the sandbox can run once the
-/// existing ones of `dirs` are granted read-only, following symlinks only
-/// until the path lies in one of them, so that a multi-call binary still
-/// sees its name. `None` if there is no `id` on `PATH`, or it cannot be
-/// reached that way.
-fn host_id_program(dirs: &[&Path]) -> Option<PathBuf> {
+/// The host directories that hold programs and the libraries they load,
+/// among those that exist.
+fn host_tool_dirs() -> Vec<&'static Path> {
+    ["/nix/store", "/usr", "/lib", "/lib64", "/bin"]
+        .map(Path::new)
+        .into_iter()
+        .filter(|d| d.symlink_metadata().is_ok())
+        .collect()
+}
+
+/// The host's `name` program (`id`, `getent`, …) as a path the sandbox can
+/// run once the existing ones of `dirs` are granted read-only, following
+/// symlinks only until the path lies in one of them, so that a multi-call
+/// binary still sees its name. `None` if there is no such program on
+/// `PATH`, or it cannot be reached that way.
+fn host_program(name: &str, dirs: &[&Path]) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     let mut program = std::env::split_paths(&path)
-        .map(|dir| dir.join("id"))
+        .map(|dir| dir.join(name))
         .find(|p| p.is_file())?;
     for _ in 0..40 {
         if dirs.iter().any(|d| program.starts_with(d)) {
@@ -656,12 +670,8 @@ fn host_id_program(dirs: &[&Path]) -> Option<PathBuf> {
 fn glibc_resolves_the_sandbox_user_through_the_synthesized_files() {
     // Runs the host's `id`, which looks names up through glibc's NSS, so
     // `nsswitch.conf`, `passwd` and `group` all take part.
-    let dirs: Vec<&Path> = ["/nix/store", "/usr", "/lib", "/lib64", "/bin"]
-        .map(Path::new)
-        .into_iter()
-        .filter(|d| d.symlink_metadata().is_ok())
-        .collect();
-    let Some(id) = host_id_program(&dirs) else {
+    let dirs = host_tool_dirs();
+    let Some(id) = host_program("id", &dirs) else {
         eprintln!("skipped: no `id` reachable in {dirs:?}");
         return;
     };
@@ -708,6 +718,88 @@ fn glibc_resolves_the_sandbox_user_through_the_synthesized_files() {
         Data::Exec(out) => {
             assert_ne!(out.code, Some(0), "{out:?}");
             assert!(out.stderr.contains("cannot find name"), "{out:?}");
+        }
+        other => panic!("expected exec output, got {other:?}"),
+    }
+}
+
+/// The node name `uname(2)` reports to this process: the host's hostname.
+fn host_hostname() -> String {
+    rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn hostname_of(result: &OpResult) -> &str {
+    match ok(result) {
+        Data::Hostname(name) => name,
+        other => panic!("expected a hostname, got {other:?}"),
+    }
+}
+
+#[test]
+fn sandbox_hostname_is_stopit_not_the_hosts() {
+    let f = SpecFixture::new();
+    let (spec, _) = f.compile_with_warnings("");
+    let results = f.session().run(&spec, &[Op::Hostname, read("/etc/hosts")]);
+    assert_eq!(hostname_of(&results[0]), etc::SANDBOX_HOSTNAME);
+    assert_eq!(hostname_of(&results[0]), "stopit");
+    // The synthesized `hosts` names it, and nothing of the host's.
+    let hosts = contents(&results[1]);
+    assert_eq!(hosts, etc::hosts(Some(etc::SANDBOX_HOSTNAME)));
+    let host = host_hostname();
+    if host != "localhost" && host != "stopit" {
+        assert!(!hosts.contains(&host), "{hosts}");
+    }
+}
+
+#[test]
+fn shared_uts_namespace_keeps_the_hosts_hostname() {
+    let f = SpecFixture::new();
+    let spec = f.compile(&config_none(
+        "sandbox.share = [\"uts\"]\nsystem.etc = [\"hosts\"]",
+    ));
+    let results = f.session().run(&spec, &[Op::Hostname, read("/etc/hosts")]);
+    assert_eq!(hostname_of(&results[0]), host_hostname());
+    // `hosts` does not name it, or copy the host's.
+    assert_eq!(contents(&results[1]), etc::hosts(None));
+}
+
+#[test]
+fn glibc_resolves_the_sandbox_hostname_through_the_synthesized_files() {
+    // Runs the host's `getent`, which looks the name up through glibc's NSS,
+    // so `nsswitch.conf` and `hosts` both take part.
+    let dirs = host_tool_dirs();
+    let Some(getent) = host_program("getent", &dirs) else {
+        eprintln!("skipped: no `getent` reachable in {dirs:?}");
+        return;
+    };
+    let ro: Vec<String> = dirs.iter().map(|d| format!("{d:?}")).collect();
+    let f = SpecFixture::new();
+    // `/dev` for the probe's `/dev/null` stdin.
+    let spec = f.compile(&config_none(&format!(
+        "system.dev = \"minimal\"\n\
+         system.etc = [\"hosts\", \"nsswitch.conf\"]\nfs.ro = [{}]",
+        ro.join(", ")
+    )));
+    let results = f.session().run(
+        &spec,
+        &[Op::Exec {
+            path: getent.to_str().unwrap().to_owned(),
+            args: ["hosts", etc::SANDBOX_HOSTNAME].map(str::to_owned).into(),
+            stdin: None,
+        }],
+    );
+    match ok(&results[0]) {
+        Data::Exec(out) => {
+            assert_eq!(out.code, Some(0), "{out:?}");
+            let fields: Vec<&str> = out.stdout.split_whitespace().collect();
+            assert!(
+                fields.contains(&"127.0.0.1") || fields.contains(&"::1"),
+                "{out:?}"
+            );
+            assert!(fields.contains(&etc::SANDBOX_HOSTNAME), "{out:?}");
         }
         other => panic!("expected exec output, got {other:?}"),
     }

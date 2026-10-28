@@ -107,6 +107,12 @@ fn run(op: &Op) -> OpResult {
             pid: std::process::id(),
             ppid: std::os::unix::process::parent_id(),
         })),
+        Op::Hostname => Ok(Data::Hostname(
+            rustix::system::uname()
+                .nodename()
+                .to_string_lossy()
+                .into_owned(),
+        )),
         Op::Mounts => fs::read("/proc/self/mountinfo")
             .map(|bytes| Data::Mounts(String::from_utf8_lossy(&bytes).into_owned()))
             .map_err(op_error),

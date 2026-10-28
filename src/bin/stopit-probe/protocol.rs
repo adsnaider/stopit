@@ -113,6 +113,8 @@ pub enum Op {
     Cwd,
     /// The probe's uid, gid, pid and parent pid.
     Ids,
+    /// The node name `uname(2)` reports: the UTS namespace's hostname.
+    Hostname,
     /// The contents of `/proc/self/mountinfo`, read in full (not capped).
     Mounts,
     /// Runs `path` with `args` (and the probe's environment), feeding it
@@ -165,6 +167,8 @@ pub enum Data {
     Cwd(String),
     /// [`Op::Ids`].
     Ids(Ids),
+    /// [`Op::Hostname`]: the node name.
+    Hostname(String),
     /// [`Op::Mounts`]: the raw contents of `/proc/self/mountinfo`.
     Mounts(String),
     /// [`Op::Exec`].
