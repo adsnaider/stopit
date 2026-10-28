@@ -93,6 +93,11 @@ fn run(op: &Op) -> OpResult {
                 })
                 .collect(),
         )),
+        Op::Argv => Ok(Data::Argv(
+            std::env::args_os()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect(),
+        )),
         Op::Cwd => std::env::current_dir()
             .map(|cwd| Data::Cwd(cwd.to_string_lossy().into_owned()))
             .map_err(op_error),
@@ -623,6 +628,10 @@ mod tests {
             panic!("env failed")
         };
         assert_eq!(env.len(), std::env::vars_os().count());
+        let Ok(Data::Argv(argv)) = run(&Op::Argv) else {
+            panic!("argv failed")
+        };
+        assert_eq!(argv.len(), std::env::args_os().count());
         let Ok(Data::Mounts(mounts)) = run(&Op::Mounts) else {
             panic!("mounts failed")
         };

@@ -107,6 +107,8 @@ pub enum Op {
     },
     /// The probe's whole environment.
     Env,
+    /// The probe's arguments, `argv[0]` included.
+    Argv,
     /// The probe's working directory.
     Cwd,
     /// The probe's uid, gid, pid and parent pid.
@@ -157,6 +159,8 @@ pub enum Data {
     List(Vec<String>),
     /// [`Op::Env`]: every variable.
     Env(BTreeMap<String, String>),
+    /// [`Op::Argv`]: every argument, in order.
+    Argv(Vec<String>),
     /// [`Op::Cwd`]: the working directory.
     Cwd(String),
     /// [`Op::Ids`].

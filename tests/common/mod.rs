@@ -487,6 +487,80 @@ impl SpecFixture {
             provisioned,
         }
     }
+
+    /// A new session in the fixture's runtime directory, with the real
+    /// stopit provisioned as its `stopit`, so `__init` runs in the sandbox.
+    pub fn init_session(&self) -> InitSession {
+        let session = SessionDir::create(Some(self.root.join("runtime").as_os_str())).unwrap();
+        let stopit = Path::new(env!("CARGO_BIN_EXE_stopit"));
+        let provisioned = provision(stopit, session.root())
+            .unwrap_or_else(|e| panic!("provisioning {stopit:?} failed: {e}"));
+        InitSession {
+            session,
+            provisioned,
+        }
+    }
+}
+
+/// A session whose provisioned `stopit` is the real one: its commands run
+/// `stopit __init`, which runs the target.
+pub struct InitSession {
+    pub session: SessionDir,
+    pub provisioned: Provisioned,
+}
+
+impl InitSession {
+    /// The generated invocation of `__init` in `spec`, running `target` with
+    /// the environment `env`, starting in the workspace mount if `spec`
+    /// mounts it (`stopit::bwrap::working_dir`).
+    pub fn command(
+        &self,
+        spec: &SandboxSpec,
+        env: &[(OsString, OsString)],
+        target: &[OsString],
+    ) -> BwrapCommand {
+        let cwd = working_dir(spec, Path::new(WORKSPACE_MOUNT));
+        BwrapCommand::for_init(spec, &self.session, &self.provisioned, &cwd, env, target)
+            .unwrap_or_else(|e| panic!("cannot build the bwrap command: {e}"))
+    }
+
+    /// Runs `target` through `__init` in `spec` with `env` and `stdin`, and
+    /// returns bwrap's output, whatever its status.
+    pub fn run(
+        &self,
+        spec: &SandboxSpec,
+        env: &[(OsString, OsString)],
+        target: &[OsString],
+        stdin: &[u8],
+    ) -> Output {
+        run_bwrap(self.command(spec, env, target).into_command(), Some(stdin))
+    }
+
+    /// Runs the probe command `probe` (see [`probe_at_host_path`]) through
+    /// `__init` in `spec` with `env`, with `ops` as its input.
+    pub fn run_probe(
+        &self,
+        spec: &SandboxSpec,
+        env: &[(OsString, OsString)],
+        probe: &[OsString],
+        ops: &[Op],
+    ) -> Vec<OpResult> {
+        let cmd = self.command(spec, env, probe);
+        let what = format!("bwrap --args {:?} -- {:?}", cmd.args(), cmd.command());
+        let input = serde_json::to_vec(ops).expect("operations serialize");
+        let out = run_bwrap(cmd.into_command(), Some(&input));
+        probe_results(&what, &out, ops)
+    }
+}
+
+/// The provisioned probe (see [`provisioned_probe`]) for running as an
+/// `__init` target: its directory, canonical, which a test exposes to the
+/// sandbox at the same path with an `ro` rule, and the argv that runs it
+/// from there.
+pub fn probe_at_host_path() -> (PathBuf, Vec<OsString>) {
+    let dir = fs::canonicalize(&provisioned_probe().dir).unwrap();
+    let prefix = provisioned_probe().command_prefix(&dir);
+    (dir, prefix)
 }
 
 /// A session whose provisioned `stopit` is the probe. The layout is the

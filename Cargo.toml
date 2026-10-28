@@ -26,6 +26,9 @@ all = { level = "warn", priority = -1 }
 
 [dependencies]
 globset = "0.4.19"
+# `execve`, `close_range`, `prctl` and the signal state `__init` resets before
+# `execve`, none of which rustix offers outside its unstable `runtime` module.
+libc = "0.2.191"
 rustix = { version = "1.1.5", features = ["fs", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

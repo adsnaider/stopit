@@ -22,6 +22,12 @@
 //! child of this process inherits them and every spawn reads them from the
 //! start.
 //!
+//! [`BwrapCommand::for_init`] runs `stopit __init` (step 8): the target's
+//! environment goes in one more sealed memfd, inherited the same way, which
+//! bwrap does not read but passes on to `__init` (it passes every inherited
+//! descriptor through to its command), and whose number `__init` is given
+//! on its argv (`__init --env-fd N -- <cmd…>`).
+//!
 //! bwrap leaves its root tmpfs writable; the last option remounts it
 //! read-only (step 2), so the sandbox writes only where a mount lets it.
 
@@ -41,6 +47,7 @@ use thiserror::Error;
 
 use crate::config::ProviderName;
 use crate::expand::EntryKind;
+use crate::init::{self, EnvError};
 use crate::manifest::{DevMode, ShareableNamespace};
 use crate::policy::PathMode;
 use crate::provision::Provisioned;
@@ -169,6 +176,14 @@ pub enum BwrapError {
     /// filled.
     #[error("cannot create a file descriptor for bwrap's arguments: {0}")]
     DataFd(#[source] io::Error),
+
+    /// The target's environment cannot be handed to `__init`.
+    #[error("cannot pass the environment to the sandbox: {0}")]
+    Env(#[source] EnvError),
+
+    /// `__init` was given no command to run.
+    #[error("no command to run in the sandbox")]
+    NoCommand,
 }
 
 /// The working directory a sandbox starts in: the workspace mount if the
@@ -195,13 +210,47 @@ pub struct BwrapCommand {
     args_fd: OwnedFd,
     /// One memfd per data argument, in the order `args` names them.
     data_fds: Vec<OwnedFd>,
+    /// The memfd holding the target's environment for `__init`, if the
+    /// command runs it ([`for_init`](Self::for_init)).
+    env_fd: Option<OwnedFd>,
 }
 
 impl BwrapCommand {
+    /// Builds the bwrap invocation that runs `stopit __init` in the sandbox
+    /// `spec` of `session`, through the stopit binary `provisioned` into the
+    /// session directory, starting in `cwd` (see [`working_dir`]); `__init`
+    /// then runs `target` (its argv, `target[0]` being the command) with
+    /// exactly the environment `env` (DESIGN.md §6.2 steps 7 and 8, §6.3).
+    ///
+    /// `env` is put in a sealed memfd ([`init::encode_env`]) that bwrap
+    /// passes on to `__init`, whose number the command names:
+    /// `<prefix> __init --env-fd N -- <target…>`. Its names must be
+    /// non-empty, unique and free of `=` and NUL, its values free of NUL.
+    pub fn for_init(
+        spec: &SandboxSpec,
+        session: &SessionDir,
+        provisioned: &Provisioned,
+        cwd: &Path,
+        env: &[(OsString, OsString)],
+        target: &[OsString],
+    ) -> Result<BwrapCommand, BwrapError> {
+        if target.is_empty() {
+            return Err(BwrapError::NoCommand);
+        }
+        let encoded = init::encode_env(env.iter().map(|(k, v)| (k, v))).map_err(BwrapError::Env)?;
+        let env_fd = sealed_memfd("stopit-init-env", &encoded).map_err(BwrapError::DataFd)?;
+        let argv = init::init_argv(env_fd.as_raw_fd(), target);
+        let mut command = Self::new(spec, session, provisioned, cwd, &argv)?;
+        command.env_fd = Some(env_fd);
+        Ok(command)
+    }
+
     /// Builds the bwrap invocation that runs `argv_after_prefix` in the
     /// sandbox `spec` of `session`, through the binary `provisioned` into
-    /// the session directory (normally stopit, which then runs
-    /// `__init -- <cmd…>`), starting in `cwd` (see [`working_dir`]).
+    /// the session directory, starting in `cwd` (see [`working_dir`]).
+    /// [`for_init`](Self::for_init) is what runs stopit's `__init`; this
+    /// runs any provisioned binary with any arguments (the tests run a probe
+    /// in stopit's place).
     ///
     /// Creates each ephemeral mount's backing directory if missing, and the
     /// memfds the arguments name.
@@ -255,6 +304,7 @@ impl BwrapCommand {
             command: plan.command,
             args_fd,
             data_fds,
+            env_fd: None,
         })
     }
 
@@ -273,11 +323,19 @@ impl BwrapCommand {
         self.args_fd.as_raw_fd()
     }
 
+    /// The descriptor holding the target's environment for `__init`, if the
+    /// command runs it ([`for_init`](Self::for_init)).
+    pub fn env_fd(&self) -> Option<RawFd> {
+        self.env_fd.as_ref().map(AsRawFd::as_raw_fd)
+    }
+
     /// Every descriptor bwrap inherits: [`args_fd`](Self::args_fd), then
-    /// the data descriptors in the order the arguments name them.
+    /// the data descriptors in the order the arguments name them, then
+    /// [`env_fd`](Self::env_fd) if any.
     pub fn inherited_fds(&self) -> Vec<RawFd> {
         std::iter::once(&self.args_fd)
             .chain(&self.data_fds)
+            .chain(&self.env_fd)
             .map(AsRawFd::as_raw_fd)
             .collect()
     }
@@ -301,6 +359,7 @@ impl BwrapCommand {
         // Built before the fork: the child must not allocate.
         let mut fds: Vec<(OwnedFd, CString)> = std::iter::once(self.args_fd)
             .chain(self.data_fds)
+            .chain(self.env_fd)
             .map(|fd| {
                 let path = CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd()))
                     .expect("no NUL in a number");
@@ -486,9 +545,9 @@ fn plan(
     // No `--new-session`: `__init` sets up the controlling terminal (§6.3).
     plan.push(["--disable-userns", "--die-with-parent"])?;
 
-    // Step 7: environment. bwrap then sets only `PWD`.
-    // TODO(§6.2 step 8): hand the target's environment to `__init` over an
-    // inherited descriptor once `__init` exists.
+    // Step 7: environment. bwrap then sets only `PWD`, which `__init`
+    // discards; the target's environment reaches `__init` through its own
+    // descriptor (`BwrapCommand::for_init`).
     plan.push(["--clearenv"])?;
     plan.push([OsStr::new("--chdir"), cwd.as_os_str()])?;
 
@@ -1598,5 +1657,120 @@ mod tests {
         let command = cmd.into_command();
         assert_eq!(command.get_program(), BWRAP);
         assert_eq!(command.get_args().collect::<Vec<_>>(), expected);
+    }
+
+    // --- `__init` ---
+
+    fn vars(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+        pairs.iter().map(|&(k, v)| (k.into(), v.into())).collect()
+    }
+
+    fn init_command(
+        f: &Fixture,
+        env: &[(OsString, OsString)],
+        target: &[&str],
+    ) -> Result<BwrapCommand, BwrapError> {
+        let target: Vec<OsString> = target.iter().map(OsString::from).collect();
+        BwrapCommand::for_init(
+            &spec(vec![host("/a", "/h/a", EntryKind::File, Masked)]),
+            &f.session,
+            &f.provisioned,
+            Path::new("/"),
+            env,
+            &target,
+        )
+    }
+
+    #[test]
+    fn for_init_runs_init_with_the_env_fd_on_its_argv() {
+        let f = Fixture::new();
+        let env = vars(&[("PATH", "/bin"), ("A", "x=y z")]);
+        let cmd = init_command(&f, &env, &["sh", "--", "-c"]).unwrap();
+        let env_fd = cmd.env_fd().expect("an environment descriptor");
+        assert_eq!(
+            cmd.command(),
+            [
+                "/run/stopit/lib/ld.so",
+                "--library-path",
+                "/run/stopit/lib",
+                "/run/stopit/stopit",
+                "__init",
+                "--env-fd",
+                &env_fd.to_string(),
+                "--",
+                "sh",
+                "--",
+                "-c",
+            ]
+        );
+        // Inherited last, after the `--args` and data descriptors, all
+        // distinct.
+        let fds = cmd.inherited_fds();
+        assert_eq!(fds.len(), 3);
+        assert_eq!(fds.last(), Some(&env_fd));
+        assert_eq!(fds.iter().collect::<BTreeSet<_>>().len(), 3);
+        assert!(env_fd >= MIN_FD);
+        // bwrap does not read it: no argument names it.
+        let number = OsString::from(env_fd.to_string());
+        assert!(!cmd.args().contains(&number));
+
+        assert_eq!(read_fd(env_fd), b"PATH=/bin\0A=x=y z\0");
+        // SAFETY: `cmd` owns `env_fd` and outlives the borrow.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(env_fd) };
+        assert!(
+            rustix::io::fcntl_getfd(borrowed)
+                .unwrap()
+                .contains(rustix::io::FdFlags::CLOEXEC)
+        );
+        let seals = rustix::fs::fcntl_get_seals(borrowed).unwrap();
+        assert!(seals.contains(SealFlags::WRITE | SealFlags::GROW | SealFlags::SEAL));
+
+        // And it reaches the child with the others.
+        let command = cmd.into_command();
+        assert_eq!(
+            command.get_args().nth(3),
+            Some(OsStr::new("/run/stopit/lib/ld.so"))
+        );
+    }
+
+    #[test]
+    fn for_init_with_an_empty_environment() {
+        let f = Fixture::new();
+        let cmd = init_command(&f, &[], &["/bin/true"]).unwrap();
+        assert_eq!(read_fd(cmd.env_fd().unwrap()), b"");
+    }
+
+    #[test]
+    fn new_has_no_env_fd() {
+        let f = Fixture::new();
+        let cmd = f.command(&SandboxSpec::default());
+        assert_eq!(cmd.env_fd(), None);
+        assert_eq!(cmd.inherited_fds(), [cmd.args_fd()]);
+    }
+
+    #[test]
+    fn for_init_refuses_an_invalid_environment_or_no_command() {
+        let f = Fixture::new();
+        for (env, expected) in [
+            (vars(&[("", "x")]), EnvError::EmptyKey),
+            (vars(&[("A=B", "x")]), EnvError::KeyHasEquals("A=B".into())),
+            (
+                vars(&[("A", "1"), ("A", "2")]),
+                EnvError::Duplicate("A".into()),
+            ),
+            (
+                vec![("A".into(), OsString::from_vec(b"x\0y".to_vec()))],
+                EnvError::Nul("A".into()),
+            ),
+        ] {
+            match init_command(&f, &env, &["cmd"]) {
+                Err(BwrapError::Env(e)) => assert_eq!(e, expected),
+                other => panic!("expected an environment error, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            init_command(&f, &[], &[]),
+            Err(BwrapError::NoCommand)
+        ));
     }
 }

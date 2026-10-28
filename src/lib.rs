@@ -6,6 +6,7 @@ pub mod bwrap;
 pub mod config;
 pub mod error;
 pub mod expand;
+pub mod init;
 pub mod manifest;
 pub mod policy;
 pub mod provider;

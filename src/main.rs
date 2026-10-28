@@ -8,6 +8,11 @@ fn main() -> ExitCode {
             println!("stopit {}", stopit::VERSION);
             ExitCode::SUCCESS
         }
+        // The init helper, run by bwrap inside every sandbox (DESIGN.md
+        // §6.3). Returns only on failure.
+        [subcommand, rest @ ..] if subcommand == stopit::init::SUBCOMMAND => {
+            ExitCode::from(stopit::init::run(rest))
+        }
         _ => {
             eprintln!("usage: stopit --version");
             ExitCode::from(2)
