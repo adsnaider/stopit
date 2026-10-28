@@ -21,6 +21,7 @@ pub mod session;
 pub mod spec;
 pub mod state;
 pub mod supervisor;
+pub mod trust;
 
 /// The version of the `stopit` crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

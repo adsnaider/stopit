@@ -15,7 +15,7 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -47,7 +47,7 @@ impl Setup {
         Setup { _dir: dir, root }
     }
 
-    /// With `.stopit.toml` holding [`probe_config`] plus `extra`.
+    /// With `.stopit.toml` holding [`probe_config`] plus `extra`, allowed.
     fn with_config(extra: &str) -> Self {
         let s = Self::new();
         s.write_config(extra);
@@ -62,16 +62,43 @@ impl Setup {
         self.root.join("runtime")
     }
 
+    fn config_path(&self) -> PathBuf {
+        self.ws().join(".stopit.toml")
+    }
+
+    /// Writes [`probe_config`] plus `extra` as `.stopit.toml`, and allows
+    /// it.
     fn write_config(&self, extra: &str) {
         self.write_raw_config(&probe_config(extra));
     }
 
-    /// Writes `contents` as `.stopit.toml`, private to the user whatever the
-    /// umask (stopit refuses one others can write).
+    /// Writes `contents` as `.stopit.toml` ([`write_unallowed`]), and
+    /// allows it with `stopit allow` ([`allow`](Self::allow)).
     fn write_raw_config(&self, contents: &str) {
-        let path = self.ws().join(".stopit.toml");
+        self.write_unallowed(contents);
+        self.allow(&[]);
+    }
+
+    /// Writes `contents` as `.stopit.toml`, private to the user whatever the
+    /// umask (stopit refuses one others can write), without allowing it.
+    fn write_unallowed(&self, contents: &str) {
+        let path = self.config_path();
         fs::write(&path, contents).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    /// `stopit allow <options…>` from the workspace, which must succeed;
+    /// returns what it printed.
+    fn allow(&self, options: &[&str]) -> String {
+        let out = output(self.stopit(&[&["allow"][..], options].concat()), b"");
+        assert_eq!(code(&out), 0, "{out:?}");
+        assert_eq!(stderr(&out), "", "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// The trust store's file.
+    fn store_file(&self) -> PathBuf {
+        self.state_dir().join(stopit::trust::STORE_FILE)
     }
 
     /// stopit's data directory, set with `STOPIT_STATE_DIR`, so that no test
@@ -344,25 +371,30 @@ fn the_workspace_option_is_canonicalized() {
     assert_eq!(stat_data(&results[1]).size, 0, "{results:?}");
 }
 
+/// Checks that `out` is the default base failing to find the probe, which
+/// it does not grant.
+#[track_caller]
+fn assert_default_base_ran(out: &Output) {
+    assert_eq!(code(out), 127, "{out:?}");
+    assert!(stderr(out).starts_with("stopit __init: "), "{out:?}");
+    assert!(stderr(out).contains("No such file or directory"), "{out:?}");
+}
+
 #[test]
-fn no_configuration_is_refused_and_nothing_runs() {
-    // Else a sandbox could create the `.stopit.toml` that the next run loads.
+fn no_configuration_runs_the_default_base_in_the_cwd() {
+    // Without a `.stopit.toml` the default base applies, with nothing to
+    // allow.
     let s = Setup::new();
     let out = output(s.run_probe_command(&[]), b"[]");
-    assert_eq!(code(&out), 125, "{out:?}");
-    let ws = s.ws().display().to_string();
-    assert_eq!(
-        stderr(&out),
-        format!(
-            "stopit: error: no .stopit.toml in {ws} or any directory above it. A configuration \
-             is required so that a sandbox cannot create one for later runs: create an empty \
-             one (touch {ws}/.stopit.toml) to use the default configuration, or pass \
-             --workspace.\n"
-        )
-    );
-    assert!(out.stdout.is_empty(), "{out:?}");
-    // Not even the session directory was created.
-    assert!(!s.runtime().join("stopit").exists());
+    assert_default_base_ran(&out);
+    assert!(s.no_session_left());
+    // `--workspace` does not look up: `sub` has none of its own, though the
+    // directory above it has one, which is not allowed.
+    s.write_unallowed("base = \"none\"\n");
+    fs::create_dir(s.ws().join("sub")).unwrap();
+    let out = output(s.run_probe_command(&["--workspace", "sub"]), b"[]");
+    assert_default_base_ran(&out);
+    assert!(s.no_session_left());
 }
 
 #[test]
@@ -371,33 +403,271 @@ fn an_empty_configuration_runs_the_default_base() {
     let s = Setup::new();
     s.write_raw_config("");
     let out = output(s.run_probe_command(&[]), b"[]");
-    assert_eq!(code(&out), 127, "{out:?}");
-    assert!(stderr(&out).starts_with("stopit __init: "), "{out:?}");
-    assert!(
-        stderr(&out).contains("No such file or directory"),
+    assert_default_base_ran(&out);
+    assert!(s.no_session_left());
+}
+
+// --- Trust on first use ---
+
+/// A script provider at `script` that creates `marker` when it runs.
+fn marking_script(script: &Path, marker: &Path) -> String {
+    fs::write(
+        script,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nprintf '{{\"version\":1}}'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(script, fs::Permissions::from_mode(0o755)).unwrap();
+    format!(
+        "[[provider]]\ntype = \"script\"\nname = \"mark\"\nsource = \"{}\"\n",
+        script.display()
+    )
+}
+
+/// What `stopit` prints when it refuses `config` as not allowed: new (or
+/// revoked), or `changed`, with the `allow` command to run.
+fn not_allowed(config: &Path, changed: bool, allow: &str) -> String {
+    let what = if changed {
+        "it changed since it was last allowed"
+    } else {
+        "it is new: it has not been allowed, or was revoked"
+    };
+    format!(
+        "stopit: error: refusing to use {config:?}: {what}. stopit only uses a configuration \
+         you allowed, as it was when you allowed it, since it decides what the sandbox may do \
+         and which scripts run on the host; review it, then run `{allow}`\n"
+    )
+}
+
+#[test]
+fn a_configuration_runs_only_once_allowed_and_as_allowed() {
+    let s = Setup::new();
+    let marker = s.root.join("ran");
+    let script = marking_script(&s.root.join("mark.sh"), &marker);
+    s.write_unallowed(&probe_config(&script));
+    let config = s.config_path();
+
+    // Not allowed: refused before any provider runs or the session
+    // directory is created.
+    let out = output(s.run_probe_command(&[]), b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert_eq!(stderr(&out), not_allowed(&config, false, "stopit allow"));
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert!(!marker.exists(), "the script provider ran");
+    assert!(!s.runtime().join("stopit").exists());
+    // The store's directory exists, private, but holds nothing yet.
+    let mode = |p: &PathBuf| fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode(&s.state_dir()), 0o700);
+    assert!(!s.store_file().exists());
+
+    // Allowed, it runs.
+    let bytes = fs::read(&config).unwrap();
+    let hash = stopit::trust::sha256_hex(&bytes);
+    assert_eq!(
+        s.allow(&[]),
+        format!("allowed {config:?} (sha256 {})\n", &hash[..12])
+    );
+    assert_eq!(mode(&s.state_dir()), 0o700);
+    assert_eq!(mode(&s.store_file()), 0o600);
+    s.probe(&[], &[]);
+    assert!(marker.exists());
+    fs::remove_file(&marker).unwrap();
+    // `allowed` lists it.
+    let out = output(s.stopit(&["allowed"]), b"");
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{} {config:?}\n", &hash[..12])
+    );
+
+    // Changed by a single byte, it is refused again.
+    let mut edited = bytes.clone();
+    edited.push(b'\n');
+    fs::write(&config, &edited).unwrap();
+    let out = output(s.run_probe_command(&[]), b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert_eq!(stderr(&out), not_allowed(&config, true, "stopit allow"));
+    assert!(!marker.exists(), "the script provider ran");
+    assert!(s.no_session_left());
+    // Allowed again, it runs.
+    s.allow(&[]);
+    s.probe(&[], &[]);
+    assert!(marker.exists());
+    fs::remove_file(&marker).unwrap();
+
+    // Revoked, it is refused again; a second revoke has nothing to do.
+    let out = output(s.stopit(&["revoke"]), b"");
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("revoked {config:?}\n")
+    );
+    let out = output(s.run_probe_command(&[]), b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert_eq!(stderr(&out), not_allowed(&config, false, "stopit allow"));
+    assert!(!marker.exists(), "the script provider ran");
+    let out = output(s.stopit(&["revoke"]), b"");
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{config:?} was not allowed: nothing to revoke\n")
+    );
+    let out = output(s.stopit(&["allowed"]), b"");
+    assert_eq!(
+        (code(&out), out.stdout.as_slice()),
+        (0, &b""[..]),
         "{out:?}"
+    );
+}
+
+#[test]
+fn allow_needs_a_configuration_and_a_valid_one() {
+    let s = Setup::new();
+    let out = output(s.stopit(&["allow"]), b"");
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "stopit: error: no .stopit.toml in {} or any directory above it: there is nothing \
+             to allow\n",
+            s.ws().display()
+        )
+    );
+    // Invalid: refused, so that the mistake shows now.
+    s.write_unallowed("bogus = 1\n");
+    let out = output(s.stopit(&["allow"]), b"");
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert!(stderr(&out).contains("bogus"), "{out:?}");
+    assert!(!s.store_file().exists());
+    // So is one others can write, as `run` refuses it.
+    s.write_unallowed("");
+    fs::set_permissions(s.config_path(), fs::Permissions::from_mode(0o666)).unwrap();
+    let out = output(s.stopit(&["allow"]), b"");
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert!(
+        stderr(&out).contains("writable by its group or others"),
+        "{out:?}"
+    );
+    assert!(!s.store_file().exists());
+}
+
+#[test]
+fn a_configuration_planted_for_the_workspace_option_is_refused() {
+    // `--workspace` does not check for nested configurations, but one the
+    // sandbox wrote was never allowed.
+    let s = Setup::with_config("");
+    let marker = s.root.join("ran");
+    let planted = marking_script(&s.root.join("mark.sh"), &marker);
+    let results = s.probe(
+        &[],
+        &[
+            mkdir("/workspace/sub"),
+            chmod("/workspace/sub", 0o755),
+            write("/workspace/sub/.stopit.toml", &planted),
+            chmod("/workspace/sub/.stopit.toml", 0o644),
+        ],
+    );
+    for r in &results {
+        assert_eq!(ok(r), &Data::Done, "{results:?}");
+    }
+    let sub = s.ws().join("sub");
+    let out = output(s.run_probe_command(&["--workspace", "sub"]), b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert_eq!(
+        stderr(&out),
+        not_allowed(
+            &sub.join(".stopit.toml"),
+            false,
+            &format!("stopit allow --workspace {}", sub.display())
+        )
+    );
+    assert!(!marker.exists(), "the planted script provider ran");
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn a_configuration_planted_outside_any_workspace_is_refused() {
+    // A writable grant of a directory that is no workspace: no outer
+    // configuration protects it, so the nested-configuration rule does not
+    // apply, but what the sandbox plants there was never allowed.
+    let s = Setup::new();
+    let other = s.root.join("other");
+    fs::create_dir(&other).unwrap();
+    fs::set_permissions(&other, fs::Permissions::from_mode(0o755)).unwrap();
+    s.write_config(&format!("fs.rw = [{other:?}]"));
+    let marker = s.root.join("ran");
+    let planted = marking_script(&s.root.join("mark.sh"), &marker);
+    // Private, whatever the umask, so that only the trust store refuses it.
+    let results = s.probe(
+        &[],
+        &[
+            write(other.join(".stopit.toml"), &planted),
+            chmod(other.join(".stopit.toml"), 0o644),
+        ],
+    );
+    for r in &results {
+        assert_eq!(ok(r), &Data::Done, "{results:?}");
+    }
+    // The user later runs from there.
+    let mut command = s.run_probe_command(&[]);
+    command.current_dir(&other);
+    let out = output(command, b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert_eq!(
+        stderr(&out),
+        not_allowed(&other.join(".stopit.toml"), false, "stopit allow")
+    );
+    assert!(!marker.exists(), "the planted script provider ran");
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn a_read_only_grant_containing_the_trust_store_masks_it() {
+    // It lists the user's projects.
+    let s = Setup::new();
+    let state = s.state_dir().parent().unwrap().to_path_buf();
+    fs::create_dir(&state).unwrap();
+    s.write_config(&format!(
+        "[[provider]]\ntype = \"config\"\nname = \"state\"\n[provider.sandbox]\n\
+         fs.ro = [{state:?}]"
+    ));
+    assert!(s.store_file().exists());
+    let store = s.state_dir();
+    let ops = [list(&state), list(&store)];
+    let command = s.run_probe_command(&[]);
+    let what = format!("{command:?}");
+    let out = output(command, &serde_json::to_vec(&ops).unwrap());
+    let results = probe_results(&what, &out, &ops);
+    assert_eq!(ok(&results[0]), &Data::List(vec!["stopit".into()]));
+    assert_eq!(ok(&results[1]), &Data::List(vec![]));
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "stopit: warning: provider \"state\": ro mount of {state:?} at {state:?} contains \
+             stopit's data directory {store:?}, which holds stopit's persistent state, such as \
+             which configurations you allowed, so it is masked at {store:?}; grant narrower \
+             paths that leave it out to silence this\n"
+        )
     );
     assert!(s.no_session_left());
 }
 
 #[test]
-fn the_workspace_option_needs_a_configuration_in_the_directory_too() {
-    // `--workspace` does not look up: `sub` has none of its own, though the
-    // directory above it does.
+fn a_trust_store_others_can_read_is_refused() {
     let s = Setup::with_config("");
-    fs::create_dir(s.ws().join("sub")).unwrap();
-    let out = output(s.run_probe_command(&["--workspace", "sub"]), b"[]");
+    fs::set_permissions(s.store_file(), fs::Permissions::from_mode(0o644)).unwrap();
+    let out = output(s.run_probe_command(&[]), b"[]");
     assert_eq!(code(&out), 125, "{out:?}");
-    let sub = s.ws().join("sub").display().to_string();
-    let err = stderr(&out);
-    assert!(
-        err.starts_with(&format!(
-            "stopit: error: no .stopit.toml in the workspace {sub}."
-        )),
-        "{err}"
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "stopit: error: refusing to read the trust store {:?}: it is accessible to its \
+             group or others (mode 0644); run `chmod 600` on it\n",
+            s.store_file()
+        )
     );
-    assert!(err.contains(&format!("touch {sub}/.stopit.toml")), "{err}");
-    assert!(out.stdout.is_empty(), "{out:?}");
     assert!(!s.runtime().join("stopit").exists());
 }
 
@@ -651,31 +921,22 @@ fn a_writable_grant_containing_the_data_directory_is_refused_and_nothing_runs() 
         )
     };
     // The data directory is `STOPIT_STATE_DIR`, not in `HOME` (which points
-    // elsewhere): a grant of its parent is refused, whether or not it
-    // exists yet.
+    // elsewhere): a grant of its parent is refused. (It exists: `allow`
+    // created it, as every run does.)
     let s = Setup::new();
     let data = s.state_dir();
     let parent = data.parent().unwrap().to_path_buf();
-    fs::create_dir(&parent).unwrap();
     s.write_config(&format!("fs.rw = [{parent:?}]"));
-    for exists in [false, true] {
-        if exists {
-            fs::create_dir(&data).unwrap();
-        }
-        let out = output(s.run_probe_command(&[]), b"[]");
-        assert_eq!(code(&out), 125, "{out:?}");
-        assert_eq!(
-            stderr(&out),
-            message(&parent, parent.to_str().unwrap(), &data)
-        );
-        assert!(out.stdout.is_empty(), "{out:?}");
-        assert!(s.no_session_left());
-        if exists {
-            assert_eq!(fs::read_dir(&data).unwrap().count(), 0);
-        } else {
-            assert!(!data.exists());
-        }
-    }
+    let store = fs::read(s.store_file()).unwrap();
+    let out = output(s.run_probe_command(&[]), b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert_eq!(
+        stderr(&out),
+        message(&parent, parent.to_str().unwrap(), &data)
+    );
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert!(s.no_session_left());
+    assert_eq!(fs::read(s.store_file()).unwrap(), store);
     // `~` is fine: the data directory is never taken from `HOME`. (The
     // default base's ephemeral `~` would win over it, so without it.)
     let home = s.root.join("home");
@@ -772,8 +1033,15 @@ fn a_warning_is_printed_once_and_base_missing_paths_not_at_all() {
 
 #[test]
 fn an_invalid_configuration_is_an_error_naming_the_file() {
+    // `stopit allow` refuses an invalid configuration, so it is allowed
+    // through the trust store directly, as if it had been valid.
     let s = Setup::new();
-    s.write_raw_config("bogus = \"\x1b]52;c;aGk=\x07\"\n");
+    let contents = "bogus = \"\x1b]52;c;aGk=\x07\"\n";
+    s.write_unallowed(contents);
+    stopit::trust::TrustStore::open(&s.state_dir())
+        .unwrap()
+        .update(|a| a.allow(s.config_path(), contents.as_bytes()))
+        .unwrap();
     let out = output(s.stopit(&["run", "true"]), b"");
     assert_eq!(code(&out), 125, "{out:?}");
     let err = stderr(&out);

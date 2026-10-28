@@ -1,5 +1,6 @@
 //! The command line of `stopit` (DESIGN.md §5): `stopit run`, `stopit
-//! shell` and `--version`.
+//! shell`, the trust store's `stopit allow`, `revoke` and `allowed` (§3),
+//! and `--version`.
 //!
 //! The internal `stopit __init` (§6.3) is not part of it: `main` dispatches
 //! it before this parser runs, so its argv contract (`__init --env-fd N --
@@ -49,19 +50,44 @@ pub enum CliCommand {
         #[command(flatten)]
         session: SessionArgs,
     },
+    /// Allow the workspace's `.stopit.toml` as it is now. Review it first:
+    /// it decides what the sandbox may do and which scripts run on the host.
+    Allow {
+        /// Which workspace.
+        #[command(flatten)]
+        workspace: WorkspaceArg,
+    },
+    /// Stop allowing the workspace's `.stopit.toml`.
+    Revoke {
+        /// Which workspace.
+        #[command(flatten)]
+        workspace: WorkspaceArg,
+    },
+    /// List the configurations you allowed.
+    Allowed,
 }
 
 /// The options `run` and `shell` share.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
 pub struct SessionArgs {
     /// The workspace directory [default: the nearest directory, from the
-    /// current one up, containing `.stopit.toml`; it is an error if there is
-    /// none]. The directory needs its own `.stopit.toml`.
+    /// current one up, containing `.stopit.toml`, else the current
+    /// directory].
     #[arg(long, value_name = "DIR")]
     pub workspace: Option<PathBuf>,
     /// The profile to run in [default: main].
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
+}
+
+/// The workspace option of `allow` and `revoke`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+pub struct WorkspaceArg {
+    /// The workspace directory [default: the nearest directory, from the
+    /// current one up, containing `.stopit.toml`, else the current
+    /// directory], found as `run` finds it.
+    #[arg(long, value_name = "DIR")]
+    pub workspace: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -191,6 +217,40 @@ mod tests {
                 command: vec![odd.clone(), odd],
             }
         );
+    }
+
+    #[test]
+    fn allow_and_revoke_take_only_the_workspace() {
+        let ws = |dir: Option<&str>| WorkspaceArg {
+            workspace: dir.map(PathBuf::from),
+        };
+        assert_eq!(
+            parse(&["allow"]).unwrap(),
+            CliCommand::Allow {
+                workspace: ws(None)
+            }
+        );
+        assert_eq!(
+            parse(&["allow", "--workspace", "w"]).unwrap(),
+            CliCommand::Allow {
+                workspace: ws(Some("w"))
+            }
+        );
+        assert_eq!(
+            parse(&["revoke", "--workspace=w"]).unwrap(),
+            CliCommand::Revoke {
+                workspace: ws(Some("w"))
+            }
+        );
+        assert_eq!(parse(&["allowed"]).unwrap(), CliCommand::Allowed);
+        for args in [
+            &["allow", "x"][..],
+            &["allow", "--profile", "p"],
+            &["revoke", "--workspace"],
+            &["allowed", "--workspace", "w"],
+        ] {
+            assert_eq!(parse(args).unwrap_err().exit_code(), 2, "{args:?}");
+        }
     }
 
     #[test]

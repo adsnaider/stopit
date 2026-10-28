@@ -285,8 +285,8 @@ fn check_owned_dir(dir: &Path) -> Result<fs::Metadata, SessionError> {
 }
 
 /// Checks that `dir` is a real directory (not a link), owned by the current
-/// user, and not accessible to group or others.
-fn check_private_dir(dir: &Path) -> Result<(), SessionError> {
+/// user, and not accessible to group or others, and returns its metadata.
+pub(crate) fn check_private_dir(dir: &Path) -> Result<fs::Metadata, SessionError> {
     let meta = check_owned_dir(dir)?;
     let mode = meta.mode() & 0o7777;
     if mode & 0o077 != 0 {
@@ -295,7 +295,7 @@ fn check_private_dir(dir: &Path) -> Result<(), SessionError> {
             mode,
         });
     }
-    Ok(())
+    Ok(meta)
 }
 
 /// A random session id: [`ID_BYTES`] bytes from the kernel, hex-encoded.
