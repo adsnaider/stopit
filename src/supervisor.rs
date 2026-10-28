@@ -1,0 +1,1271 @@
+//! The supervisor: `stopit run` and `stopit shell` (DESIGN.md §2, §5).
+//!
+//! [`run`] runs one command in one sandbox, in the foreground:
+//!
+//! 1. finds the workspace and its `.stopit.toml` ([`discover_workspace`],
+//!    §3.1) and loads the configuration (the default one if there is
+//!    none);
+//! 2. creates the session directory (§2.1), which the providers are told
+//!    about;
+//! 3. runs the providers, compiles every profile of the session
+//!    (`spec::compile_session`) and prints its warnings ([`warning_lines`]);
+//! 4. picks the profile (`main`, or `--profile`, §3.3);
+//! 5. provisions itself into the session directory (§2.1), computes the
+//!    target's environment from its own (§9), and runs bwrap with `__init`
+//!    and the command, on the supervisor's own stdio ([`wait_foreground`]);
+//! 6. waits for it, restores the terminal's state, removes the session
+//!    directory, and exits with the command's status ([`exit_code`]).
+//!
+//! `SIGINT`, `SIGQUIT`, `SIGTERM` and `SIGHUP` are caught from the start
+//! ([`catch_signals`]): before bwrap is spawned, one ends the run (after
+//! removing the session directory) with `128 + N`; while it runs, they are
+//! forwarded to it.
+//!
+//! Errors are printed as `stopit: error: …` and exit with
+//! [`EXIT_SUPERVISOR_FAILED`]; warnings as `stopit: warning: …`. Every line
+//! is escaped ([`escape_message`]): configuration, scripts and the
+//! filesystem (often sandbox-writable) put text in them. bwrap's own
+//! messages are not stopit's, and are not escaped.
+//!
+//! Not done yet: the PTY proxy (§5; until then the sandbox runs on the host's
+//! terminal, see [`TerminalSession`]), the startup summary of widening
+//! grants (§3), the user-global configuration layered under `.stopit.toml`
+//! (§3), the refusal of a default base with no user provider granting tools
+//! (§3.2), protecting script providers' sources (§3.6), the broker,
+//! protected files and the network proxy.
+
+use std::collections::HashSet;
+use std::ffi::OsString;
+use std::fs::{self, File};
+use std::io::{self, IsTerminal, Read};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::{Path, PathBuf};
+use std::process::{ExitCode, ExitStatus};
+use std::sync::atomic::{AtomicI32, Ordering};
+
+use rustix::io::Errno;
+use rustix::process::Pid;
+use rustix::termios::Termios;
+use thiserror::Error;
+
+use crate::bwrap::{BwrapCommand, BwrapError, TerminalSession, working_dir};
+use crate::config::{Base, Config, ConfigError, ProfileRef};
+use crate::escape::escape_message;
+use crate::expand::{ExpandError, ExpansionContext, ResolveWarning};
+use crate::manifest::SandboxHome;
+use crate::provider::{BASE_PROVIDER_NAME, ProviderContext, ProviderError, session_providers};
+use crate::provision::{ProvisionError, provision_self};
+use crate::resolve::{PlanWarning, PlanWarningKind};
+use crate::session::{SessionDir, SessionError};
+use crate::spec::{CompileError, CompiledSession, SpecWarning, compile_session};
+
+/// The name of the configuration file that marks a workspace (§3.1).
+pub const CONFIG_FILE: &str = ".stopit.toml";
+
+/// The exit status when the supervisor itself fails, before or around the
+/// command (bad configuration, no `XDG_RUNTIME_DIR`, bwrap missing), as
+/// `env` and `timeout` report theirs. The command can exit with it too.
+pub const EXIT_SUPERVISOR_FAILED: u8 = 125;
+
+/// Error running a command in the sandbox.
+#[derive(Debug, Error)]
+pub enum RunError {
+    /// The current directory cannot be determined.
+    #[error("cannot determine the current directory: {0}")]
+    Cwd(#[source] io::Error),
+
+    /// The workspace directory cannot be resolved.
+    #[error("cannot resolve the workspace {path:?}: {source}")]
+    Workspace {
+        /// The workspace as given.
+        path: PathBuf,
+        /// The underlying error.
+        source: io::Error,
+    },
+
+    /// The workspace is not a directory.
+    #[error("the workspace {0:?} is not a directory")]
+    WorkspaceNotDir(PathBuf),
+
+    /// Looking for the configuration file failed for another reason than
+    /// its absence.
+    #[error("cannot check for {path:?}: {source}")]
+    Discover {
+        /// The candidate configuration file.
+        path: PathBuf,
+        /// The underlying error.
+        source: io::Error,
+    },
+
+    /// The configuration file cannot be read.
+    #[error("cannot read {path:?}: {source}")]
+    ReadConfig {
+        /// The configuration file.
+        path: PathBuf,
+        /// The underlying error.
+        source: io::Error,
+    },
+
+    /// The configuration file, or its directory, could be changed by someone
+    /// else than the user ([`check_config_trust`]).
+    #[error("refusing to read {path:?}: {reason}")]
+    UntrustedConfig {
+        /// The configuration file.
+        path: PathBuf,
+        /// What is wrong with it.
+        reason: String,
+    },
+
+    /// The configuration file is invalid.
+    #[error("{path:?}: {source}")]
+    Config {
+        /// The configuration file.
+        path: PathBuf,
+        /// What is wrong with it.
+        source: ConfigError,
+    },
+
+    /// `HOME` is not set, so `~` rules cannot be expanded.
+    #[error("HOME is not set; stopit needs it to expand `~` in rules")]
+    HomeUnset,
+
+    /// `HOME` cannot be resolved.
+    #[error("cannot resolve HOME {path:?}: {source}")]
+    Home {
+        /// The value of `HOME`.
+        path: PathBuf,
+        /// The underlying error.
+        source: io::Error,
+    },
+
+    /// The workspace or `HOME` cannot be used to expand rules.
+    #[error(transparent)]
+    Expand(#[from] ExpandError),
+
+    /// `stopit shell` without `SHELL` in the environment.
+    #[error("SHELL is not set; run a shell explicitly with `stopit run <shell>`")]
+    ShellUnset,
+
+    /// `--profile` is not a profile name.
+    #[error("invalid profile name {name:?}: {reason}")]
+    ProfileName {
+        /// The name as given.
+        name: String,
+        /// Why it is invalid.
+        reason: String,
+    },
+
+    /// The session directory cannot be created.
+    #[error(transparent)]
+    Session(#[from] SessionError),
+
+    /// A provider failed.
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
+
+    /// The profiles do not compile.
+    #[error(transparent)]
+    Compile(#[from] CompileError),
+
+    /// `--profile` names no profile of the session.
+    #[error("there is no profile {name:?}; the profiles are: {available}")]
+    UnknownProfile {
+        /// The profile asked for.
+        name: String,
+        /// Every profile of the session, comma-separated.
+        available: String,
+    },
+
+    /// stopit cannot copy itself into the session directory.
+    #[error("cannot provision stopit into the session directory: {0}")]
+    Provision(#[from] ProvisionError),
+
+    /// The bwrap command cannot be built.
+    #[error(transparent)]
+    Bwrap(#[from] BwrapError),
+
+    /// bwrap is not installed.
+    #[error("bwrap (bubblewrap) is not installed or not on PATH")]
+    BwrapMissing,
+
+    /// bwrap cannot be started or waited for.
+    #[error("cannot run bwrap: {0}")]
+    Spawn(#[source] io::Error),
+
+    /// The signal handlers cannot be installed.
+    #[error("cannot set up signal handling: {0}")]
+    Signals(#[source] io::Error),
+
+    /// stdio is the controlling terminal, and stopit is not in its
+    /// foreground process group.
+    #[error(
+        "stopit is not in the foreground of its terminal (started in the background?); until \
+         stopit runs the sandbox on a terminal of its own, it only starts in the foreground"
+    )]
+    Background,
+
+    /// Whether stopit is in the foreground of its terminal cannot be told.
+    #[error("cannot check that stopit is in the foreground of its terminal: {0}")]
+    Foreground(#[source] io::Error),
+}
+
+/// What [`run`] runs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Invocation {
+    /// `--workspace`, if given.
+    pub workspace: Option<PathBuf>,
+    /// `--profile`, if given.
+    pub profile: Option<String>,
+    /// The command and its arguments.
+    pub command: Vec<OsString>,
+}
+
+/// The command `stopit shell` runs: `$SHELL` from the host environment,
+/// given as `shell`.
+pub fn shell_command(shell: Option<OsString>) -> Result<Vec<OsString>, RunError> {
+    match shell {
+        Some(shell) if !shell.is_empty() => Ok(vec![shell]),
+        _ => Err(RunError::ShellUnset),
+    }
+}
+
+/// Prints `stopit: error: <message>` to stderr, escaped.
+pub fn print_error(message: &str) {
+    eprintln!("stopit: error: {}", escape_message(message));
+}
+
+/// Prints `stopit: warning: <message>` to stderr, escaped.
+fn print_warning(message: &str) {
+    eprintln!("stopit: warning: {}", escape_message(message));
+}
+
+/// Runs `invocation` in the sandbox and returns the status to exit with:
+/// the command's (see [`exit_code`]), `128 + N` if signal `N` stopped the
+/// supervisor before the command started, or [`EXIT_SUPERVISOR_FAILED`]
+/// after printing why the supervisor failed (`128 + N` instead if a signal
+/// arrived meanwhile, which may be why: Ctrl-C during a script provider).
+///
+/// Returns rather than exiting, so that the session directory is removed
+/// (dropped) before the process ends.
+pub fn run(invocation: Invocation) -> ExitCode {
+    match supervise(invocation) {
+        Ok(code) => code,
+        Err(e) => {
+            print_error(&e.to_string());
+            match take_signal() {
+                Some(signal) => ExitCode::from(signal_exit_code(signal)),
+                None => ExitCode::from(EXIT_SUPERVISOR_FAILED),
+            }
+        }
+    }
+}
+
+fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
+    catch_signals().map_err(RunError::Signals)?;
+    let cwd = std::env::current_dir().map_err(RunError::Cwd)?;
+    let workspace = discover_workspace(&cwd, invocation.workspace.as_deref())?;
+    let config = workspace.load_config()?;
+    // TODO(§3): layer `.stopit.toml` over the user-global configuration.
+    let home = host_home(std::env::var_os("HOME"))?;
+    let mount = config.workspace.mount.clone();
+    let ctx = ExpansionContext::new(
+        workspace.dir.clone(),
+        mount.clone(),
+        home.clone(),
+        SandboxHome::default(),
+    )?;
+    let profile = match &invocation.profile {
+        None => ProfileRef::main(),
+        Some(name) => name.parse().map_err(|e| RunError::ProfileName {
+            name: name.clone(),
+            reason: format!("{e}"),
+        })?,
+    };
+
+    // Before the providers, which are told where it is. From here on,
+    // returning removes it.
+    let session = SessionDir::create_from_env()?;
+    let pctx = ProviderContext {
+        workspace: workspace.dir.clone(),
+        workspace_mount: mount.clone(),
+        home,
+        session_dir: session.root().to_path_buf(),
+    };
+    // Relative script sources are resolved against the configuration
+    // file's directory: the workspace, by construction.
+    // TODO(§3.6): protect script providers' sources (`protected_paths`).
+    let outputs = session_providers(&config, &workspace.dir)?
+        .iter()
+        .map(|p| Ok((p.name().clone(), p.manifest(&pctx)?)))
+        .collect::<Result<Vec<_>, ProviderError>>()?;
+    let compiled = compile_session(&config, outputs, &ctx)?;
+    for line in warning_lines(&compiled, config.base) {
+        print_warning(&line);
+    }
+    // TODO(§3): print the startup summary of grants that widen access.
+    // TODO(§3.2): refuse a default base with no user provider granting tools.
+    let Some(profile) = compiled.get(&profile) else {
+        return Err(RunError::UnknownProfile {
+            name: profile.as_str().to_owned(),
+            available: compiled
+                .order()
+                .iter()
+                .map(ProfileRef::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+        });
+    };
+
+    let provisioned = provision_self(&session)?;
+    let env = profile.spec.target_env(std::env::vars_os());
+    let sandbox_cwd = working_dir(&profile.spec, mount.as_path());
+    let stdio = stdio_terminals();
+    let terminal = terminal_session(stdio);
+    let command = BwrapCommand::for_init(
+        &profile.spec,
+        &session,
+        &provisioned,
+        &sandbox_cwd,
+        &env,
+        &invocation.command,
+        terminal,
+    )?;
+    ignore_job_control();
+    if terminal == TerminalSession::Detach {
+        check_foreground(stdio)?;
+    }
+    let saved = TerminalState::save(stdio);
+    let status = wait_foreground(command);
+    saved.restore();
+    // The sandbox is gone, or going: bwrap returns once its namespace's
+    // init exits, and if bwrap itself was killed, `--die-with-parent` kills
+    // the init and so the namespace. Its mounts go with it.
+    drop(session);
+    Ok(ExitCode::from(status?))
+}
+
+// --- Signals ---
+
+/// The signals the supervisor catches ([`catch_signals`]) and forwards to
+/// bwrap.
+const CAUGHT: [libc::c_int; 4] = [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP];
+
+/// The last caught signal not yet handled, or 0.
+static RECEIVED: AtomicI32 = AtomicI32::new(0);
+
+/// The handler of [`CAUGHT`]: records the signal for the main thread.
+extern "C" fn record_signal(signal: libc::c_int) {
+    RECEIVED.store(signal, Ordering::SeqCst);
+}
+
+/// The last caught signal not yet handled, if any, now handled.
+fn take_signal() -> Option<libc::c_int> {
+    match RECEIVED.swap(0, Ordering::SeqCst) {
+        0 => None,
+        signal => Some(signal),
+    }
+}
+
+/// Catches [`CAUGHT`] with [`record_signal`], so that the supervisor is not
+/// killed before it removes the session directory: while bwrap runs, they
+/// are forwarded to it ([`wait_foreground`]); before, one ends the run.
+///
+/// A caught signal goes back to its default action on `exec`, so bwrap and
+/// the script providers inherit nothing from this. A signal ignored when
+/// stopit started (`nohup`'s `SIGHUP`) stays ignored, as shells leave it,
+/// and is then inherited ignored.
+fn catch_signals() -> io::Result<()> {
+    for signal in CAUGHT {
+        // SAFETY: `sigaction` on a zeroed, then filled, local struct. The
+        // handler only stores to an atomic, which is async-signal-safe.
+        unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(signal, std::ptr::null(), &mut old) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if old.sa_sigaction == libc::SIG_IGN {
+                continue;
+            }
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = record_signal as extern "C" fn(libc::c_int) as usize;
+            // Interrupted system calls elsewhere (script providers' pipes)
+            // restart; `ppoll`, which `wait_foreground` relies on, never does.
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Ignores `SIGTSTP`, `SIGTTIN` and `SIGTTOU` for the rest of the process's
+/// life, and for bwrap, which inherits them ignored (`__init` resets them
+/// for the command).
+///
+/// Until the PTY proxy exists, a sandbox detached from the terminal
+/// ([`TerminalSession::Detach`]) still has it as its stdio, but the kernel's
+/// job-control checks only apply to a process's controlling terminal: were
+/// the supervisor stopped (Ctrl-Z) or put in the background, the sandbox
+/// would go on reading and writing the terminal behind the shell's back. So
+/// the supervisor cannot be stopped by the terminal, and refuses to start in
+/// the background ([`check_foreground`]).
+fn ignore_job_control() {
+    for signal in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
+        // SAFETY: `signal` with `SIG_IGN` installs no handler code; it only
+        // changes this process's disposition. It cannot fail for these
+        // signals.
+        unsafe { libc::signal(signal, libc::SIG_IGN) };
+    }
+}
+
+/// Fails unless the supervisor is in the foreground process group of every
+/// stdio that is a terminal (`stdio`, see [`stdio_terminals`]) and its
+/// controlling terminal. A terminal that is not its controlling terminal
+/// has no foreground for it (the kernel's job control does not apply), and
+/// passes.
+fn check_foreground(stdio: [bool; 3]) -> Result<(), RunError> {
+    let own = rustix::process::getpgrp();
+    for fd in stdio_fds(stdio) {
+        foreground(rustix::termios::tcgetpgrp(fd), own)?;
+    }
+    Ok(())
+}
+
+/// [`check_foreground`] for one terminal, whose foreground process group is
+/// `tty_pgrp`, and the supervisor's process group `own`.
+pub fn foreground(tty_pgrp: rustix::io::Result<Pid>, own: Pid) -> Result<(), RunError> {
+    match tty_pgrp {
+        Ok(pgrp) if pgrp == own => Ok(()),
+        Ok(_) => Err(RunError::Background),
+        // Not the controlling terminal.
+        Err(Errno::NOTTY) => Ok(()),
+        Err(e) => Err(RunError::Foreground(e.into())),
+    }
+}
+
+/// The supervisor's stdio, among `stdio` (see [`stdio_terminals`]), that is
+/// a terminal.
+fn stdio_fds(stdio: [bool; 3]) -> impl Iterator<Item = BorrowedFd<'static>> {
+    let fds = [
+        io::stdin().as_fd().as_raw_fd(),
+        io::stdout().as_fd().as_raw_fd(),
+        io::stderr().as_fd().as_raw_fd(),
+    ];
+    fds.into_iter()
+        .zip(stdio)
+        .filter(|&(_, tty)| tty)
+        // SAFETY: stdio stays open for the life of the process.
+        .map(|(fd, _)| unsafe { BorrowedFd::borrow_raw(fd) })
+}
+
+/// The terminal settings of the supervisor's stdio, to restore after the
+/// command: a sandbox detached from the terminal still has it as its stdio,
+/// and can change them (raw mode, echo off) and exit without restoring
+/// them.
+struct TerminalState(Vec<(BorrowedFd<'static>, Termios)>);
+
+impl TerminalState {
+    /// The settings of every stdio among `stdio` that is a terminal, or of
+    /// none if they cannot be read.
+    fn save(stdio: [bool; 3]) -> Self {
+        TerminalState(
+            stdio_fds(stdio)
+                .filter_map(|fd| Some((fd, rustix::termios::tcgetattr(fd).ok()?)))
+                .collect(),
+        )
+    }
+
+    /// Restores them, as far as possible: there is nothing to do about a
+    /// failure but leave the terminal as the command left it.
+    fn restore(self) {
+        for (fd, termios) in self.0 {
+            let _ = rustix::termios::tcsetattr(fd, rustix::termios::OptionalActions::Now, &termios);
+        }
+    }
+}
+
+/// Spawns `command` (bwrap) on the supervisor's stdio and waits for it,
+/// returning the exit status to exit with ([`exit_code`]).
+///
+/// The caught signals ([`CAUGHT`]) are blocked from just before the spawn
+/// (bwrap starts with the mask the supervisor had before) and only
+/// unblocked while waiting in `ppoll`, so none is missed between checking
+/// for one and waiting. One that arrived before the spawn ends the run
+/// with `128 + N` instead. One that arrives while bwrap runs is forwarded
+/// to it, so that the sandbox ends and the supervisor goes on to clean up;
+/// the supervisor then exits with bwrap's status, `128 + N` if the signal
+/// killed it. That includes `SIGINT` and `SIGQUIT`: a terminal's Ctrl-C
+/// reaches bwrap through the process group anyway, but not the sandboxed
+/// program, which is in a session of its own (§6.2 step 1), and a signal
+/// sent to the supervisor alone should end the sandbox just the same.
+fn wait_foreground(command: BwrapCommand) -> Result<u8, RunError> {
+    let mask = BlockedSignals::block().map_err(RunError::Signals)?;
+    if let Some(signal) = take_signal() {
+        return Ok(signal_exit_code(signal));
+    }
+    let mut command = command.into_command();
+    let old = mask.old;
+    // SAFETY: `pthread_sigmask` is async-signal-safe, and `old` a copy.
+    unsafe {
+        command.pre_exec(move || {
+            match libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) {
+                0 => Ok(()),
+                e => Err(io::Error::from_raw_os_error(e)),
+            }
+        });
+    }
+    let mut child = command.spawn().map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            RunError::BwrapMissing
+        } else {
+            RunError::Spawn(e)
+        }
+    })?;
+    let pid = Pid::from_child(&child);
+    // Waiting through a pidfd lets `ppoll` wait for the child and the
+    // signals at once. Without one (impossible on the kernels stopit
+    // supports), signals are only forwarded once bwrap is done.
+    if let Ok(pidfd) = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) {
+        loop {
+            if let Some(signal) = take_signal() {
+                // SAFETY: a plain syscall. The child is not reaped yet, so
+                // its pid is still its own.
+                unsafe { libc::kill(pid.as_raw_nonzero().get(), signal) };
+            }
+            match mask.wait_readable(pidfd.as_fd()) {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    }
+    let status = child.wait().map_err(RunError::Spawn)?;
+    Ok(exit_code(status))
+}
+
+/// [`CAUGHT`] blocked, until dropped.
+struct BlockedSignals {
+    /// The mask before blocking them.
+    old: libc::sigset_t,
+}
+
+impl BlockedSignals {
+    fn block() -> io::Result<Self> {
+        // SAFETY: plain libc calls on local, initialized signal sets.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            for signal in CAUGHT {
+                libc::sigaddset(&mut set, signal);
+            }
+            let mut old: libc::sigset_t = std::mem::zeroed();
+            match libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old) {
+                0 => Ok(BlockedSignals { old }),
+                e => Err(io::Error::from_raw_os_error(e)),
+            }
+        }
+    }
+
+    /// Waits until `fd` is readable, with [`CAUGHT`] unblocked meanwhile:
+    /// `Interrupted` if one of them (or another signal) arrived.
+    fn wait_readable(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
+        let mut pollfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: plain libc calls on a local signal set and pollfd.
+        unsafe {
+            let mut waiting = self.old;
+            for signal in CAUGHT {
+                libc::sigdelset(&mut waiting, signal);
+            }
+            if libc::ppoll(&mut pollfd, 1, std::ptr::null(), &waiting) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BlockedSignals {
+    fn drop(&mut self) {
+        // SAFETY: restores the mask saved in `block`.
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.old, std::ptr::null_mut()) };
+    }
+}
+
+/// The exit status for a process killed by `signal`: `128 + N`, as shells
+/// report it.
+fn signal_exit_code(signal: libc::c_int) -> u8 {
+    u8::try_from(128 + signal).unwrap_or(u8::MAX)
+}
+
+/// The exit status for a command that ended with `status`: its exit code,
+/// or `128 + N` if it was killed by signal `N`, as shells report it.
+pub fn exit_code(status: ExitStatus) -> u8 {
+    if let Some(code) = status.code() {
+        // An exit code is the low 8 bits of what the process passed to
+        // `exit`, so it always fits.
+        return u8::try_from(code).unwrap_or(EXIT_SUPERVISOR_FAILED);
+    }
+    match status.signal() {
+        Some(signal) => signal_exit_code(signal),
+        None => EXIT_SUPERVISOR_FAILED,
+    }
+}
+
+/// Whether the sandbox must leave the supervisor's session (see
+/// [`TerminalSession`]): when any of its stdio is a terminal, or the
+/// supervisor has a controlling terminal at all, which the sandbox could
+/// open as `/dev/tty` (the minimal `/dev` has it) even with every stdio
+/// redirected.
+pub fn needs_new_session(stdio_is_terminal: [bool; 3], has_controlling_terminal: bool) -> bool {
+    stdio_is_terminal.contains(&true) || has_controlling_terminal
+}
+
+/// Whether each of the supervisor's stdin, stdout and stderr is a terminal.
+fn stdio_terminals() -> [bool; 3] {
+    [
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+        io::stderr().is_terminal(),
+    ]
+}
+
+/// [`needs_new_session`] for this process, whose stdio is a terminal as
+/// `stdio` says.
+fn terminal_session(stdio: [bool; 3]) -> TerminalSession {
+    if needs_new_session(stdio, has_controlling_terminal()) {
+        TerminalSession::Detach
+    } else {
+        TerminalSession::Keep
+    }
+}
+
+/// Whether this process has a controlling terminal: `/dev/tty` opens only
+/// then (`ENXIO` otherwise). Any other failure counts as having one, which
+/// only costs job control.
+fn has_controlling_terminal() -> bool {
+    use rustix::fs::{Mode, OFlags, open};
+    match open(
+        "/dev/tty",
+        OFlags::RDONLY | OFlags::NOCTTY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(_) => true,
+        Err(e) => e != rustix::io::Errno::NXIO,
+    }
+}
+
+/// The canonical host `HOME`, from its value `home`.
+fn host_home(home: Option<OsString>) -> Result<PathBuf, RunError> {
+    let home = match home {
+        Some(home) if !home.is_empty() => PathBuf::from(home),
+        _ => return Err(RunError::HomeUnset),
+    };
+    fs::canonicalize(&home).map_err(|source| RunError::Home { path: home, source })
+}
+
+/// The session's workspace and its configuration file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Workspace {
+    /// The workspace directory, canonical.
+    pub dir: PathBuf,
+    /// Its `.stopit.toml`, if it has one.
+    pub config: Option<PathBuf>,
+}
+
+impl Workspace {
+    /// The configuration: the configuration file's, or the default one
+    /// (`base = "default"` and nothing else) without a file.
+    ///
+    /// The file must be the user's own and only theirs to change
+    /// ([`check_config_trust`]): it decides what the sandbox may do and which
+    /// script providers run on the host, as the user.
+    pub fn load_config(&self) -> Result<Config, RunError> {
+        let Some(path) = &self.config else {
+            return Ok(Config::default());
+        };
+        let text = read_trusted(path)?;
+        Config::from_toml_str(&text).map_err(|source| RunError::Config {
+            path: path.clone(),
+            source,
+        })
+    }
+}
+
+/// The owner and mode (file type bits included) of a file, as `stat`
+/// reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ownership {
+    /// The owner's user id.
+    pub uid: u32,
+    /// `st_mode`.
+    pub mode: u32,
+}
+
+impl Ownership {
+    fn of(stat: &rustix::fs::Stat) -> Self {
+        Ownership {
+            uid: stat.st_uid,
+            mode: stat.st_mode,
+        }
+    }
+}
+
+/// Reads the configuration file at `path` if [`check_config_trust`] allows
+/// it, from the descriptor it checked: its directory is opened, then the
+/// file in it without following a symlink (a symlink is refused, as the
+/// file it leads to could be anyone's, anywhere).
+fn read_trusted(path: &Path) -> Result<String, RunError> {
+    use rustix::fs::{Mode, OFlags, fstat, open, openat};
+    let read_error = |source: io::Error| RunError::ReadConfig {
+        path: path.to_path_buf(),
+        source,
+    };
+    let untrusted = |reason: String| RunError::UntrustedConfig {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(read_error(io::ErrorKind::InvalidInput.into()));
+    };
+    let dir_fd = open(
+        dir,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| read_error(e.into()))?;
+    // Non-blocking, so that a FIFO does not hang the open; it is refused as
+    // not a regular file.
+    let fd = match openat(
+        &dir_fd,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NOCTTY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::LOOP) => return Err(untrusted("it is a symbolic link".into())),
+        Err(e) => return Err(read_error(e.into())),
+    };
+    let file = fstat(&fd).map_err(|e| read_error(e.into()))?;
+    let dir_stat = fstat(&dir_fd).map_err(|e| read_error(e.into()))?;
+    check_config_trust(
+        Ownership::of(&file),
+        Ownership::of(&dir_stat),
+        rustix::process::getuid().as_raw(),
+    )
+    .map_err(untrusted)?;
+    let mut text = String::new();
+    File::from(fd)
+        .read_to_string(&mut text)
+        .map_err(read_error)?;
+    Ok(text)
+}
+
+/// Whether a configuration file `file` in the directory `dir` can be trusted
+/// by the user `uid`, and why not: the file must be a regular file owned by
+/// `uid` and writable by no one else (no group or other write bit), and
+/// the directory owned by `uid` or root and not writable by group or
+/// others, unless it is sticky (as `/tmp` is, where no one else can
+/// replace the user's file). Otherwise another user could choose what the
+/// sandbox may do and run their script providers as `uid`: walking up from
+/// `/tmp/proj` finds a `/tmp/.stopit.toml` anyone can create.
+pub fn check_config_trust(file: Ownership, dir: Ownership, uid: u32) -> Result<(), String> {
+    if file.mode & libc::S_IFMT != libc::S_IFREG {
+        return Err("it is not a regular file".into());
+    }
+    if file.uid != uid {
+        return Err(format!(
+            "it is owned by uid {}, not by you (uid {uid})",
+            file.uid
+        ));
+    }
+    if file.mode & 0o022 != 0 {
+        return Err(format!(
+            "it is writable by its group or others (mode {:04o}); run `chmod go-w` on it",
+            file.mode & 0o7777
+        ));
+    }
+    if dir.uid != uid && dir.uid != 0 {
+        return Err(format!(
+            "its directory is owned by uid {}, neither you (uid {uid}) nor root",
+            dir.uid
+        ));
+    }
+    if dir.mode & 0o022 != 0 && dir.mode & libc::S_ISVTX == 0 {
+        return Err(format!(
+            "its directory is writable by its group or others and not sticky (mode {:04o}), so \
+             they could replace it",
+            dir.mode & 0o7777
+        ));
+    }
+    Ok(())
+}
+
+/// Finds the workspace (§3.1), from the current directory `cwd`: the
+/// directory `explicit` (`--workspace`, relative to `cwd`) if given, else
+/// the nearest directory from `cwd` up that contains `.stopit.toml`, else
+/// `cwd` itself. Its configuration file is its own `.stopit.toml`, if any;
+/// `--workspace` does not look further up.
+///
+/// The workspace is canonical (no symlinks, `.` or `..`): it is the
+/// session's identity, and rules below it are resolved against it.
+pub fn discover_workspace(cwd: &Path, explicit: Option<&Path>) -> Result<Workspace, RunError> {
+    let canonical = |path: PathBuf| {
+        fs::canonicalize(&path).map_err(|source| RunError::Workspace { path, source })
+    };
+    if let Some(explicit) = explicit {
+        let dir = canonical(cwd.join(explicit))?;
+        if !dir.is_dir() {
+            return Err(RunError::WorkspaceNotDir(dir));
+        }
+        let config = config_in(&dir)?;
+        return Ok(Workspace { dir, config });
+    }
+    let start = canonical(cwd.to_path_buf())?;
+    for dir in start.ancestors() {
+        if let Some(config) = config_in(dir)? {
+            return Ok(Workspace {
+                dir: dir.to_path_buf(),
+                config: Some(config),
+            });
+        }
+    }
+    Ok(Workspace {
+        dir: start,
+        config: None,
+    })
+}
+
+/// `dir`'s `.stopit.toml`, if it has an entry of that name (a broken one
+/// fails later, when read).
+fn config_in(dir: &Path) -> Result<Option<PathBuf>, RunError> {
+    let path = dir.join(CONFIG_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => Ok(Some(path)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(RunError::Discover { path, source }),
+    }
+}
+
+/// The session's warnings to print, in order: every profile's, each
+/// distinct message once (an inherited rule is planned again in every
+/// profile inheriting it, and warns again there), without the missing
+/// paths of the built-in base's own rules ([`is_quiet`]).
+pub fn warning_lines(session: &CompiledSession, base: Base) -> Vec<String> {
+    distinct_messages(session.warnings().map(|(_, w)| w), base)
+}
+
+/// The messages of `warnings` not [`is_quiet`] under `base`, each distinct
+/// one once, in order.
+fn distinct_messages<'a>(
+    warnings: impl IntoIterator<Item = &'a SpecWarning>,
+    base: Base,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    warnings
+        .into_iter()
+        .filter(|w| !is_quiet(w, base))
+        .map(ToString::to_string)
+        .filter(|m| seen.insert(m.clone()))
+        .collect()
+}
+
+/// Whether `warning` is not worth printing: a path missing for a rule of
+/// the built-in `base` provider of `base = "default"`. Its rules name files
+/// many workspaces lack (`.envrc`, `flake.lock`, `.vscode`, …), so these
+/// would warn in nearly every workspace. Under `base = "none"` a user
+/// provider may be named `base`, and is not quiet.
+pub fn is_quiet(warning: &SpecWarning, base: Base) -> bool {
+    base == Base::Default
+        && matches!(
+            warning,
+            SpecWarning::Mount(PlanWarning {
+                provider,
+                kind: PlanWarningKind::Resolve(ResolveWarning::Missing { .. }),
+                ..
+            }) if provider.as_str() == BASE_PROVIDER_NAME
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::policy::NetworkMode;
+
+    // --- Workspace discovery ---
+
+    /// A canonical temporary directory.
+    fn tmp() -> (TempDir, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        (dir, root)
+    }
+
+    #[test]
+    fn the_nearest_config_up_from_the_cwd_marks_the_workspace() {
+        let (_d, root) = tmp();
+        let deep = root.join("ws/a/b");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(root.join(CONFIG_FILE), "").unwrap();
+        fs::write(root.join("ws").join(CONFIG_FILE), "").unwrap();
+        let ws = discover_workspace(&deep, None).unwrap();
+        assert_eq!(ws.dir, root.join("ws"));
+        assert_eq!(ws.config, Some(root.join("ws").join(CONFIG_FILE)));
+        // From the workspace itself.
+        assert_eq!(
+            discover_workspace(&root.join("ws"), None).unwrap().dir,
+            root.join("ws")
+        );
+    }
+
+    #[test]
+    fn without_a_config_the_cwd_is_the_workspace() {
+        let (_d, root) = tmp();
+        // Nothing above a fresh temporary directory is expected to hold a
+        // `.stopit.toml`; if one does, the test says so.
+        let found = discover_workspace(&root, None).unwrap();
+        assert_eq!(found.config, None, "a {CONFIG_FILE} above {root:?}?");
+        assert_eq!(found.dir, root);
+    }
+
+    #[test]
+    fn the_workspace_is_canonical() {
+        let (_d, root) = tmp();
+        fs::create_dir_all(root.join("real/sub")).unwrap();
+        fs::write(root.join("real").join(CONFIG_FILE), "").unwrap();
+        symlink(root.join("real"), root.join("link")).unwrap();
+        let ws = discover_workspace(&root.join("link/sub/.."), None).unwrap();
+        assert_eq!(ws.dir, root.join("real"));
+        assert_eq!(ws.config, Some(root.join("real").join(CONFIG_FILE)));
+        let ws = discover_workspace(&root, Some(Path::new("link/./sub"))).unwrap();
+        assert_eq!(ws.dir, root.join("real/sub"));
+    }
+
+    #[test]
+    fn workspace_option_overrides_discovery_and_does_not_walk_up() {
+        let (_d, root) = tmp();
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir_all(root.join("c")).unwrap();
+        fs::write(root.join("a").join(CONFIG_FILE), "").unwrap();
+        fs::write(root.join("c").join(CONFIG_FILE), "").unwrap();
+        // Relative to the cwd, or absolute.
+        let ws = discover_workspace(&root.join("a/b"), Some(Path::new("../../c"))).unwrap();
+        assert_eq!(ws.dir, root.join("c"));
+        assert_eq!(ws.config, Some(root.join("c").join(CONFIG_FILE)));
+        // `a/b` has no configuration of its own; `a`'s is not used.
+        let ws = discover_workspace(&root, Some(&root.join("a/b"))).unwrap();
+        assert_eq!(ws.dir, root.join("a/b"));
+        assert_eq!(ws.config, None);
+    }
+
+    #[test]
+    fn a_bad_workspace_option_is_an_error() {
+        let (_d, root) = tmp();
+        fs::write(root.join("file"), "").unwrap();
+        let e = discover_workspace(&root, Some(Path::new("missing"))).unwrap_err();
+        assert!(matches!(e, RunError::Workspace { .. }), "{e}");
+        let e = discover_workspace(&root, Some(Path::new("file"))).unwrap_err();
+        assert!(matches!(e, RunError::WorkspaceNotDir(_)), "{e}");
+    }
+
+    #[test]
+    fn configs_load_or_fail_with_their_path() {
+        let (_d, root) = tmp();
+        let none = Workspace {
+            dir: root.clone(),
+            config: None,
+        };
+        assert_eq!(none.load_config().unwrap(), Config::default());
+        assert_eq!(Config::default().base, Base::Default);
+        let path = root.join(CONFIG_FILE);
+        let with = Workspace {
+            dir: root.clone(),
+            config: Some(path.clone()),
+        };
+        write_config(&path, "base = \"none\"", 0o644);
+        assert_eq!(with.load_config().unwrap().base, Base::None);
+        write_config(&path, "bogus = 1", 0o644);
+        let e = with.load_config().unwrap_err();
+        assert!(matches!(e, RunError::Config { .. }), "{e}");
+        assert!(e.to_string().contains(".stopit.toml"), "{e}");
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let e = with.load_config().unwrap_err();
+        assert!(matches!(e, RunError::UntrustedConfig { .. }), "{e}");
+        assert!(e.to_string().contains("not a regular file"), "{e}");
+    }
+
+    /// Writes `contents` to the configuration file `path`, with `mode`
+    /// whatever the umask.
+    fn write_config(path: &Path, contents: &str, mode: u32) {
+        fs::write(path, contents).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// A workspace `root/ws` with mode `dir_mode` and a valid configuration
+    /// file, with mode `file_mode`.
+    fn workspace_with_modes(root: &Path, dir_mode: u32, file_mode: u32) -> Workspace {
+        let dir = root.join("ws");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(CONFIG_FILE);
+        write_config(&path, "base = \"none\"", file_mode);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(dir_mode)).unwrap();
+        Workspace {
+            dir,
+            config: Some(path),
+        }
+    }
+
+    #[test]
+    fn a_private_config_in_a_private_or_sticky_directory_loads() {
+        for (dir_mode, file_mode) in [
+            (0o700, 0o600),
+            (0o755, 0o644),
+            (0o555, 0o444),
+            // Sticky, as `/tmp`: no one else can replace the file.
+            (0o1777, 0o644),
+            (0o1770, 0o600),
+        ] {
+            let (_d, root) = tmp();
+            let ws = workspace_with_modes(&root, dir_mode, file_mode);
+            let loaded = ws.load_config();
+            assert!(loaded.is_ok(), "{dir_mode:o} {file_mode:o}: {loaded:?}");
+            // Restore, so that the temporary directory can be removed.
+            fs::set_permissions(&ws.dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_config_others_can_write_is_refused() {
+        for file_mode in [0o664, 0o646, 0o666, 0o620] {
+            let (_d, root) = tmp();
+            let ws = workspace_with_modes(&root, 0o755, file_mode);
+            let e = ws.load_config().unwrap_err();
+            assert!(matches!(e, RunError::UntrustedConfig { .. }), "{e}");
+            let message = e.to_string();
+            assert!(message.contains(".stopit.toml"), "{message}");
+            assert!(
+                message.contains("writable by its group or others"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_config_in_a_directory_others_can_write_is_refused() {
+        for dir_mode in [0o775, 0o757, 0o777] {
+            let (_d, root) = tmp();
+            let ws = workspace_with_modes(&root, dir_mode, 0o644);
+            let e = ws.load_config().unwrap_err();
+            assert!(matches!(e, RunError::UntrustedConfig { .. }), "{e}");
+            assert!(e.to_string().contains("not sticky"), "{e}");
+            // Restore, so that the temporary directory can be removed.
+            fs::set_permissions(&ws.dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_config_symlink_is_refused() {
+        // Even to a private file of the user's: what it leads to could be
+        // swapped, and is not where the workspace says.
+        let (_d, root) = tmp();
+        let ws = workspace_with_modes(&root, 0o755, 0o644);
+        let real = root.join("real.toml");
+        write_config(&real, "base = \"none\"", 0o644);
+        let path = ws.config.clone().unwrap();
+        fs::remove_file(&path).unwrap();
+        symlink(&real, &path).unwrap();
+        let e = ws.load_config().unwrap_err();
+        assert!(matches!(e, RunError::UntrustedConfig { .. }), "{e}");
+        assert!(e.to_string().contains("symbolic link"), "{e}");
+    }
+
+    #[test]
+    fn config_trust_checks_owners_and_modes() {
+        const ME: u32 = 1000;
+        let file = |uid, mode| Ownership {
+            uid,
+            mode: libc::S_IFREG | mode,
+        };
+        let dir = |uid, mode| Ownership {
+            uid,
+            mode: libc::S_IFDIR | mode,
+        };
+        let check = |f, d| check_config_trust(f, d, ME);
+        assert_eq!(check(file(ME, 0o644), dir(ME, 0o755)), Ok(()));
+        // A directory of root's, or a sticky one of anyone allowed to own it.
+        assert_eq!(check(file(ME, 0o600), dir(0, 0o755)), Ok(()));
+        assert_eq!(check(file(ME, 0o600), dir(0, 0o1777)), Ok(()));
+        assert_eq!(check(file(ME, 0o600), dir(ME, 0o1777)), Ok(()));
+
+        // Another user's file, even in the user's own directory.
+        let e = check(file(1001, 0o644), dir(ME, 0o755)).unwrap_err();
+        assert!(
+            e.contains("owned by uid 1001, not by you (uid 1000)"),
+            "{e}"
+        );
+        // Root's too: it is not the user's choice.
+        assert!(check(file(0, 0o644), dir(0, 0o755)).is_err());
+        // Writable by others.
+        let e = check(file(ME, 0o664), dir(ME, 0o755)).unwrap_err();
+        assert!(e.contains("mode 0664"), "{e}");
+        assert!(check(file(ME, 0o602), dir(ME, 0o755)).is_err());
+        // Not a regular file.
+        let e = check(dir(ME, 0o755), dir(ME, 0o755)).unwrap_err();
+        assert!(e.contains("not a regular file"), "{e}");
+        let fifo = Ownership {
+            uid: ME,
+            mode: libc::S_IFIFO | 0o644,
+        };
+        assert!(check(fifo, dir(ME, 0o755)).is_err());
+
+        // The directory: another user's (even sticky, as they may change
+        // its mode), or writable by others without the sticky bit.
+        let e = check(file(ME, 0o644), dir(1001, 0o755)).unwrap_err();
+        assert!(e.contains("directory is owned by uid 1001"), "{e}");
+        assert!(check(file(ME, 0o644), dir(1001, 0o1777)).is_err());
+        let e = check(file(ME, 0o644), dir(ME, 0o775)).unwrap_err();
+        assert!(e.contains("mode 0775"), "{e}");
+        assert!(check(file(ME, 0o644), dir(0, 0o777)).is_err());
+    }
+
+    // --- Commands, home and exit status ---
+
+    #[test]
+    fn shell_runs_shell_or_fails_clearly() {
+        assert_eq!(
+            shell_command(Some("/bin/zsh".into())).unwrap(),
+            [OsString::from("/bin/zsh")]
+        );
+        for unset in [None, Some(OsString::new())] {
+            let e = shell_command(unset).unwrap_err();
+            assert!(matches!(e, RunError::ShellUnset), "{e}");
+            assert!(e.to_string().contains("SHELL is not set"), "{e}");
+        }
+    }
+
+    #[test]
+    fn home_must_be_set_and_resolvable() {
+        let (_d, root) = tmp();
+        symlink(&root, root.join("link")).unwrap();
+        assert_eq!(host_home(Some(root.join("link").into())).unwrap(), root);
+        for unset in [None, Some(OsString::new())] {
+            assert!(matches!(host_home(unset), Err(RunError::HomeUnset)));
+        }
+        let e = host_home(Some(root.join("missing").into())).unwrap_err();
+        assert!(matches!(e, RunError::Home { .. }), "{e}");
+    }
+
+    #[test]
+    fn exit_codes_pass_through_and_signals_map_to_128_plus_n() {
+        // Raw wait statuses: an exit code in the second byte, a signal in
+        // the low 7 bits.
+        for code in [0, 1, 2, 125, 126, 127, 255] {
+            assert_eq!(exit_code(ExitStatus::from_raw(code << 8)), code as u8);
+        }
+        assert_eq!(exit_code(ExitStatus::from_raw(libc::SIGINT)), 130);
+        assert_eq!(exit_code(ExitStatus::from_raw(libc::SIGKILL)), 137);
+        assert_eq!(exit_code(ExitStatus::from_raw(libc::SIGTERM)), 143);
+        // With a core dump (bit 7).
+        assert_eq!(exit_code(ExitStatus::from_raw(libc::SIGSEGV | 0x80)), 139);
+    }
+
+    #[test]
+    fn a_new_session_whenever_a_terminal_is_reachable() {
+        assert!(!needs_new_session([false; 3], false));
+        for i in 0..3 {
+            let mut stdio = [false; 3];
+            stdio[i] = true;
+            assert!(needs_new_session(stdio, false), "{i}");
+        }
+        // All stdio redirected, but `/dev/tty` still reaches the terminal.
+        assert!(needs_new_session([false; 3], true));
+    }
+
+    #[test]
+    fn only_the_foreground_of_the_controlling_terminal_may_start() {
+        let pid = |n| Pid::from_raw(n).unwrap();
+        assert!(foreground(Ok(pid(42)), pid(42)).is_ok());
+        let e = foreground(Ok(pid(7)), pid(42)).unwrap_err();
+        assert!(matches!(e, RunError::Background), "{e}");
+        assert!(e.to_string().contains("in the background"), "{e}");
+        // A terminal that is not the controlling one has no foreground.
+        assert!(foreground(Err(Errno::NOTTY), pid(42)).is_ok());
+        let e = foreground(Err(Errno::IO), pid(42)).unwrap_err();
+        assert!(matches!(e, RunError::Foreground(_)), "{e}");
+    }
+
+    // --- Warnings ---
+
+    fn missing(provider: &str, pattern: &str) -> SpecWarning {
+        SpecWarning::Mount(PlanWarning {
+            provider: provider.parse().unwrap(),
+            pattern: pattern.into(),
+            kind: PlanWarningKind::Resolve(ResolveWarning::Missing {
+                path: PathBuf::from(pattern),
+            }),
+        })
+    }
+
+    fn unreadable(provider: &str, pattern: &str) -> SpecWarning {
+        SpecWarning::Mount(PlanWarning {
+            provider: provider.parse().unwrap(),
+            pattern: pattern.into(),
+            kind: PlanWarningKind::Resolve(ResolveWarning::Io {
+                path: PathBuf::from(pattern),
+                error: io::Error::from_raw_os_error(libc::EACCES),
+            }),
+        })
+    }
+
+    #[test]
+    fn missing_paths_of_the_default_base_are_quiet() {
+        assert!(is_quiet(&missing("base", "/w/.envrc"), Base::Default));
+        // Not under `base = "none"`, where `base` is a user's provider.
+        assert!(!is_quiet(&missing("base", "/w/.envrc"), Base::None));
+        // Not another provider's.
+        assert!(!is_quiet(&missing("config", "/w/.envrc"), Base::Default));
+        // Not another problem with a base rule.
+        assert!(!is_quiet(&unreadable("base", "/w/.envrc"), Base::Default));
+        let domains = SpecWarning::DomainsIgnored {
+            mode: NetworkMode::Loopback,
+            domains: ["example.com".parse().unwrap()].into_iter().collect(),
+        };
+        assert!(!is_quiet(&domains, Base::Default));
+    }
+
+    #[test]
+    fn warnings_are_printed_once_each_in_order_without_quiet_ones() {
+        let warnings = [
+            missing("config", "/b"),
+            missing("base", "/w/.envrc"),
+            missing("config", "/a"),
+            // The same rule, warned about again in an inheriting profile.
+            missing("config", "/b"),
+            unreadable("base", "/w/x"),
+            missing("config", "/a"),
+        ];
+        let lines = distinct_messages(&warnings, Base::Default);
+        assert_eq!(
+            lines,
+            [
+                warnings[0].to_string(),
+                warnings[2].to_string(),
+                warnings[4].to_string()
+            ]
+        );
+        assert!(lines[0].contains("\"/b\" does not exist"), "{lines:?}");
+        // Under `base = "none"` nothing is quiet.
+        assert_eq!(distinct_messages(&warnings, Base::None).len(), 4);
+    }
+}

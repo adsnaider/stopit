@@ -32,6 +32,7 @@ use serde_json::{Map, Number, Value};
 
 use super::{Provider, ProviderContext, ProviderError, ProviderOutput};
 use crate::config::{ProfileRef, ProviderName, ScriptSource};
+use crate::escape::escape_message;
 use crate::manifest::Manifest;
 
 /// Maximum size of a script's stdout; more is an error.
@@ -339,32 +340,21 @@ fn kill_group(child: &Child) {
 /// Reads stderr to the end, keeping the first [`STDERR_LIMIT`] bytes, as
 /// trimmed (lossy) text with a marker when the rest was discarded.
 ///
-/// Control characters other than `\n` and `\t` are escaped (`\u{1b}`): the
-/// text ends up on the host terminal, and stderr may echo content the
-/// sandbox can write, so it must not carry terminal escape sequences
-/// (DESIGN.md §5.3).
+/// Control and format characters other than `\n` and `\t` are escaped
+/// ([`escape_message`], `\u{1b}`): the text ends up on the host terminal,
+/// and stderr may echo content the sandbox can write, so it must not carry
+/// terminal escape sequences (DESIGN.md §5.3). The supervisor escapes every
+/// message it prints again; escaping here keeps the error's own text safe
+/// for any other caller.
 fn read_stderr(r: &mut impl Read) -> io::Result<String> {
     let mut buf = Vec::new();
     r.take(STDERR_LIMIT as u64).read_to_end(&mut buf)?;
     let discarded = io::copy(r, &mut io::sink())?;
-    let mut text = escape_controls(String::from_utf8_lossy(&buf).trim());
+    let mut text = escape_message(String::from_utf8_lossy(&buf).trim());
     if discarded > 0 {
         text.push_str(&format!(" [... {discarded} more bytes discarded]"));
     }
     Ok(text)
-}
-
-/// Escapes control characters (C0, DEL and C1) except `\n` and `\t`.
-fn escape_controls(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if c.is_control() && c != '\n' && c != '\t' {
-            out.extend(c.escape_default());
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 /// Converts a TOML table to JSON. `path` is the dotted key path of the table

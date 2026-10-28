@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use stopit::bwrap::{
     BWRAP_MAX_ARGS, BwrapCommand, BwrapError, PROC_MASKED_DIRS, PROC_MASKED_FILES,
-    PROC_OPTIONAL_MASKS,
+    PROC_OPTIONAL_MASKS, TerminalSession,
 };
 use stopit::etc::{self, SandboxIds};
 use stopit::manifest::EtcFile;
@@ -956,6 +956,7 @@ fn many_mounts_pass_through_args_fd_up_to_bwraps_limit() {
         &session.provisioned,
         Path::new("/"),
         &[],
+        TerminalSession::Keep,
     )
     .unwrap_err();
     assert!(matches!(err, BwrapError::TooManyArgs { .. }), "{err}");

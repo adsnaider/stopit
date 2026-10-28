@@ -297,6 +297,52 @@ fn the_signal_mask_is_cleared() {
     assert_eq!(blk, "SigBlk:\t0000000000000000");
 }
 
+/// `command` made to start with `SIGTSTP`, `SIGTTIN` and `SIGTTOU` ignored,
+/// as the supervisor runs bwrap. Ignored dispositions survive `exec`.
+fn ignoring_job_control(mut command: Command) -> Command {
+    // SAFETY: the closure only calls `signal`, which is async-signal-safe,
+    // with `SIG_IGN`.
+    unsafe {
+        command.pre_exec(|| {
+            for signal in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
+                if libc::signal(signal, libc::SIG_IGN) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    command
+}
+
+/// The ignored signals among `SIGTSTP`, `SIGTTIN` and `SIGTTOU` (bits 19 to
+/// 21 of the `SigIgn` line of `/proc/self/status`) as the probe sees them,
+/// when `command` (bwrap running it) starts with them ignored.
+fn ignored_job_control(command: BwrapCommand) -> u64 {
+    let ops = [read("/proc/self/status")];
+    let input = serde_json::to_vec(&ops).unwrap();
+    let out = run_bwrap(ignoring_job_control(command.into_command()), Some(&input));
+    let results = probe_results("ignored signals", &out, &ops);
+    let line = contents(&results[0])
+        .lines()
+        .find_map(|l| l.strip_prefix("SigIgn:\t"))
+        .expect("a SigIgn line")
+        .to_owned();
+    u64::from_str_radix(&line, 16).unwrap() & 0x38_0000
+}
+
+#[test]
+fn job_control_signals_ignored_by_the_supervisor_are_reset() {
+    let init = Init::new();
+    let direct = init.f.session();
+    let spec = init.f.compile(&config_none("system.proc = true"));
+    // bwrap passes them on ignored, so the target having them at their
+    // default is `__init`'s doing.
+    assert_eq!(ignored_job_control(direct.command(&spec)), 0x38_0000);
+    let ignored = ignored_job_control(init.session.command(&init.spec, &[], &init.probe));
+    assert_eq!(ignored, 0);
+}
+
 // --- Command, argv, stdio and exit status ---
 
 #[test]
@@ -467,6 +513,7 @@ fn bad_init_arguments_fail_before_running_anything() {
             &init.session.provisioned,
             Path::new("/"),
             &argv,
+            stopit::bwrap::TerminalSession::Keep,
         )
         .unwrap();
         run_bwrap(cmd.into_command(), None)

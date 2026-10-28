@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use stopit::bwrap::{BwrapCommand, working_dir};
+use stopit::bwrap::{BwrapCommand, TerminalSession, working_dir};
 use stopit::config::{Config, ProfileRef};
 use stopit::expand::ExpansionContext;
 use stopit::provider::{ProviderContext, session_providers};
@@ -152,16 +152,22 @@ pub fn run_bwrap_within(mut command: Command, stdin: Option<&[u8]>, limit: Durat
 /// Spawns `command` once as [`run_bwrap_within`] does, leaving it to be
 /// spawned again.
 pub fn spawn_bwrap(command: &mut Command, stdin: Option<&[u8]>, limit: Duration) -> Output {
-    let child = command
+    command
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
-    let mut child = match child {
+        .stderr(Stdio::piped());
+    spawn_with_stdio(command, stdin, limit)
+}
+
+/// [`spawn_bwrap`] with the stdio `command` was given: `stdin` is written
+/// to its stdin if that is piped, and its stdout and stderr are collected
+/// if they are piped (and empty otherwise).
+pub fn spawn_with_stdio(command: &mut Command, stdin: Option<&[u8]>, limit: Duration) -> Output {
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) if e.kind() == io::ErrorKind::NotFound => panic!(
             "bwrap (bubblewrap) is not on PATH; this test needs it. \
@@ -178,8 +184,20 @@ pub fn spawn_bwrap(command: &mut Command, stdin: Option<&[u8]>, limit: Duration)
             let _ = pipe.write_all(&input);
         })
     });
-    let (stdout, stdout_reader) = drain(child.stdout.take().expect("stdout is piped"));
-    let (stderr, stderr_reader) = drain(child.stderr.take().expect("stderr is piped"));
+    let pipe_or_nothing =
+        |pipe: Option<Box<dyn Read + Send>>| drain(pipe.unwrap_or_else(|| Box::new(io::empty())));
+    let (stdout, stdout_reader) = pipe_or_nothing(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let (stderr, stderr_reader) = pipe_or_nothing(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
 
     let deadline = Instant::now() + limit;
     let mut status = None;
@@ -520,8 +538,16 @@ impl InitSession {
         target: &[OsString],
     ) -> BwrapCommand {
         let cwd = working_dir(spec, Path::new(WORKSPACE_MOUNT));
-        BwrapCommand::for_init(spec, &self.session, &self.provisioned, &cwd, env, target)
-            .unwrap_or_else(|e| panic!("cannot build the bwrap command: {e}"))
+        BwrapCommand::for_init(
+            spec,
+            &self.session,
+            &self.provisioned,
+            &cwd,
+            env,
+            target,
+            TerminalSession::Keep,
+        )
+        .unwrap_or_else(|e| panic!("cannot build the bwrap command: {e}"))
     }
 
     /// Runs `target` through `__init` in `spec` with `env` and `stdin`, and
@@ -576,8 +602,15 @@ impl ProbeSession {
     /// workspace mount if `spec` mounts it (`stopit::bwrap::working_dir`).
     pub fn command(&self, spec: &SandboxSpec) -> BwrapCommand {
         let cwd = working_dir(spec, Path::new(WORKSPACE_MOUNT));
-        BwrapCommand::new(spec, &self.session, &self.provisioned, &cwd, &[])
-            .unwrap_or_else(|e| panic!("cannot build the bwrap command: {e}"))
+        BwrapCommand::new(
+            spec,
+            &self.session,
+            &self.provisioned,
+            &cwd,
+            &[],
+            TerminalSession::Keep,
+        )
+        .unwrap_or_else(|e| panic!("cannot build the bwrap command: {e}"))
     }
 
     /// Runs the probe with `ops` in `spec`.

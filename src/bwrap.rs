@@ -194,6 +194,28 @@ pub enum BwrapError {
     NoCommand,
 }
 
+/// Whether the sandbox stays in the caller's session or gets a new one.
+///
+/// Until the supervisor runs sandboxes on a PTY of its own (DESIGN.md §5.1),
+/// their stdio is the host's, and so may be the controlling terminal they
+/// inherit. A process with access to the host terminal can push input into
+/// it with `TIOCSTI` on kernels that allow it, and seccomp, which will block
+/// that ioctl (§6.3 step 4), is not installed yet. bwrap's `--new-session`
+/// runs the sandbox in a new session, with no controlling terminal, where
+/// `TIOCSTI` on the host terminal fails. The kernel's job control then no
+/// longer covers the sandbox, so the supervisor disables it (Ctrl-Z is
+/// ignored, a background start refused); it is only used while the sandbox
+/// can reach a terminal, and goes away with the PTY (§6.2 step 1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TerminalSession {
+    /// Stay in the caller's session (no `--new-session`).
+    #[default]
+    Keep,
+    /// A new session, detached from the caller's controlling terminal
+    /// (`--new-session`).
+    Detach,
+}
+
 /// The working directory a sandbox starts in: the workspace mount if the
 /// spec mounts something there, else `/` (DESIGN.md §6.2).
 pub fn working_dir(spec: &SandboxSpec, workspace_mount: &Path) -> PathBuf {
@@ -234,6 +256,9 @@ impl BwrapCommand {
     /// passes on to `__init`, whose number the command names:
     /// `<prefix> __init --env-fd N -- <target…>`. Its names must be
     /// non-empty, unique and free of `=` and NUL, its values free of NUL.
+    ///
+    /// `terminal` says whether the sandbox gets a new session (see
+    /// [`TerminalSession`]).
     pub fn for_init(
         spec: &SandboxSpec,
         session: &SessionDir,
@@ -241,6 +266,7 @@ impl BwrapCommand {
         cwd: &Path,
         env: &[(OsString, OsString)],
         target: &[OsString],
+        terminal: TerminalSession,
     ) -> Result<BwrapCommand, BwrapError> {
         if target.is_empty() {
             return Err(BwrapError::NoCommand);
@@ -248,7 +274,7 @@ impl BwrapCommand {
         let encoded = init::encode_env(env.iter().map(|(k, v)| (k, v))).map_err(BwrapError::Env)?;
         let env_fd = sealed_memfd("stopit-init-env", &encoded).map_err(BwrapError::DataFd)?;
         let argv = init::init_argv(env_fd.as_raw_fd(), target);
-        let mut command = Self::new(spec, session, provisioned, cwd, &argv)?;
+        let mut command = Self::new(spec, session, provisioned, cwd, &argv, terminal)?;
         command.env_fd = Some(env_fd);
         Ok(command)
     }
@@ -268,6 +294,7 @@ impl BwrapCommand {
         provisioned: &Provisioned,
         cwd: &Path,
         argv_after_prefix: &[OsString],
+        terminal: TerminalSession,
     ) -> Result<BwrapCommand, BwrapError> {
         let runtime = RuntimeBinds {
             exe: provisioned.exe().to_path_buf(),
@@ -281,6 +308,7 @@ impl BwrapCommand {
             SandboxIds::current(),
             cwd,
             argv_after_prefix,
+            terminal,
             &|path| path.symlink_metadata().is_ok(),
             &mut |sandbox, key| {
                 session
@@ -513,12 +541,16 @@ fn checked(arg: &OsStr) -> Result<OsString, BwrapError> {
 /// the sandbox. `proc_has` tells whether a `/proc` path exists (on the
 /// host, whose kernel the sandbox's procfs shows), and `ephemeral_dir`
 /// provides the backing directory of an ephemeral mount at a sandbox path.
+// The host-dependent inputs are parameters so that the unit tests can fake
+// them; grouping them would only rename the list.
+#[allow(clippy::too_many_arguments)]
 fn plan(
     spec: &SandboxSpec,
     runtime: &RuntimeBinds,
     ids: SandboxIds,
     cwd: &Path,
     argv_after_prefix: &[OsString],
+    terminal: TerminalSession,
     proc_has: &dyn Fn(&Path) -> bool,
     ephemeral_dir: &mut dyn FnMut(&Path, &EphemeralKey) -> Result<PathBuf, BwrapError>,
 ) -> Result<Plan, BwrapError> {
@@ -560,9 +592,14 @@ fn plan(
     // `network = "none"` it must be taken down again (by `__init`, before
     // seccomp, or by a netlink call from the supervisor into the namespace).
     // Until then `none` behaves like `loopback`.
-    //
-    // No `--new-session`: `__init` sets up the controlling terminal (§6.3).
     plan.push(["--disable-userns", "--die-with-parent"])?;
+    // TODO(§5.1, Phase 2): once the sandbox's stdio is a PTY of the
+    // supervisor's, `__init` sets up the controlling terminal (§6.3 step 1)
+    // and `--new-session` is never used. Until then it keeps the sandbox off
+    // the host's terminal (see `TerminalSession`).
+    if terminal == TerminalSession::Detach {
+        plan.push(["--new-session"])?;
+    }
     // bwrap refuses `--hostname` without `--unshare-uts`.
     if let Some(hostname) = hostname {
         plan.push(["--hostname", hostname])?;
@@ -822,12 +859,22 @@ mod tests {
         spec: &SandboxSpec,
         proc_has: &dyn Fn(&Path) -> bool,
     ) -> Result<Plan, BwrapError> {
+        try_golden_in(spec, TerminalSession::Keep, proc_has)
+    }
+
+    /// [`try_golden`] with `terminal` as the session choice.
+    fn try_golden_in(
+        spec: &SandboxSpec,
+        terminal: TerminalSession,
+        proc_has: &dyn Fn(&Path) -> bool,
+    ) -> Result<Plan, BwrapError> {
         plan(
             spec,
             &runtime(),
             IDS,
             Path::new("/"),
             &["arg".into()],
+            terminal,
             proc_has,
             &mut |_, key| Ok(Path::new("/eph").join(key.dir_name())),
         )
@@ -1040,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn never_a_new_session_or_unshare_all() {
+    fn never_unshare_all_and_a_new_session_only_when_detached() {
         let mut spec = SandboxSpec::default();
         spec.system.proc = true;
         spec.system.dev = Some(DevMode::Minimal);
@@ -1048,6 +1095,17 @@ mod tests {
         assert!(!args.contains(&"--new-session".to_string()));
         assert!(!args.contains(&"--unshare-all".to_string()));
         assert!(!args.contains(&"--share-net".to_string()));
+
+        // Detached, `--new-session` comes right after the other process
+        // options, and nothing else changes.
+        let detached = try_golden_in(&SandboxSpec::default(), TerminalSession::Detach, &|_| true);
+        let mut expected = around(&[]);
+        let at = expected
+            .iter()
+            .position(|a| a == "--die-with-parent")
+            .unwrap();
+        expected.insert(at + 1, "--new-session".into());
+        assert_eq!(strings(&detached.unwrap()), expected);
     }
 
     #[test]
@@ -1280,6 +1338,7 @@ mod tests {
             ids,
             Path::new("/"),
             &[],
+            TerminalSession::Keep,
             &|_| true,
             &mut |_, _| unreachable!(),
         )
@@ -1449,6 +1508,7 @@ mod tests {
             IDS,
             Path::new("/workspace"),
             &[],
+            TerminalSession::Keep,
             &|_| true,
             &mut |_, _| unreachable!(),
         )
@@ -1466,6 +1526,7 @@ mod tests {
             IDS,
             Path::new("workspace"),
             &[],
+            TerminalSession::Keep,
             &|_| true,
             &mut |_, _| unreachable!(),
         )
@@ -1508,6 +1569,7 @@ mod tests {
                 IDS,
                 cwd,
                 argv,
+                TerminalSession::Keep,
                 &|_| true,
                 &mut |_, _| unreachable!(),
             )
@@ -1522,6 +1584,7 @@ mod tests {
             IDS,
             Path::new("/"),
             &[],
+            TerminalSession::Keep,
             &|_| true,
             &mut |_, _| unreachable!(),
         ));
@@ -1575,6 +1638,7 @@ mod tests {
                 &self.provisioned,
                 Path::new("/"),
                 &["__init".into()],
+                TerminalSession::Keep,
             )
             .unwrap()
         }
@@ -1761,6 +1825,7 @@ mod tests {
             IDS,
             Path::new("/"),
             &["arg".into(), "more".into()],
+            TerminalSession::Keep,
             &|_| true,
             &mut |_, _| unreachable!(),
         )
@@ -1875,6 +1940,7 @@ mod tests {
             &f.provisioned,
             Path::new("/"),
             &[],
+            TerminalSession::Keep,
         )
         .unwrap_err();
         match &err {
@@ -1923,6 +1989,7 @@ mod tests {
             Path::new("/"),
             env,
             &target,
+            TerminalSession::Keep,
         )
     }
 

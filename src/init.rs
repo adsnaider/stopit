@@ -34,13 +34,14 @@
 
 use std::collections::HashSet;
 use std::ffi::{CStr, CString, OsStr, OsString};
-use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, Read, Write as _};
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use thiserror::Error;
+
+use crate::escape::escape_bytes;
 
 /// The subcommand that runs the init helper: `stopit __init`.
 pub const SUBCOMMAND: &str = "__init";
@@ -402,16 +403,24 @@ fn set_no_new_privs() -> io::Result<()> {
     }
 }
 
-/// Restores what `execve` would otherwise pass on from `__init` itself: the
-/// Rust runtime ignores `SIGPIPE`, and an ignored signal stays ignored
-/// across `execve`, so `SIGPIPE` goes back to its default action; and no
-/// signal is blocked. `std::process::Command` does the same for its
-/// children.
+/// Signals the supervisor ignores while the sandbox runs on the host's
+/// terminal (`supervisor`, job control), which `__init` gives back their
+/// default action.
+const SUPERVISOR_IGNORED: [libc::c_int; 3] = [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU];
+
+/// Restores what `execve` would otherwise pass on from `__init` and the
+/// supervisor: an ignored signal stays ignored across `execve`, and the
+/// Rust runtime ignores `SIGPIPE` while the supervisor ignores `SIGTSTP`,
+/// `SIGTTIN` and `SIGTTOU` (job control, DESIGN.md §6.2 step 1), so these
+/// go back to their default action; and no signal is blocked.
+/// `std::process::Command` does the same for `SIGPIPE` and the mask.
 fn reset_signals() -> io::Result<()> {
     // SAFETY: plain libc calls on a local, initialized signal set.
     unsafe {
-        if libc::signal(libc::SIGPIPE, libc::SIG_DFL) == libc::SIG_ERR {
-            return Err(io::Error::last_os_error());
+        for signal in std::iter::once(libc::SIGPIPE).chain(SUPERVISOR_IGNORED) {
+            if libc::signal(signal, libc::SIG_DFL) == libc::SIG_ERR {
+                return Err(io::Error::last_os_error());
+            }
         }
         let mut empty: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut empty);
@@ -527,34 +536,6 @@ pub fn search_path(name: &[u8], path: &[u8], mut try_exec: impl FnMut(&CStr) -> 
     } else {
         ExecError::NotInPath
     }
-}
-
-/// `bytes` as printable text: every character `char::escape_debug` escapes
-/// (control characters, C0, DEL and C1, as `\u{1b}`; format characters such
-/// as the bidi override U+202E and the zero-width space U+200B; U+2028 and
-/// U+2029; unassigned and private-use ones), bytes that are not UTF-8 as
-/// `\xff`, and `\` as `\\`, so the result is unambiguous and carries no
-/// terminal escape sequence or text-direction trick. Everything else,
-/// other Unicode included, is kept.
-///
-/// For text the sandbox controls (a command name) printed to the user's
-/// terminal.
-pub fn escape_bytes(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len());
-    for chunk in bytes.utf8_chunks() {
-        for c in chunk.valid().chars() {
-            // `escape_debug` also escapes `\`, and the quotes, which stay.
-            if matches!(c, '\'' | '"') {
-                out.push(c);
-            } else {
-                out.extend(c.escape_debug());
-            }
-        }
-        for b in chunk.invalid() {
-            let _ = write!(out, "\\x{b:02x}");
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -962,39 +943,7 @@ mod tests {
         );
     }
 
-    // --- Escaping and descriptors ---
-
-    #[test]
-    fn escaping_makes_control_bytes_and_invalid_utf8_visible() {
-        assert_eq!(escape_bytes(b"plain-name_1.2"), "plain-name_1.2");
-        assert_eq!(escape_bytes("héllo ✓".as_bytes()), "héllo ✓");
-        assert_eq!(escape_bytes(b"a\x1b[2Jb"), "a\\u{1b}[2Jb");
-        assert_eq!(escape_bytes(b"a\nb\tc\rd"), "a\\nb\\tc\\rd");
-        assert_eq!(escape_bytes(b"\x7f"), "\\u{7f}");
-        // C1, as UTF-8.
-        assert_eq!(escape_bytes("\u{9b}".as_bytes()), "\\u{9b}");
-        assert_eq!(escape_bytes(b"x\xff\xfey"), "x\\xff\\xfey");
-        assert_eq!(escape_bytes(b"back\\slash"), "back\\\\slash");
-        for b in 0u8..=255 {
-            let escaped = escape_bytes(&[b]);
-            assert!(
-                !escaped.chars().any(char::is_control),
-                "{b:#x}: {escaped:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn escaping_covers_format_and_separator_characters() {
-        // Bidi override, zero-width space, line and paragraph separators:
-        // invisible or deceptive, so shown by code point.
-        assert_eq!(escape_bytes("a\u{202e}b".as_bytes()), "a\\u{202e}b");
-        assert_eq!(escape_bytes("a\u{200b}b".as_bytes()), "a\\u{200b}b");
-        assert_eq!(escape_bytes("a\u{2028}b".as_bytes()), "a\\u{2028}b");
-        assert_eq!(escape_bytes("a\u{2029}b".as_bytes()), "a\\u{2029}b");
-        // Quotes are kept, as plain text.
-        assert_eq!(escape_bytes(b"it's \"x\""), "it's \"x\"");
-    }
+    // --- Descriptors ---
 
     #[test]
     fn closing_descriptors_from_a_high_number_succeeds() {
