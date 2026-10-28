@@ -20,6 +20,7 @@ mod serde_util;
 pub mod session;
 pub mod spec;
 pub mod state;
+pub mod summary;
 pub mod supervisor;
 pub mod trust;
 

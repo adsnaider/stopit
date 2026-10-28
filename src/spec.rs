@@ -3149,6 +3149,76 @@ mod tests {
         v.iter().map(|d| d.parse().unwrap()).collect()
     }
 
+    /// The startup summary of `main` in the session compiled from `src`.
+    fn summary_of(f: &Fixture, src: &str) -> Vec<String> {
+        use crate::summary::{SummaryContext, summary_lines};
+        let cfg = Config::from_toml_str(src).unwrap();
+        let s = f.compile(src);
+        let home = f.root.join("home");
+        let ctx = SummaryContext {
+            profile: "main",
+            workspace: &f.ws(),
+            workspace_mount: Path::new(f.ws_mount),
+            home: &home,
+            base: cfg.base,
+            unprotected: &[],
+        };
+        summary_lines(spec(&s, "main"), &ctx)
+    }
+
+    #[test]
+    fn the_default_base_summary_is_only_the_header() {
+        let f = Fixture::new();
+        f.file("ws/flake.lock");
+        f.file("ws/.env");
+        f.file("ws/.stopit.toml");
+        assert_eq!(
+            summary_of(&f, ""),
+            [format!(
+                "profile \"main\" (workspace {} rw at /workspace)",
+                f.ws().display()
+            )]
+        );
+    }
+
+    #[test]
+    fn the_summary_lists_widening_grants_inside_the_workspace() {
+        let f = Fixture::new();
+        f.mkdir("ws/out");
+        f.mkdir("ws/secrets");
+        let ws = f.ws();
+        let ws = ws.display();
+        // `ro` workspace with an `rw` part (and sockets not masked).
+        let src = format!(
+            "base = \"none\"\n{}",
+            prov(
+                "p",
+                "main",
+                "fs.ro = [\"{workspace}\"]\nfs.rw = [\"{workspace}/out\"]"
+            )
+        );
+        assert_eq!(
+            summary_of(&f, &src),
+            [
+                format!("profile \"main\" (workspace {ws} ro at /workspace)"),
+                format!("  rw       {ws}/out -> /workspace/out  (provider \"p\")"),
+                "  sockets  not masked in rw grants".to_owned(),
+            ]
+        );
+        // A workspace that is not mounted, with a part of it mounted.
+        let src = format!(
+            "base = \"none\"\n{}",
+            prov("p", "main", "fs.ro = [\"{workspace}/secrets\"]")
+        );
+        assert_eq!(
+            summary_of(&f, &src),
+            [
+                format!("profile \"main\" (workspace {ws}, not mounted)"),
+                format!("  ro       {ws}/secrets -> /workspace/secrets  (provider \"p\")"),
+            ]
+        );
+    }
+
     #[test]
     fn base_none_is_the_empty_sandbox() {
         let f = Fixture::new();

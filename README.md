@@ -180,13 +180,17 @@ Allowed configurations are recorded by path and content hash in `~/.local/share/
 
 `stopit allow` trusts the file as it is when you run it, so read it first, especially after an agent has worked in the project.
 
+## Startup summary
+
+Before the sandbox starts, `stopit run` and `stopit shell` print to stderr what the profile grants beyond the default base: mounts of host content outside the workspace, or wider than the workspace's own mount (`rw` ones first), unmasked sockets, network access, shared namespaces, re-enabled syscalls, script providers with `protect = false`, and extra environment variable names (never values). The default configuration prints only a header line. `-q` / `--quiet` leaves the summary out (warnings and errors are still printed); give it before the command, since after it `-q` is the command's own.
+
 ## Current limitations
 
 - No terminal proxy yet. The sandbox shares your terminal in its own session, so job control is off: Ctrl-Z is ignored and starting stopit in the background is refused.
 - No seccomp or Landlock filters yet. Mount namespaces and bubblewrap are the only boundary.
 - `network = "none"` still has loopback up. Domain filtering is not built.
 - `protected` files are read-only. There is no approval prompt.
-- No brokered tools (`git`, `jj`) and no startup summary of what each sandbox can reach.
+- No brokered tools (`git`, `jj`).
 - Script providers are not hashed by `stopit allow`. A script you change after allowing still runs.
 
 DESIGN.md section 11 has the complete list.

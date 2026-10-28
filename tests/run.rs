@@ -123,9 +123,15 @@ impl Setup {
         command
     }
 
-    /// `stopit run <options…> <probe>`: [`stopit`](Self::stopit) with the
-    /// probe's argv after `options`.
+    /// `stopit run --quiet <options…> <probe>`: [`stopit`](Self::stopit)
+    /// with the probe's argv after `options`, without the startup summary,
+    /// so that most tests see only warnings and errors on stderr.
     fn run_probe_command(&self, options: &[&str]) -> Command {
+        self.run_probe_command_with_summary(&[&["--quiet"][..], options].concat())
+    }
+
+    /// [`run_probe_command`](Self::run_probe_command) without `--quiet`.
+    fn run_probe_command_with_summary(&self, options: &[&str]) -> Command {
         let mut command = self.stopit(&[&["run"][..], options].concat());
         command.args(probe_argv());
         command
@@ -247,7 +253,7 @@ fn arguments_after_the_command_are_the_commands() {
 #[test]
 fn a_missing_command_is_127_with_an_escaped_message() {
     let s = Setup::with_config("");
-    let out = output(s.stopit(&["run", "no\x1b[31msuch"]), b"");
+    let out = output(s.stopit(&["run", "--quiet", "no\x1b[31msuch"]), b"");
     assert_eq!(code(&out), 127, "{out:?}");
     // The default base grants no `PATH`.
     assert_eq!(
@@ -256,6 +262,68 @@ fn a_missing_command_is_127_with_an_escaped_message() {
     );
     assert!(out.stdout.is_empty(), "{out:?}");
     assert!(s.no_session_left());
+}
+
+// --- The startup summary ---
+
+/// The summary's header line for a workspace at `s.ws()`.
+fn summary_header(s: &Setup) -> String {
+    format!(
+        "stopit: profile \"main\" (workspace {} rw at /workspace)\n",
+        s.ws().display()
+    )
+}
+
+#[test]
+fn the_summary_lists_what_the_profile_grants_beyond_the_default_base() {
+    let s = Setup::with_config("fs.rw = [\"~/data\"]\nnetwork.mode = \"full\"");
+    fs::create_dir(s.root.join("home/data")).unwrap();
+    let out = output(s.run_probe_command_with_summary(&[]), b"[]");
+    assert_eq!(code(&out), 0, "{out:?}");
+    let (probe_dir, _) = probe_at_host_path();
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "{}stopit:   rw       ~/data  (provider \"tools\")\n\
+             stopit:   ro       {}  (provider \"tools\")\n\
+             stopit:   network  full\n",
+            summary_header(&s),
+            probe_dir.display()
+        )
+    );
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn quiet_suppresses_the_summary_but_not_warnings() {
+    let s = Setup::with_config("fs.rw = [\"~/data\"]\nnetwork.mode = \"full\"");
+    fs::create_dir(s.root.join("home/data")).unwrap();
+    let out = output(s.run_probe_command(&[]), b"[]");
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(stderr(&out), "", "{out:?}");
+    // `-q` is the same; a missing `rw` path still warns.
+    fs::remove_dir(s.root.join("home/data")).unwrap();
+    let out = output(s.run_probe_command_with_summary(&["-q"]), b"[]");
+    assert_eq!(code(&out), 0, "{out:?}");
+    let err = stderr(&out);
+    assert!(err.starts_with("stopit: warning: "), "{err}");
+    assert!(!err.contains("profile \"main\""), "{err}");
+}
+
+#[test]
+fn the_default_configuration_prints_only_the_header() {
+    let s = Setup::new();
+    s.write_raw_config("");
+    let out = output(s.stopit(&["run", "true"]), b"");
+    assert_eq!(code(&out), 127, "{out:?}");
+    // Then the missing command's own message: the base grants no tools.
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "{}stopit __init: true: not found (the environment has no PATH)\n",
+            summary_header(&s)
+        )
+    );
 }
 
 // --- What the sandbox sees ---
@@ -1706,7 +1774,7 @@ fn shell_runs_the_hosts_shell() {
         ),
     };
     let s = Setup::with_config(&extra);
-    let mut command = s.stopit(&["shell"]);
+    let mut command = s.stopit(&["shell", "--quiet"]);
     command.env("SHELL", &exe);
     let results = s.probe_with(command, &[Op::Argv, Op::Cwd]);
     assert_eq!(

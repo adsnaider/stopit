@@ -14,7 +14,9 @@
 //!    and the configuration file in each (§3, §3.6) and refusing mounts that
 //!    would expose stopit's own state directories (§6.2, Reserved host
 //!    paths), and prints its warnings ([`warning_lines`]);
-//! 4. picks the profile (`main`, or `--profile`, §3.3);
+//! 4. picks the profile (`main`, or `--profile`, §3.3) and, unless
+//!    `--quiet`, prints the summary of what it grants beyond the default
+//!    base ([`summary_lines`]), after the warnings;
 //! 5. provisions itself into the session directory (§2.1), computes the
 //!    target's environment from its own (§9), and runs bwrap with `__init`
 //!    and the command, on the supervisor's own stdio ([`wait_foreground`]);
@@ -32,11 +34,11 @@
 //! filesystem (often sandbox-writable) put text in them. bwrap's own
 //! messages are not stopit's, and are not escaped.
 //!
-//! Not done yet: the PTY proxy (§5; until then the sandbox runs on the host's
-//! terminal, see [`TerminalSession`]), the startup summary of widening
-//! grants (§3), the user-global configuration layered under `.stopit.toml`
-//! (§3), the refusal of a default base with no user provider granting tools
-//! (§3.2), the broker, protected files and the network proxy.
+//! Not done yet: the PTY proxy (§5; until then the sandbox runs on the
+//! host's terminal, see [`TerminalSession`]), the user-global configuration
+//! layered under `.stopit.toml` (§3), the refusal of a default base with no
+//! user provider granting tools (§3.2), the broker, protected files and the
+//! network proxy.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -56,7 +58,7 @@ use rustix::termios::Termios;
 use thiserror::Error;
 
 use crate::bwrap::{BwrapCommand, BwrapError, TerminalSession, working_dir};
-use crate::config::{Base, Config, ConfigError, ProfileRef};
+use crate::config::{Base, Config, ConfigError, ProfileRef, ProviderKind, ProviderName};
 use crate::escape::{escape_message, shell_quote};
 use crate::expand::{ExpandError, ExpansionContext, ResolveWarning};
 use crate::manifest::SandboxHome;
@@ -71,6 +73,7 @@ use crate::spec::{CompileError, CompiledSession, SpecWarning, compile_session, s
 use crate::state::{
     StateDirs, StateError, data_dirs_from_host, resolve_allowing_missing, runtime_dir,
 };
+use crate::summary::{SummaryContext, summary_lines};
 use crate::trust::{Allowed, Decision, TrustError, TrustStore};
 
 /// The name of the configuration file that marks a workspace (§3.1).
@@ -298,6 +301,8 @@ pub struct Invocation {
     pub workspace: Option<PathBuf>,
     /// `--profile`, if given.
     pub profile: Option<String>,
+    /// `--quiet`: do not print the startup summary ([`summary_lines`]).
+    pub quiet: bool,
     /// The command and its arguments.
     pub command: Vec<OsString>,
 }
@@ -319,6 +324,22 @@ pub fn print_error(message: &str) {
 /// Prints `stopit: warning: <message>` to stderr, escaped.
 fn print_warning(message: &str) {
     eprintln!("stopit: warning: {}", escape_message(message));
+}
+
+/// Prints `stopit: <line>` of the startup summary to stderr, escaped (the
+/// summary escapes its values already; this keeps its backslashes).
+fn print_summary_line(line: &str) {
+    eprintln!("stopit: {}", escape_message(line));
+}
+
+/// The script providers of `config` with `protect = false`, in order.
+fn unprotected_providers(config: &Config) -> Vec<&ProviderName> {
+    config
+        .providers
+        .iter()
+        .filter(|e| matches!(e.kind, ProviderKind::Script { protect: false, .. }))
+        .map(|e| &e.name)
+        .collect()
 }
 
 /// Runs `invocation` in the sandbox and returns the status to exit with:
@@ -545,7 +566,7 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     let pctx = ProviderContext {
         workspace: workspace.dir.clone(),
         workspace_mount: mount.clone(),
-        home,
+        home: home.clone(),
         session_dir: session.root().to_path_buf(),
         // Script paths must not run through links in these (§3.6).
         rw_grants: static_rw_roots(&static_outputs(&providers), &ctx),
@@ -582,8 +603,8 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     for line in warning_lines(&compiled, config.base) {
         print_warning(&line);
     }
-    // TODO(§3): print the startup summary of grants that widen access.
     // TODO(§3.2): refuse a default base with no user provider granting tools.
+    let profile_name = profile.as_str().to_owned();
     let Some(profile) = compiled.get(&profile) else {
         return Err(RunError::UnknownProfile {
             name: profile.as_str().to_owned(),
@@ -595,6 +616,22 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
                 .join(", "),
         });
     };
+    // After the warnings, right before the sandbox starts, so it is the
+    // last thing above the command's own output.
+    if !invocation.quiet {
+        let unprotected = unprotected_providers(&config);
+        let ctx = SummaryContext {
+            profile: &profile_name,
+            workspace: &workspace.dir,
+            workspace_mount: mount.as_path(),
+            home: &home,
+            base: config.base,
+            unprotected: &unprotected,
+        };
+        for line in summary_lines(&profile.spec, &ctx) {
+            print_summary_line(&line);
+        }
+    }
 
     let provisioned = provision_self(&session)?;
     let env = profile.spec.target_env(std::env::vars_os());

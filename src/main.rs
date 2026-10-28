@@ -28,6 +28,7 @@ fn main() -> ExitCode {
         CliCommand::Run { session, command } => Invocation {
             workspace: session.workspace,
             profile: session.profile,
+            quiet: session.quiet,
             command,
         },
         CliCommand::Shell { session } => {
@@ -35,6 +36,7 @@ fn main() -> ExitCode {
                 Ok(command) => Invocation {
                     workspace: session.workspace,
                     profile: session.profile,
+                    quiet: session.quiet,
                     command,
                 },
                 Err(e) => {

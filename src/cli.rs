@@ -83,6 +83,11 @@ pub struct SessionArgs {
     /// The profile to run in [default: main].
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
+    /// Do not print the startup summary of what the sandbox is granted
+    /// (warnings and errors are still printed). Must come before the
+    /// command: after it, `-q` is the command's own.
+    #[arg(short, long)]
+    pub quiet: bool,
 }
 
 /// The workspace option of `allow` and `revoke`.
@@ -113,6 +118,7 @@ mod tests {
             session: SessionArgs {
                 workspace: workspace.map(PathBuf::from),
                 profile: profile.map(str::to_owned),
+                quiet: false,
             },
             command: command.iter().map(OsString::from).collect(),
         }
@@ -196,11 +202,39 @@ mod tests {
                 session: SessionArgs {
                     workspace: Some("w".into()),
                     profile: Some("p".into()),
+                    quiet: false,
                 }
             }
         );
         let e = parse(&["shell", "ls"]).unwrap_err();
         assert_eq!(e.exit_code(), 2);
+    }
+
+    #[test]
+    fn quiet_is_a_session_option_before_the_command() {
+        let quiet = |command: &[&str]| CliCommand::Run {
+            session: SessionArgs {
+                quiet: true,
+                ..SessionArgs::default()
+            },
+            command: command.iter().map(OsString::from).collect(),
+        };
+        assert_eq!(parse(&["run", "-q", "ls"]).unwrap(), quiet(&["ls"]));
+        assert_eq!(parse(&["run", "--quiet", "ls"]).unwrap(), quiet(&["ls"]));
+        // After the command it is the command's own.
+        assert_eq!(
+            parse(&["run", "ls", "-q"]).unwrap(),
+            run(None, None, &["ls", "-q"])
+        );
+        assert_eq!(
+            parse(&["shell", "--quiet"]).unwrap(),
+            CliCommand::Shell {
+                session: SessionArgs {
+                    quiet: true,
+                    ..SessionArgs::default()
+                }
+            }
+        );
     }
 
     #[test]
@@ -218,6 +252,7 @@ mod tests {
                 session: SessionArgs {
                     workspace: Some(PathBuf::from(&odd)),
                     profile: None,
+                    quiet: false,
                 },
                 command: vec![odd.clone(), odd],
             }
