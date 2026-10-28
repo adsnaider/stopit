@@ -5,6 +5,7 @@
 pub mod bwrap;
 pub mod config;
 pub mod error;
+pub mod etc;
 pub mod expand;
 pub mod init;
 pub mod manifest;

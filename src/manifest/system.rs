@@ -119,7 +119,10 @@ impl fmt::Display for EtcFile {
 /// The sandbox `HOME`: an absolute sandbox path.
 ///
 /// No `~`, no globs, no placeholders, the same component rules as
-/// [`SandboxPath`](super::SandboxPath), and not `/`.
+/// [`SandboxPath`](super::SandboxPath), and not `/`. It also contains no
+/// `:` and no control character, since it is written into the synthesized
+/// `/etc/passwd` (DESIGN.md §6.2 step 4), whose fields `:` separates and
+/// whose entries a newline ends.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(try_from = "String")]
 pub struct SandboxHome(String);
@@ -143,8 +146,16 @@ impl FromStr for SandboxHome {
     type Err = ValueError;
 
     fn from_str(s: &str) -> Result<Self, ValueError> {
-        check_plain_absolute(s)
-            .map_err(|why| ValueError::new(format!("invalid sandbox home {s:?}: {why}")))?;
+        let invalid = |why: &str| ValueError::new(format!("invalid sandbox home {s:?}: {why}"));
+        check_plain_absolute(s).map_err(invalid)?;
+        if s.contains(':') {
+            return Err(invalid(
+                "must not contain `:`, the field separator of /etc/passwd",
+            ));
+        }
+        if s.chars().any(char::is_control) {
+            return Err(invalid("must not contain control characters"));
+        }
         Ok(SandboxHome(s.to_owned()))
     }
 }
@@ -342,6 +353,14 @@ mod tests {
             "/..",
             "//",
             "/a\0b",
+            "/home/a:b",
+            ":",
+            "/a:",
+            "/home/a\nb",
+            "/home/a\rb",
+            "/home/a\tb",
+            "/home/a\u{7f}b",
+            "/home/a\u{85}b",
         ] {
             let msg = bad.parse::<SandboxHome>().unwrap_err().to_string();
             assert!(msg.contains("sandbox home"), "{bad:?}: {msg}");
@@ -355,6 +374,13 @@ mod tests {
         assert!(msg.contains("NUL"), "{msg}");
         let msg = "/".parse::<SandboxHome>().unwrap_err().to_string();
         assert!(msg.contains("root"), "{msg}");
+        let msg = "/a:b".parse::<SandboxHome>().unwrap_err().to_string();
+        assert!(msg.contains("`:`"), "{msg}");
+        let msg = "/a\nb".parse::<SandboxHome>().unwrap_err().to_string();
+        assert!(msg.contains("control characters"), "{msg}");
+        // A newline is refused from configuration too.
+        let msg = jv_err(r#""system": {"home": "/a\nb"}"#);
+        assert!(msg.contains("control characters"), "{msg}");
     }
 
     #[test]

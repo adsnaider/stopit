@@ -1,20 +1,23 @@
 //! The bubblewrap command line for one sandbox (DESIGN.md §6.2).
 //!
 //! [`BwrapCommand::new`] compiles a [`SandboxSpec`] into bwrap's arguments:
-//! the namespaces (step 1), the system mounts (step 3), the filesystem
-//! mounts (step 5), the runtime directory (step 6), the environment (step 7)
-//! and the command (step 8). Synthesized `/etc` files and `HOME` stubs
-//! (step 4) are not generated yet.
+//! the namespaces (step 1), the system mounts (step 3), the synthesized
+//! `/etc` files (step 4, see [`crate::etc`]), the filesystem mounts (step
+//! 5), the runtime directory (step 6), the environment (step 7) and the
+//! command (step 8). The sandbox-`HOME` stubs of step 4 are not generated
+//! yet.
 //!
 //! Everything is pure generation except what the arguments need on the
 //! host: each ephemeral mount's session backing directory is created if
-//! missing ([`SessionDir::ephemeral_dir`]), and the data bwrap reads from
-//! file descriptors is put in sealed memfds. The options reach bwrap through
+//! missing ([`SessionDir::ephemeral_dir`]), the sandbox user's ids are the
+//! caller's ([`SandboxIds::current`]), and the data bwrap reads from file
+//! descriptors is put in sealed memfds. The options reach bwrap through
 //! `--args FD` (a profile's mounts can number thousands, beyond what argv
-//! comfortably holds), and each masked file's empty content through its own
-//! `--ro-bind-data FD`. A memfd holds any amount of data without a reader,
-//! so nothing can block writing it before bwrap runs, as a pipe would above
-//! its buffer size. Only the command after `--` is passed on argv.
+//! comfortably holds), and each masked file's empty content, and each
+//! synthesized file's content, through its own `--ro-bind-data FD`. A memfd
+//! holds any amount of data without a reader, so nothing can block writing
+//! it before bwrap runs, as a pipe would above its buffer size. Only the
+//! command after `--` is passed on argv.
 //!
 //! The descriptors are inherited at the numbers the arguments name:
 //! [`BwrapCommand::into_command`] reopens each in the child, after the
@@ -46,6 +49,7 @@ use rustix::io::fcntl_dupfd_cloexec;
 use thiserror::Error;
 
 use crate::config::ProviderName;
+use crate::etc::{self, SandboxIds};
 use crate::expand::EntryKind;
 use crate::init::{self, EnvError};
 use crate::manifest::{DevMode, ShareableNamespace};
@@ -80,6 +84,10 @@ pub const PROC_OPTIONAL_MASKS: [&str; 4] =
 /// The mode of an empty file masking a file (§3.4): nobody may open it, so
 /// even reading it fails with `EACCES`, while `stat` shows an empty file.
 const MASKED_FILE_PERMS: &str = "0000";
+
+/// The mode of a synthesized `/etc` file: readable by everyone. It is
+/// mounted read-only, so writing it fails with `EROFS` regardless.
+const ETC_FILE_PERMS: &str = "0444";
 
 /// The most arguments bwrap accepts, counting both those on its argv (after
 /// the program name, the command included) and those read through
@@ -270,6 +278,7 @@ impl BwrapCommand {
         let plan = plan(
             spec,
             &runtime,
+            SandboxIds::current(),
             cwd,
             argv_after_prefix,
             &|path| path.symlink_metadata().is_ok(),
@@ -477,10 +486,15 @@ impl Plan {
 
     /// Masks `dst` with an empty file nobody may open (§3.4).
     fn empty_file(&mut self, dst: &Path) -> Result<(), BwrapError> {
-        self.push(["--perms", MASKED_FILE_PERMS, "--ro-bind-data"])?;
+        self.data_file(MASKED_FILE_PERMS, Vec::new(), dst)
+    }
+
+    /// Mounts a read-only file holding `data`, with mode `perms`, at `dst`.
+    fn data_file(&mut self, perms: &str, data: Vec<u8>, dst: &Path) -> Result<(), BwrapError> {
+        self.push(["--perms", perms, "--ro-bind-data"])?;
         // Each needs its own descriptor: bwrap closes it after reading.
         self.args.push(Arg::Data(self.data.len()));
-        self.data.push(Vec::new());
+        self.data.push(data);
         self.push([dst])
     }
 }
@@ -495,13 +509,14 @@ fn checked(arg: &OsStr) -> Result<OsString, BwrapError> {
     Ok(arg.to_os_string())
 }
 
-/// Generates the invocation for `spec`. `proc_has` tells whether a `/proc`
-/// path exists (on the host, whose kernel the sandbox's procfs shows), and
-/// `ephemeral_dir` provides the backing directory of an ephemeral mount at a
-/// sandbox path.
+/// Generates the invocation for `spec`, whose user has the ids `ids` inside
+/// the sandbox. `proc_has` tells whether a `/proc` path exists (on the
+/// host, whose kernel the sandbox's procfs shows), and `ephemeral_dir`
+/// provides the backing directory of an ephemeral mount at a sandbox path.
 fn plan(
     spec: &SandboxSpec,
     runtime: &RuntimeBinds,
+    ids: SandboxIds,
     cwd: &Path,
     argv_after_prefix: &[OsString],
     proc_has: &dyn Fn(&Path) -> bool,
@@ -572,9 +587,19 @@ fn plan(
         Some(DevMode::Minimal) => plan.push(["--dev", "/dev"])?,
         None => {}
     }
-    // TODO(§6.2 step 4): synthesize `spec.system.etc` (`/etc/passwd`,
-    // `/etc/group`, `/etc/hosts`, `/etc/nsswitch.conf`) and the sandbox
-    // `HOME` stubs with `--ro-bind-data`. Until then they are absent.
+
+    // Step 4: synthesized `/etc` files, before the filesystem mounts. No
+    // mount may equal or contain one (§6.2, Reserved paths), so none can
+    // hide them, and mounts elsewhere in `/etc` (`/etc/ssl/certs`) are
+    // unaffected: bwrap creates `/etc` and the mount points in its root
+    // tmpfs, in whichever order.
+    for &file in &spec.system.etc {
+        let data = etc::contents(file, ids, &spec.system.home).into_bytes();
+        plan.data_file(ETC_FILE_PERMS, data, &etc::sandbox_path(file))?;
+    }
+    // TODO(§6.2 step 4): the sandbox-`HOME` stubs (`.gitconfig`, …), which
+    // the spec has no content for yet. They go after the filesystem
+    // mounts, so that an ephemeral or granted `HOME` does not hide them.
 
     // Step 5: filesystem mounts, parents first. A masked directory is an
     // empty tmpfs made read-only only after every mount below it, since
@@ -727,6 +752,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::manifest::EtcFile;
     use crate::policy::PathMode::{Ephemeral, Masked, Protected, Ro, Rw};
 
     // --- Building specs ---
@@ -767,6 +793,12 @@ mod tests {
 
     // --- Golden argument lists (pure generation) ---
 
+    /// The sandbox user's ids in the golden tests.
+    const IDS: SandboxIds = SandboxIds {
+        uid: 1000,
+        gid: 100,
+    };
+
     fn runtime() -> RuntimeBinds {
         RuntimeBinds {
             exe: "/s/stopit".into(),
@@ -785,6 +817,7 @@ mod tests {
         plan(
             spec,
             &runtime(),
+            IDS,
             Path::new("/"),
             &["arg".into()],
             proc_has,
@@ -1067,10 +1100,135 @@ mod tests {
     }
 
     #[test]
-    fn etc_files_are_not_synthesized_yet() {
+    fn etc_files_are_read_only_data_files() {
         let mut spec = SandboxSpec::default();
-        spec.system.etc = [crate::manifest::EtcFile::Passwd].into_iter().collect();
-        assert_eq!(golden(&spec), around(&[]));
+        spec.system.etc = EtcFile::ALL.into_iter().collect();
+        spec.system.home = "/home/agent".parse().unwrap();
+        let plan = try_golden(&spec, &|_| true).unwrap();
+        assert_eq!(
+            strings(&plan),
+            around(&[
+                "--perms",
+                "0444",
+                "--ro-bind-data",
+                "<data 0>",
+                "/etc/passwd",
+                "--perms",
+                "0444",
+                "--ro-bind-data",
+                "<data 1>",
+                "/etc/group",
+                "--perms",
+                "0444",
+                "--ro-bind-data",
+                "<data 2>",
+                "/etc/hosts",
+                "--perms",
+                "0444",
+                "--ro-bind-data",
+                "<data 3>",
+                "/etc/nsswitch.conf",
+            ])
+        );
+        let data: Vec<String> = plan
+            .data
+            .iter()
+            .map(|d| String::from_utf8(d.clone()).unwrap())
+            .collect();
+        assert_eq!(
+            data,
+            [
+                "user:x:1000:100::/home/agent:/bin/sh\n\
+                 nobody:x:65534:65534::/nonexistent:/bin/false\n",
+                "user:x:100:\nnogroup:x:65534:\n",
+                etc::HOSTS,
+                etc::NSSWITCH_CONF,
+            ]
+        );
+    }
+
+    #[test]
+    fn each_subset_of_etc_files_gives_exactly_those_files() {
+        let home: crate::manifest::SandboxHome = "/home/user".parse().unwrap();
+        for bits in 0..1u32 << EtcFile::ALL.len() {
+            let wanted: BTreeSet<EtcFile> = EtcFile::ALL
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| bits & 1 << i != 0)
+                .map(|(_, f)| f)
+                .collect();
+            let mut spec = SandboxSpec::default();
+            spec.system.etc = wanted.clone();
+            let plan = try_golden(&spec, &|_| true).unwrap();
+            let args = strings(&plan);
+            let mounted: Vec<(String, Vec<u8>)> = args
+                .windows(5)
+                .filter(|w| w[2] == "--ro-bind-data")
+                .map(|w| {
+                    assert_eq!(w[..2], ["--perms", ETC_FILE_PERMS]);
+                    let n: usize = w[3]
+                        .strip_prefix("<data ")
+                        .and_then(|s| s.strip_suffix('>'))
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    (w[4].clone(), plan.data[n].clone())
+                })
+                .collect();
+            let expected: Vec<(String, Vec<u8>)> = wanted
+                .iter()
+                .map(|&f| {
+                    (
+                        etc::sandbox_path(f).to_str().unwrap().to_owned(),
+                        etc::contents(f, IDS, &home).into_bytes(),
+                    )
+                })
+                .collect();
+            assert_eq!(mounted, expected, "{wanted:?}");
+            assert_eq!(plan.data.len(), wanted.len(), "{wanted:?}");
+        }
+    }
+
+    #[test]
+    fn etc_files_come_after_system_mounts_and_before_fs_mounts() {
+        let mut spec = spec(vec![
+            host("/etc/ssl/certs", "/h/certs", EntryKind::Dir, Ro),
+            host("/w", "/h/w", EntryKind::Dir, Masked),
+        ]);
+        spec.system.proc = true;
+        spec.system.dev = Some(DevMode::Minimal);
+        spec.system.etc = [EtcFile::Hosts, EtcFile::Passwd].into_iter().collect();
+        let args = golden(&spec);
+        let at = |s: &str| args.iter().position(|a| a == s).unwrap();
+        assert!(at("/dev") < at("/etc/passwd"));
+        // In `EtcFile` order, whatever the configuration's.
+        assert!(at("/etc/passwd") < at("/etc/hosts"));
+        assert!(at("/etc/hosts") < at("/etc/ssl/certs"));
+        assert!(at("/etc/hosts") < at("/w"));
+        // The masked `/proc` files' data come first.
+        let data = |dst: &str| args[at(dst) - 1].clone();
+        assert_eq!(data("/proc/timer_list"), "<data 2>");
+        assert_eq!(data("/etc/passwd"), "<data 3>");
+        assert_eq!(data("/etc/hosts"), "<data 4>");
+    }
+
+    #[test]
+    fn etc_files_use_the_given_ids() {
+        let mut spec = SandboxSpec::default();
+        spec.system.etc = [EtcFile::Passwd, EtcFile::Group].into_iter().collect();
+        let ids = SandboxIds { uid: 4242, gid: 77 };
+        let plan = plan(
+            &spec,
+            &runtime(),
+            ids,
+            Path::new("/"),
+            &[],
+            &|_| true,
+            &mut |_, _| unreachable!(),
+        )
+        .unwrap();
+        assert!(plan.data[0].starts_with(b"user:x:4242:77::/home/user:/bin/sh\n"));
+        assert!(plan.data[1].starts_with(b"user:x:77:\n"));
     }
 
     #[test]
@@ -1231,6 +1389,7 @@ mod tests {
         let plan = plan(
             &SandboxSpec::default(),
             &runtime(),
+            IDS,
             Path::new("/workspace"),
             &[],
             &|_| true,
@@ -1247,6 +1406,7 @@ mod tests {
         let err = plan(
             &SandboxSpec::default(),
             &runtime(),
+            IDS,
             Path::new("workspace"),
             &[],
             &|_| true,
@@ -1288,6 +1448,7 @@ mod tests {
             plan(
                 &SandboxSpec::default(),
                 &runtime(),
+                IDS,
                 cwd,
                 argv,
                 &|_| true,
@@ -1301,6 +1462,7 @@ mod tests {
         nul_err(plan(
             &SandboxSpec::default(),
             &rt,
+            IDS,
             Path::new("/"),
             &[],
             &|_| true,
@@ -1441,6 +1603,31 @@ mod tests {
     }
 
     #[test]
+    fn etc_descriptors_hold_the_files_for_the_current_user() {
+        let f = Fixture::new();
+        let mut spec = SandboxSpec::default();
+        spec.system.etc = [EtcFile::Passwd, EtcFile::NsswitchConf]
+            .into_iter()
+            .collect();
+        let cmd = f.command(&spec);
+        let named: Vec<(RawFd, &OsString)> = cmd
+            .args()
+            .windows(3)
+            .filter(|w| w[0] == "--ro-bind-data")
+            .map(|w| (w[1].to_str().unwrap().parse().unwrap(), &w[2]))
+            .collect();
+        let ids = SandboxIds::current();
+        assert_eq!(named.len(), 2);
+        assert_eq!(named[0].1, "/etc/passwd");
+        assert_eq!(
+            read_fd(named[0].0),
+            etc::passwd(ids, &spec.system.home).into_bytes()
+        );
+        assert_eq!(named[1].1, "/etc/nsswitch.conf");
+        assert_eq!(read_fd(named[1].0), etc::NSSWITCH_CONF.as_bytes());
+    }
+
+    #[test]
     fn descriptors_are_sealed_and_close_on_exec() {
         let f = Fixture::new();
         let cmd = f.command(&spec(vec![host("/a", "/h/a", EntryKind::File, Masked)]));
@@ -1514,6 +1701,7 @@ mod tests {
         let err = plan(
             &exact_spec,
             &runtime(),
+            IDS,
             Path::new("/"),
             &["arg".into(), "more".into()],
             &|_| true,

@@ -7,13 +7,15 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use stopit::bwrap::{
     BWRAP_MAX_ARGS, BwrapCommand, BwrapError, PROC_MASKED_DIRS, PROC_MASKED_FILES,
     PROC_OPTIONAL_MASKS,
 };
+use stopit::etc::{self, SandboxIds};
+use stopit::manifest::EtcFile;
 
 use common::*;
 
@@ -492,6 +494,223 @@ fn dev_is_minimal() {
     ));
     assert_eq!(errno(&results[3]), "ENOENT");
     assert_eq!(errno(&results[4]), "ENOENT");
+}
+
+// --- Synthesized `/etc` files ---
+
+/// The ids of this process, which the sandbox user has.
+fn host_ids() -> (u32, u32) {
+    (
+        rustix::process::getuid().as_raw(),
+        rustix::process::getgid().as_raw(),
+    )
+}
+
+#[test]
+fn default_base_synthesizes_read_only_etc_files() {
+    let f = SpecFixture::new();
+    let (spec, _) = f.compile_with_warnings("");
+    let files = ["passwd", "group", "hosts", "nsswitch.conf"];
+    let mut ops = vec![list("/etc")];
+    for name in files {
+        let path = format!("/etc/{name}");
+        ops.extend([
+            stat(&path),
+            read(&path),
+            write(&path, "x"),
+            append(&path, "x"),
+            chmod(&path, 0o666),
+            remove(&path),
+            rename(&path, "/etc/moved"),
+        ]);
+    }
+    ops.push(write("/etc/new", "x"));
+    let results = f.session().run(&spec, &ops);
+    assert_eq!(
+        ok(&results[0]),
+        &names(&["group", "hosts", "nsswitch.conf", "passwd"])
+    );
+    // For this process's ids, the sandbox user's (the line format is
+    // checked against the probe's ids below, and golden in `stopit::etc`).
+    let home = "/home/user".parse().unwrap();
+    let expected = EtcFile::ALL.map(|f| etc::contents(f, SandboxIds::current(), &home));
+    for (i, (name, want)) in files.iter().zip(&expected).enumerate() {
+        let r = &results[1 + i * 7..1 + (i + 1) * 7];
+        let st = stat_data(&r[0]);
+        assert_eq!((st.kind, st.mode), (FileKind::File, 0o444), "{name}");
+        assert_eq!(st.size, want.len() as u64, "{name}");
+        assert_eq!(contents(&r[1]), want, "{name}");
+        assert_eq!(errno(&r[2]), "EROFS", "{name}: {:?}", r[2]);
+        not_writable(&r[3]);
+        assert_eq!(errno(&r[4]), "EROFS", "{name}: {:?}", r[4]);
+        for result in &r[5..] {
+            let e = errno(result);
+            assert!(e == "EROFS" || e == "EBUSY", "{name}: {result:?}");
+        }
+    }
+    assert_eq!(errno(results.last().unwrap()), "EROFS");
+}
+
+#[test]
+fn passwd_names_the_sandbox_users_ids() {
+    let f = SpecFixture::new();
+    let spec = f.compile(&config_none(
+        "system.etc = [\"passwd\", \"group\"]\nsystem.home = \"/home/agent\"",
+    ));
+    let results = f
+        .session()
+        .run(&spec, &[Op::Ids, read("/etc/passwd"), read("/etc/group")]);
+    let Data::Ids(ids) = ok(&results[0]) else {
+        panic!("expected ids, got {:?}", results[0])
+    };
+    assert_eq!((ids.uid, ids.gid), host_ids());
+    let user: Vec<&str> = contents(&results[1])
+        .lines()
+        .next()
+        .unwrap()
+        .split(':')
+        .collect();
+    assert_eq!(
+        user,
+        [
+            "user",
+            "x",
+            &ids.uid.to_string(),
+            &ids.gid.to_string(),
+            "",
+            "/home/agent",
+            "/bin/sh"
+        ]
+    );
+    let group = contents(&results[2]).lines().next().unwrap().to_owned();
+    assert_eq!(group, format!("user:x:{}:", ids.gid));
+}
+
+#[test]
+fn without_etc_files_there_is_no_etc() {
+    let f = SpecFixture::new();
+    let spec = f.compile(&config_none("system.etc = [\"hosts\"]"));
+    let results = f.session().run(&spec, &[list("/etc"), stat("/etc/passwd")]);
+    assert_eq!(ok(&results[0]), &names(&["hosts"]));
+    assert_eq!(errno(&results[1]), "ENOENT");
+
+    let spec = f.compile(&config_none("system.etc = []\nsystem.proc = true"));
+    let results = f.session().run(&spec, &[stat("/etc/passwd"), stat("/etc")]);
+    assert_eq!(errno(&results[0]), "ENOENT");
+    assert_eq!(errno(&results[1]), "ENOENT");
+}
+
+#[test]
+fn etc_files_coexist_with_a_grant_inside_etc() {
+    let certs = Path::new("/etc/ssl/certs");
+    if fs::metadata(certs).is_err() {
+        eprintln!("skipped: the host has no {certs:?}");
+        return;
+    }
+    let f = SpecFixture::new();
+    let spec = f.compile(&config_none(
+        "system.etc = [\"passwd\", \"group\", \"hosts\", \"nsswitch.conf\"]\n\
+         fs.ro = [\"/etc/ssl/certs\"]",
+    ));
+    let results = f.session().run(
+        &spec,
+        &[
+            list("/etc"),
+            list("/etc/ssl"),
+            stat_follow("/etc/ssl/certs"),
+            read("/etc/hosts"),
+            write("/etc/ssl/new", "x"),
+        ],
+    );
+    assert_eq!(
+        ok(&results[0]),
+        &names(&["group", "hosts", "nsswitch.conf", "passwd", "ssl"])
+    );
+    assert_eq!(ok(&results[1]), &names(&["certs"]));
+    assert_eq!(stat_data(&results[2]).kind, FileKind::Dir);
+    assert_eq!(contents(&results[3]), etc::HOSTS);
+    assert_eq!(errno(&results[4]), "EROFS");
+}
+
+/// The host's `id` program as a path the sandbox can run once the
+/// existing ones of `dirs` are granted read-only, following symlinks only
+/// until the path lies in one of them, so that a multi-call binary still
+/// sees its name. `None` if there is no `id` on `PATH`, or it cannot be
+/// reached that way.
+fn host_id_program(dirs: &[&Path]) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let mut program = std::env::split_paths(&path)
+        .map(|dir| dir.join("id"))
+        .find(|p| p.is_file())?;
+    for _ in 0..40 {
+        if dirs.iter().any(|d| program.starts_with(d)) {
+            return Some(program);
+        }
+        let target = fs::read_link(&program).ok()?;
+        program = program.parent()?.join(target);
+    }
+    None
+}
+
+#[test]
+fn glibc_resolves_the_sandbox_user_through_the_synthesized_files() {
+    // Runs the host's `id`, which looks names up through glibc's NSS, so
+    // `nsswitch.conf`, `passwd` and `group` all take part.
+    let dirs: Vec<&Path> = ["/nix/store", "/usr", "/lib", "/lib64", "/bin"]
+        .map(Path::new)
+        .into_iter()
+        .filter(|d| d.symlink_metadata().is_ok())
+        .collect();
+    let Some(id) = host_id_program(&dirs) else {
+        eprintln!("skipped: no `id` reachable in {dirs:?}");
+        return;
+    };
+    let ro: Vec<String> = dirs.iter().map(|d| format!("{d:?}")).collect();
+    let f = SpecFixture::new();
+    // `/dev` for the probe's `/dev/null` stdin.
+    let spec = f.compile(&config_none(&format!(
+        "system.dev = \"minimal\"\n\
+         system.etc = [\"passwd\", \"group\", \"nsswitch.conf\"]\nfs.ro = [{}]",
+        ro.join(", ")
+    )));
+    let exec = |args: &[&str]| Op::Exec {
+        path: id.to_str().unwrap().to_owned(),
+        args: args.iter().map(|a| a.to_string()).collect(),
+        stdin: None,
+    };
+    let results = f.session().run(
+        &spec,
+        &[exec(&["-un"]), exec(&["-gn"]), exec(&["-un", "65534"])],
+    );
+    let (uid, gid) = host_ids();
+    let stdout = |r: &OpResult| match ok(r) {
+        Data::Exec(out) => {
+            assert_eq!(out.code, Some(0), "{out:?}");
+            out.stdout.clone()
+        }
+        other => panic!("expected exec output, got {other:?}"),
+    };
+    if uid != etc::OVERFLOW_ID {
+        assert_eq!(stdout(&results[0]), "user\n");
+        assert_eq!(stdout(&results[2]), "nobody\n");
+    }
+    if gid != etc::OVERFLOW_ID {
+        assert_eq!(stdout(&results[1]), "user\n");
+    }
+
+    // Without them the name comes from nowhere else.
+    let spec = f.compile(&config_none(&format!(
+        "system.dev = \"minimal\"\nfs.ro = [{}]",
+        ro.join(", ")
+    )));
+    let result = f.session().run_one(&spec, exec(&["-un"]));
+    match ok(&result) {
+        Data::Exec(out) => {
+            assert_ne!(out.code, Some(0), "{out:?}");
+            assert!(out.stderr.contains("cannot find name"), "{out:?}");
+        }
+        other => panic!("expected exec output, got {other:?}"),
+    }
 }
 
 // --- Runtime directory, environment, process ---
