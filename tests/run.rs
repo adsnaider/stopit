@@ -337,10 +337,31 @@ fn the_workspace_option_is_canonicalized() {
 }
 
 #[test]
-fn no_configuration_runs_the_default_base_in_the_cwd() {
-    // Without a `.stopit.toml` the default base applies: nothing grants the
-    // probe, so it is not found.
+fn no_configuration_is_refused_and_nothing_runs() {
+    // Else a sandbox could create the `.stopit.toml` that the next run loads.
     let s = Setup::new();
+    let out = output(s.run_probe_command(&[]), b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    let ws = s.ws().display().to_string();
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "stopit: error: no .stopit.toml in {ws} or any directory above it. A configuration \
+             is required so that a sandbox cannot create one for later runs: create an empty \
+             one (touch {ws}/.stopit.toml) to use the default configuration, or pass \
+             --workspace.\n"
+        )
+    );
+    assert!(out.stdout.is_empty(), "{out:?}");
+    // Not even the session directory was created.
+    assert!(!s.runtime().join("stopit").exists());
+}
+
+#[test]
+fn an_empty_configuration_runs_the_default_base() {
+    // The default base grants nothing for the probe, so it is not found.
+    let s = Setup::new();
+    s.write_raw_config("");
     let out = output(s.run_probe_command(&[]), b"[]");
     assert_eq!(code(&out), 127, "{out:?}");
     assert!(stderr(&out).starts_with("stopit __init: "), "{out:?}");
@@ -348,6 +369,28 @@ fn no_configuration_runs_the_default_base_in_the_cwd() {
         stderr(&out).contains("No such file or directory"),
         "{out:?}"
     );
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn the_workspace_option_needs_a_configuration_in_the_directory_too() {
+    // `--workspace` does not look up: `sub` has none of its own, though the
+    // directory above it does.
+    let s = Setup::with_config("");
+    fs::create_dir(s.ws().join("sub")).unwrap();
+    let out = output(s.run_probe_command(&["--workspace", "sub"]), b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    let sub = s.ws().join("sub").display().to_string();
+    let err = stderr(&out);
+    assert!(
+        err.starts_with(&format!(
+            "stopit: error: no .stopit.toml in the workspace {sub}."
+        )),
+        "{err}"
+    );
+    assert!(err.contains(&format!("touch {sub}/.stopit.toml")), "{err}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert!(!s.runtime().join("stopit").exists());
 }
 
 // --- What runs on the host next session ---

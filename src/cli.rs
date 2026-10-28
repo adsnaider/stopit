@@ -55,8 +55,8 @@ pub enum CliCommand {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
 pub struct SessionArgs {
     /// The workspace directory [default: the nearest directory, from the
-    /// current one up, containing `.stopit.toml`, else the current
-    /// directory].
+    /// current one up, containing `.stopit.toml`; it is an error if there is
+    /// none]. The directory needs its own `.stopit.toml`.
     #[arg(long, value_name = "DIR")]
     pub workspace: Option<PathBuf>,
     /// The profile to run in [default: main].

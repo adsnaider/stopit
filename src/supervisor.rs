@@ -3,8 +3,8 @@
 //! [`run`] runs one command in one sandbox, in the foreground:
 //!
 //! 1. finds the workspace and its `.stopit.toml` ([`discover_workspace`],
-//!    §3.1) and loads the configuration (the default one if there is
-//!    none);
+//!    §3.1) and loads the configuration (a workspace without one is an
+//!    error);
 //! 2. creates the session directory (§2.1), which the providers are told
 //!    about;
 //! 3. runs the providers, compiles every profile of the session
@@ -115,6 +115,17 @@ pub enum RunError {
         /// Why `outer` would not load either (it fails the checks of
         /// [`check_config_trust`]), if so: it is then not suggested.
         outer_unusable: Option<String>,
+    },
+
+    /// There is no configuration file: without one, a sandbox could create
+    /// it and the next run would load it ([`discover_workspace`]).
+    #[error("{}", no_config_message(dir, *explicit))]
+    NoConfig {
+        /// The directory searched from (walking up), or named by
+        /// `--workspace`.
+        dir: PathBuf,
+        /// Whether `--workspace` named it.
+        explicit: bool,
     },
 
     /// The configuration file cannot be read.
@@ -324,14 +335,12 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     // protected in every profile whatever the base and rules (§3, §3.6),
     // the latter attributed to the name reserved for stopit's own rules.
     let mut protected = protected_sources(&providers)?;
-    if let Some(path) = &workspace.config {
-        protected.push(ProtectedSource {
-            provider: SUPERVISOR_PROVIDER_NAME
-                .parse()
-                .expect("the supervisor's name is a valid provider name"),
-            path: path.clone(),
-        });
-    }
+    protected.push(ProtectedSource {
+        provider: SUPERVISOR_PROVIDER_NAME
+            .parse()
+            .expect("the supervisor's name is a valid provider name"),
+        path: workspace.config.clone(),
+    });
     let compiled = compile_session(&config, outputs, &protected, &ctx)?;
     for line in warning_lines(&compiled, config.base) {
         print_warning(&line);
@@ -708,21 +717,19 @@ fn host_home(home: Option<OsString>) -> Result<PathBuf, RunError> {
 pub struct Workspace {
     /// The workspace directory, canonical.
     pub dir: PathBuf,
-    /// Its `.stopit.toml`, if it has one.
-    pub config: Option<PathBuf>,
+    /// Its `.stopit.toml`.
+    pub config: PathBuf,
 }
 
 impl Workspace {
-    /// The configuration: the configuration file's, or the default one
-    /// (`base = "default"` and nothing else) without a file.
+    /// The configuration in the configuration file (an empty one is the
+    /// default configuration: `base = "default"` and nothing else).
     ///
     /// The file must be the user's own and only theirs to change
     /// ([`check_config_trust`]): it decides what the sandbox may do and which
     /// script providers run on the host, as the user.
     pub fn load_config(&self) -> Result<Config, RunError> {
-        let Some(path) = &self.config else {
-            return Ok(Config::default());
-        };
+        let path = &self.config;
         let text = read_trusted(path)?;
         Config::from_toml_str(&text).map_err(|source| RunError::Config {
             path: path.clone(),
@@ -850,6 +857,31 @@ pub fn check_config_trust(file: Ownership, dir: Ownership, uid: u32) -> Result<(
     Ok(())
 }
 
+/// The message of [`RunError::NoConfig`]: why a configuration is required
+/// and how to get one, for the directory `dir` searched from or named by
+/// `--workspace` (`explicit`).
+fn no_config_message(dir: &Path, explicit: bool) -> String {
+    let dir = dir.display();
+    let (place, hint) = if explicit {
+        (
+            format!("no {CONFIG_FILE} in the workspace {dir}"),
+            format!("create one in it (touch {dir}/{CONFIG_FILE}) or pass another --workspace"),
+        )
+    } else {
+        (
+            format!("no {CONFIG_FILE} in {dir} or any directory above it"),
+            format!(
+                "create an empty one (touch {dir}/{CONFIG_FILE}) to use the default \
+                 configuration, or pass --workspace"
+            ),
+        )
+    };
+    format!(
+        "{place}. A configuration is required so that a sandbox cannot create one for later \
+         runs: {hint}."
+    )
+}
+
 /// The message of [`RunError::NestedConfig`]: it suggests `--workspace`
 /// with the outer configuration's directory only if that one would load.
 fn nested_config_message(inner: &Path, outer: &Path, outer_unusable: Option<&str>) -> String {
@@ -876,9 +908,10 @@ fn nested_config_message(inner: &Path, outer: &Path, outer_unusable: Option<&str
 
 /// Finds the workspace (§3.1), from the current directory `cwd`: the
 /// directory `explicit` (`--workspace`, relative to `cwd`) if given, else
-/// the nearest directory from `cwd` up that contains `.stopit.toml`, else
-/// `cwd` itself. Its configuration file is its own `.stopit.toml`, if any;
-/// `--workspace` does not look further up.
+/// the nearest directory from `cwd` up that contains `.stopit.toml`. Its
+/// configuration file is its own `.stopit.toml`; `--workspace` does not look
+/// further up. No configuration file is an error ([`RunError::NoConfig`]):
+/// otherwise a sandbox could create one for the next run to load (§3, §11).
 ///
 /// A `.stopit.toml` found walking up is refused if a directory above it has
 /// a `.stopit.toml` entry owned by the user ([`RunError::NestedConfig`]):
@@ -918,7 +951,12 @@ fn discover_workspace_as(
         if !dir.is_dir() {
             return Err(RunError::WorkspaceNotDir(dir));
         }
-        let config = config_in(&dir)?;
+        let Some(config) = config_in(&dir)? else {
+            return Err(RunError::NoConfig {
+                dir,
+                explicit: true,
+            });
+        };
         return Ok(Workspace { dir, config });
     }
     let start = canonical(cwd.to_path_buf())?;
@@ -946,13 +984,13 @@ fn discover_workspace_as(
             }
             return Ok(Workspace {
                 dir: dir.to_path_buf(),
-                config: Some(config),
+                config,
             });
         }
     }
-    Ok(Workspace {
+    Err(RunError::NoConfig {
         dir: start,
-        config: None,
+        explicit: false,
     })
 }
 
@@ -1033,7 +1071,7 @@ mod tests {
         fs::write(root.join("ws").join(CONFIG_FILE), "").unwrap();
         let ws = discover_workspace(&deep, None).unwrap();
         assert_eq!(ws.dir, root.join("ws"));
-        assert_eq!(ws.config, Some(root.join("ws").join(CONFIG_FILE)));
+        assert_eq!(ws.config, root.join("ws").join(CONFIG_FILE));
         // From the workspace itself.
         assert_eq!(
             discover_workspace(&root.join("ws"), None).unwrap().dir,
@@ -1097,7 +1135,7 @@ mod tests {
         for dir in ["ws/sub", "ws"] {
             let ws = discover_workspace(&root, Some(Path::new(dir))).unwrap();
             assert_eq!(ws.dir, root.join(dir));
-            assert_eq!(ws.config, Some(root.join(dir).join(CONFIG_FILE)));
+            assert_eq!(ws.config, root.join(dir).join(CONFIG_FILE));
         }
     }
 
@@ -1160,20 +1198,34 @@ mod tests {
         let me = rustix::process::getuid().as_raw();
         let ws = discover_workspace_as(&root.join("proj/sub"), None, me.wrapping_add(1)).unwrap();
         assert_eq!(ws.dir, root.join("proj"));
-        assert_eq!(ws.config, Some(root.join("proj").join(CONFIG_FILE)));
+        assert_eq!(ws.config, root.join("proj").join(CONFIG_FILE));
         // For its owner, it counts.
         let e = discover_workspace_as(&root.join("proj/sub"), None, me).unwrap_err();
         assert!(matches!(e, RunError::NestedConfig { .. }), "{e:?}");
     }
 
     #[test]
-    fn without_a_config_the_cwd_is_the_workspace() {
+    fn without_a_config_there_is_no_workspace() {
         let (_d, root) = tmp();
         // Nothing above a fresh temporary directory is expected to hold a
         // `.stopit.toml`; if one does, the test says so.
-        let found = discover_workspace(&root, None).unwrap();
-        assert_eq!(found.config, None, "a {CONFIG_FILE} above {root:?}?");
-        assert_eq!(found.dir, root);
+        let e = discover_workspace(&root, None).unwrap_err();
+        let RunError::NoConfig { dir, explicit } = &e else {
+            panic!("a {CONFIG_FILE} above {root:?}? {e:?}");
+        };
+        assert_eq!(dir, &root);
+        assert!(!explicit);
+        let msg = e.to_string();
+        assert!(msg.contains("or any directory above it"), "{msg}");
+        assert!(
+            msg.contains(&format!("touch {}/.stopit.toml", root.display())),
+            "{msg}"
+        );
+        assert!(msg.contains("sandbox cannot create one"), "{msg}");
+        // From below, the message names the directory the search began in.
+        fs::create_dir(root.join("sub")).unwrap();
+        let e = discover_workspace(&root.join("sub"), None).unwrap_err();
+        assert!(matches!(&e, RunError::NoConfig { dir, .. } if dir == &root.join("sub")));
     }
 
     #[test]
@@ -1181,10 +1233,11 @@ mod tests {
         let (_d, root) = tmp();
         fs::create_dir_all(root.join("real/sub")).unwrap();
         fs::write(root.join("real").join(CONFIG_FILE), "").unwrap();
+        fs::write(root.join("real/sub").join(CONFIG_FILE), "").unwrap();
         symlink(root.join("real"), root.join("link")).unwrap();
         let ws = discover_workspace(&root.join("link/sub/.."), None).unwrap();
         assert_eq!(ws.dir, root.join("real"));
-        assert_eq!(ws.config, Some(root.join("real").join(CONFIG_FILE)));
+        assert_eq!(ws.config, root.join("real").join(CONFIG_FILE));
         let ws = discover_workspace(&root, Some(Path::new("link/./sub"))).unwrap();
         assert_eq!(ws.dir, root.join("real/sub"));
     }
@@ -1199,11 +1252,23 @@ mod tests {
         // Relative to the cwd, or absolute.
         let ws = discover_workspace(&root.join("a/b"), Some(Path::new("../../c"))).unwrap();
         assert_eq!(ws.dir, root.join("c"));
-        assert_eq!(ws.config, Some(root.join("c").join(CONFIG_FILE)));
+        assert_eq!(ws.config, root.join("c").join(CONFIG_FILE));
         // `a/b` has no configuration of its own; `a`'s is not used.
-        let ws = discover_workspace(&root, Some(&root.join("a/b"))).unwrap();
-        assert_eq!(ws.dir, root.join("a/b"));
-        assert_eq!(ws.config, None);
+        let e = discover_workspace(&root, Some(&root.join("a/b"))).unwrap_err();
+        let RunError::NoConfig { dir, explicit } = &e else {
+            panic!("{e:?}");
+        };
+        assert_eq!(dir, &root.join("a/b"));
+        assert!(explicit);
+        let msg = e.to_string();
+        assert!(msg.contains("in the workspace"), "{msg}");
+        assert!(
+            msg.contains(&format!(
+                "touch {}/.stopit.toml",
+                root.join("a/b").display()
+            )),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -1219,17 +1284,15 @@ mod tests {
     #[test]
     fn configs_load_or_fail_with_their_path() {
         let (_d, root) = tmp();
-        let none = Workspace {
-            dir: root.clone(),
-            config: None,
-        };
-        assert_eq!(none.load_config().unwrap(), Config::default());
-        assert_eq!(Config::default().base, Base::Default);
         let path = root.join(CONFIG_FILE);
         let with = Workspace {
             dir: root.clone(),
-            config: Some(path.clone()),
+            config: path.clone(),
         };
+        // An empty file is the default configuration.
+        write_config(&path, "", 0o644);
+        assert_eq!(with.load_config().unwrap(), Config::default());
+        assert_eq!(Config::default().base, Base::Default);
         write_config(&path, "base = \"none\"", 0o644);
         assert_eq!(with.load_config().unwrap().base, Base::None);
         write_config(&path, "bogus = 1", 0o644);
@@ -1258,10 +1321,7 @@ mod tests {
         let path = dir.join(CONFIG_FILE);
         write_config(&path, "base = \"none\"", file_mode);
         fs::set_permissions(&dir, fs::Permissions::from_mode(dir_mode)).unwrap();
-        Workspace {
-            dir,
-            config: Some(path),
-        }
+        Workspace { dir, config: path }
     }
 
     #[test]
@@ -1320,7 +1380,7 @@ mod tests {
         let ws = workspace_with_modes(&root, 0o755, 0o644);
         let real = root.join("real.toml");
         write_config(&real, "base = \"none\"", 0o644);
-        let path = ws.config.clone().unwrap();
+        let path = ws.config.clone();
         fs::remove_file(&path).unwrap();
         symlink(&real, &path).unwrap();
         let e = ws.load_config().unwrap_err();
