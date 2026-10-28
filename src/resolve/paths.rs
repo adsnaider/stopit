@@ -1212,16 +1212,17 @@ mod tests {
             .iter()
             .map(|m| (m.sandbox.clone(), kind_of(m), m.mode))
             .collect();
-        let mut expected = [
-            (p("/opt/f"), EntryKind::Symlink, Ro),
-            (p("/workspace/wslink"), EntryKind::Dir, Masked),
-            (p("/home/user/dirlink"), EntryKind::Dir, Masked),
-            (p("/home/user/filelink"), EntryKind::File, Masked),
-            (p("/home/user/sub/glink"), EntryKind::File, Masked),
-            (abs.clone(), EntryKind::Dir, Masked),
-        ];
-        expected.sort_by(|a, b| depth(&a.0).cmp(&depth(&b.0)).then_with(|| a.0.cmp(&b.0)));
-        assert_eq!(got, expected);
+        assert_eq!(
+            got,
+            [
+                (p("/opt/f"), EntryKind::Symlink, Ro),
+                (p("/workspace/wslink"), EntryKind::Dir, Masked),
+                (p("/home/user/dirlink"), EntryKind::Dir, Masked),
+                (p("/home/user/filelink"), EntryKind::File, Masked),
+                (p("/home/user/sub/glink"), EntryKind::File, Masked),
+                (abs.clone(), EntryKind::Dir, Masked),
+            ]
+        );
         // The source is still the link as written.
         assert_eq!(
             mounts[3].source,
