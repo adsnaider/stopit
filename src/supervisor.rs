@@ -8,7 +8,9 @@
 //! 2. creates the session directory (§2.1), which the providers are told
 //!    about;
 //! 3. runs the providers, compiles every profile of the session
-//!    (`spec::compile_session`) and prints its warnings ([`warning_lines`]);
+//!    (`spec::compile_session`), protecting the script providers' sources
+//!    and the configuration file in each (§3, §3.6), and prints its
+//!    warnings ([`warning_lines`]);
 //! 4. picks the profile (`main`, or `--profile`, §3.3);
 //! 5. provisions itself into the session directory (§2.1), computes the
 //!    target's environment from its own (§9), and runs bwrap with `__init`
@@ -31,14 +33,14 @@
 //! terminal, see [`TerminalSession`]), the startup summary of widening
 //! grants (§3), the user-global configuration layered under `.stopit.toml`
 //! (§3), the refusal of a default base with no user provider granting tools
-//! (§3.2), protecting script providers' sources (§3.6), the broker,
-//! protected files and the network proxy.
+//! (§3.2), the broker, protected files and the network proxy.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, ExitStatus};
@@ -54,11 +56,14 @@ use crate::config::{Base, Config, ConfigError, ProfileRef};
 use crate::escape::escape_message;
 use crate::expand::{ExpandError, ExpansionContext, ResolveWarning};
 use crate::manifest::SandboxHome;
-use crate::provider::{BASE_PROVIDER_NAME, ProviderContext, ProviderError, session_providers};
+use crate::provider::{
+    BASE_PROVIDER_NAME, ProtectedSource, ProviderContext, ProviderError, SUPERVISOR_PROVIDER_NAME,
+    protected_sources, session_providers, static_outputs,
+};
 use crate::provision::{ProvisionError, provision_self};
 use crate::resolve::{PlanWarning, PlanWarningKind};
 use crate::session::{SessionDir, SessionError};
-use crate::spec::{CompileError, CompiledSession, SpecWarning, compile_session};
+use crate::spec::{CompileError, CompiledSession, SpecWarning, compile_session, static_rw_roots};
 
 /// The name of the configuration file that marks a workspace (§3.1).
 pub const CONFIG_FILE: &str = ".stopit.toml";
@@ -96,6 +101,20 @@ pub enum RunError {
         path: PathBuf,
         /// The underlying error.
         source: io::Error,
+    },
+
+    /// Walking up from the current directory found a configuration file
+    /// below another one: a sandbox of the outer workspace could have
+    /// written it ([`discover_workspace`]).
+    #[error("{}", nested_config_message(inner, outer, outer_unusable.as_deref()))]
+    NestedConfig {
+        /// The configuration file found first, walking up.
+        inner: PathBuf,
+        /// The next one further up owned by the user.
+        outer: PathBuf,
+        /// Why `outer` would not load either (it fails the checks of
+        /// [`check_config_trust`]), if so: it is then not suggested.
+        outer_unusable: Option<String>,
     },
 
     /// The configuration file cannot be read.
@@ -286,20 +305,34 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     // Before the providers, which are told where it is. From here on,
     // returning removes it.
     let session = SessionDir::create_from_env()?;
+    // Relative script sources are resolved against the configuration
+    // file's directory: the workspace, by construction.
+    let providers = session_providers(&config, &workspace.dir)?;
     let pctx = ProviderContext {
         workspace: workspace.dir.clone(),
         workspace_mount: mount.clone(),
         home,
         session_dir: session.root().to_path_buf(),
+        // Script paths must not run through links in these (§3.6).
+        rw_grants: static_rw_roots(&static_outputs(&providers), &ctx),
     };
-    // Relative script sources are resolved against the configuration
-    // file's directory: the workspace, by construction.
-    // TODO(§3.6): protect script providers' sources (`protected_paths`).
-    let outputs = session_providers(&config, &workspace.dir)?
+    let outputs = providers
         .iter()
         .map(|p| Ok((p.name().clone(), p.manifest(&pctx)?)))
         .collect::<Result<Vec<_>, ProviderError>>()?;
-    let compiled = compile_session(&config, outputs, &ctx)?;
+    // The script providers' sources, and the configuration file itself,
+    // protected in every profile whatever the base and rules (§3, §3.6),
+    // the latter attributed to the name reserved for stopit's own rules.
+    let mut protected = protected_sources(&providers)?;
+    if let Some(path) = &workspace.config {
+        protected.push(ProtectedSource {
+            provider: SUPERVISOR_PROVIDER_NAME
+                .parse()
+                .expect("the supervisor's name is a valid provider name"),
+            path: path.clone(),
+        });
+    }
+    let compiled = compile_session(&config, outputs, &protected, &ctx)?;
     for line in warning_lines(&compiled, config.base) {
         print_warning(&line);
     }
@@ -718,10 +751,24 @@ impl Ownership {
 }
 
 /// Reads the configuration file at `path` if [`check_config_trust`] allows
-/// it, from the descriptor it checked: its directory is opened, then the
-/// file in it without following a symlink (a symlink is refused, as the
-/// file it leads to could be anyone's, anywhere).
+/// it, from the descriptor it checked ([`open_trusted`]).
 fn read_trusted(path: &Path) -> Result<String, RunError> {
+    let mut text = String::new();
+    File::from(open_trusted(path)?)
+        .read_to_string(&mut text)
+        .map_err(|source| RunError::ReadConfig {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(text)
+}
+
+/// Opens the configuration file at `path` for reading if
+/// [`check_config_trust`] allows it, and returns the descriptor it checked:
+/// its directory is opened, then the file in it without following a
+/// symlink (a symlink is refused, as the file it leads to could be
+/// anyone's, anywhere).
+fn open_trusted(path: &Path) -> Result<rustix::fd::OwnedFd, RunError> {
     use rustix::fs::{Mode, OFlags, fstat, open, openat};
     let read_error = |source: io::Error| RunError::ReadConfig {
         path: path.to_path_buf(),
@@ -760,11 +807,7 @@ fn read_trusted(path: &Path) -> Result<String, RunError> {
         rustix::process::getuid().as_raw(),
     )
     .map_err(untrusted)?;
-    let mut text = String::new();
-    File::from(fd)
-        .read_to_string(&mut text)
-        .map_err(read_error)?;
-    Ok(text)
+    Ok(fd)
 }
 
 /// Whether a configuration file `file` in the directory `dir` can be trusted
@@ -807,15 +850,66 @@ pub fn check_config_trust(file: Ownership, dir: Ownership, uid: u32) -> Result<(
     Ok(())
 }
 
+/// The message of [`RunError::NestedConfig`]: it suggests `--workspace`
+/// with the outer configuration's directory only if that one would load.
+fn nested_config_message(inner: &Path, outer: &Path, outer_unusable: Option<&str>) -> String {
+    let dir = |p: &Path| p.parent().unwrap_or(Path::new("/")).display().to_string();
+    let head = format!(
+        "refusing to use {inner:?}: {outer:?} is in a directory above it, so it lies inside that \
+         configuration's workspace, where a sandbox could have written it, and nested \
+         configurations found by walking up are refused"
+    );
+    match outer_unusable {
+        None => format!(
+            "{head}: run with `--workspace {}` to use the outer one, or, if you wrote the inner \
+             one yourself, with `--workspace {}`",
+            dir(outer),
+            dir(inner)
+        ),
+        Some(why) => format!(
+            "{head}; the outer one fails the trust checks too ({why}), so fix that, or, if you \
+             wrote the inner one yourself, run with `--workspace {}`",
+            dir(inner)
+        ),
+    }
+}
+
 /// Finds the workspace (§3.1), from the current directory `cwd`: the
 /// directory `explicit` (`--workspace`, relative to `cwd`) if given, else
 /// the nearest directory from `cwd` up that contains `.stopit.toml`, else
 /// `cwd` itself. Its configuration file is its own `.stopit.toml`, if any;
 /// `--workspace` does not look further up.
 ///
+/// A `.stopit.toml` found walking up is refused if a directory above it has
+/// a `.stopit.toml` entry owned by the user ([`RunError::NestedConfig`]):
+/// it lies inside that configuration's workspace, which a sandbox could
+/// write, and a planted one would decide the grants and script providers of
+/// the next `stopit run` from below it. The default base protects existing
+/// nested ones, but a glob cannot keep a sandbox from creating one (§3,
+/// §11). The sandbox cannot create or change the outer one, which the
+/// supervisor protects in every profile of its sessions, so this blocks
+/// that. Ownership alone decides, not the trust checks of
+/// [`check_config_trust`]: a sandbox can change modes in the workspace
+/// (`chmod 0777` on its root) to make the outer one fail them, but not
+/// owners. One owned by someone else is skipped: anyone may have created
+/// it (`/tmp`), and it is never loaded. The error suggests `--workspace`
+/// with the outer directory only if the outer one passes the trust checks.
+/// `--workspace` names the directory explicitly, and is how a nested
+/// configuration is used on purpose.
+///
 /// The workspace is canonical (no symlinks, `.` or `..`): it is the
 /// session's identity, and rules below it are resolved against it.
 pub fn discover_workspace(cwd: &Path, explicit: Option<&Path>) -> Result<Workspace, RunError> {
+    discover_workspace_as(cwd, explicit, rustix::process::getuid().as_raw())
+}
+
+/// [`discover_workspace`] for the user `uid`, whose `.stopit.toml` files
+/// above another one count as outer configurations.
+fn discover_workspace_as(
+    cwd: &Path,
+    explicit: Option<&Path>,
+    uid: u32,
+) -> Result<Workspace, RunError> {
     let canonical = |path: PathBuf| {
         fs::canonicalize(&path).map_err(|source| RunError::Workspace { path, source })
     };
@@ -830,6 +924,26 @@ pub fn discover_workspace(cwd: &Path, explicit: Option<&Path>) -> Result<Workspa
     let start = canonical(cwd.to_path_buf())?;
     for dir in start.ancestors() {
         if let Some(config) = config_in(dir)? {
+            for above in dir.ancestors().skip(1) {
+                // The user's own counts whatever the modes, which a sandbox
+                // can change; someone else's is skipped.
+                let Some(outer) = config_in(above)? else {
+                    continue;
+                };
+                let owner = fs::symlink_metadata(&outer).map_err(|source| RunError::Discover {
+                    path: outer.clone(),
+                    source,
+                })?;
+                if owner.uid() != uid {
+                    continue;
+                }
+                let outer_unusable = open_trusted(&outer).err().map(|e| e.to_string());
+                return Err(RunError::NestedConfig {
+                    inner: config,
+                    outer,
+                    outer_unusable,
+                });
+            }
             return Ok(Workspace {
                 dir: dir.to_path_buf(),
                 config: Some(config),
@@ -916,7 +1030,6 @@ mod tests {
         let (_d, root) = tmp();
         let deep = root.join("ws/a/b");
         fs::create_dir_all(&deep).unwrap();
-        fs::write(root.join(CONFIG_FILE), "").unwrap();
         fs::write(root.join("ws").join(CONFIG_FILE), "").unwrap();
         let ws = discover_workspace(&deep, None).unwrap();
         assert_eq!(ws.dir, root.join("ws"));
@@ -926,6 +1039,131 @@ mod tests {
             discover_workspace(&root.join("ws"), None).unwrap().dir,
             root.join("ws")
         );
+    }
+
+    /// Writes an empty configuration file at `path` that
+    /// [`check_config_trust`] allows whatever the umask.
+    fn write_trusted(path: &Path) {
+        fs::write(path, "").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+        let dir = path.parent().unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_config_below_another_is_refused_unless_named() {
+        let (_d, root) = tmp();
+        let deep = root.join("ws/sub/deeper");
+        fs::create_dir_all(&deep).unwrap();
+        write_trusted(&root.join("ws").join(CONFIG_FILE));
+        // As a sandbox of `ws` could plant it; any entry counts.
+        symlink("x", root.join("ws/sub").join(CONFIG_FILE)).unwrap();
+        for cwd in [root.join("ws/sub"), deep] {
+            let e = discover_workspace(&cwd, None).unwrap_err();
+            let RunError::NestedConfig {
+                inner,
+                outer,
+                outer_unusable,
+            } = &e
+            else {
+                panic!("{e:?}");
+            };
+            assert_eq!(inner, &root.join("ws/sub").join(CONFIG_FILE));
+            assert_eq!(outer, &root.join("ws").join(CONFIG_FILE));
+            assert_eq!(outer_unusable, &None);
+            let msg = e.to_string();
+            assert!(msg.contains("nested configurations"), "{msg}");
+            assert!(
+                msg.contains(&format!("`--workspace {}`", root.join("ws").display())),
+                "{msg}"
+            );
+            assert!(
+                msg.contains(&format!("`--workspace {}`", root.join("ws/sub").display())),
+                "{msg}"
+            );
+        }
+        // Not when the outer one is further up either.
+        fs::create_dir_all(root.join("top/mid/ws")).unwrap();
+        write_trusted(&root.join("top").join(CONFIG_FILE));
+        fs::write(root.join("top/mid/ws").join(CONFIG_FILE), "").unwrap();
+        let e = discover_workspace(&root.join("top/mid/ws"), None).unwrap_err();
+        assert!(matches!(e, RunError::NestedConfig { .. }), "{e:?}");
+        // The outer workspace itself is fine.
+        assert_eq!(
+            discover_workspace(&root.join("ws"), None).unwrap().dir,
+            root.join("ws")
+        );
+        // `--workspace` names the directory: either one is used as asked.
+        for dir in ["ws/sub", "ws"] {
+            let ws = discover_workspace(&root, Some(Path::new(dir))).unwrap();
+            assert_eq!(ws.dir, root.join(dir));
+            assert_eq!(ws.config, Some(root.join(dir).join(CONFIG_FILE)));
+        }
+    }
+
+    #[test]
+    fn an_outer_config_the_user_owns_counts_whatever_the_modes() {
+        // A sandbox of `ws` can `chmod 0777` the workspace root it owns, so
+        // that the outer configuration fails the trust checks: it still
+        // counts, but is not suggested.
+        let (_d, root) = tmp();
+        fs::create_dir_all(root.join("ws/sub")).unwrap();
+        let outer = root.join("ws").join(CONFIG_FILE);
+        write_trusted(&outer);
+        fs::write(root.join("ws/sub").join(CONFIG_FILE), "").unwrap();
+        let unusable = |dir_mode: u32, file_mode: u32| {
+            fs::set_permissions(root.join("ws"), fs::Permissions::from_mode(dir_mode)).unwrap();
+            fs::set_permissions(&outer, fs::Permissions::from_mode(file_mode)).unwrap();
+            let e = discover_workspace(&root.join("ws/sub"), None).unwrap_err();
+            let RunError::NestedConfig {
+                outer: found,
+                outer_unusable,
+                ..
+            } = &e
+            else {
+                panic!("{e:?}");
+            };
+            assert_eq!(found, &outer);
+            let msg = e.to_string();
+            assert!(
+                !msg.contains(&format!("`--workspace {}`", root.join("ws").display())),
+                "{msg}"
+            );
+            assert!(
+                msg.contains(&format!("`--workspace {}`", root.join("ws/sub").display())),
+                "{msg}"
+            );
+            assert!(msg.contains("fails the trust checks"), "{msg}");
+            outer_unusable.clone().expect("the outer one is unusable")
+        };
+        let why = unusable(0o777, 0o644);
+        assert!(why.contains("its directory is writable"), "{why}");
+        let why = unusable(0o755, 0o666);
+        assert!(why.contains("writable by its group or others"), "{why}");
+        // A symlink the user owns counts too, whatever it leads to.
+        fs::set_permissions(root.join("ws"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_file(&outer).unwrap();
+        symlink("/nonexistent", &outer).unwrap();
+        let e = discover_workspace(&root.join("ws/sub"), None).unwrap_err();
+        assert!(matches!(e, RunError::NestedConfig { .. }), "{e:?}");
+    }
+
+    #[test]
+    fn a_config_above_owned_by_someone_else_does_not_count_as_outer() {
+        // As `/tmp/.stopit.toml` above `/tmp/proj`: anyone could have
+        // created it. Here every file belongs to the test's user, so it is
+        // someone else's for any other uid.
+        let (_d, root) = tmp();
+        fs::create_dir_all(root.join("proj/sub")).unwrap();
+        write_trusted(&root.join(CONFIG_FILE));
+        fs::write(root.join("proj").join(CONFIG_FILE), "").unwrap();
+        let me = rustix::process::getuid().as_raw();
+        let ws = discover_workspace_as(&root.join("proj/sub"), None, me.wrapping_add(1)).unwrap();
+        assert_eq!(ws.dir, root.join("proj"));
+        assert_eq!(ws.config, Some(root.join("proj").join(CONFIG_FILE)));
+        // For its owner, it counts.
+        let e = discover_workspace_as(&root.join("proj/sub"), None, me).unwrap_err();
+        assert!(matches!(e, RunError::NestedConfig { .. }), "{e:?}");
     }
 
     #[test]

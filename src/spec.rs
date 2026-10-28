@@ -21,7 +21,9 @@
 //! and its host sources against those roots (§3.4, Symlinks; §6.2,
 //! "Untrusted links"), against the host workspace (§6.2, "Workspace
 //! exposure") and against the profile's masked and protected mounts (§6.2,
-//! "Restricted content exposure").
+//! "Restricted content exposure"). Last, the paths providers asked to be
+//! protected (script providers' sources, §3.6) are protected wherever the
+//! profile would let the sandbox write them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -29,6 +31,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use rustix::io::Errno;
@@ -36,12 +39,13 @@ use thiserror::Error;
 
 use crate::config::{Config, ProfileRef, ProviderName};
 use crate::error::is_missing;
-use crate::expand::{EntryKind, ExpansionContext};
+use crate::expand::{EntryKind, ExpansionContext, expand_bind, expand_pattern};
 use crate::manifest::{
-    DevMode, Domain, EtcFile, OptInSyscall, SandboxHome, ShareableNamespace, ShimName, ShimSpec,
+    BindMode, DevMode, Domain, EtcFile, OptInSyscall, SandboxHome, ShareableNamespace, ShimName,
+    ShimSpec,
 };
 use crate::policy::{NetworkMode, PathMode};
-use crate::provider::ProviderOutput;
+use crate::provider::{ProtectedSource, ProviderOutput};
 use crate::resolve::{
     EffectiveEnv, EffectiveGrants, EffectiveNetwork, MergeError, MountPlan, MountSource,
     PathPlanError, PlanWarning, PlannedMount, ProfileError, build_profile_graph, hidden_note,
@@ -269,6 +273,12 @@ pub enum SpecWarning {
     /// that it lies under the restriction.
     #[error(transparent)]
     LinkedIntoRestricted(Box<LinkedIntoRestricted>),
+    /// An `rw` mount's host source lies strictly inside a directory a
+    /// provider asked to be protected (a script provider's source, DESIGN.md
+    /// §3.6), so the mount is protected instead: no grant can lift that
+    /// protection.
+    #[error(transparent)]
+    InsideProtectedSource(Box<InsideProtectedSource>),
     /// The profile itself granted `network.allow_domains` but its network
     /// mode is not `proxy`, the only mode that uses them, so the domains
     /// were dropped. Domains inherited from the parent are dropped without
@@ -732,6 +742,34 @@ pub struct LinkedIntoRestricted {
     pub restricted_sandbox: PathBuf,
 }
 
+/// An `rw` mount whose host source lies strictly inside a directory a
+/// provider asked to be protected (see
+/// [`SpecWarning::InsideProtectedSource`]), and which is mounted
+/// `protected` instead.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "provider {:?}: rw mount of {host:?} (resolving to {resolved:?}) at {sandbox:?} lies inside \
+     {protected:?}, the source of provider {:?}, which runs on the host and is protected in every \
+     profile, so it is mounted protected instead; to make it writable, move it out of that \
+     directory",
+    .provider.as_str(),
+    .protected_provider.as_str()
+)]
+pub struct InsideProtectedSource {
+    /// The provider whose rule produced the mount.
+    pub provider: ProviderName,
+    /// The mount's host source, as planned.
+    pub host: PathBuf,
+    /// `host` with every symlink resolved: strictly inside `protected`.
+    pub resolved: PathBuf,
+    /// The mount's sandbox destination.
+    pub sandbox: PathBuf,
+    /// The provider whose source is protected.
+    pub protected_provider: ProviderName,
+    /// The protected source, canonical.
+    pub protected: PathBuf,
+}
+
 /// A host directory that a sandbox of the session can write, so that any
 /// symlink inside it may have been planted (DESIGN.md §3.4, Symlinks).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1071,6 +1109,7 @@ fn check_host_sources(
     mounts: Vec<PlannedMount>,
     ctx: &ExpansionContext,
     roots: &UntrustedRoots,
+    protected: &[SourceToProtect<'_>],
     warnings: &mut Vec<SpecWarning>,
 ) -> Result<Vec<PlannedMount>, SpecError> {
     let ws_host = ctx.workspace_host();
@@ -1205,7 +1244,137 @@ fn check_host_sources(
         sources.push(Some((resolved, resolved_kind)));
         kept.push(m);
     }
-    Ok(cover_restricted_exposure(kept, &sources, ws_host, warnings))
+    // Every `rw` mount has a canonical source; the covers added next are
+    // never `rw`.
+    let rw_sources: BTreeMap<PathBuf, PathBuf> = kept
+        .iter()
+        .zip(&sources)
+        .filter(|(m, _)| m.mode == PathMode::Rw)
+        .filter_map(|(m, s)| Some((m.sandbox.clone(), s.as_ref()?.0.clone())))
+        .collect();
+    let mounts = cover_restricted_exposure(kept, &sources, ws_host, warnings);
+    Ok(protect_sources(mounts, &rw_sources, protected, warnings))
+}
+
+/// A host path a provider asked to be protected ([`ProtectedSource`]), with
+/// the kind of entry there.
+#[derive(Debug, Clone, Copy)]
+struct SourceToProtect<'a> {
+    provider: &'a ProviderName,
+    /// Canonical.
+    path: &'a Path,
+    /// Never [`EntryKind::Symlink`], `path` being canonical.
+    kind: EntryKind,
+}
+
+/// Protects the host paths providers asked to be protected (a script
+/// provider's source, which runs on the host at the next start, DESIGN.md
+/// §3.6) wherever `mounts` let the sandbox write them, returning `mounts`
+/// with the protecting mounts added, in plan order. `rw_sources` maps the
+/// sandbox path of every `rw` mount to its canonical host source.
+///
+/// This is the supervisor's rule, not a grant, so it runs last, on the
+/// mounts as they will be mounted, rather than as a rule competing in path
+/// precedence (DESIGN.md §3.5), where an exact `rw` rule of the same path,
+/// or a profile's own rule, would beat it. It works like the protected
+/// covers of [`cover_restricted_exposure`], with no protected mount of its
+/// own to compare against: for every protected path P and every `rw` mount
+/// M of the canonical source S at T_M, if S is P or an ancestor of it, M
+/// lets the sandbox write P at X, T_M joined with P's path below S, unless
+/// another mount lies between T_M (exclusive) and X (inclusive): it is
+/// mounted on top (and is compared in turn if it is `rw`; any other mode
+/// shows P read-only, or not at all). So X gets a `protected` mount of P,
+/// attributed to the provider that asked; if X is T_M (S is P), it replaces
+/// M. One mount is added per sandbox path, wherever P shows: at its aligned
+/// path in the workspace, and at every other path an `rw` grant shows it.
+/// Nothing is added where P is not writable: not visible at all, masked
+/// (a mask on the way is mounted on top), or read-only. This runs after
+/// the restricted-content covers, so that a mask covering P's directory
+/// there is on top of M too, rather than below a protected mount added
+/// first.
+///
+/// A source S strictly inside a protected directory P is not a narrower
+/// grant that may lift it, as it would be for a protected rule (§3.5): M is
+/// mounted `protected` instead, with a
+/// [`SpecWarning::InsideProtectedSource`].
+///
+/// The mounts added need none of the other checks, for the reasons the
+/// covers need none: P is canonical and lies inside S, and X lies below
+/// T_M, reached through M's tree along P.
+fn protect_sources(
+    mut mounts: Vec<PlannedMount>,
+    rw_sources: &BTreeMap<PathBuf, PathBuf>,
+    protected: &[SourceToProtect<'_>],
+    warnings: &mut Vec<SpecWarning>,
+) -> Vec<PlannedMount> {
+    let mut added: BTreeMap<PathBuf, PlannedMount> = BTreeMap::new();
+    // The `rw` mounts inside a protected directory, by index, each with the
+    // first such directory.
+    let mut inside: BTreeMap<usize, &SourceToProtect<'_>> = BTreeMap::new();
+    {
+        let at: BTreeSet<&Path> = mounts.iter().map(|m| m.sandbox.as_path()).collect();
+        for p in protected {
+            for (i, m) in mounts.iter().enumerate() {
+                if m.mode != PathMode::Rw {
+                    continue;
+                }
+                let Some(s) = rw_sources.get(&m.sandbox) else {
+                    continue;
+                };
+                let Ok(rel) = p.path.strip_prefix(s) else {
+                    if s.starts_with(p.path) {
+                        inside.entry(i).or_insert(p);
+                    }
+                    continue;
+                };
+                let x = join_rel(&m.sandbox, rel);
+                let overmounted = x
+                    .ancestors()
+                    .take_while(|a| *a != m.sandbox)
+                    .any(|a| at.contains(a));
+                if overmounted {
+                    continue;
+                }
+                added.entry(x.clone()).or_insert_with(|| PlannedMount {
+                    sandbox: x,
+                    source: MountSource::Host {
+                        path: p.path.to_owned(),
+                        kind: p.kind,
+                    },
+                    mode: PathMode::Protected,
+                    provider: p.provider.clone(),
+                    glob_link: false,
+                });
+            }
+        }
+    }
+    for (i, p) in inside {
+        let m = &mut mounts[i];
+        let MountSource::Host { path: host, .. } = &m.source else {
+            unreachable!("an rw mount has a host source");
+        };
+        warnings.push(SpecWarning::InsideProtectedSource(Box::new(
+            InsideProtectedSource {
+                provider: m.provider.clone(),
+                host: host.clone(),
+                resolved: rw_sources[&m.sandbox].clone(),
+                sandbox: m.sandbox.clone(),
+                protected_provider: p.provider.clone(),
+                protected: p.path.to_owned(),
+            },
+        )));
+        m.mode = PathMode::Protected;
+    }
+    if added.is_empty() {
+        return mounts;
+    }
+    let added: Vec<PlannedMount> = added.into_values().collect();
+    debug_assert!(check_mount_destinations(&added).is_ok());
+    // Only the `rw` mount exposing P can lie at an added path: its own.
+    mounts.retain(|m| added.iter().all(|a| a.sandbox != m.sandbox));
+    mounts.extend(added);
+    sort_plan(&mut mounts);
+    mounts
 }
 
 /// `base` joined with the relative path `rel`, or `base` itself if `rel` is
@@ -2012,6 +2181,124 @@ pub(crate) fn first_link_inside(path: &Path, root: &Path) -> io::Result<Option<P
     Ok(resolved.untrusted.into_iter().next().map(|l| l.link))
 }
 
+/// Whether `path` (to protect, canonical), whose `meta` it is, is a regular
+/// file with other hard links through which a sandbox could rewrite it: one
+/// the user owns (who can make it writable whatever its mode) or can write
+/// (`faccessat(W_OK, AT_EACCESS)`, so ACLs count). Files of other owners the
+/// user cannot write, such as Nix store files deduplicated into hard links
+/// by `auto-optimise-store`, cannot be rewritten through any name.
+pub(crate) fn has_rewritable_hard_links(path: &Path, meta: &fs::Metadata) -> bool {
+    use rustix::fs::{Access, AtFlags, CWD, accessat};
+    meta.is_file()
+        && meta.nlink() > 1
+        && (meta.uid() == rustix::process::getuid().as_raw()
+            || accessat(CWD, path, Access::WRITE_OK, AtFlags::EACCESS).is_ok())
+}
+
+/// Why [`resolve_script_path`] did not resolve a path.
+#[derive(Debug)]
+pub(crate) enum ScriptPathError {
+    /// The lookup followed a symlink inside an untrusted root, whether it
+    /// then succeeded or not.
+    Link {
+        /// The first such link, named below its canonical parent directory.
+        link: PathBuf,
+        /// The innermost root containing it.
+        root: UntrustedRoot,
+    },
+    /// The lookup failed, without following a link inside a root first.
+    Lookup(io::Error),
+}
+
+/// Resolves the absolute host path `path` (a script provider's source) to
+/// its canonical path, as [`resolve_host_source`] does, unless the lookup
+/// follows a symlink inside the host `workspace` (canonical) or one of
+/// `rw_grants` (canonical roots): then the first such link is the error,
+/// even if the lookup fails after following it, since a link a sandbox
+/// planted may be what makes it fail.
+pub(crate) fn resolve_script_path(
+    path: &Path,
+    workspace: &Path,
+    rw_grants: &[UntrustedRoot],
+) -> Result<PathBuf, ScriptPathError> {
+    let mut roots = UntrustedRoots::new(workspace);
+    for root in rw_grants {
+        if !roots.roots.iter().any(|r| r.path == root.path) {
+            roots.roots.push(root.clone());
+        }
+    }
+    let link = |untrusted: Vec<UntrustedLink<'_>>| {
+        untrusted.into_iter().next().map(|l| ScriptPathError::Link {
+            link: l.link,
+            root: l.root.clone(),
+        })
+    };
+    match resolve_host_source(path, &roots) {
+        Ok(resolved) => match link(resolved.untrusted) {
+            Some(e) => Err(e),
+            None => Ok(resolved.path),
+        },
+        Err(u) => Err(link(u.untrusted).unwrap_or(ScriptPathError::Lookup(u.error))),
+    }
+}
+
+/// The host directories that the `rw` grants of `outputs` (the `config`
+/// providers', known before any script runs) let a sandbox write, as
+/// untrusted roots: every `fs.rw` path and the host side of every `rw`
+/// bind, of the top-level grants and of every contributed profile, each
+/// canonicalised. A glob counts as its walk root (its literal prefix), a
+/// superset of what it matches. A path that cannot be resolved is not a
+/// root, as in [`UntrustedRoots::add_rw_mounts`].
+///
+/// The supervisor refuses a script provider reached through a link inside
+/// one of them (DESIGN.md §3.6); the session's other roots, those of script
+/// providers' grants, are only known once the scripts have run.
+pub fn static_rw_roots(
+    outputs: &[(ProviderName, ProviderOutput)],
+    ctx: &ExpansionContext,
+) -> Vec<UntrustedRoot> {
+    let none = UntrustedRoots::none();
+    let mut roots: Vec<UntrustedRoot> = Vec::new();
+    for (provider, output) in outputs {
+        let manifest = &output.manifest;
+        let profiles = std::iter::once((output.profile.clone(), &manifest.grants)).chain(
+            manifest
+                .profiles
+                .iter()
+                .map(|(name, p)| (ProfileRef::contributed(provider, name), &p.grants)),
+        );
+        for (profile, grants) in profiles {
+            let rw = grants.fs.rw.iter().filter_map(|p| {
+                let e = expand_pattern(p, ctx);
+                e.host().or_else(|| e.walk_root())
+            });
+            let binds = grants
+                .fs
+                .bind
+                .iter()
+                .filter(|b| b.mode == BindMode::Rw)
+                .map(|b| expand_bind(b, ctx).host);
+            for host in rw.chain(binds) {
+                let Ok(resolved) = resolve_host_source(&host, &none) else {
+                    continue;
+                };
+                if roots.iter().any(|r| r.path == resolved.path) {
+                    continue;
+                }
+                roots.push(UntrustedRoot {
+                    path: resolved.path,
+                    kind: UntrustedKind::RwGrant {
+                        provider: provider.clone(),
+                        profile: Some(profile.clone()),
+                        host,
+                    },
+                });
+            }
+        }
+    }
+    roots
+}
+
 /// Checks the workspace mount point and sandbox `HOME` against the
 /// reserved-path rules of DESIGN.md §6.2.
 ///
@@ -2075,7 +2362,7 @@ fn compile_profile(
     let planned = plan_profile(grants, ctx)?;
     let mut roots = UntrustedRoots::new(ctx.workspace_host());
     roots.add_rw_mounts(None, &planned.plan.mounts);
-    finish_profile(planned, grants, parent, ctx, &roots)
+    finish_profile(planned, grants, parent, ctx, &roots, &[])
 }
 
 /// A profile whose mounts are planned but not yet checked against the
@@ -2100,8 +2387,9 @@ fn plan_profile(
 }
 
 /// The second stage of compiling a profile: checks the planned mounts'
-/// destinations, then the host sources of those kept, against `roots`, and
-/// assembles the spec.
+/// destinations, then the host sources of those kept, against `roots`,
+/// protects the `protected` sources wherever the sandbox could write them
+/// (see [`protect_sources`]), and assembles the spec.
 ///
 /// Destinations come first because their check settles what is mounted
 /// (it drops glob-matched links inside untrusted roots, and `rw` mounts for
@@ -2115,12 +2403,13 @@ fn finish_profile(
     parent: Option<&EffectiveGrants>,
     ctx: &ExpansionContext,
     roots: &UntrustedRoots,
+    protected: &[SourceToProtect<'_>],
 ) -> Result<CompiledProfile, SpecError> {
     let PlannedProfile { home, plan } = planned;
     let mut warnings: Vec<SpecWarning> = plan.warnings.into_iter().map(Into::into).collect();
     let mounts =
         check_destination_links(plan.mounts, ctx.workspace_sandbox(), roots, &mut warnings)?;
-    let mounts = check_host_sources(mounts, ctx, roots, &mut warnings)?;
+    let mounts = check_host_sources(mounts, ctx, roots, protected, &mut warnings)?;
     let inherited_domains = parent.map(|p| &p.network.allow_domains);
     let network = network_spec(&grants.network, inherited_domains, &mut warnings);
     let spec = SandboxSpec {
@@ -2225,6 +2514,40 @@ pub enum CompileError {
     /// Merging a profile's grants failed.
     #[error("cannot merge the profiles' grants: {0}")]
     Merge(#[from] MergeError),
+    /// A path a provider asked to be protected (a script provider's source)
+    /// cannot be inspected, so it cannot be protected; it runs on the host,
+    /// so this fails closed.
+    #[error(
+        "cannot inspect {path:?}, the source of provider {:?}, to protect it: {}",
+        .provider.as_str(),
+        io::Error::from(*.kind)
+    )]
+    ProtectedSource {
+        /// The provider that asked.
+        provider: ProviderName,
+        /// The path.
+        path: PathBuf,
+        /// What went wrong.
+        kind: io::ErrorKind,
+    },
+    /// A path a provider asked to be protected is a regular file with more
+    /// than one hard link: the sandbox could rewrite it through another
+    /// name, inside an `rw` tree, which protecting this one cannot prevent
+    /// (DESIGN.md §3.6).
+    #[error(
+        "refusing to protect {path:?}, the source of provider {:?}: it has {links} hard links, so \
+         a sandbox could rewrite it through another name that no protection covers; give it a \
+         single link (copy it, then replace the original with the copy)",
+        .provider.as_str()
+    )]
+    ProtectedSourceHardLinked {
+        /// The provider that asked.
+        provider: ProviderName,
+        /// The path.
+        path: PathBuf,
+        /// Its number of hard links.
+        links: u64,
+    },
     /// Compiling one profile failed.
     #[error("cannot compile profile {:?}: {error}", .profile.as_str())]
     Profile {
@@ -2247,15 +2570,51 @@ pub enum CompileError {
 /// profile's mounts are planned first, then every profile's destinations
 /// and host sources are checked.
 ///
+/// `protected` are the paths providers asked to be protected (see
+/// [`protected_sources`](crate::provider::protected_sources)): each is
+/// protected in every profile, wherever the profile would let the sandbox
+/// write it, whatever the providers grant (see [`protect_sources`]). One
+/// that cannot be inspected is an error, and so is a regular file with more
+/// than one hard link ([`CompileError::ProtectedSourceHardLinked`]). Hard
+/// links to files inside a protected directory are not detected (DESIGN.md
+/// §11).
+///
 /// Stops at the first failing stage, and within each of the two profile
 /// stages at the first failing profile in graph order.
 pub fn compile_session(
     config: &Config,
     outputs: Vec<(ProviderName, ProviderOutput)>,
+    protected: &[ProtectedSource],
     ctx: &ExpansionContext,
 ) -> Result<CompiledSession, CompileError> {
     let graph = build_profile_graph(config, outputs)?;
     let merged = merge_profiles(&graph)?;
+    let protected = protected
+        .iter()
+        .map(|p| match p.path.symlink_metadata() {
+            Ok(meta) if has_rewritable_hard_links(&p.path, &meta) => {
+                Err(CompileError::ProtectedSourceHardLinked {
+                    provider: p.provider.clone(),
+                    path: p.path.clone(),
+                    links: meta.nlink(),
+                })
+            }
+            Ok(meta) => Ok(SourceToProtect {
+                provider: &p.provider,
+                path: &p.path,
+                kind: EntryKind::from_file_type(meta.file_type()),
+            }),
+            Err(e) => Err(CompileError::ProtectedSource {
+                provider: p.provider.clone(),
+                path: p.path.clone(),
+                kind: e.kind(),
+            }),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    debug_assert!(
+        protected.iter().all(|p| p.kind != EntryKind::Symlink),
+        "protected sources are canonical"
+    );
     let fail = |profile: &ProfileRef| {
         let profile = profile.clone();
         move |error| CompileError::Profile {
@@ -2276,7 +2635,8 @@ pub fn compile_session(
             .get(profile)
             .and_then(|node| node.parent.as_ref())
             .map(|p| merged.get(p).expect("every parent is a merged profile"));
-        let compiled = finish_profile(p, grants, parent, ctx, &roots).map_err(fail(profile))?;
+        let compiled =
+            finish_profile(p, grants, parent, ctx, &roots, &protected).map_err(fail(profile))?;
         profiles.insert(profile.clone(), compiled);
     }
     Ok(CompiledSession {
@@ -2370,6 +2730,7 @@ mod tests {
                 workspace_mount: self.ws_mount.parse().unwrap(),
                 home: self.root.join("home"),
                 session_dir: self.root.join("session"),
+                rw_grants: Vec::new(),
             };
             session_providers(cfg, Path::new("/cfg"))
                 .unwrap()
@@ -2379,8 +2740,25 @@ mod tests {
         }
 
         fn try_compile(&self, src: &str) -> Result<CompiledSession, CompileError> {
+            self.try_compile_protecting(src, &[])
+        }
+
+        /// Compiles `src` with the paths below the temp root `protected`
+        /// asked to be protected, each by the provider named with it.
+        fn try_compile_protecting(
+            &self,
+            src: &str,
+            protected: &[(&str, &str)],
+        ) -> Result<CompiledSession, CompileError> {
             let cfg = Config::from_toml_str(src).unwrap();
-            compile_session(&cfg, self.outputs(&cfg), &self.ctx)
+            let protected: Vec<ProtectedSource> = protected
+                .iter()
+                .map(|(provider, rel)| ProtectedSource {
+                    provider: provider.parse().unwrap(),
+                    path: self.root.join(rel),
+                })
+                .collect();
+            compile_session(&cfg, self.outputs(&cfg), &protected, &self.ctx)
         }
 
         fn compile(&self, src: &str) -> CompiledSession {
@@ -2578,6 +2956,7 @@ mod tests {
             "ws/flake.nix",
             "ws/nix/a.nix",
             "ws/.stopit.toml",
+            "ws/sub/.stopit.toml",
             "ws/flake.lock",
             "ws/.envrc",
             "ws/.github/workflows/ci.yml",
@@ -2605,6 +2984,7 @@ mod tests {
                 row("/workspace/flake.nix", Protected, "base"),
                 row("/workspace/.github/workflows", Protected, "base"),
                 row("/workspace/nix/a.nix", Protected, "base"),
+                row("/workspace/sub/.stopit.toml", Protected, "base"),
                 row("/workspace/sub/key.pem", Masked, "base"),
             ]
         );
@@ -2630,6 +3010,7 @@ mod tests {
             "ws/flake.lock",
             "ws/.envrc",
             "ws/.stopit.toml",
+            "ws/sub/.stopit.toml",
             "ws/.github/workflows/ci.yml",
             "ws/src/main.rs",
             "home/.config/tool/x",
@@ -2670,6 +3051,8 @@ mod tests {
             row("/workspace/sub/id.key", Masked, "base"),
             row("/workspace/flake.nix", Protected, "base"),
             row("/workspace/.vscode", Protected, "base"),
+            row("/workspace/.stopit.toml", Protected, "base"),
+            row("/workspace/sub/.stopit.toml", Protected, "base"),
         ] {
             assert!(main.contains(&want), "{want:?} not in {main:?}");
         }
@@ -4350,10 +4733,12 @@ mod tests {
         // workspace rules then mask it as a whole, once per restrictive
         // rule that could not inspect something there.
         let globs_masked = 6; // `**/.env`, `**/.env.*`, … in `fs.masked`.
+        let globs_protected = 2; // `**/*.nix`, `**/.stopit.toml` in `fs.protected`.
         let literals_protected = 6; // `flake.lock`, `.envrc`, … in `fs.protected`.
         // Each case: the files, the directory made inaccessible and its
         // mode, and the rules expected to mask it (by mode, in rule order).
-        let all_globs: Vec<PathMode> = [vec![Masked; globs_masked], vec![Protected]].concat();
+        let all_globs: Vec<PathMode> =
+            [vec![Masked; globs_masked], vec![Protected; globs_protected]].concat();
         let globs_and_literals: Vec<PathMode> =
             [all_globs.clone(), vec![Protected; literals_protected]].concat();
         let nix_and_literals: Vec<PathMode> = vec![Protected; 1 + literals_protected];
@@ -4493,6 +4878,7 @@ mod tests {
                 vec![ws.clone(), mask.clone(), protected.clone()],
                 &f.ctx,
                 &roots,
+                &[],
                 &mut warnings,
             )
             .map(|kept| (kept, warnings));
@@ -4500,6 +4886,7 @@ mod tests {
                 vec![ws.clone(), protected.clone()],
                 &f.ctx,
                 &roots,
+                &[],
                 &mut Vec::new(),
             );
             (under, alone)
@@ -4566,7 +4953,7 @@ mod tests {
             glob_link: true,
         };
         let roots = UntrustedRoots::new(&f.ws());
-        let e = check_host_sources(vec![m], &f.ctx, &roots, &mut Vec::new()).unwrap_err();
+        let e = check_host_sources(vec![m], &f.ctx, &roots, &[], &mut Vec::new()).unwrap_err();
         let SpecError::UntrustedLinkFollowed(found) = &e else {
             panic!("expected an untrusted link, got {e:?}");
         };
@@ -7176,6 +7563,358 @@ mod tests {
         assert_eq!(at(&ws.join("x")), Some(ws.clone()));
         assert_eq!(at(&root.join("ab")), None);
         assert_eq!(at(&root), None);
+    }
+
+    // --- Providers' protected sources ---
+
+    /// `base = "none"` with the workspace granted `rw` in `main` by
+    /// provider `u`, then `extra`.
+    fn ws_rw(extra: &str) -> String {
+        format!(
+            "base = \"none\"\n{}{extra}",
+            prov("u", "main", "fs.rw = [\"{workspace}\"]")
+        )
+    }
+
+    fn protected_row(sandbox: &str) -> (String, PathMode, String) {
+        row(sandbox, Protected, "env")
+    }
+
+    #[test]
+    fn a_provider_source_in_an_rw_workspace_is_protected_there() {
+        let f = Fixture::new();
+        f.file("ws/scripts/env.sh");
+        let s = f
+            .try_compile_protecting(&ws_rw(""), &[("env", "ws/scripts/env.sh")])
+            .unwrap();
+        let main = get(&s, "main");
+        assert!(main.warnings.is_empty(), "{:?}", main.warnings);
+        assert_eq!(
+            mounts(&main.spec),
+            [
+                row("/workspace", Rw, "u"),
+                protected_row("/workspace/scripts/env.sh")
+            ]
+        );
+        assert_eq!(
+            main.spec.mounts[1].source,
+            host(&f.ws().join("scripts/env.sh"), EntryKind::File)
+        );
+        // Nothing asked to be protected (`protect = false`): nothing added.
+        let s = f.try_compile_protecting(&ws_rw(""), &[]).unwrap();
+        assert_eq!(mounts(spec(&s, "main")), [row("/workspace", Rw, "u")]);
+    }
+
+    #[test]
+    fn a_provider_source_beats_exact_and_own_rw_rules_in_every_profile() {
+        let f = Fixture::new();
+        f.file("ws/scripts/env.sh");
+        // An exact `rw` rule of the source in `main`, and another as the
+        // own rule of a profile inheriting it: both would beat a protected
+        // rule (§3.5), but not the supervisor's protection.
+        let src = ws_rw(&format!(
+            "[profiles.child]\n{}{}",
+            prov("x", "main", "fs.rw = [\"{workspace}/scripts/env.sh\"]"),
+            prov("c", "child", "fs.rw = [\"{workspace}/scripts/env.sh\"]"),
+        ));
+        let s = f
+            .try_compile_protecting(&src, &[("env", "ws/scripts/env.sh")])
+            .unwrap();
+        for p in ["main", "child"] {
+            let c = get(&s, p);
+            assert!(c.warnings.is_empty(), "{p}: {:?}", c.warnings);
+            assert_eq!(
+                mounts(&c.spec),
+                [
+                    row("/workspace", Rw, "u"),
+                    protected_row("/workspace/scripts/env.sh")
+                ],
+                "{p}"
+            );
+            assert_eq!(
+                c.spec.mounts[1].source,
+                host(&f.ws().join("scripts/env.sh"), EntryKind::File),
+                "{p}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_provider_source_is_protected_wherever_an_rw_grant_shows_it() {
+        let f = Fixture::new();
+        f.file("home/bin/env.sh");
+        f.mkdir("home/other");
+        let src = format!(
+            "base = \"none\"\n[profiles.ro_view]\ninherit = \"none\"\n[profiles.hidden]\n\
+             inherit = \"none\"\n{}{}{}",
+            prov(
+                "u",
+                "main",
+                "fs.rw = [\"~/bin\"]\nfs.bind = [{ host = \"~/bin\", sandbox = \"/opt/bin\", \
+                 mode = \"rw\" }, { host = \"~\", sandbox = \"/opt/home\", mode = \"rw\" }]"
+            ),
+            prov("r", "ro_view", "fs.ro = [\"~/bin\"]"),
+            prov("h", "hidden", "fs.rw = [\"~/other\"]"),
+        );
+        let s = f
+            .try_compile_protecting(&src, &[("env", "home/bin/env.sh")])
+            .unwrap();
+        let main = get(&s, "main");
+        assert!(main.warnings.is_empty(), "{:?}", main.warnings);
+        assert_eq!(
+            mounts(&main.spec),
+            [
+                row("/opt/bin", Rw, "u"),
+                row("/opt/home", Rw, "u"),
+                row("/home/user/bin", Rw, "u"),
+                protected_row("/opt/bin/env.sh"),
+                protected_row("/home/user/bin/env.sh"),
+                protected_row("/opt/home/bin/env.sh"),
+            ]
+        );
+        // Read-only, or not shown at all: nothing to add.
+        assert_eq!(
+            mounts(spec(&s, "ro_view")),
+            [row("/home/user/bin", Ro, "r")]
+        );
+        assert_eq!(
+            mounts(spec(&s, "hidden")),
+            [row("/home/user/other", Rw, "h")]
+        );
+    }
+
+    #[test]
+    fn a_masked_or_read_only_provider_source_stays_so() {
+        let f = Fixture::new();
+        f.file("ws/scripts/env.sh");
+        for (mode, rule) in [(Masked, "masked"), (Ro, "ro")] {
+            let src = ws_rw(&prov(
+                "x",
+                "main",
+                &format!("fs.{rule} = [\"{{workspace}}/scripts\"]"),
+            ));
+            let s = f
+                .try_compile_protecting(&src, &[("env", "ws/scripts/env.sh")])
+                .unwrap();
+            assert_eq!(
+                mounts(spec(&s, "main")),
+                [
+                    row("/workspace", Rw, "u"),
+                    row("/workspace/scripts", mode, "x")
+                ],
+                "{rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_provider_source_inside_a_covered_mask_stays_hidden() {
+        // `~/cfg` is masked at its own path and shown through an `rw` bind of
+        // `~`, so it is masked at `/opt/home/cfg` too: the script inside
+        // must not be shown read-only on top of that cover.
+        let f = Fixture::new();
+        f.file("home/cfg/env.sh");
+        let src = format!(
+            "base = \"none\"\n{}",
+            prov(
+                "u",
+                "main",
+                "fs.masked = [\"~/cfg\"]\nfs.bind = [{ host = \"~\", sandbox = \"/opt/home\", \
+                 mode = \"rw\" }]"
+            ),
+        );
+        let s = f
+            .try_compile_protecting(&src, &[("env", "home/cfg/env.sh")])
+            .unwrap();
+        let main = get(&s, "main");
+        assert_eq!(
+            mounts(&main.spec),
+            [
+                row("/opt/home", Rw, "u"),
+                row("/home/user/cfg", Masked, "u"),
+                row("/opt/home/cfg", Masked, "u"),
+            ]
+        );
+        assert!(
+            matches!(
+                main.warnings.as_slice(),
+                [SpecWarning::RestrictedContentExposed(_)]
+            ),
+            "{:?}",
+            main.warnings
+        );
+    }
+
+    #[test]
+    fn a_provider_source_directory_is_protected_with_rw_grants_inside_it() {
+        let f = Fixture::new();
+        f.file("ws/scripts/env.sh");
+        f.mkdir("ws/scripts/out");
+        let src = ws_rw(&prov("x", "main", "fs.rw = [\"{workspace}/scripts/out\"]"));
+        let s = f
+            .try_compile_protecting(&src, &[("env", "ws/scripts")])
+            .unwrap();
+        let main = get(&s, "main");
+        assert_eq!(
+            mounts(&main.spec),
+            [
+                row("/workspace", Rw, "u"),
+                protected_row("/workspace/scripts"),
+                row("/workspace/scripts/out", Protected, "x"),
+            ]
+        );
+        assert_eq!(
+            main.spec.mounts[1].source,
+            host(&f.ws().join("scripts"), EntryKind::Dir)
+        );
+        let [SpecWarning::InsideProtectedSource(w)] = main.warnings.as_slice() else {
+            panic!("{:?}", main.warnings);
+        };
+        assert_eq!(w.provider.as_str(), "x");
+        assert_eq!(w.protected_provider.as_str(), "env");
+        assert_eq!(w.protected, f.ws().join("scripts"));
+        assert_eq!(w.sandbox, Path::new("/workspace/scripts/out"));
+        let msg = main.warnings[0].to_string();
+        assert!(msg.contains("provider \"x\""), "{msg}");
+        assert!(msg.contains("source of provider \"env\""), "{msg}");
+    }
+
+    #[test]
+    fn a_provider_source_that_cannot_be_inspected_is_an_error() {
+        let f = Fixture::new();
+        let e = f
+            .try_compile_protecting(&ws_rw(""), &[("env", "ws/gone.sh")])
+            .unwrap_err();
+        let CompileError::ProtectedSource {
+            provider,
+            path,
+            kind,
+        } = &e
+        else {
+            panic!("{e:?}");
+        };
+        assert_eq!(provider.as_str(), "env");
+        assert_eq!(path, &f.ws().join("gone.sh"));
+        assert_eq!(*kind, io::ErrorKind::NotFound);
+        let msg = e.to_string();
+        assert!(msg.contains("provider \"env\""), "{msg}");
+        assert!(msg.contains("gone.sh"), "{msg}");
+    }
+
+    #[test]
+    fn a_hard_linked_provider_source_is_an_error() {
+        // The sandbox could rewrite it through its other name, in the `rw`
+        // workspace, wherever the source itself is protected; or outside
+        // every grant, through a name inside one.
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        f.file("ws/scripts/env.sh");
+        // Read-only does not help: its owner, the user, can chmod it
+        // through any name.
+        fs::set_permissions(
+            f.root.join("ws/scripts/env.sh"),
+            fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
+        f.mkdir("home/bin");
+        fs::hard_link(f.root.join("ws/scripts/env.sh"), f.root.join("ws/copy.sh")).unwrap();
+        fs::hard_link(
+            f.root.join("ws/scripts/env.sh"),
+            f.root.join("home/bin/env.sh"),
+        )
+        .unwrap();
+        for source in ["ws/scripts/env.sh", "home/bin/env.sh"] {
+            let e = f
+                .try_compile_protecting(&ws_rw(""), &[("env", source)])
+                .unwrap_err();
+            let CompileError::ProtectedSourceHardLinked {
+                provider,
+                path,
+                links,
+            } = &e
+            else {
+                panic!("{source}: {e:?}");
+            };
+            assert_eq!(provider.as_str(), "env");
+            assert_eq!(path, &f.root.join(source));
+            assert_eq!(*links, 3);
+            let msg = e.to_string();
+            assert!(msg.contains("provider \"env\""), "{msg}");
+            assert!(msg.contains(source), "{msg}");
+            assert!(msg.contains("3 hard links"), "{msg}");
+        }
+        // A single link is fine again; a directory's link count is its
+        // subdirectories', not hard links, and is not checked.
+        fs::remove_file(f.root.join("ws/copy.sh")).unwrap();
+        fs::remove_file(f.root.join("home/bin/env.sh")).unwrap();
+        f.mkdir("ws/scripts/sub");
+        f.try_compile_protecting(&ws_rw(""), &[("env", "ws/scripts/env.sh")])
+            .unwrap();
+        f.try_compile_protecting(&ws_rw(""), &[("env", "ws/scripts")])
+            .unwrap();
+    }
+
+    #[test]
+    fn static_rw_roots_are_the_config_providers_rw_grants() {
+        let f = Fixture::new();
+        for d in [
+            "home/cache",
+            "home/data",
+            "home/real",
+            "home/ro",
+            "home/prof",
+            "ws/out",
+        ] {
+            f.mkdir(d);
+        }
+        std::os::unix::fs::symlink(f.root.join("home/real"), f.root.join("home/link")).unwrap();
+        let src = format!(
+            "base = \"none\"\n[profiles.child]\n{}{}",
+            prov(
+                "a",
+                "main",
+                "fs.rw = [\"~/cache\", \"~/link\", \"{workspace}/out/*\", \"~/gone\", \"~/cache\"]\n\
+                 fs.ro = [\"~/ro\"]\nfs.bind = [{ host = \"~/data\", sandbox = \"/d\", mode = \"rw\" \
+                 }, { host = \"~/ro\", sandbox = \"/r\", mode = \"ro\" }]\n\
+                 [provider.sandbox.profiles.extra]\nfs.rw = [\"~/prof\"]"
+            ),
+            prov("b", "child", "fs.rw = [\"{workspace}\"]"),
+        );
+        let cfg = Config::from_toml_str(&src).unwrap();
+        let roots = static_rw_roots(&f.outputs(&cfg), &f.ctx);
+        let got: Vec<(PathBuf, String, String)> = roots
+            .iter()
+            .map(|r| {
+                let UntrustedKind::RwGrant {
+                    provider, profile, ..
+                } = &r.kind
+                else {
+                    panic!("{r:?}");
+                };
+                (
+                    r.path.clone(),
+                    provider.as_str().to_owned(),
+                    profile.as_ref().unwrap().as_str().to_owned(),
+                )
+            })
+            .collect();
+        let home = f.root.join("home");
+        let row = |p: PathBuf, provider: &str, profile: &str| {
+            (p, provider.to_owned(), profile.to_owned())
+        };
+        // Canonical, once each; a glob as its walk root; a missing path and
+        // read-only grants are no roots.
+        assert_eq!(
+            got,
+            [
+                row(home.join("cache"), "a", "main"),
+                row(home.join("real"), "a", "main"),
+                row(f.ws().join("out"), "a", "main"),
+                row(home.join("data"), "a", "main"),
+                row(home.join("prof"), "a", "a.extra"),
+                row(f.ws(), "b", "child"),
+            ]
+        );
     }
 
     #[test]

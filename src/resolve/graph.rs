@@ -469,6 +469,7 @@ mod tests {
             workspace_mount: "/workspace".parse().unwrap(),
             home: PathBuf::from("/home/u"),
             session_dir: PathBuf::from("/run/s"),
+            rw_grants: Vec::new(),
         };
         cfg.providers
             .iter()

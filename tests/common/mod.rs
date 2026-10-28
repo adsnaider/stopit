@@ -23,10 +23,10 @@ use std::time::{Duration, Instant};
 use stopit::bwrap::{BwrapCommand, TerminalSession, working_dir};
 use stopit::config::{Config, ProfileRef};
 use stopit::expand::ExpansionContext;
-use stopit::provider::{ProviderContext, session_providers};
+use stopit::provider::{ProviderContext, protected_sources, session_providers, static_outputs};
 use stopit::provision::{Provisioned, provision};
 use stopit::session::SessionDir;
-use stopit::spec::{SandboxSpec, compile_session};
+use stopit::spec::{SandboxSpec, compile_session, static_rw_roots};
 use tempfile::TempDir;
 
 #[allow(unused_imports)]
@@ -468,17 +468,6 @@ impl SpecFixture {
     /// panicking on them.
     pub fn compile_with_warnings(&self, toml: &str) -> (SandboxSpec, Vec<String>) {
         let config = Config::from_toml_str(toml).unwrap();
-        let pctx = ProviderContext {
-            workspace: self.workspace(),
-            workspace_mount: WORKSPACE_MOUNT.parse().unwrap(),
-            home: self.home(),
-            session_dir: self.root.join("runtime"),
-        };
-        let outputs = session_providers(&config, &self.root)
-            .unwrap()
-            .iter()
-            .map(|p| (p.name().clone(), p.manifest(&pctx).unwrap()))
-            .collect();
         let ctx = ExpansionContext::new(
             self.workspace(),
             WORKSPACE_MOUNT.parse().unwrap(),
@@ -486,7 +475,20 @@ impl SpecFixture {
             SANDBOX_HOME.parse().unwrap(),
         )
         .unwrap();
-        let session = compile_session(&config, outputs, &ctx)
+        let providers = session_providers(&config, &self.root).unwrap();
+        let pctx = ProviderContext {
+            workspace: self.workspace(),
+            workspace_mount: WORKSPACE_MOUNT.parse().unwrap(),
+            home: self.home(),
+            session_dir: self.root.join("runtime"),
+            rw_grants: static_rw_roots(&static_outputs(&providers), &ctx),
+        };
+        let outputs = providers
+            .iter()
+            .map(|p| (p.name().clone(), p.manifest(&pctx).unwrap()))
+            .collect();
+        let protected = protected_sources(&providers).unwrap();
+        let session = compile_session(&config, outputs, &protected, &ctx)
             .unwrap_or_else(|e| panic!("the configuration does not compile: {e}"));
         let main = session.get(&ProfileRef::main()).expect("main exists");
         let warnings = main.warnings.iter().map(|w| w.to_string()).collect();

@@ -35,4 +35,12 @@ impl Provider for ConfigProvider {
             manifest: self.manifest.clone(),
         })
     }
+
+    /// The inline manifest, as [`manifest`](Provider::manifest) returns it.
+    fn static_output(&self) -> Option<ProviderOutput> {
+        Some(ProviderOutput {
+            profile: self.profile.clone(),
+            manifest: self.manifest.clone(),
+        })
+    }
 }

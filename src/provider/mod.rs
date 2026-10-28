@@ -16,8 +16,11 @@ use thiserror::Error;
 
 use crate::config::{ProfileRef, ProviderEntry, ProviderKind, ProviderName, WorkspaceMount};
 use crate::manifest::{Manifest, ManifestError};
+use crate::spec::UntrustedRoot;
 
-pub use base::{BASE_PROVIDER_NAME, default_base_manifest, session_providers};
+pub use base::{
+    BASE_PROVIDER_NAME, SUPERVISOR_PROVIDER_NAME, default_base_manifest, session_providers,
+};
 pub use config::ConfigProvider;
 pub use script::{STDERR_LIMIT, STDOUT_LIMIT, ScriptProvider};
 
@@ -32,6 +35,12 @@ pub struct ProviderContext {
     pub home: PathBuf,
     /// The session runtime directory.
     pub session_dir: PathBuf,
+    /// The host directories the `config` providers grant `rw`, known
+    /// before any script runs
+    /// ([`static_rw_roots`](crate::spec::static_rw_roots)): with the workspace,
+    /// the roots a script provider's path must not run through a symlink
+    /// inside (DESIGN.md §3.6).
+    pub rw_grants: Vec<UntrustedRoot>,
 }
 
 /// The result of running a provider.
@@ -68,6 +77,40 @@ pub enum ProviderError {
     ReservedName {
         /// The offending name.
         name: ProviderName,
+    },
+
+    /// A user provider is named like the supervisor's own rules
+    /// ([`SUPERVISOR_PROVIDER_NAME`]).
+    #[error(
+        "provider name {:?} is reserved for stopit's own rules (such as protecting the \
+         configuration file): choose a different name",
+        .name.as_str()
+    )]
+    ReservedForSupervisor {
+        /// The offending name.
+        name: ProviderName,
+    },
+
+    /// A script provider's source is a regular file with more than one
+    /// hard link: the sandbox could rewrite it through another name, which
+    /// protecting this one cannot prevent, so it is not run (DESIGN.md
+    /// §3.6).
+    #[error(
+        "refusing to run script provider {:?} ({}): {path:?} has {links} hard links, so a sandbox \
+         could have rewritten it through another name that no protection covers; give it a \
+         single link (copy it, then replace the original with the copy)",
+        .name.as_str(),
+        .script.display()
+    )]
+    SourceHardLinked {
+        /// Effective name of the entry.
+        name: ProviderName,
+        /// The script path as declared, joined to the base directory.
+        script: PathBuf,
+        /// The canonical script path.
+        path: PathBuf,
+        /// Its number of hard links.
+        links: u64,
     },
 
     /// The built-in provider of the default base is invalid (its name or
@@ -191,6 +234,30 @@ pub enum ProviderError {
         error: ManifestError,
     },
 
+    /// A script provider's path runs through a symlink inside the host
+    /// workspace or a directory a `config` provider grants `rw`, which a
+    /// sandbox can write: it may have planted the link to have its own code
+    /// run on the host (DESIGN.md §3.6).
+    #[error(
+        "refusing to run script provider {:?} ({}): its path runs through the symlink {} inside \
+         {root}; a sandbox can write there, so it could have planted the link to run its own \
+         code on the host: point `source` at a path without links inside it",
+        .name.as_str(),
+        .script.display(),
+        .link.display()
+    )]
+    SourceLink {
+        /// Effective name of the entry.
+        name: ProviderName,
+        /// The script path as declared, joined to the base directory.
+        script: PathBuf,
+        /// The first such symlink on the way, named below its canonical
+        /// parent directory.
+        link: PathBuf,
+        /// The innermost writable directory containing it.
+        root: Box<UntrustedRoot>,
+    },
+
     /// A context path cannot be passed to a script provider as JSON.
     #[error(
         "cannot run script provider {:?} ({}): context path {field} {path:?} is not valid UTF-8",
@@ -237,11 +304,67 @@ pub trait Provider: Send + Sync {
     fn manifest(&self, ctx: &ProviderContext) -> Result<ProviderOutput, ProviderError>;
 
     /// Host paths this provider asks to be `protected`, because they hold
-    /// code that runs on the host (a script provider's `source`). None by
-    /// default.
+    /// code that runs on the host (a script provider's `source`): canonical
+    /// paths, files or directories. None by default.
+    ///
+    /// The supervisor protects them in every profile of the session,
+    /// whatever the providers grant (see [`protected_sources`]).
     fn protected_paths(&self) -> Result<Vec<PathBuf>, ProviderError> {
         Ok(Vec::new())
     }
+
+    /// The output, if it is known without running anything on the host and
+    /// without a context (a `config` provider's inline manifest). None by
+    /// default.
+    ///
+    /// The supervisor reads these outputs' `rw` grants before any script
+    /// runs (see [`static_outputs`]).
+    fn static_output(&self) -> Option<ProviderOutput> {
+        None
+    }
+}
+
+/// The outputs of `providers` known before any of them runs
+/// ([`Provider::static_output`]), with their providers, in provider order.
+///
+/// Their `rw` grants ([`static_rw_roots`](crate::spec::static_rw_roots)) are the directories, besides the
+/// workspace, that a script provider's path must not run through a symlink
+/// inside (DESIGN.md §3.6).
+pub fn static_outputs(providers: &[Box<dyn Provider>]) -> Vec<(ProviderName, ProviderOutput)> {
+    providers
+        .iter()
+        .filter_map(|p| Some((p.name().clone(), p.static_output()?)))
+        .collect()
+}
+
+/// A canonical host path a provider asks to be `protected`
+/// ([`Provider::protected_paths`]), with that provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtectedSource {
+    /// The provider asking.
+    pub provider: ProviderName,
+    /// The canonical host path.
+    pub path: PathBuf,
+}
+
+/// Every path `providers` ask to be protected, in provider order.
+///
+/// These are the supervisor's rule, not grants: the session compiler
+/// protects them wherever a profile would let the sandbox write them, which
+/// no provider's grant can lift (DESIGN.md §3.6).
+pub fn protected_sources(
+    providers: &[Box<dyn Provider>],
+) -> Result<Vec<ProtectedSource>, ProviderError> {
+    let mut out = Vec::new();
+    for p in providers {
+        for path in p.protected_paths()? {
+            out.push(ProtectedSource {
+                provider: p.name().clone(),
+                path,
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// Builds the provider for a configuration entry.
@@ -292,6 +415,7 @@ mod tests {
             workspace_mount: "/workspace".parse().unwrap(),
             home: PathBuf::from(format!("/home/{tag}")),
             session_dir: PathBuf::from(format!("/run/{tag}")),
+            rw_grants: Vec::new(),
         }
     }
 
@@ -426,6 +550,41 @@ mod tests {
         )
         .unwrap();
         assert!(p.protected_paths().unwrap().is_empty());
+    }
+
+    #[test]
+    fn protected_sources_name_their_provider_in_order() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        for f in ["a.sh", "b.sh"] {
+            std::fs::write(root.join(f), "").unwrap();
+        }
+        let es = entries(
+            "[[provider]]\ntype = \"script\"\nname = \"a\"\nsource = \"a.sh\"\n\
+             [[provider]]\ntype = \"config\"\n\
+             [[provider]]\ntype = \"script\"\nname = \"off\"\nsource = \"a.sh\"\nprotect = false\n\
+             [[provider]]\ntype = \"script\"\nname = \"b\"\nsource = \"b.sh\"",
+        );
+        let ps: Vec<_> = es.iter().map(|e| from_entry(e, &root).unwrap()).collect();
+        assert_eq!(
+            protected_sources(&ps).unwrap(),
+            [
+                ProtectedSource {
+                    provider: "a".parse().unwrap(),
+                    path: root.join("a.sh"),
+                },
+                ProtectedSource {
+                    provider: "b".parse().unwrap(),
+                    path: root.join("b.sh"),
+                },
+            ]
+        );
+        // A source that cannot be resolved is an error naming its provider.
+        let es = entries("[[provider]]\ntype = \"script\"\nname = \"gone\"\nsource = \"c.sh\"");
+        let ps = [from_entry(&es[0], &root).unwrap()];
+        let e = protected_sources(&ps).unwrap_err();
+        assert!(matches!(e, ProviderError::Resolve { .. }), "{e:?}");
+        assert!(e.to_string().contains("\"gone\""), "{e}");
     }
 
     #[test]

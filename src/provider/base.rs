@@ -10,6 +10,11 @@ use crate::manifest::Manifest;
 /// providers cannot use it under that base.
 pub const BASE_PROVIDER_NAME: &str = "base";
 
+/// The name the supervisor's own rules are attributed to (the protection of
+/// the loaded configuration file, DESIGN.md §3). User providers cannot use
+/// it under any base, so that a message naming it is never about theirs.
+pub const SUPERVISOR_PROVIDER_NAME: &str = "stopit";
+
 /// The default base's sandbox manifest (Appendix A), as data.
 const DEFAULT_MANIFEST_TOML: &str = include_str!("base_default.toml");
 
@@ -34,6 +39,15 @@ pub fn session_providers(
     config: &Config,
     base_dir: &Path,
 ) -> Result<Vec<Box<dyn Provider>>, ProviderError> {
+    if let Some(entry) = config
+        .providers
+        .iter()
+        .find(|e| e.name.as_str() == SUPERVISOR_PROVIDER_NAME)
+    {
+        return Err(ProviderError::ReservedForSupervisor {
+            name: entry.name.clone(),
+        });
+    }
     let mut providers: Vec<Box<dyn Provider>> = Vec::new();
     match config.base {
         Base::None => {}
@@ -90,6 +104,7 @@ mod tests {
             workspace_mount: "/workspace".parse().unwrap(),
             home: PathBuf::from("/home/h"),
             session_dir: PathBuf::from("/run/s"),
+            rw_grants: Vec::new(),
         }
     }
 
@@ -119,9 +134,10 @@ mod tests {
         assert!(masked.contains(&"{workspace}/**/.env".to_owned()));
         assert!(masked.contains(&"{workspace}/**/.pypirc".to_owned()));
         assert_eq!(g.fs.mask_sockets, Some(true));
-        assert_eq!(g.fs.protected.len(), 7);
+        assert_eq!(g.fs.protected.len(), 8);
         let protected = strs(&g.fs.protected, |p| p.as_str());
         assert!(protected.contains(&"{workspace}/.stopit.toml".to_owned()));
+        assert!(protected.contains(&"{workspace}/**/.stopit.toml".to_owned()));
         assert!(protected.contains(&"{workspace}/.github/workflows".to_owned()));
         assert_eq!(strs(&g.fs.ephemeral, |p| p.as_str()), ["/tmp", "~"]);
         assert!(g.fs.ro.is_empty() && g.fs.bind.is_empty());
@@ -168,6 +184,24 @@ mod tests {
 
         let c = cfg(&format!("base = \"none\"\n{src}"));
         assert_eq!(names(&c), ["base"]);
+    }
+
+    #[test]
+    fn user_provider_named_stopit_is_reserved_under_every_base() {
+        let src = "[[provider]]\ntype = \"config\"\nname = \"stopit\"";
+        for base in ["", "base = \"none\"\n"] {
+            let Err(e) = session_providers(&cfg(&format!("{base}{src}")), Path::new("/cfg")) else {
+                panic!("{base:?}: the name is reserved");
+            };
+            assert!(
+                matches!(e, ProviderError::ReservedForSupervisor { .. }),
+                "{e:?}"
+            );
+            let msg = e.to_string();
+            assert!(msg.contains("\"stopit\""), "{msg}");
+            assert!(msg.contains("reserved"), "{msg}");
+            assert!(msg.contains("different name"), "{msg}");
+        }
     }
 
     #[test]

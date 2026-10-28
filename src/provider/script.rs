@@ -21,6 +21,7 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -34,6 +35,7 @@ use super::{Provider, ProviderContext, ProviderError, ProviderOutput};
 use crate::config::{ProfileRef, ProviderName, ScriptSource};
 use crate::escape::escape_message;
 use crate::manifest::Manifest;
+use crate::spec::{ScriptPathError, has_rewritable_hard_links, resolve_script_path};
 
 /// Maximum size of a script's stdout; more is an error.
 pub const STDOUT_LIMIT: usize = 16 * 1024 * 1024;
@@ -124,6 +126,70 @@ impl ScriptProvider {
         // path modulo filesystem changes, and the first one is kept.
         let _ = self.canonical.set(resolved);
         Ok(self.canonical.get().expect("just set"))
+    }
+
+    /// Resolves the script's path, as declared, to its canonical path, and
+    /// caches it as [`canonical_source`](Self::canonical_source) does, unless
+    /// the path runs through a symlink inside the host workspace or one of
+    /// `ctx.rw_grants`, the final component included (DESIGN.md §3.6). The
+    /// link is the error even if the lookup fails after following it.
+    ///
+    /// A sandbox can write there, so it can plant such a link, or replace
+    /// one, and the script is run and protected at the link's target:
+    /// protecting the target leaves the link itself replaceable, and the
+    /// next session would run whatever it then leads to. These are the
+    /// untrusted roots known before any script runs (DESIGN.md §3.4,
+    /// Symlinks); links in the `rw` grants of script providers are not
+    /// checked (§11).
+    ///
+    /// With `protect`, a script that is a regular file with more than one
+    /// hard link is refused too ([`ProviderError::SourceHardLinked`]).
+    fn checked_source(&self, ctx: &ProviderContext) -> Result<&Path, ProviderError> {
+        let resolve_error = |error| {
+            self.base_dir_error()
+                .unwrap_or_else(|| ProviderError::Resolve {
+                    name: self.name.clone(),
+                    script: self.source.clone(),
+                    error,
+                })
+        };
+        let path = std::path::absolute(&self.source).map_err(resolve_error)?;
+        let resolved = match resolve_script_path(&path, &ctx.workspace, &ctx.rw_grants) {
+            Ok(resolved) => resolved,
+            Err(ScriptPathError::Link { link, root }) => {
+                return Err(ProviderError::SourceLink {
+                    name: self.name.clone(),
+                    script: self.source.clone(),
+                    link,
+                    root: Box::new(root),
+                });
+            }
+            Err(ScriptPathError::Lookup(error)) => return Err(resolve_error(error)),
+        };
+        // A protected script with another name could have been rewritten
+        // through it: refused before it runs (the session compiler checks
+        // again before protecting it).
+        if self.protect {
+            let meta = fs::symlink_metadata(&resolved).map_err(resolve_error)?;
+            if has_rewritable_hard_links(&resolved, &meta) {
+                return Err(ProviderError::SourceHardLinked {
+                    name: self.name.clone(),
+                    script: self.source.clone(),
+                    path: resolved,
+                    links: meta.nlink(),
+                });
+            }
+        }
+        // The file protected must be the file run, and the one checked: a
+        // path cached earlier (`protected_paths` before `manifest`) must be
+        // this one.
+        let cached = self.canonical.get_or_init(|| resolved.clone());
+        if *cached != resolved {
+            return Err(resolve_error(io::Error::other(format!(
+                "it resolved to {cached:?} before, and now to {resolved:?}"
+            ))));
+        }
+        Ok(cached)
     }
 
     /// An error blaming `base_dir` if it is not an accessible directory.
@@ -288,8 +354,9 @@ impl Provider for ScriptProvider {
 
     /// The canonical script path when `protect` is true, otherwise nothing.
     ///
-    /// Protecting the script's directory (for scripts that source other
-    /// files, DESIGN.md §3.6) is not implemented yet.
+    /// Only the script itself: protecting the files it sources, or its
+    /// directory (DESIGN.md §3.6), is not implemented yet (§11), so such
+    /// files need `protected` rules of their own.
     fn protected_paths(&self) -> Result<Vec<PathBuf>, ProviderError> {
         if self.protect {
             Ok(vec![self.canonical_source()?.to_owned()])
@@ -299,9 +366,14 @@ impl Provider for ScriptProvider {
     }
 
     /// Runs the script and parses its manifest. The grants apply to `main`.
+    ///
+    /// A script whose path runs through a symlink inside the host workspace
+    /// (`ctx.workspace`, canonical) or one of `ctx.rw_grants` is refused
+    /// before it runs ([`ProviderError::SourceLink`]).
     fn manifest(&self, ctx: &ProviderContext) -> Result<ProviderOutput, ProviderError> {
         let input = serde_json::to_vec(&self.stdin_json(ctx)?)
             .expect("serializing a serde_json::Value cannot fail");
+        self.checked_source(ctx)?;
         let out = self.run(input)?;
         let text = String::from_utf8(out).map_err(|error| ProviderError::StdoutNotUtf8 {
             name: self.name.clone(),
@@ -452,6 +524,7 @@ mod tests {
 
     use super::*;
     use crate::config::{Config, ProviderKind};
+    use crate::spec::UntrustedRoot;
 
     /// Writing an executable while another test thread forks can leave a
     /// write descriptor open in the child for a moment, making `exec` of the
@@ -473,6 +546,7 @@ mod tests {
             workspace_mount: "/workspace".parse().unwrap(),
             home: PathBuf::from("/home/u"),
             session_dir: PathBuf::from("/run/s"),
+            rw_grants: Vec::new(),
         }
     }
 
@@ -701,19 +775,19 @@ mod tests {
             [fs::canonicalize(&a).unwrap()]
         );
 
-        // The resolution is cached: repointing the symlink afterwards does
-        // not change which file runs, so the protected file is the executed
-        // one.
+        // The resolution is cached, and running resolves it again, checking
+        // its links: repointing the symlink in between is an error rather
+        // than running a file other than the protected one, or one other
+        // than the checked one.
         fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(&b, &link).unwrap();
-        let out = run(&p).unwrap();
-        assert_eq!(out.manifest.grants.fs.ro.len(), 1);
-        assert!(out.manifest.grants.fs.rw.is_empty(), "ran b.sh");
+        let e = run(&p).unwrap_err();
+        assert!(matches!(e, ProviderError::Resolve { .. }), "{e:?}");
+        assert!(e.to_string().contains("before"), "{e}");
         assert_eq!(
             p.protected_paths().unwrap(),
             [fs::canonicalize(&a).unwrap()]
         );
-
         // A fresh provider resolves the new target, also when it runs first.
         let p = provider("s", "link.sh", dir.path());
         assert_eq!(run(&p).unwrap().manifest.grants.fs.rw.len(), 1);
@@ -721,6 +795,139 @@ mod tests {
             p.protected_paths().unwrap(),
             [fs::canonicalize(&b).unwrap()]
         );
+    }
+
+    #[test]
+    fn scripts_reached_through_links_inside_the_workspace_are_refused() {
+        let dir = TempDir::new().unwrap();
+        let ws = fs::canonicalize(dir.path()).unwrap();
+        fs::create_dir(ws.join("real")).unwrap();
+        write_script(
+            &ws.join("real"),
+            "a.sh",
+            "#!/bin/sh\ntouch ./ran\nprintf '{\"version\":1}'\n",
+        );
+        std::os::unix::fs::symlink("real", ws.join("dirlink")).unwrap();
+        std::os::unix::fs::symlink("real/a.sh", ws.join("link.sh")).unwrap();
+        let in_ws = |p: &ScriptProvider| {
+            let _guard = EXEC_LOCK.read().unwrap_or_else(|e| e.into_inner());
+            p.manifest(&ProviderContext {
+                workspace: ws.clone(),
+                ..ctx()
+            })
+        };
+        let other_dir = TempDir::new().unwrap();
+        let other = fs::canonicalize(other_dir.path()).unwrap();
+        write_script(
+            &other,
+            "out.sh",
+            "#!/bin/sh\ntouch ./ran\nprintf '{\"version\":1}'\n",
+        );
+        // The script itself, pointing outside the workspace.
+        std::os::unix::fs::symlink(other.join("out.sh"), ws.join("away.sh")).unwrap();
+        // A link the lookup fails after following (a dangling one).
+        std::os::unix::fs::symlink("missing", ws.join("dangling")).unwrap();
+        // A link on the way, or the script itself, pointing inside or
+        // outside the workspace, or going nowhere: refused before running.
+        for (source, link) in [
+            ("dirlink/a.sh", "dirlink"),
+            ("link.sh", "link.sh"),
+            ("away.sh", "away.sh"),
+            ("dangling/a.sh", "dangling"),
+        ] {
+            let e = in_ws(&provider("env", source, &ws)).unwrap_err();
+            let ProviderError::SourceLink { link: l, root, .. } = &e else {
+                panic!("{source}: {e:?}");
+            };
+            assert_eq!(l, &ws.join(link), "{source}");
+            assert_eq!(root.path, ws, "{source}");
+            let msg = e.to_string();
+            assert!(msg.contains("\"env\""), "{msg}");
+            assert!(msg.contains("inside the host workspace"), "{msg}");
+            assert!(!ws.join("ran").exists(), "{source}: the script ran");
+        }
+        // Without a link it runs.
+        in_ws(&provider("env", "real/a.sh", &ws)).unwrap();
+        assert!(ws.join("ran").exists());
+        // So does a link outside the workspace: the host's.
+        let outside = other.join("out_link.sh");
+        std::os::unix::fs::symlink(ws.join("real/a.sh"), &outside).unwrap();
+        in_ws(&provider("env", outside.to_str().unwrap(), &ws)).unwrap();
+    }
+
+    #[test]
+    fn scripts_reached_through_links_inside_static_rw_grants_are_refused() {
+        let dir = TempDir::new().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        for d in ["ws", "cache/real"] {
+            fs::create_dir_all(root.join(d)).unwrap();
+        }
+        write_script(
+            &root.join("cache/real"),
+            "a.sh",
+            "#!/bin/sh\nprintf '{\"version\":1}'\n",
+        );
+        std::os::unix::fs::symlink("real", root.join("cache/tool")).unwrap();
+        let grant = UntrustedRoot {
+            path: root.join("cache"),
+            kind: crate::spec::UntrustedKind::RwGrant {
+                provider: "tools".parse().unwrap(),
+                profile: Some(ProfileRef::main()),
+                host: root.join("cache"),
+            },
+        };
+        let run_with = |source: &str, rw_grants: Vec<UntrustedRoot>| {
+            let _guard = EXEC_LOCK.read().unwrap_or_else(|e| e.into_inner());
+            provider("env", source, &root).manifest(&ProviderContext {
+                workspace: root.join("ws"),
+                rw_grants,
+                ..ctx()
+            })
+        };
+        let e = run_with("cache/tool/a.sh", vec![grant.clone()]).unwrap_err();
+        let ProviderError::SourceLink { link, root: r, .. } = &e else {
+            panic!("{e:?}");
+        };
+        assert_eq!(link, &root.join("cache/tool"));
+        assert_eq!(**r, grant);
+        let msg = e.to_string();
+        assert!(msg.contains("granted rw"), "{msg}");
+        assert!(msg.contains("provider \"tools\""), "{msg}");
+        // Not without the grant, nor without the link.
+        run_with("cache/tool/a.sh", Vec::new()).unwrap();
+        run_with("cache/real/a.sh", vec![grant]).unwrap();
+    }
+
+    #[test]
+    fn hard_linked_protected_scripts_are_refused_before_running() {
+        let dir = TempDir::new().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let script = write_script(
+            &root,
+            "a.sh",
+            "#!/bin/sh\ntouch ./ran\nprintf '{\"version\":1}'\n",
+        );
+        fs::hard_link(&script, root.join("other.sh")).unwrap();
+        let e = run(&provider("env", "a.sh", &root)).unwrap_err();
+        let ProviderError::SourceHardLinked { path, links, .. } = &e else {
+            panic!("{e:?}");
+        };
+        assert_eq!(path, &script);
+        assert_eq!(*links, 2);
+        let msg = e.to_string();
+        assert!(msg.contains("\"env\""), "{msg}");
+        assert!(msg.contains("2 hard links"), "{msg}");
+        assert!(!root.join("ran").exists(), "the script ran");
+        // Not protected, it is not checked.
+        let unprotected = ScriptProvider::new(
+            "env".parse().unwrap(),
+            &"a.sh".parse().unwrap(),
+            &root,
+            false,
+            toml::Table::new(),
+        );
+        run(&unprotected).unwrap();
+        assert!(root.join("ran").exists());
     }
 
     #[test]

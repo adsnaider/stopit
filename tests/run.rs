@@ -350,6 +350,239 @@ fn no_configuration_runs_the_default_base_in_the_cwd() {
     );
 }
 
+// --- What runs on the host next session ---
+
+#[test]
+fn a_script_provider_in_the_workspace_cannot_be_rewritten_by_the_sandbox() {
+    let s = Setup::new();
+    let script = "#!/bin/sh\nprintf '{\"version\":1}'\n";
+    fs::create_dir(s.ws().join("scripts")).unwrap();
+    let path = s.ws().join("scripts/env.sh");
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    s.write_config(
+        "[[provider]]\ntype = \"script\"\nname = \"env\"\nsource = \"scripts/env.sh\"\n",
+    );
+    let results = s.probe(
+        &[],
+        &[
+            write("/workspace/scripts/env.sh", "#!/bin/sh\necho pwned\n"),
+            append("/workspace/scripts/env.sh", "echo pwned\n"),
+            chmod("/workspace/scripts/env.sh", 0o777),
+            remove("/workspace/scripts/env.sh"),
+            rename("/workspace/scripts/env.sh", "/workspace/scripts/old.sh"),
+            // Its directory is the workspace's, still writable.
+            write("/workspace/scripts/notes", "x"),
+            read("/workspace/scripts/env.sh"),
+        ],
+    );
+    for r in &results[..3] {
+        assert_eq!(errno(r), "EROFS", "{results:?}");
+    }
+    // It is a mount point.
+    for r in &results[3..5] {
+        assert_eq!(errno(r), "EBUSY", "{results:?}");
+    }
+    assert_eq!(ok(&results[5]), &Data::Done, "{results:?}");
+    assert_eq!(contents(&results[6]), script);
+    assert_eq!(fs::read_to_string(&path).unwrap(), script);
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+        0o755
+    );
+}
+
+#[test]
+fn a_script_provider_reached_through_a_workspace_link_is_refused() {
+    // A sandbox could have replaced `scripts` with a link to code of its
+    // own: the script is not run.
+    let s = Setup::new();
+    fs::create_dir(s.root.join("real")).unwrap();
+    let path = s.root.join("real/env.sh");
+    fs::write(&path, "#!/bin/sh\ntouch ran\nprintf '{\"version\":1}'\n").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(s.root.join("real"), s.ws().join("scripts")).unwrap();
+    s.write_config(
+        "[[provider]]\ntype = \"script\"\nname = \"env\"\nsource = \"scripts/env.sh\"\n",
+    );
+    let out = output(s.run_probe_command(&[]), b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    let err = stderr(&out);
+    assert!(
+        err.starts_with("stopit: error: refusing to run script provider \"env\""),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!("symlink {}", s.ws().join("scripts").display())),
+        "{err}"
+    );
+    assert!(!s.ws().join("ran").exists());
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn configurations_in_the_workspace_cannot_be_written_by_the_sandbox() {
+    let s = Setup::with_config("");
+    fs::create_dir(s.ws().join("sub")).unwrap();
+    fs::write(s.ws().join("sub/.stopit.toml"), "base = \"none\"\n").unwrap();
+    let top = fs::read_to_string(s.ws().join(".stopit.toml")).unwrap();
+    let results = s.probe(
+        &[],
+        &[
+            write("/workspace/.stopit.toml", "base = \"none\"\n"),
+            write("/workspace/sub/.stopit.toml", "[[provider]]\n"),
+        ],
+    );
+    for r in &results {
+        assert_eq!(errno(r), "EROFS", "{results:?}");
+    }
+    assert_eq!(
+        fs::read_to_string(s.ws().join(".stopit.toml")).unwrap(),
+        top
+    );
+    assert_eq!(
+        fs::read_to_string(s.ws().join("sub/.stopit.toml")).unwrap(),
+        "base = \"none\"\n"
+    );
+}
+
+#[test]
+fn the_loaded_configuration_is_protected_without_the_default_base() {
+    // No base rule protects it, and the workspace is granted `rw`: the
+    // supervisor protects it anyway.
+    let s = Setup::new();
+    let config = format!(
+        "base = \"none\"\n{}",
+        probe_config("fs.rw = [\"{workspace}\"]")
+    );
+    s.write_raw_config(&config);
+    let results = s.probe(
+        &[],
+        &[
+            write("/workspace/.stopit.toml", "base = \"none\"\n"),
+            append("/workspace/.stopit.toml", "[[provider]]\n"),
+            write("/workspace/notes", "x"),
+        ],
+    );
+    for r in &results[..2] {
+        assert_eq!(errno(r), "EROFS", "{results:?}");
+    }
+    assert_eq!(ok(&results[2]), &Data::Done, "{results:?}");
+    assert_eq!(
+        fs::read_to_string(s.ws().join(".stopit.toml")).unwrap(),
+        config
+    );
+}
+
+#[test]
+fn a_hard_linked_script_provider_is_refused() {
+    let s = Setup::new();
+    let path = s.ws().join("env.sh");
+    // It marks the host when it runs.
+    fs::write(&path, "#!/bin/sh\ntouch ran\nprintf '{\"version\":1}'\n").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    // Another name for it, which the sandbox could have written through.
+    fs::hard_link(&path, s.ws().join("other.sh")).unwrap();
+    s.write_config("[[provider]]\ntype = \"script\"\nname = \"env\"\nsource = \"env.sh\"\n");
+    let out = output(s.run_probe_command(&[]), b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    let err = stderr(&out);
+    assert!(
+        err.starts_with("stopit: error: refusing to run script provider \"env\""),
+        "{err}"
+    );
+    assert!(err.contains("2 hard links"), "{err}");
+    assert!(!s.ws().join("ran").exists(), "the script ran");
+    assert!(s.no_session_left());
+    // With a single link, it runs.
+    fs::remove_file(s.ws().join("other.sh")).unwrap();
+    s.probe(&[], &[]);
+    assert!(s.ws().join("ran").exists());
+}
+
+#[test]
+fn a_configuration_planted_below_the_workspace_is_refused() {
+    let s = Setup::with_config("");
+    // The sandbox can create one where none exists: a glob protects only
+    // what exists at the start.
+    let planted = "[[provider]]\ntype = \"script\"\nsource = \"/bin/false\"\n";
+    let results = s.probe(
+        &[],
+        &[
+            mkdir("/workspace/sub"),
+            write("/workspace/sub/.stopit.toml", planted),
+        ],
+    );
+    for r in &results {
+        assert_eq!(ok(r), &Data::Done, "{results:?}");
+    }
+    // A later run from there finds it first, and refuses it.
+    let mut command = s.run_probe_command(&[]);
+    command.current_dir(s.ws().join("sub"));
+    let out = output(command, b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    let err = stderr(&out);
+    assert!(err.starts_with("stopit: error: refusing to use "), "{err}");
+    assert!(err.contains("nested configurations"), "{err}");
+    assert!(
+        err.contains(&format!("`--workspace {}`", s.ws().display())),
+        "{err}"
+    );
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert!(s.no_session_left());
+    // Naming the outer workspace runs as usual.
+    let mut command = s.run_probe_command(&["--workspace", s.ws().to_str().unwrap()]);
+    command.current_dir(s.ws().join("sub"));
+    let results = s.probe_with(command, &[Op::Cwd]);
+    assert_eq!(ok(&results[0]), &Data::Cwd("/workspace".into()));
+}
+
+#[test]
+fn a_sandbox_cannot_switch_the_nested_configuration_rule_off() {
+    // Making the workspace root writable by others makes the outer
+    // configuration fail the trust checks; it still counts as outer.
+    let s = Setup::with_config("");
+    let planted = "[[provider]]\ntype = \"script\"\nsource = \"/bin/false\"\n";
+    let results = s.probe(
+        &[],
+        &[
+            chmod("/workspace", 0o777),
+            mkdir("/workspace/sub"),
+            write("/workspace/sub/.stopit.toml", planted),
+        ],
+    );
+    for r in &results {
+        assert_eq!(ok(r), &Data::Done, "{results:?}");
+    }
+    assert_eq!(
+        fs::metadata(s.ws()).unwrap().permissions().mode() & 0o7777,
+        0o777
+    );
+    // From `sub/`: refused, without suggesting the outer one, which would
+    // not load.
+    let mut command = s.run_probe_command(&[]);
+    command.current_dir(s.ws().join("sub"));
+    let out = output(command, b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    let err = stderr(&out);
+    assert!(err.starts_with("stopit: error: refusing to use "), "{err}");
+    assert!(err.contains("nested configurations"), "{err}");
+    assert!(err.contains("fails the trust checks"), "{err}");
+    assert!(
+        !err.contains(&format!("`--workspace {}`", s.ws().display())),
+        "{err}"
+    );
+    assert!(s.no_session_left());
+    // From the workspace itself: its configuration fails the trust checks,
+    // so it is refused too.
+    let out = output(s.run_probe_command(&[]), b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    let err = stderr(&out);
+    assert!(err.starts_with("stopit: error: "), "{err}");
+    assert!(err.contains("its directory is writable"), "{err}");
+    assert!(s.no_session_left());
+}
+
 // --- Warnings and errors ---
 
 #[test]

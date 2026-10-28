@@ -362,8 +362,8 @@ masked = [
 mask_sockets = true
 protected = [
   "{workspace}/**/*.nix", "{workspace}/flake.lock", "{workspace}/.envrc",
-  "{workspace}/.stopit.toml", "{workspace}/.vscode", "{workspace}/.idea",
-  "{workspace}/.github/workflows",
+  "{workspace}/.stopit.toml", "{workspace}/**/.stopit.toml", "{workspace}/.vscode",
+  "{workspace}/.idea", "{workspace}/.github/workflows",
 ]
 ephemeral = ["/tmp", "~"]
 [provider.sandbox.env]
@@ -533,7 +533,7 @@ mod tests {
         let g = &sandbox.grants;
         assert_eq!(g.fs.rw.len(), 1);
         assert_eq!(g.fs.masked.len(), 6);
-        assert_eq!(g.fs.protected.len(), 7);
+        assert_eq!(g.fs.protected.len(), 8);
         assert_eq!(g.fs.ephemeral.len(), 2);
         assert_eq!(g.fs.mask_sockets, Some(true));
         assert_eq!(g.system.proc, Some(true));
