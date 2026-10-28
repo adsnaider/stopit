@@ -129,6 +129,54 @@ impl EnvPattern {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Whether the variable `name` matches: the whole name, compared byte
+    /// for byte (so case-sensitively), with each `*` standing for any run
+    /// of bytes, including none. Any name can be tested, valid or not: `*`
+    /// also covers bytes that are not UTF-8 or not allowed in an
+    /// [`EnvName`].
+    pub fn matches(&self, name: &[u8]) -> bool {
+        self.glob(name, false)
+    }
+
+    /// Like [`matches`](Self::matches), but ASCII letters match in either
+    /// case (`*_TOKEN` matches `github_token`). Other bytes are compared
+    /// exactly.
+    pub fn matches_ignore_ascii_case(&self, name: &[u8]) -> bool {
+        self.glob(name, true)
+    }
+
+    fn glob(&self, name: &[u8], ignore_case: bool) -> bool {
+        let pat = self.0.as_bytes();
+        let same = |a: u8, b: u8| {
+            if ignore_case {
+                a.eq_ignore_ascii_case(&b)
+            } else {
+                a == b
+            }
+        };
+        let (mut p, mut n) = (0, 0);
+        // The last `*` seen: its position in `pat`, and how much of `name`
+        // it has covered so far.
+        let mut star: Option<(usize, usize)> = None;
+        while n < name.len() {
+            if pat.get(p) == Some(&b'*') {
+                star = Some((p, n));
+                p += 1;
+            } else if pat.get(p).is_some_and(|&c| same(c, name[n])) {
+                p += 1;
+                n += 1;
+            } else if let Some((sp, sn)) = star {
+                // Let the last `*` swallow one more byte and retry.
+                p = sp + 1;
+                n = sn + 1;
+                star = Some((sp, sn + 1));
+            } else {
+                return false;
+            }
+        }
+        pat[p..].iter().all(|&c| c == b'*')
+    }
 }
 
 impl FromStr for EnvPattern {
@@ -430,6 +478,71 @@ mod tests {
             assert!(msg.contains("variable pattern"), "{bad:?}: {msg}");
             assert!(msg.contains(&format!("{bad:?}")), "{bad:?}: {msg}");
         }
+    }
+
+    #[test]
+    fn pattern_matching() {
+        let m = |p: &str, n: &str| pat(p).matches(n.as_bytes());
+        // Exact names, case-sensitively.
+        assert!(m("TERM", "TERM"));
+        assert!(!m("TERM", "term"));
+        assert!(!m("TERM", "TERMS"));
+        assert!(!m("TERM", "XTERM"));
+        assert!(!m("TERM", ""));
+        // Prefix, suffix and infix wildcards.
+        assert!(m("RUST_*", "RUST_LOG"));
+        assert!(m("RUST_*", "RUST_"));
+        assert!(!m("RUST_*", "RUST"));
+        assert!(!m("RUST_*", "XRUST_LOG"));
+        assert!(m("*_TOKEN", "GITHUB_TOKEN"));
+        assert!(m("*_TOKEN", "_TOKEN"));
+        assert!(!m("*_TOKEN", "TOKEN"));
+        assert!(!m("*_TOKEN", "A_TOKEN_X"));
+        assert!(m("A*B", "AB"));
+        assert!(m("A*B", "AxxB"));
+        assert!(m("A*B", "AB_B"));
+        assert!(!m("A*B", "AxxBx"));
+        assert!(m("*A*", "xAy"));
+        assert!(m("*_*", "A_B"));
+        assert!(!m("*_*", "AB"));
+        // Backtracking.
+        assert!(m("*ab*ab", "abxabab"));
+        assert!(m("*aab", "aaab"));
+        assert!(!m("*aab", "aaba"));
+        // Runs of stars, inside a pattern too, and no match after a star.
+        assert!(m("A**B", "AB"));
+        assert!(m("A**B", "AxB"));
+        assert!(!m("A**B", "A"));
+        assert!(!m("*A", "B"));
+        assert!(!m("*A", "AB"));
+        assert!(!m("*A", ""));
+        // Everything, including odd names.
+        for p in ["*", "**", "***"] {
+            assert!(m(p, ""));
+            assert!(m(p, "ANYTHING"));
+            assert!(m(p, "a=b"));
+        }
+        assert!(pat("*_KEY").matches(b"my\xffvar_KEY"));
+        assert!(pat("*").matches(b"\xff"));
+        assert!(!pat("A").matches(b"\xff"));
+        assert!(!pat("A_*").matches(b"A"));
+    }
+
+    #[test]
+    fn pattern_matching_ignoring_ascii_case() {
+        let m = |p: &str, n: &str| pat(p).matches_ignore_ascii_case(n.as_bytes());
+        assert!(m("*_TOKEN", "github_token"));
+        assert!(m("*_TOKEN", "GitHub_Token"));
+        assert!(m("aws_*", "AWS_SECRET"));
+        assert!(m("TERM", "term"));
+        assert!(!m("TERM", "terms"));
+        assert!(!m("*_TOKEN", "github_tokens"));
+        assert!(m("A**B", "axb"));
+        // Only ASCII letters fold: other bytes are exact.
+        assert!(!pat("*_KEY").matches_ignore_ascii_case(b"x_k\xe9y"));
+        assert!(pat("*_KEY").matches_ignore_ascii_case(b"x\xff_key"));
+        // The case-sensitive matcher is unchanged.
+        assert!(!pat("*_TOKEN").matches(b"github_token"));
     }
 
     #[test]

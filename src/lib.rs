@@ -4,6 +4,7 @@
 
 pub mod bwrap;
 pub mod config;
+mod env;
 pub mod error;
 pub mod etc;
 pub mod expand;

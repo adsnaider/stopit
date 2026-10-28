@@ -134,6 +134,45 @@ fn environment_is_exactly_what_was_passed() {
 }
 
 #[test]
+fn environment_computed_from_a_spec_and_a_host_environment_is_what_the_target_gets() {
+    let mut init = Init::new();
+    init.spec = init.f.compile(&init_config(
+        &[],
+        "env.pass = [\"TERM\", \"RUST_*\", \"*_TOKEN\", \"PATH\", \"HOME\", \"USER\"]\n\
+         env.deny = [\"*_TOKEN\"]\n\
+         env.set = { EDITOR = \"nvim\" }\n\
+         env.path_prepend = [\"/run/a/bin\", \"/run/b/bin\"]",
+    ));
+    let host = vars(&[
+        ("HOME", "/home/adam"),
+        ("PATH", "/usr/bin:/home/adam/bin"),
+        ("USER", "adam"),
+        ("LOGNAME", "adam"),
+        ("TERM", "xterm"),
+        ("RUST_LOG", "debug"),
+        ("GITHUB_TOKEN", "secret"),
+        ("EDITOR", "emacs"),
+        ("SSH_AUTH_SOCK", "/run/user/1000/agent"),
+    ]);
+    let env = init.spec.target_env(host);
+    assert_eq!(
+        env,
+        vars(&[
+            ("EDITOR", "nvim"),
+            // The sandbox's identity, not the host's.
+            ("HOME", SANDBOX_HOME),
+            ("LOGNAME", "user"),
+            ("PATH", "/run/a/bin:/run/b/bin"),
+            ("RUST_LOG", "debug"),
+            ("TERM", "xterm"),
+            ("USER", "user"),
+        ])
+    );
+    let results = init.probe(&env, &[], &[Op::Env]);
+    assert_eq!(ok(&results[0]), &env_data(&env));
+}
+
+#[test]
 fn empty_environment_stays_empty() {
     let init = Init::new();
     let result = init.probe(&[], &[], &[Op::Env]);

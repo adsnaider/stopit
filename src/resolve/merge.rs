@@ -73,9 +73,9 @@ pub struct EffectiveSystem {
 pub struct EffectiveEnv {
     /// Host variables to pass through, without duplicates.
     pub pass: Vec<EnvPattern>,
-    /// Host variables to drop, without duplicates. Not yet applied to
-    /// `pass`: `deny` always wins, which is enforced when the environment is
-    /// built.
+    /// Host variables to drop (ignoring ASCII case), without duplicates. Not subtracted from
+    /// `pass` here: `deny` always wins, which [`EffectiveEnv::apply`]
+    /// enforces when the environment is built.
     pub deny: Vec<EnvPattern>,
     /// Explicit variables.
     pub set: BTreeMap<EnvName, EnvValue>,
@@ -891,6 +891,14 @@ mod tests {
             ["/e", "/d", "/c", "/a", "/b"]
         );
         assert_eq!(strs(&eff(&m, "bare").env.path_prepend), ["/x"]);
+        // The target's `PATH` is those entries, in that order (§9).
+        let path = |profile: &str| {
+            let env = eff(&m, profile).env.apply(&Default::default(), []);
+            let (_, path) = env.into_iter().find(|(k, _)| k == "PATH").unwrap();
+            path
+        };
+        assert_eq!(path("child"), "/e:/d:/c:/a:/b");
+        assert_eq!(path("main"), "/c:/a:/b");
     }
 
     #[test]

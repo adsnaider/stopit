@@ -67,8 +67,8 @@ pub struct SandboxSpec {
     pub namespaces: Namespaces,
     /// Network access.
     pub network: NetworkSpec,
-    /// The environment policy, as merged. Not yet applied to a real
-    /// environment: `deny` still has to win over `pass` (§9).
+    /// The environment policy, as merged. [`SandboxSpec::target_env`] applies
+    /// it to a host environment (§9).
     pub env: EffectiveEnv,
     /// Syscalls re-enabled in the seccomp filter (§6.3); every other
     /// hardening measure is always on.
