@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::resolve::EphemeralKey;
+
 /// Mode of every directory stopit creates for a session.
 const PRIVATE_MODE: u32 = 0o700;
 
@@ -205,6 +207,29 @@ impl SessionDir {
     pub fn ephemeral(&self) -> PathBuf {
         self.root.join("ephemeral")
     }
+
+    /// The backing directory of the ephemeral mounts keyed by `key`,
+    /// `ephemeral/<key.dir_name()>` (DESIGN.md §3.4), created with mode 0700
+    /// if it does not exist yet. Every sandbox of the session gets the same
+    /// directory for the same key, so what one writes there the next sees.
+    ///
+    /// An existing entry must be a real directory (not a link) owned by us.
+    /// Its mode is not checked: the sandbox owns the directory it sees
+    /// mounted and may `chmod` it, which must not stop the next sandbox of
+    /// the session from starting. Others cannot reach it anyway, since
+    /// `ephemeral/` itself is private.
+    pub fn ephemeral_dir(&self, key: &EphemeralKey) -> Result<PathBuf, SessionError> {
+        let dir = self.ephemeral().join(key.dir_name());
+        match create_private_dir(&dir) {
+            Ok(()) => {}
+            // Made by an earlier sandbox of this session.
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                check_owned_dir(&dir)?;
+            }
+            Err(source) => return Err(SessionError::Create { path: dir, source }),
+        }
+        Ok(dir)
+    }
 }
 
 impl Drop for SessionDir {
@@ -243,9 +268,9 @@ fn check_owner(dir: &Path, meta: &fs::Metadata) -> Result<(), SessionError> {
     Ok(())
 }
 
-/// Checks that `dir` is a real directory (not a link), owned by the current
-/// user, and not accessible to group or others.
-fn check_private_dir(dir: &Path) -> Result<(), SessionError> {
+/// Checks that `dir` is a real directory (not a link) owned by the current
+/// user, and returns its metadata.
+fn check_owned_dir(dir: &Path) -> Result<fs::Metadata, SessionError> {
     let meta = fs::symlink_metadata(dir).map_err(|source| SessionError::Inspect {
         path: dir.to_path_buf(),
         source,
@@ -256,6 +281,13 @@ fn check_private_dir(dir: &Path) -> Result<(), SessionError> {
         });
     }
     check_owner(dir, &meta)?;
+    Ok(meta)
+}
+
+/// Checks that `dir` is a real directory (not a link), owned by the current
+/// user, and not accessible to group or others.
+fn check_private_dir(dir: &Path) -> Result<(), SessionError> {
+    let meta = check_owned_dir(dir)?;
     let mode = meta.mode() & 0o7777;
     if mode & 0o077 != 0 {
         return Err(SessionError::Insecure {
@@ -539,6 +571,48 @@ mod tests {
 
         assert!(!root.exists());
         assert_eq!(fs::read(&target).unwrap(), b"keep me");
+    }
+
+    fn key(pattern: &str) -> EphemeralKey {
+        EphemeralKey::new(&pattern.parse().unwrap())
+    }
+
+    #[test]
+    fn ephemeral_dir_is_created_private_and_reused() {
+        let rt = runtime();
+        let session = create(&rt).unwrap();
+        let tmp = session.ephemeral_dir(&key("/tmp")).unwrap();
+        assert_eq!(tmp, session.ephemeral().join(key("/tmp").dir_name()));
+        assert!(fs::symlink_metadata(&tmp).unwrap().is_dir());
+        assert_eq!(mode(&tmp), 0o700);
+        fs::write(tmp.join("kept"), b"data").unwrap();
+
+        // The same key gets the same directory, content and all, even after
+        // the sandbox changed its mode.
+        fs::set_permissions(&tmp, Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(session.ephemeral_dir(&key("/tmp")).unwrap(), tmp);
+        assert_eq!(fs::read(tmp.join("kept")).unwrap(), b"data");
+
+        // Another key gets another directory.
+        let home = session.ephemeral_dir(&key("~")).unwrap();
+        assert_ne!(home, tmp);
+        assert_eq!(fs::read_dir(&home).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn ephemeral_dir_that_is_not_a_real_directory_is_an_error() {
+        let rt = runtime();
+        let session = create(&rt).unwrap();
+        let outside = TempDir::new().unwrap();
+        let link = session.ephemeral().join(key("/tmp").dir_name());
+        symlink(outside.path(), &link).unwrap();
+        let err = session.ephemeral_dir(&key("/tmp")).unwrap_err();
+        assert!(matches!(err, SessionError::NotDirectory { .. }), "{err}");
+
+        let file = session.ephemeral().join(key("~").dir_name());
+        fs::write(&file, b"").unwrap();
+        let err = session.ephemeral_dir(&key("~")).unwrap_err();
+        assert!(matches!(err, SessionError::NotDirectory { .. }), "{err}");
     }
 
     #[test]

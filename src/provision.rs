@@ -214,6 +214,17 @@ pub struct Provisioned {
 }
 
 impl Provisioned {
+    /// A `Provisioned` for unit tests elsewhere in the crate, with arbitrary
+    /// paths and nothing copied.
+    #[cfg(test)]
+    pub(crate) fn for_tests(exe: PathBuf, loader: Option<PathBuf>, lib_dir: PathBuf) -> Self {
+        Provisioned {
+            exe,
+            loader,
+            lib_dir,
+        }
+    }
+
     /// The copied binary on the host, `<dir>/stopit`.
     pub fn exe(&self) -> &Path {
         &self.exe

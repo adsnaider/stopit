@@ -1,5 +1,6 @@
 //! Shared integration-test harness: provisioning binaries for sandbox runs,
-//! running bwrap, and running `stopit-probe` in a sandbox with typed results.
+//! running bwrap, running `stopit-probe` in a sandbox with typed results,
+//! and compiling real specs into generated bwrap commands that run it.
 //!
 //! Each test file that uses it declares `mod common;`. Not every file uses
 //! every part, hence the `dead_code` allowance.
@@ -12,13 +13,21 @@ pub mod protocol;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read, Write as _};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use stopit::bwrap::{BwrapCommand, working_dir};
+use stopit::config::{Config, ProfileRef};
+use stopit::expand::ExpansionContext;
+use stopit::provider::{ProviderContext, session_providers};
 use stopit::provision::{Provisioned, provision};
+use stopit::session::SessionDir;
+use stopit::spec::{SandboxSpec, compile_session};
+use tempfile::TempDir;
 
 #[allow(unused_imports)]
 pub use protocol::{Data, ExecOutput, FileKind, Ids, Op, OpError, OpResult, Stat};
@@ -124,12 +133,26 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let args: Vec<OsString> = args
-        .into_iter()
-        .map(|a| a.as_ref().to_os_string())
-        .collect();
-    let child = Command::new("bwrap")
-        .args(&args)
+    let mut command = Command::new("bwrap");
+    command.args(args);
+    run_bwrap(command, stdin)
+}
+
+/// Runs `command`, a bwrap invocation, as [`bwrap`] does: feeding it
+/// `stdin`, collecting its output, and killing it at [`BWRAP_DEADLINE`].
+pub fn run_bwrap(command: Command, stdin: Option<&[u8]>) -> Output {
+    run_bwrap_within(command, stdin, BWRAP_DEADLINE)
+}
+
+/// [`run_bwrap`] with another deadline than [`BWRAP_DEADLINE`].
+pub fn run_bwrap_within(mut command: Command, stdin: Option<&[u8]>, limit: Duration) -> Output {
+    spawn_bwrap(&mut command, stdin, limit)
+}
+
+/// Spawns `command` once as [`run_bwrap_within`] does, leaving it to be
+/// spawned again.
+pub fn spawn_bwrap(command: &mut Command, stdin: Option<&[u8]>, limit: Duration) -> Output {
+    let child = command
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
@@ -158,7 +181,7 @@ where
     let (stdout, stdout_reader) = drain(child.stdout.take().expect("stdout is piped"));
     let (stderr, stderr_reader) = drain(child.stderr.take().expect("stderr is piped"));
 
-    let deadline = Instant::now() + BWRAP_DEADLINE;
+    let deadline = Instant::now() + limit;
     let mut status = None;
     loop {
         if status.is_none() {
@@ -191,7 +214,7 @@ where
                 String::from_utf8_lossy(&buffer.lock().unwrap()).into_owned()
             };
             panic!(
-                "bwrap {args:?} did not finish within {BWRAP_DEADLINE:?} and was killed\n\
+                "{command:?} did not finish within {limit:?} and was killed\n\
                  exit status before the kill: {status:?}\nstdout so far: {}\nstderr so far: {}",
                 lossy(&stdout),
                 lossy(&stderr),
@@ -208,19 +231,39 @@ where
 /// mount it there.
 ///
 /// This is the low-level entry point, below [`Sandbox`]: it takes a full
-/// bwrap argument list passed on argv. FD-based arguments (`--args`,
-/// `--ro-bind-data`) come with the bwrap-args commit. Panics if the probe
-/// does not report one result per operation, with bwrap's and the probe's
-/// output.
+/// bwrap argument list passed on argv. [`run_probe_command`] runs a
+/// generated [`BwrapCommand`] instead. Panics if the probe does not report
+/// one result per operation, with bwrap's and the probe's output.
 pub fn run_probe(bwrap_args: &[OsString], command: &[OsString], ops: &[Op]) -> Vec<OpResult> {
     let input = serde_json::to_vec(ops).expect("operations serialize");
     let mut argv = bwrap_args.to_vec();
     argv.push("--".into());
     argv.extend_from_slice(command);
     let out = bwrap(&argv, Some(&input));
+    probe_results(&format!("bwrap {argv:?}"), &out, ops)
+}
+
+/// Runs a probe through a generated bwrap invocation, with `ops` as its
+/// input; `cmd` must run a provisioned probe (see [`ProbeSession`]). Panics
+/// as [`run_probe`] does, naming the arguments passed through `--args`.
+pub fn run_probe_command(cmd: BwrapCommand, ops: &[Op]) -> Vec<OpResult> {
+    run_probe_command_within(cmd, BWRAP_DEADLINE, ops)
+}
+
+/// [`run_probe_command`] with another deadline than [`BWRAP_DEADLINE`].
+pub fn run_probe_command_within(cmd: BwrapCommand, limit: Duration, ops: &[Op]) -> Vec<OpResult> {
+    let input = serde_json::to_vec(ops).expect("operations serialize");
+    let what = format!("bwrap --args {:?} -- {:?}", cmd.args(), cmd.command());
+    let out = run_bwrap_within(cmd.into_command(), Some(&input), limit);
+    probe_results(&what, &out, ops)
+}
+
+/// The probe's results from its output `out`, one per operation in `ops`.
+/// Panics with `what` (the invocation) and the output otherwise.
+pub fn probe_results(what: &str, out: &Output, ops: &[Op]) -> Vec<OpResult> {
     let describe = || {
         format!(
-            "bwrap {argv:?}\nstatus: {}\nstdout: {}\nstderr: {}",
+            "{what}\nstatus: {}\nstdout: {}\nstderr: {}",
             out.status,
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
@@ -339,6 +382,148 @@ impl Sandbox {
     pub fn run_one(&self, op: Op) -> OpResult {
         self.run(&[op]).pop().expect("one result per operation")
     }
+}
+
+// --- Compiled specs and generated commands -------------------------------------
+
+/// The workspace mount every [`SpecFixture`] uses.
+pub const WORKSPACE_MOUNT: &str = "/workspace";
+
+/// The sandbox `HOME` every [`SpecFixture`] uses.
+pub const SANDBOX_HOME: &str = "/home/user";
+
+/// A temporary host layout to compile real [`SandboxSpec`]s against, through
+/// the public pipeline (`stopit::spec::compile_session`): a workspace
+/// (`ws/`, mounted at [`WORKSPACE_MOUNT`]), a host home (`home/`, with
+/// `~` at [`SANDBOX_HOME`]) and a private runtime directory (`runtime/`)
+/// for sessions. Everything is below one canonical temporary directory.
+pub struct SpecFixture {
+    root: PathBuf,
+    _dir: TempDir,
+}
+
+impl SpecFixture {
+    pub fn new() -> Self {
+        let tmp = fs::canonicalize(std::env::temp_dir()).unwrap();
+        let dir = TempDir::new_in(tmp).unwrap();
+        let root = dir.path().to_path_buf();
+        for sub in ["ws", "home", "runtime"] {
+            fs::create_dir(root.join(sub)).unwrap();
+        }
+        fs::set_permissions(root.join("runtime"), fs::Permissions::from_mode(0o700)).unwrap();
+        SpecFixture { root, _dir: dir }
+    }
+
+    /// The temporary directory everything is in.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The host workspace.
+    pub fn workspace(&self) -> PathBuf {
+        self.root.join("ws")
+    }
+
+    /// The host home.
+    pub fn home(&self) -> PathBuf {
+        self.root.join("home")
+    }
+
+    /// Writes `contents` to `rel` below the root, creating its parents.
+    pub fn file(&self, rel: &str, contents: &str) -> PathBuf {
+        let path = self.root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    /// Compiles the configuration `toml` (the contents of a `.stopit.toml`)
+    /// and returns the `main` profile's spec. Panics on an error, and on any
+    /// warning, so a test notices when its layout is not what it meant.
+    pub fn compile(&self, toml: &str) -> SandboxSpec {
+        let (spec, warnings) = self.compile_with_warnings(toml);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:#?}");
+        spec
+    }
+
+    /// Like [`compile`](Self::compile), but returns the warnings instead of
+    /// panicking on them.
+    pub fn compile_with_warnings(&self, toml: &str) -> (SandboxSpec, Vec<String>) {
+        let config = Config::from_toml_str(toml).unwrap();
+        let pctx = ProviderContext {
+            workspace: self.workspace(),
+            workspace_mount: WORKSPACE_MOUNT.parse().unwrap(),
+            home: self.home(),
+            session_dir: self.root.join("runtime"),
+        };
+        let outputs = session_providers(&config, &self.root)
+            .unwrap()
+            .iter()
+            .map(|p| (p.name().clone(), p.manifest(&pctx).unwrap()))
+            .collect();
+        let ctx = ExpansionContext::new(
+            self.workspace(),
+            WORKSPACE_MOUNT.parse().unwrap(),
+            self.home(),
+            SANDBOX_HOME.parse().unwrap(),
+        )
+        .unwrap();
+        let session = compile_session(&config, outputs, &ctx)
+            .unwrap_or_else(|e| panic!("the configuration does not compile: {e}"));
+        let main = session.get(&ProfileRef::main()).expect("main exists");
+        let warnings = main.warnings.iter().map(|w| w.to_string()).collect();
+        (main.spec.clone(), warnings)
+    }
+
+    /// A new session in the fixture's runtime directory, with the probe
+    /// provisioned as its `stopit`.
+    pub fn session(&self) -> ProbeSession {
+        let session = SessionDir::create(Some(self.root.join("runtime").as_os_str())).unwrap();
+        let probe = Path::new(env!("CARGO_BIN_EXE_stopit-probe"));
+        let provisioned = provision(probe, session.root())
+            .unwrap_or_else(|e| panic!("provisioning {probe:?} failed: {e}"));
+        ProbeSession {
+            session,
+            provisioned,
+        }
+    }
+}
+
+/// A session whose provisioned `stopit` is the probe. The layout is the
+/// same as for stopit itself, so [`BwrapCommand`] runs the probe in its
+/// place, with no arguments after the prefix.
+pub struct ProbeSession {
+    pub session: SessionDir,
+    pub provisioned: Provisioned,
+}
+
+impl ProbeSession {
+    /// The generated invocation of the probe in `spec`, starting in the
+    /// workspace mount if `spec` mounts it (`stopit::bwrap::working_dir`).
+    pub fn command(&self, spec: &SandboxSpec) -> BwrapCommand {
+        let cwd = working_dir(spec, Path::new(WORKSPACE_MOUNT));
+        BwrapCommand::new(spec, &self.session, &self.provisioned, &cwd, &[])
+            .unwrap_or_else(|e| panic!("cannot build the bwrap command: {e}"))
+    }
+
+    /// Runs the probe with `ops` in `spec`.
+    pub fn run(&self, spec: &SandboxSpec, ops: &[Op]) -> Vec<OpResult> {
+        run_probe_command(self.command(spec), ops)
+    }
+
+    /// Runs the probe with the single operation `op` in `spec`.
+    pub fn run_one(&self, spec: &SandboxSpec, op: Op) -> OpResult {
+        self.run(spec, &[op])
+            .pop()
+            .expect("one result per operation")
+    }
+}
+
+/// A configuration with `base = "none"` and one `config` provider whose
+/// `[provider.sandbox]` table holds `body` (dotted keys such as
+/// `fs.rw = ["{workspace}"]`).
+pub fn config_none(body: &str) -> String {
+    format!("base = \"none\"\n[[provider]]\ntype = \"config\"\n[provider.sandbox]\n{body}\n")
 }
 
 // --- Building operations ---------------------------------------------------

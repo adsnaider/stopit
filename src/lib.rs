@@ -2,6 +2,7 @@
 //! the filesystem, network and other host resources. See `DESIGN.md` at the
 //! repository root for the full design.
 
+pub mod bwrap;
 pub mod config;
 pub mod error;
 pub mod expand;
