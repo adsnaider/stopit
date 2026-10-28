@@ -682,6 +682,10 @@ static SIGNAL_PIPE_INIT: std::sync::OnceLock<Result<(), i32>> = std::sync::OnceL
 
 /// Signal handler for [`CAUGHT`] that records the signal and wakes [`signal_poll_fd`].
 extern "C" fn record_signal(signal: libc::c_int) {
+    // SAFETY: `__errno_location` returns this thread's valid `errno` slot.
+    // Saving and restoring it keeps `write` from clobbering `errno` in the
+    // interrupted code.
+    let saved_errno = unsafe { *libc::__errno_location() };
     RECEIVED.store(signal, Ordering::SeqCst);
     let wfd = SIGNAL_WRITE_FD.load(Ordering::Relaxed);
     if wfd >= 0 {
@@ -690,6 +694,10 @@ extern "C" fn record_signal(signal: libc::c_int) {
         unsafe {
             let _ = libc::write(wfd, (&raw const byte).cast(), 1);
         }
+    }
+    // SAFETY: restores the thread's saved `errno`.
+    unsafe {
+        *libc::__errno_location() = saved_errno;
     }
 }
 
@@ -707,8 +715,8 @@ pub(crate) fn signal_poll_fd() -> Option<libc::c_int> {
     (fd >= 0).then_some(fd)
 }
 
-/// The last caught signal not yet handled, if any, now handled.
-fn take_signal() -> Option<libc::c_int> {
+/// Drains all wakeup bytes currently buffered in [`SIGNAL_READ_FD`].
+pub(crate) fn drain_signal_pipe() {
     let rfd = SIGNAL_READ_FD.load(Ordering::Acquire);
     if rfd >= 0 {
         let mut buf = [0u8; 64];
@@ -716,7 +724,13 @@ fn take_signal() -> Option<libc::c_int> {
         // life of the process.
         while unsafe { libc::read(rfd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
     }
-    match RECEIVED.swap(0, Ordering::SeqCst) {
+}
+
+/// The last caught signal not yet handled, if any, now handled.
+fn take_signal() -> Option<libc::c_int> {
+    let signal = RECEIVED.swap(0, Ordering::SeqCst);
+    drain_signal_pipe();
+    match signal {
         0 => None,
         signal => Some(signal),
     }
@@ -753,7 +767,8 @@ fn catch_signals() -> io::Result<()> {
     init_signal_pipe()?;
     for signal in CAUGHT {
         // SAFETY: `sigaction` on a zeroed, then filled, local struct. The
-        // handler only stores to an atomic, which is async-signal-safe.
+        // handler saves and restores `errno`, stores to atomics, and writes a
+        // byte to a non-blocking pipe, all of which are async-signal-safe.
         unsafe {
             let mut old: libc::sigaction = std::mem::zeroed();
             if libc::sigaction(signal, std::ptr::null(), &mut old) != 0 {
@@ -2447,5 +2462,26 @@ mod tests {
             bwrap_exit_code(ExitStatus::from_raw(libc::SIGTERM), ""),
             143
         );
+    }
+
+    #[test]
+    fn record_signal_preserves_errno_when_pipe_is_full() {
+        init_signal_pipe().unwrap();
+        let wfd = SIGNAL_WRITE_FD.load(Ordering::Acquire);
+        let fill = [1u8; 4096];
+        // Fill the non-blocking pipe until `write` sets `EAGAIN`.
+        // SAFETY: `wfd` is a valid non-blocking pipe descriptor.
+        while unsafe { libc::write(wfd, fill.as_ptr().cast(), fill.len()) } > 0 {}
+
+        // Store 0 so concurrent `script` tests never observe a fake signal.
+        // SAFETY: thread-local `errno` slot is valid for this thread.
+        unsafe {
+            *libc::__errno_location() = libc::ENOENT;
+        }
+        record_signal(0);
+        // SAFETY: reads this thread's `errno` slot.
+        let after = unsafe { *libc::__errno_location() };
+        drain_signal_pipe();
+        assert_eq!(after, libc::ENOENT);
     }
 }

@@ -200,12 +200,17 @@ pub enum SpecWarning {
     /// §1.5, §6.2, "Untrusted links").
     #[error(transparent)]
     DestinationMasked(Box<DestinationMasked>),
-    /// A mask synthesized for a [`SpecWarning::DestinationMasked`] lies at
-    /// the sandbox path of the mount underneath (that mount's own source
-    /// cannot be searched), so it replaces that mount: the whole grant (the
-    /// workspace mount, say) is hidden this session.
+    /// A mask synthesized for a [`SpecWarning::DestinationMasked`] or
+    /// [`SpecWarning::SocketScanMasked`] lies at the sandbox path of the mount
+    /// underneath, so it replaces that mount and hides the whole grant this
+    /// session.
     #[error(transparent)]
     GrantHidden(Box<GrantHidden>),
+    /// Scanning an `rw` mount for Unix domain sockets could not read or
+    /// inspect inside a directory, so stopit masks that directory as a whole
+    /// to keep hidden sockets unreachable, per DESIGN.md §1.5 and §3.4.
+    #[error(transparent)]
+    SocketScanMasked(Box<SocketScanMasked>),
     /// A mount was skipped because its host source cannot be resolved: for
     /// any mode, a final symlink whose target is missing (there is nothing
     /// to show or hide, as for a missing path), and for an `rw` mount any
@@ -498,8 +503,8 @@ pub struct DestinationMasked {
     pub masked_host: PathBuf,
 }
 
-/// A mount replaced by a mask over a directory that cannot be searched (see
-/// [`SpecWarning::GrantHidden`]).
+/// A mount replaced by a mask over a directory that cannot be searched or read.
+/// See [`SpecWarning::GrantHidden`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error(
     "provider {:?}: {}",
@@ -518,6 +523,30 @@ pub struct GrantHidden {
     pub dir: PathBuf,
     /// Whether `sandbox` is the workspace mount.
     pub workspace: bool,
+}
+
+/// Scanning an `rw` mount for Unix domain sockets failed inside a directory,
+/// so stopit masks that directory as a whole to hide any sockets inside it.
+#[derive(Debug, Error)]
+#[error(
+    "provider {:?}: scanning the rw mount at {mount_sandbox:?} for sockets failed at {path:?} \
+     with {error}, so stopit masks {masked_host:?} at {masked:?} to hide any sockets inside it",
+    .provider.as_str()
+)]
+pub struct SocketScanMasked {
+    /// The provider whose rule produced the `rw` mount.
+    pub provider: ProviderName,
+    /// The `rw` mount's sandbox destination.
+    pub mount_sandbox: PathBuf,
+    /// The host path where scanning failed.
+    pub path: PathBuf,
+    /// The error reading or inspecting `path`.
+    #[source]
+    pub error: io::Error,
+    /// The sandbox path of the masked directory.
+    pub masked: PathBuf,
+    /// The host directory masked there.
+    pub masked_host: PathBuf,
 }
 
 /// A mount's host source cannot be resolved to a canonical path (see
@@ -1419,7 +1448,12 @@ fn check_host_sources(
     let workspace = (ws_host, ctx.workspace_sandbox());
     let mounts = check_state_dirs(mounts, &canonical, workspace, state, warnings)?;
     let mounts = if mask_sockets {
-        mask_rw_sockets(mounts, &canonical_entries)
+        mask_rw_sockets(
+            mounts,
+            &canonical_entries,
+            ctx.workspace_sandbox(),
+            warnings,
+        )
     } else {
         mounts
     };
@@ -1442,10 +1476,13 @@ fn check_host_sources(
 /// following symlinks, skips subtrees covered by another mount of the profile,
 /// and emits `masked` mounts attributed to [`SUPERVISOR_PROVIDER_NAME`]. Masks
 /// unreadable or unsearchable directories inside an `rw` mount as directories
-/// so the sandbox cannot uncover sockets hidden inside them.
+/// with [`SpecWarning::SocketScanMasked`] so the sandbox cannot uncover sockets
+/// hidden inside them.
 fn mask_rw_sockets(
     mut mounts: Vec<PlannedMount>,
     canonical: &BTreeMap<PathBuf, (PathBuf, EntryKind)>,
+    ws_sandbox: &Path,
+    warnings: &mut Vec<SpecWarning>,
 ) -> Vec<PlannedMount> {
     let stopit: ProviderName = SUPERVISOR_PROVIDER_NAME
         .parse()
@@ -1473,27 +1510,31 @@ fn mask_rw_sockets(
             let entries = match fs::read_dir(&dir_host) {
                 Ok(entries) => entries,
                 Err(err) if is_missing(err.kind()) => continue,
-                Err(_) => {
+                Err(error) => {
                     mask_unreadable_rw_dir(
+                        m,
                         &dir_sandbox,
                         &dir_host,
-                        &m.sandbox,
+                        dir_host.clone(),
+                        error,
+                        ws_sandbox,
                         &stopit,
                         &mut added,
                         &mut replace_rw,
+                        warnings,
                     );
                     continue;
                 }
             };
-            let mut dir_failed = false;
+            let mut dir_failure = None;
             let mut subdirs = Vec::new();
             let mut sockets = Vec::new();
             for entry in entries {
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(err) if is_missing(err.kind()) => continue,
-                    Err(_) => {
-                        dir_failed = true;
+                    Err(error) => {
+                        dir_failure = Some((dir_host.clone(), error));
                         break;
                     }
                 };
@@ -1506,8 +1547,8 @@ fn mask_rw_sockets(
                 let meta = match fs::symlink_metadata(&child_host) {
                     Ok(meta) => meta,
                     Err(err) if is_missing(err.kind()) => continue,
-                    Err(_) => {
-                        dir_failed = true;
+                    Err(error) => {
+                        dir_failure = Some((child_host, error));
                         break;
                     }
                 };
@@ -1521,14 +1562,18 @@ fn mask_rw_sockets(
                     sockets.push((child_host, child_sandbox));
                 }
             }
-            if dir_failed {
+            if let Some((failed_path, error)) = dir_failure {
                 mask_unreadable_rw_dir(
+                    m,
                     &dir_sandbox,
                     &dir_host,
-                    &m.sandbox,
+                    failed_path,
+                    error,
+                    ws_sandbox,
                     &stopit,
                     &mut added,
                     &mut replace_rw,
+                    warnings,
                 );
                 continue;
             }
@@ -1546,6 +1591,7 @@ fn mask_rw_sockets(
                         glob_link: false,
                     });
             }
+            subdirs.sort_by(|a, b| b.1.cmp(&a.1));
             stack.extend(subdirs);
         }
     }
@@ -1563,16 +1609,35 @@ fn mask_rw_sockets(
     mounts
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mask_unreadable_rw_dir(
+    mount: &PlannedMount,
     dir_sandbox: &Path,
     dir_host: &Path,
-    mount_sandbox: &Path,
+    failed_path: PathBuf,
+    error: io::Error,
+    ws_sandbox: &Path,
     stopit: &ProviderName,
     added: &mut BTreeMap<PathBuf, PlannedMount>,
     replace_rw: &mut BTreeSet<PathBuf>,
+    warnings: &mut Vec<SpecWarning>,
 ) {
-    if dir_sandbox == mount_sandbox {
-        replace_rw.insert(mount_sandbox.to_owned());
+    warnings.push(SpecWarning::SocketScanMasked(Box::new(SocketScanMasked {
+        provider: mount.provider.clone(),
+        mount_sandbox: mount.sandbox.clone(),
+        path: failed_path,
+        error,
+        masked: dir_sandbox.to_owned(),
+        masked_host: dir_host.to_owned(),
+    })));
+    if dir_sandbox == mount.sandbox && replace_rw.insert(mount.sandbox.clone()) {
+        warnings.push(SpecWarning::GrantHidden(Box::new(GrantHidden {
+            provider: mount.provider.clone(),
+            mode: mount.mode,
+            sandbox: mount.sandbox.clone(),
+            dir: dir_host.to_owned(),
+            workspace: mount.sandbox == ws_sandbox,
+        })));
     }
     added.retain(|k, _| !(k.starts_with(dir_sandbox) && k != dir_sandbox));
     added.insert(
@@ -9295,6 +9360,10 @@ fs.masked = [\"{workspace}/hidden\"]
             !summary.iter().any(|l| l.contains("root.sock")),
             "{summary:?}"
         );
+        assert!(
+            !summary.iter().any(|l| l.contains("daemon.sock")),
+            "{summary:?}"
+        );
 
         let unmasked = body.replace("fs.mask_sockets = true", "fs.mask_sockets = false");
         let compiled_off = f.compile(&none_with(&unmasked));
@@ -9341,6 +9410,57 @@ fs.masked = [\"{workspace}/hidden\"]
                 row("/workspace/locked_read_only", Masked, "stopit"),
                 row("/workspace/locked_zero", Masked, "stopit"),
             ]
+        );
+        let ws_warnings = &compiled.get(&ProfileRef::main()).unwrap().warnings;
+        assert_eq!(ws_warnings.len(), 2, "{ws_warnings:?}");
+        assert!(
+            matches!(
+                &ws_warnings[0],
+                SpecWarning::SocketScanMasked(w)
+                    if w.masked == Path::new("/workspace/locked_read_only")
+            ),
+            "{ws_warnings:?}"
+        );
+        assert!(
+            matches!(
+                &ws_warnings[1],
+                SpecWarning::SocketScanMasked(w)
+                    if w.masked == Path::new("/workspace/locked_zero")
+            ),
+            "{ws_warnings:?}"
+        );
+
+        // When an `rw` grant root itself has mode `0o100` so planning
+        // keeps it, yet is unreadable so socket scanning fails at the root, the
+        // mask replaces the grant and emits `GrantHidden` too.
+        f.mkdir("home/exec_only");
+        let p_exec = f.root.join("home/exec_only");
+        fs::set_permissions(&p_exec, fs::Permissions::from_mode(0o100)).unwrap();
+        let grant_body = "fs.mask_sockets = true\nfs.rw = [\"~/exec_only\"]\n";
+        let compiled_grant = f.compile(&none_with(grant_body));
+        fs::set_permissions(&p_exec, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let sp_grant = spec(&compiled_grant, "main");
+        assert_eq!(
+            mounts(sp_grant),
+            [row("/home/user/exec_only", Masked, "stopit")]
+        );
+        let grant_warnings = &compiled_grant.get(&ProfileRef::main()).unwrap().warnings;
+        assert!(
+            grant_warnings.iter().any(|w| matches!(
+                w,
+                SpecWarning::SocketScanMasked(s)
+                    if s.masked == Path::new("/home/user/exec_only")
+            )),
+            "{grant_warnings:?}"
+        );
+        assert!(
+            grant_warnings.iter().any(|w| matches!(
+                w,
+                SpecWarning::GrantHidden(g)
+                    if g.sandbox == Path::new("/home/user/exec_only") && !g.workspace
+            )),
+            "{grant_warnings:?}"
         );
     }
 }

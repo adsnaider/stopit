@@ -8,22 +8,32 @@
 //! yet.
 //!
 //! Everything is pure generation except what the arguments need on the
-//! host: each ephemeral mount's session backing directory is created if
-//! missing ([`SessionDir::ephemeral_dir`]), the sandbox user's ids are the
-//! caller's ([`SandboxIds::current`]), and the data bwrap reads from file
-//! descriptors is put in sealed memfds. The options reach bwrap through
-//! `--args FD` (a profile's mounts can number thousands, beyond what argv
-//! comfortably holds), and each masked file's empty content, and each
-//! synthesized file's content, through its own `--ro-bind-data FD`. A memfd
-//! holds any amount of data without a reader, so nothing can block writing
-//! it before bwrap runs, as a pipe would above its buffer size. Only the
-//! command after `--` is passed on argv.
+//! host. [`SessionDir::ephemeral_dir`] creates each ephemeral mount's
+//! session backing directory if missing, and `BwrapCommand` checks nested
+//! mount destinations inside those backing directories against planted
+//! symlinks. [`SandboxIds::current`] reads the caller's user and group ids.
+//! Host mounts and pinned parent directories inside untrusted roots or
+//! session `ephemeral/` directories are opened with `openat2` using
+//! `O_PATH | O_CLOEXEC` and `RESOLVE_NO_SYMLINKS` and passed to bwrap via
+//! `--bind-fd` or `--ro-bind-fd`. Host mounts outside untrusted roots stay
+//! path strings so large read-only tool closures do not exhaust descriptor
+//! limits.
 //!
-//! The descriptors are inherited at the numbers the arguments name:
-//! [`BwrapCommand::into_command`] reopens each in the child, after the
-//! fork, and moves it onto its number without close-on-exec, so no other
-//! child of this process inherits them and every spawn reads them from the
-//! start.
+//! Sealed memfds carry the data bwrap reads from descriptors. The options
+//! reach bwrap through `--args FD`, while each masked file's empty content
+//! and each synthesized file's content use `--ro-bind-data FD`. A memfd
+//! holds any amount of data without a reader, so writing it before bwrap
+//! runs never blocks like a pipe above its buffer size.
+//! [`BwrapCommand::into_command`] passes `--args FD --` and the command on
+//! argv, and [`BwrapCommand::into_command_with_status`] prepends
+//! `--json-status-fd FD` with a non-blocking pipe so the supervisor can tell
+//! bwrap setup failures apart from the sandboxed command's exit status.
+//!
+//! In the forked child before `exec`, `pre_exec` reopens each memfd from the
+//! start, duplicates the memfds, bind descriptors, and optional status pipe
+//! onto their target numbers without `FD_CLOEXEC`, and calls `close_range`
+//! with `CLOSE_RANGE_CLOEXEC` on every other descriptor above stdio so parent
+//! descriptors never leak into bwrap.
 //!
 //! [`BwrapCommand::for_init`] runs `stopit __init` (step 8): the target's
 //! environment goes in one more sealed memfd, inherited the same way, which
@@ -1126,46 +1136,53 @@ fn collect_pinned_parents(
         ) {
             continue;
         }
-        for p in mount.sandbox.ancestors().skip(1) {
-            if p == Path::new("/") || mount_by_sandbox.contains_key(p) || pinned.contains_key(p) {
+        let Some(parent) = mount.sandbox.parent() else {
+            continue;
+        };
+        let mut cur_sandbox = PathBuf::from("/");
+        let mut active_anc: Option<(PathBuf, PathMode)> = mount_by_sandbox
+            .get(Path::new("/"))
+            .and_then(|m| ancestor_untrusted_dir(m));
+        for c in parent.components().skip(1) {
+            cur_sandbox.push(c);
+            if let Some(m) = mount_by_sandbox.get(cur_sandbox.as_path()) {
+                active_anc = ancestor_untrusted_dir(m);
                 continue;
             }
-            let Some(anc) = p
-                .ancestors()
-                .skip(1)
-                .find_map(|a| mount_by_sandbox.get(a).copied())
-            else {
+            let Some((ref mut anc_host, anc_mode)) = active_anc else {
                 continue;
             };
-            let Some((anc_dir, anc_mode)) = ancestor_untrusted_dir(anc) else {
+            anc_host.push(c);
+            if pinned.contains_key(&cur_sandbox) {
                 continue;
-            };
-            let rel = p
-                .strip_prefix(&anc.sandbox)
-                .expect("ancestor mount is a prefix");
-            let host_dir = anc_dir.join(rel);
-            let Some(res) = host_meta(&host_dir) else {
+            }
+            let Some(res) = host_meta(anc_host) else {
+                active_anc = None;
                 continue;
             };
             match res {
-                Err(err) if crate::error::is_missing(err.kind()) => continue,
+                Err(err) if crate::error::is_missing(err.kind()) => {
+                    active_anc = None;
+                }
                 Err(error) => {
                     return Err(BwrapError::MountOpen {
                         sandbox: mount.sandbox.clone(),
-                        path: host_dir,
+                        path: anc_host.clone(),
                         error,
                     });
                 }
                 Ok(meta) if meta.file_type().is_symlink() => {
                     return Err(BwrapError::UntrustedSymlink {
                         sandbox: mount.sandbox.clone(),
-                        path: host_dir,
+                        path: anc_host.clone(),
                     });
                 }
                 Ok(meta) if meta.is_dir() => {
-                    pinned.insert(p.to_path_buf(), (host_dir, anc_mode));
+                    pinned.insert(cur_sandbox.clone(), (anc_host.clone(), anc_mode));
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    active_anc = None;
+                }
             }
         }
     }
@@ -2752,9 +2769,13 @@ mod tests {
         assert!(pos("/workspace/a") < pos("/workspace/a/c"));
         assert!(pos("/workspace/a/c") < pos("/workspace/a/c/ro.txt"));
 
-        // Swapping an intermediate directory for a symlink fails closed.
-        fs::remove_dir_all(ws.join("a/c")).unwrap();
-        std::os::unix::fs::symlink("/etc", ws.join("a/c")).unwrap();
+        // Swapping the shallow ancestor `ws/a` for a symlink stops before
+        // descending into `ws/a/b` and names `ws/a` immediately.
+        let symlink_target = dir.path().canonicalize().unwrap().join("decoy");
+        fs::create_dir_all(symlink_target.join("b")).unwrap();
+        fs::remove_dir_all(ws.join("a")).unwrap();
+        std::os::unix::fs::symlink(&symlink_target, ws.join("a")).unwrap();
+        let inspected = std::cell::RefCell::new(Vec::new());
         let err = plan(
             &s,
             &s.untrusted_roots,
@@ -2764,13 +2785,21 @@ mod tests {
             &["arg".into()],
             TerminalSession::Keep,
             &|_| true,
-            &|p| Some(fs::symlink_metadata(p)),
+            &|p| {
+                inspected.borrow_mut().push(p.to_path_buf());
+                Some(fs::symlink_metadata(p))
+            },
             &mut |_, key| Ok(eph_back.join(key.dir_name())),
         )
         .unwrap_err();
         assert!(
-            matches!(err, BwrapError::UntrustedSymlink { .. }),
+            matches!(&err, BwrapError::UntrustedSymlink { path, .. } if path == &ws.join("a")),
             "{err:?}"
+        );
+        assert!(
+            !inspected.borrow().contains(&ws.join("a/b")),
+            "must not traverse through symlinked parent: {:?}",
+            inspected.borrow()
         );
     }
 
@@ -2827,6 +2856,7 @@ mod tests {
     fn into_command_with_status_passes_json_status_fd_and_checks_arg_limit() {
         let f = Fixture::new();
         let cmd = f.command(&SandboxSpec::default());
+        let base = cmd.args().len() + ARGV_OVERHEAD + cmd.command().len();
         let args_fd = cmd.args_fd().to_string();
         let (command, _status_reader) = cmd.into_command_with_status().unwrap();
         let argv: Vec<String> = command
@@ -2839,5 +2869,43 @@ mod tests {
         assert_eq!(argv[2], "--args");
         assert_eq!(argv[3], args_fd);
         assert_eq!(argv[4], "--");
+
+        let spec_with_total_args = |target_total: usize| {
+            let rem = target_total - base;
+            let masks = [0, 2, 1][rem % 3];
+            let mut mounts = ro_files((rem - 5 * masks) / 3);
+            for i in 0..masks {
+                mounts.push(host(&format!("/x{i}"), "/h/x", EntryKind::File, Masked));
+            }
+            spec(mounts)
+        };
+
+        // Right at `BWRAP_MAX_ARGS - STATUS_ARGV_OVERHEAD`, adding `--json-status-fd FD`
+        // reaches `BWRAP_MAX_ARGS` and succeeds.
+        let fits = f.command(&spec_with_total_args(BWRAP_MAX_ARGS - STATUS_ARGV_OVERHEAD));
+        assert_eq!(
+            fits.args().len() + ARGV_OVERHEAD + fits.command().len(),
+            BWRAP_MAX_ARGS - STATUS_ARGV_OVERHEAD
+        );
+        assert!(fits.into_command_with_status().is_ok());
+
+        // At `BWRAP_MAX_ARGS - 1` and `BWRAP_MAX_ARGS`, `BwrapCommand::new` succeeds,
+        // and `into_command_with_status` rejects the extra two status arguments.
+        for total in [BWRAP_MAX_ARGS - 1, BWRAP_MAX_ARGS] {
+            let near_full = f.command(&spec_with_total_args(total));
+            assert_eq!(
+                near_full.args().len() + ARGV_OVERHEAD + near_full.command().len(),
+                total
+            );
+            let err = near_full.into_command_with_status().unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    BwrapError::TooManyArgs { count, max, .. }
+                        if count == total + STATUS_ARGV_OVERHEAD && max == BWRAP_MAX_ARGS
+                ),
+                "{err:?}"
+            );
+        }
     }
 }

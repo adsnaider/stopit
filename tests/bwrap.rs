@@ -1257,6 +1257,42 @@ fn mask_sockets_blocks_connect_when_enabled_and_allows_it_when_disabled() {
 }
 
 #[test]
+fn mask_sockets_mounts_unreadable_rw_directory_as_read_only_empty_tmpfs() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+
+    let f = SpecFixture::new();
+    let locked = f.workspace().join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    f.file("ws/locked/secret.txt", "hidden");
+    let _listener = UnixListener::bind(locked.join("hidden.sock")).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let (spec, warnings) = f.compile_with_warnings(&ws_rw("fs.mask_sockets = true"));
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("scanning the rw mount") && w.contains("/workspace/locked")),
+        "{warnings:?}"
+    );
+
+    let session = f.session();
+    let results = session.run(
+        &spec,
+        &[
+            list("/workspace/locked"),
+            chmod("/workspace/locked", 0o700),
+            write("/workspace/locked/new.txt", "x"),
+        ],
+    );
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_eq!(ok(&results[0]), &names(&[]));
+    assert_eq!(errno(&results[1]), "EROFS");
+    assert_eq!(errno(&results[2]), "EROFS");
+}
+
+#[test]
 fn pinned_parents_block_rename_and_rmdir_while_allowing_sibling_edits() {
     let f = SpecFixture::new();
     f.file("ws/a/b/.env", "SECRET=1");
@@ -1295,6 +1331,26 @@ fn pinned_parents_block_rename_and_rmdir_while_allowing_sibling_edits() {
         "after"
     );
     assert!(!f.workspace().join("a/new.txt").exists());
+
+    // Swapping `ws/a` to a symlink above `ws/a/b/.env` before `BwrapCommand::new`
+    // is rejected immediately at `ws/a`.
+    let decoy = f.root().join("decoy");
+    fs::create_dir_all(decoy.join("b")).unwrap();
+    fs::remove_dir_all(f.workspace().join("a")).unwrap();
+    std::os::unix::fs::symlink(&decoy, f.workspace().join("a")).unwrap();
+    let err = BwrapCommand::new(
+        &spec,
+        &session.session,
+        &session.provisioned,
+        Path::new(WORKSPACE_MOUNT),
+        &[],
+        TerminalSession::Keep,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, BwrapError::UntrustedSymlink { path, .. } if path == &f.workspace().join("a")),
+        "{err:?}"
+    );
 }
 
 #[test]

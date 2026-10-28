@@ -490,6 +490,9 @@ fn wait_fd_or_signal(fd: RawFd) -> Result<(), libc::c_int> {
             }
             return Ok(());
         }
+        if pfds[1].revents != 0 {
+            crate::supervisor::drain_signal_pipe();
+        }
         if pfds[0].revents != 0 {
             return Ok(());
         }
