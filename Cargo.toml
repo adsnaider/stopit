@@ -35,7 +35,7 @@ libc = "0.2.191"
 # `system` is used only by stopit-probe (uname), which shares this package.
 # `termios` and `pty`: the sandbox's PTY, the host terminal's raw mode, the
 # foreground check and terminal-state restore.
-rustix = { version = "1.1.5", features = ["fs", "process", "pty", "system", "termios"] }
+rustix = { version = "1.1.5", features = ["fs", "net", "process", "pty", "system", "termios"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 # SHA-256 of the configurations the user allowed (`stopit allow`, the trust

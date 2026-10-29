@@ -1,6 +1,6 @@
 //! The command line of `stopit` (DESIGN.md §5): `stopit run`, `stopit
-//! shell`, the trust store's `stopit allow`, `revoke` and `allowed` (§3),
-//! and `--version`.
+//! shell`, `stopit server` (§5.5), the trust store's `stopit allow`,
+//! `revoke` and `allowed` (§3), and `--version`.
 //!
 //! The internal `stopit __init` (§6.3) is not part of it: `main` dispatches
 //! it before this parser runs, so its argv contract (`__init --env-fd N --
@@ -50,6 +50,17 @@ pub enum CliCommand {
         #[command(flatten)]
         session: SessionArgs,
     },
+    /// Serve the workspace's session: `stopit run` and `stopit shell` there
+    /// attach to it and share its temporary directories. Runs until
+    /// stopped with Ctrl-C or a signal.
+    Server {
+        /// Which workspace.
+        #[command(flatten)]
+        workspace: WorkspaceArg,
+        /// Do not log runs, or the startup line, to stderr.
+        #[arg(short, long)]
+        quiet: bool,
+    },
     /// Allow the workspace's `.stopit.toml` as it is now. Review it first:
     /// it decides what the sandbox may do and which scripts run on the host.
     Allow {
@@ -88,9 +99,16 @@ pub struct SessionArgs {
     /// command: after it, `-q` is the command's own.
     #[arg(short, long)]
     pub quiet: bool,
+    /// Attach to the `stopit server` with this session id [default: the one
+    /// serving the workspace, if any].
+    #[arg(long, value_name = "ID", conflicts_with = "standalone")]
+    pub server: Option<String>,
+    /// Run without a server, even if one serves the workspace.
+    #[arg(long)]
+    pub standalone: bool,
 }
 
-/// The workspace option of `allow` and `revoke`.
+/// The workspace option of `allow`, `revoke` and `server`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
 pub struct WorkspaceArg {
     /// The workspace directory [default: the nearest directory, from the
@@ -118,7 +136,7 @@ mod tests {
             session: SessionArgs {
                 workspace: workspace.map(PathBuf::from),
                 profile: profile.map(str::to_owned),
-                quiet: false,
+                ..SessionArgs::default()
             },
             command: command.iter().map(OsString::from).collect(),
         }
@@ -202,7 +220,7 @@ mod tests {
                 session: SessionArgs {
                     workspace: Some("w".into()),
                     profile: Some("p".into()),
-                    quiet: false,
+                    ..SessionArgs::default()
                 }
             }
         );
@@ -251,8 +269,7 @@ mod tests {
             CliCommand::Run {
                 session: SessionArgs {
                     workspace: Some(PathBuf::from(&odd)),
-                    profile: None,
-                    quiet: false,
+                    ..SessionArgs::default()
                 },
                 command: vec![odd.clone(), odd],
             }
@@ -347,5 +364,37 @@ mod tests {
     fn the_cli_is_consistent() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn server_and_standalone_options() {
+        assert_eq!(
+            parse(&["server"]).unwrap(),
+            CliCommand::Server {
+                workspace: WorkspaceArg::default(),
+                quiet: false
+            }
+        );
+        assert_eq!(
+            parse(&["server", "--workspace", "w", "-q"]).unwrap(),
+            CliCommand::Server {
+                workspace: WorkspaceArg {
+                    workspace: Some(PathBuf::from("w"))
+                },
+                quiet: true
+            }
+        );
+        let CliCommand::Run { session, .. } = parse(&["run", "--server", "abc", "ls"]).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(session.server.as_deref(), Some("abc"));
+        let CliCommand::Shell { session } = parse(&["shell", "--standalone"]).unwrap() else {
+            panic!()
+        };
+        assert!(session.standalone);
+        let e = parse(&["run", "--server", "abc", "--standalone", "ls"]).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::ArgumentConflict);
+        assert!(parse(&["server", "ls"]).is_err());
     }
 }

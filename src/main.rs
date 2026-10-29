@@ -30,6 +30,8 @@ fn main() -> ExitCode {
             profile: session.profile,
             quiet: session.quiet,
             command,
+            server: session.server,
+            standalone: session.standalone,
         },
         CliCommand::Shell { session } => {
             match supervisor::shell_command(std::env::var_os("SHELL")) {
@@ -38,6 +40,8 @@ fn main() -> ExitCode {
                     profile: session.profile,
                     quiet: session.quiet,
                     command,
+                    server: session.server,
+                    standalone: session.standalone,
                 },
                 Err(e) => {
                     supervisor::print_error(&e.to_string());
@@ -50,6 +54,9 @@ fn main() -> ExitCode {
             return supervisor::revoke(workspace.workspace, config);
         }
         CliCommand::Allowed => return supervisor::allowed(),
+        CliCommand::Server { workspace, quiet } => {
+            return stopit::server::serve(workspace.workspace, quiet);
+        }
     };
     supervisor::run(invocation)
 }

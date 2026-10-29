@@ -67,13 +67,13 @@ use crate::provider::{
     BASE_PROVIDER_NAME, ProtectedSource, ProviderContext, ProviderError, SUPERVISOR_PROVIDER_NAME,
     layered_session_providers, protected_sources, static_outputs,
 };
-use crate::provision::{ProvisionError, provision_self};
+use crate::provision::{ProvisionError, Provisioned, provision_self};
 use crate::pty::{HostTerminal, Pty, PtyRelay, RawMode};
 use crate::resolve::{PlanWarning, PlanWarningKind};
 use crate::session::{SessionDir, SessionError};
 use crate::spec::{
-    CompileError, CompiledSession, ScriptPathError, SpecWarning, UntrustedRoot, compile_session,
-    has_rewritable_hard_links, resolve_script_path, static_rw_roots,
+    CompileError, CompiledProfile, CompiledSession, ScriptPathError, SpecWarning, UntrustedRoot,
+    compile_session, has_rewritable_hard_links, resolve_script_path, static_rw_roots,
 };
 use crate::state::{
     ConfigDirs, GLOBAL_CONFIG_FILE, StateDirs, StateError, config_dirs_from_host,
@@ -299,6 +299,61 @@ pub enum RunError {
     #[error("cannot set up the sandbox's terminal: {0}")]
     Pty(#[source] io::Error),
 
+    /// A server already serves the workspace.
+    #[error(
+        "a stopit server already serves {workspace:?} as session {id} (pid {pid}); stop it \
+         first, or use it with `stopit run`"
+    )]
+    ServerRunning {
+        /// The workspace.
+        workspace: PathBuf,
+        /// The other server's session id.
+        id: String,
+        /// The other server's process id.
+        pid: u32,
+    },
+
+    /// The server's control socket cannot be set up or used.
+    #[error("cannot listen on {path:?}: {source}")]
+    Listen {
+        /// The socket.
+        path: PathBuf,
+        /// The underlying error.
+        source: io::Error,
+    },
+
+    /// `--server` names no live server.
+    #[error(
+        "no stopit server runs as session {id}; start one with `stopit server` in the workspace, \
+         or leave out --server"
+    )]
+    NoSuchServer {
+        /// The session id given.
+        id: String,
+    },
+
+    /// The server's control socket cannot be reached.
+    #[error("cannot reach the stopit server at {path:?}: {source}")]
+    Connect {
+        /// The socket.
+        path: PathBuf,
+        /// The underlying error.
+        source: io::Error,
+    },
+
+    /// The other side of the control socket broke the protocol, or the
+    /// socket failed.
+    #[error("the stopit control connection failed: {0}")]
+    Client(#[source] io::Error),
+
+    /// The server refused or failed the request.
+    #[error("the stopit server says: {0}")]
+    Server(String),
+
+    /// The server ended before the command did.
+    #[error("the stopit server ended before the command did")]
+    ServerGone,
+
     /// Whether stopit is in the foreground of its terminal cannot be told.
     #[error("cannot check that stopit is in the foreground of its terminal: {0}")]
     Foreground(#[source] io::Error),
@@ -322,6 +377,11 @@ pub struct Invocation {
     pub quiet: bool,
     /// The command and its arguments.
     pub command: Vec<OsString>,
+    /// `--server`: the session id of the server to attach to.
+    pub server: Option<String>,
+    /// `--standalone`: run without a server even if one serves the
+    /// workspace.
+    pub standalone: bool,
 }
 
 /// The command `stopit shell` runs: `$SHELL` from the host environment,
@@ -336,17 +396,6 @@ pub fn shell_command(shell: Option<OsString>) -> Result<Vec<OsString>, RunError>
 /// Prints `stopit: error: <message>` to stderr, escaped.
 pub fn print_error(message: &str) {
     eprintln!("stopit: error: {}", escape_message(message));
-}
-
-/// Prints `stopit: warning: <message>` to stderr, escaped.
-fn print_warning(message: &str) {
-    eprintln!("stopit: warning: {}", escape_message(message));
-}
-
-/// Prints `stopit: <line>` of the startup summary to stderr, escaped (the
-/// summary escapes its values already; this keeps its backslashes).
-fn print_summary_line(line: &str) {
-    eprintln!("stopit: {}", escape_message(line));
 }
 
 /// The script providers of `config` with `protect = false`, in order.
@@ -532,212 +581,30 @@ fn allowed_entry_line(path: &Path, hash: &str, missing: bool) -> String {
 fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     catch_signals().map_err(RunError::Signals)?;
     let cwd = std::env::current_dir().map_err(RunError::Cwd)?;
-    let workspace = discover_workspace(&cwd, invocation.workspace.as_deref())?;
-    let file = workspace.read_config()?;
-    // No mount may expose them (§6.2, Reserved host paths), even before
-    // they exist. From the password database, not `HOME`, plus
-    // `STOPIT_STATE_DIR` if set. The store is created now if missing, so
-    // that read-only views of it mask it.
-    let data_dirs = data_dirs_from_host()?;
-    let config_dirs = config_dirs_from_host()?;
-    let store = TrustStore::open(&data_dirs.store.path)?;
-    // Before anything runs or is created: only a configuration the user
-    // allowed, in the exact bytes read, which are the bytes parsed; and not
-    // the default one in place of an allowed one that is gone.
-    let allowed = store.read()?;
-    drop(store);
-    let explicit = invocation.workspace.is_some().then_some(&workspace.dir);
-    let project_layer = match &file {
-        None => {
-            let links = discovery_links(
-                &cwd,
-                invocation.workspace.as_deref(),
-                std::env::var_os("PWD"),
-            );
-            check_missing(&allowed, &workspace.dir, explicit.is_some(), &links)?;
-            None
-        }
-        Some(file) => {
-            check_allowed(&allowed, file, explicit.map(PathBuf::as_path))?;
-            Some(file.parse_layer()?)
-        }
-    };
-    // Read, checked and parsed even when `.stopit.toml` sets `base = "none"`
-    // and the layer goes unused: its target and its script sources are
-    // protected in every session, or a sandbox of this one could plant what
-    // every other workspace runs (§3, The user-global configuration).
-    let global_file = read_global_config(&config_dirs)?;
-    let global_layer = match &global_file {
-        Some(gf) => Some(gf.parse_layer()?),
-        None => None,
-    };
-    let global_entries = global_layer
-        .as_ref()
-        .map(|layer| layer.providers.clone())
-        .unwrap_or_default();
-    let LayeredConfig {
-        config,
-        providers: layered_entries,
-        replaced,
-    } = ConfigLayer::layer(
-        global_layer.map(|layer| (layer, config_dirs.active.path.as_path())),
-        project_layer.map(|layer| (layer, workspace.dir.as_path())),
-    );
-    if let Some(gf) = &global_file {
-        for name in replaced.iter().filter(|n| is_default_provider_name(n)) {
-            print_warning(&format!(
-                "the [[provider]] named \"{name}\" in {CONFIG_FILE} replaces the one of that name \
-                 in {:?}; give one of them another `name` to keep both",
-                gf.path
-            ));
-        }
+    if let Some(server) = crate::server::pick_server(&invocation, &cwd)? {
+        return Ok(ExitCode::from(crate::server::attach(&server, &invocation)?));
     }
-    let home = host_home(std::env::var_os("HOME"))?;
-    let mount = config.workspace.mount.clone();
-    let ctx = ExpansionContext::new(
-        workspace.dir.clone(),
-        mount.clone(),
-        home.clone(),
-        SandboxHome::default(),
-    )?;
-    let profile = match &invocation.profile {
-        None => ProfileRef::main(),
-        Some(name) => name.parse().map_err(|e| RunError::ProfileName {
-            name: name.clone(),
-            reason: format!("{e}"),
-        })?,
-    };
-
-    // Before the providers, which are told where it is. From here on,
-    // returning removes it.
-    let session = SessionDir::create_from_env()?;
-    let providers = layered_session_providers(config.base, &layered_entries)?;
-    // Script paths must not run through links in these (§3.6), nor the way
-    // to the global configuration and its scripts.
-    let rw_grants = static_rw_roots(&static_outputs(&providers), &ctx);
-    let global_guarded = match &global_file {
-        Some(gf) => guard_global_config(
-            gf,
-            &global_entries,
-            &config_dirs.active.path,
-            &workspace.dir,
-            &rw_grants,
-        )?,
-        None => Vec::new(),
-    };
-    let pctx = ProviderContext {
-        workspace: workspace.dir.clone(),
-        workspace_mount: mount.clone(),
-        home: home.clone(),
-        session_dir: session.root().to_path_buf(),
-        rw_grants,
-    };
-    let outputs = providers
-        .iter()
-        .map(|p| Ok((p.name().clone(), p.manifest(&pctx)?)))
-        .collect::<Result<Vec<_>, ProviderError>>()?;
-    let has_user_tools = outputs.iter().any(|(_, out)| {
-        out.origin != ProviderOrigin::Builtin && manifest_grants_tools(&out.manifest)
-    });
-    // The script providers' sources, and the configuration files themselves,
-    // protected in every profile whatever the base and rules (§3, §3.6),
-    // the latter attributed to the name reserved for stopit's own rules.
-    let mut protected = protected_sources(&providers)?;
-    if let Some(file) = &file {
-        protected.push(ProtectedSource {
-            provider: SUPERVISOR_PROVIDER_NAME
-                .parse()
-                .expect("the supervisor's name is a valid provider name"),
-            path: file.path.clone(),
-        });
+    let loaded = LoadedSession::load(&cwd, invocation.workspace.as_deref())?;
+    for line in loaded.warning_lines() {
+        eprintln!("{line}");
     }
-    for path in global_guarded {
-        if !protected.iter().any(|p| p.path == path) {
-            protected.push(ProtectedSource {
-                provider: SUPERVISOR_PROVIDER_NAME
-                    .parse()
-                    .expect("the supervisor's name is a valid provider name"),
-                path,
-            });
-        }
-    }
-    // stopit's own state, which no mount may expose (§6.2, Reserved host
-    // paths): the parent of every session directory, the data directories,
-    // and the configuration directories. `XDG_RUNTIME_DIR` is set and
-    // absolute, or there would be no session.
-    let runtime = runtime_dir(Path::new(
-        &std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_default(),
-    ))?;
-    debug_assert_eq!(Some(runtime.path.as_path()), session.root().parent());
-    let global_config_path = config_dirs.active.path.join(GLOBAL_CONFIG_FILE);
-    let state = StateDirs {
-        runtime,
-        data: data_dirs,
-        config: config_dirs,
-    };
-    let compiled = compile_session(&config, outputs, &protected, &state, &ctx)?;
-    if config.base == Base::Default && !has_user_tools {
-        return Err(RunError::NoToolsConfigured {
-            global_config: global_config_path,
-        });
-    }
-    for line in warning_lines(&compiled, config.base) {
-        print_warning(&line);
-    }
-    let profile_name = profile.as_str().to_owned();
-    let Some(profile) = compiled.get(&profile) else {
-        return Err(RunError::UnknownProfile {
-            name: profile.as_str().to_owned(),
-            available: compiled
-                .order()
-                .iter()
-                .map(ProfileRef::as_str)
-                .collect::<Vec<_>>()
-                .join(", "),
-        });
-    };
+    let (profile_name, profile) = loaded.profile(invocation.profile.as_deref())?;
     // After the warnings, right before the sandbox starts, so it is the
     // last thing above the command's own output.
     if !invocation.quiet {
-        let unprotected = unprotected_providers(&config);
-        let ctx = SummaryContext {
-            profile: &profile_name,
-            workspace: &workspace.dir,
-            workspace_mount: mount.as_path(),
-            home: &home,
-            base: config.base,
-            unprotected: &unprotected,
-        };
-        for line in summary_lines(&profile.spec, &ctx) {
-            print_summary_line(&line);
+        for line in loaded.summary_lines(&profile_name, profile) {
+            eprintln!("{line}");
         }
     }
-
-    let provisioned = provision_self(&session)?;
-    let env = profile.spec.target_env(std::env::vars_os());
-    let sandbox_cwd = working_dir(&profile.spec, mount.as_path());
     let stdio = stdio_terminals();
     let terminal = terminal_session(stdio);
-    let clipboard = match config.terminal.clipboard_write {
-        ClipboardWrite::Allow => ClipboardPolicy::Allow,
-        // TODO(§5.2): `ask` needs a prompt; until then it blocks.
-        ClipboardWrite::Block | ClipboardWrite::Ask => ClipboardPolicy::Block,
-    };
-    let command = BwrapCommand::for_init(
-        &profile.spec,
-        &session,
-        &provisioned,
-        &sandbox_cwd,
-        &env,
-        &invocation.command,
-        terminal,
-    )?;
+    let command = loaded.command(profile, &invocation.command, std::env::vars_os(), terminal)?;
     ignore_job_control();
     if terminal != TerminalSession::Keep {
         check_foreground(stdio)?;
     }
     let pty = if terminal == TerminalSession::Pty {
-        Some(SandboxTerminal::open(stdio, clipboard).map_err(RunError::Pty)?)
+        Some(SandboxTerminal::open(stdio, loaded.clipboard()).map_err(RunError::Pty)?)
     } else {
         None
     };
@@ -745,8 +612,273 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     // The sandbox is gone, or going: bwrap returns once its namespace's
     // init exits, and if bwrap itself was killed, `--die-with-parent` kills
     // the init and so the namespace. Its mounts go with it.
-    drop(session);
+    drop(loaded);
     Ok(ExitCode::from(status?))
+}
+
+/// A workspace's session, ready to run sandboxes in: its configuration
+/// checked and layered, its providers run, every profile compiled, and the
+/// stopit binary provisioned into the session directory. Dropping it
+/// removes the session directory.
+pub(crate) struct LoadedSession {
+    /// The workspace and its configuration file.
+    pub(crate) workspace: Workspace,
+    config: Config,
+    home: PathBuf,
+    compiled: CompiledSession,
+    /// Warnings found while loading, without the `stopit: warning:` prefix.
+    warnings: Vec<String>,
+    provisioned: Provisioned,
+    /// Dropped last.
+    pub(crate) session: SessionDir,
+}
+
+impl LoadedSession {
+    /// Finds the workspace from `cwd` or `explicit` (`--workspace`), checks
+    /// and loads its configuration over the user-global one, runs the
+    /// providers, compiles every profile, and provisions stopit into a new
+    /// session directory.
+    pub(crate) fn load(cwd: &Path, explicit_dir: Option<&Path>) -> Result<Self, RunError> {
+        let workspace = discover_workspace(cwd, explicit_dir)?;
+        let file = workspace.read_config()?;
+        // No mount may expose them (§6.2, Reserved host paths), even before
+        // they exist. From the password database, not `HOME`, plus
+        // `STOPIT_STATE_DIR` if set. The store is created now if missing, so
+        // that read-only views of it mask it.
+        let data_dirs = data_dirs_from_host()?;
+        let config_dirs = config_dirs_from_host()?;
+        let store = TrustStore::open(&data_dirs.store.path)?;
+        // Before anything runs or is created: only a configuration the user
+        // allowed, in the exact bytes read, which are the bytes parsed; and
+        // not the default one in place of an allowed one that is gone.
+        let allowed = store.read()?;
+        drop(store);
+        let explicit = explicit_dir.is_some().then_some(&workspace.dir);
+        let project_layer = match &file {
+            None => {
+                let links = discovery_links(cwd, explicit_dir, std::env::var_os("PWD"));
+                check_missing(&allowed, &workspace.dir, explicit.is_some(), &links)?;
+                None
+            }
+            Some(file) => {
+                check_allowed(&allowed, file, explicit.map(PathBuf::as_path))?;
+                Some(file.parse_layer()?)
+            }
+        };
+        // Read, checked and parsed even when `.stopit.toml` sets
+        // `base = "none"` and the layer goes unused: its target and its
+        // script sources are protected in every session, or a sandbox of
+        // this one could plant what every other workspace runs (§3, The
+        // user-global configuration).
+        let global_file = read_global_config(&config_dirs)?;
+        let global_layer = match &global_file {
+            Some(gf) => Some(gf.parse_layer()?),
+            None => None,
+        };
+        let global_entries = global_layer
+            .as_ref()
+            .map(|layer| layer.providers.clone())
+            .unwrap_or_default();
+        let LayeredConfig {
+            config,
+            providers: layered_entries,
+            replaced,
+        } = ConfigLayer::layer(
+            global_layer.map(|layer| (layer, config_dirs.active.path.as_path())),
+            project_layer.map(|layer| (layer, workspace.dir.as_path())),
+        );
+        let mut warnings = Vec::new();
+        if let Some(gf) = &global_file {
+            for name in replaced.iter().filter(|n| is_default_provider_name(n)) {
+                warnings.push(format!(
+                    "the [[provider]] named \"{name}\" in {CONFIG_FILE} replaces the one of that \
+                     name in {:?}; give one of them another `name` to keep both",
+                    gf.path
+                ));
+            }
+        }
+        let home = host_home(std::env::var_os("HOME"))?;
+        let mount = config.workspace.mount.clone();
+        let ctx = ExpansionContext::new(
+            workspace.dir.clone(),
+            mount.clone(),
+            home.clone(),
+            SandboxHome::default(),
+        )?;
+
+        // Before the providers, which are told where it is. From here on,
+        // returning removes it.
+        let session = SessionDir::create_from_env()?;
+        let providers = layered_session_providers(config.base, &layered_entries)?;
+        // Script paths must not run through links in these (§3.6), nor the
+        // way to the global configuration and its scripts.
+        let rw_grants = static_rw_roots(&static_outputs(&providers), &ctx);
+        let global_guarded = match &global_file {
+            Some(gf) => guard_global_config(
+                gf,
+                &global_entries,
+                &config_dirs.active.path,
+                &workspace.dir,
+                &rw_grants,
+            )?,
+            None => Vec::new(),
+        };
+        let pctx = ProviderContext {
+            workspace: workspace.dir.clone(),
+            workspace_mount: mount.clone(),
+            home: home.clone(),
+            session_dir: session.root().to_path_buf(),
+            rw_grants,
+        };
+        let outputs = providers
+            .iter()
+            .map(|p| Ok((p.name().clone(), p.manifest(&pctx)?)))
+            .collect::<Result<Vec<_>, ProviderError>>()?;
+        let has_user_tools = outputs.iter().any(|(_, out)| {
+            out.origin != ProviderOrigin::Builtin && manifest_grants_tools(&out.manifest)
+        });
+        // The script providers' sources, and the configuration files
+        // themselves, protected in every profile whatever the base and rules
+        // (§3, §3.6), the latter attributed to the name reserved for
+        // stopit's own rules.
+        let mut protected = protected_sources(&providers)?;
+        let supervisor_name: ProviderName = SUPERVISOR_PROVIDER_NAME
+            .parse()
+            .expect("the supervisor's name is a valid provider name");
+        if let Some(file) = &file {
+            protected.push(ProtectedSource {
+                provider: supervisor_name.clone(),
+                path: file.path.clone(),
+            });
+        }
+        for path in global_guarded {
+            if !protected.iter().any(|p| p.path == path) {
+                protected.push(ProtectedSource {
+                    provider: supervisor_name.clone(),
+                    path,
+                });
+            }
+        }
+        // stopit's own state, which no mount may expose (§6.2, Reserved host
+        // paths): the parent of every session directory, the data
+        // directories, and the configuration directories. `XDG_RUNTIME_DIR`
+        // is set and absolute, or there would be no session.
+        let runtime = runtime_dir(Path::new(
+            &std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_default(),
+        ))?;
+        debug_assert_eq!(Some(runtime.path.as_path()), session.root().parent());
+        let global_config_path = config_dirs.active.path.join(GLOBAL_CONFIG_FILE);
+        let state = StateDirs {
+            runtime,
+            data: data_dirs,
+            config: config_dirs,
+        };
+        let compiled = compile_session(&config, outputs, &protected, &state, &ctx)?;
+        if config.base == Base::Default && !has_user_tools {
+            return Err(RunError::NoToolsConfigured {
+                global_config: global_config_path,
+            });
+        }
+        warnings.extend(warning_lines(&compiled, config.base));
+        let provisioned = provision_self(&session)?;
+        Ok(LoadedSession {
+            workspace,
+            config,
+            home,
+            compiled,
+            warnings,
+            provisioned,
+            session,
+        })
+    }
+
+    /// The warnings as printed, `stopit: warning: …` and escaped.
+    pub(crate) fn warning_lines(&self) -> Vec<String> {
+        self.warnings
+            .iter()
+            .map(|w| format!("stopit: warning: {}", escape_message(w)))
+            .collect()
+    }
+
+    /// The profile `name` (`main` if `None`), with its name.
+    pub(crate) fn profile(
+        &self,
+        name: Option<&str>,
+    ) -> Result<(ProfileRef, &CompiledProfile), RunError> {
+        let profile = match name {
+            None => ProfileRef::main(),
+            Some(name) => name.parse().map_err(|e| RunError::ProfileName {
+                name: name.to_owned(),
+                reason: format!("{e}"),
+            })?,
+        };
+        match self.compiled.get(&profile) {
+            Some(compiled) => Ok((profile, compiled)),
+            None => Err(RunError::UnknownProfile {
+                name: profile.as_str().to_owned(),
+                available: self
+                    .compiled
+                    .order()
+                    .iter()
+                    .map(ProfileRef::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            }),
+        }
+    }
+
+    /// The startup summary of `profile`, named `name`, as printed
+    /// (`stopit: …`, escaped).
+    pub(crate) fn summary_lines(
+        &self,
+        name: &ProfileRef,
+        profile: &CompiledProfile,
+    ) -> Vec<String> {
+        let unprotected = unprotected_providers(&self.config);
+        let ctx = SummaryContext {
+            profile: name.as_str(),
+            workspace: &self.workspace.dir,
+            workspace_mount: self.config.workspace.mount.as_path(),
+            home: &self.home,
+            base: self.config.base,
+            unprotected: &unprotected,
+        };
+        summary_lines(&profile.spec, &ctx)
+            .iter()
+            .map(|line| format!("stopit: {}", escape_message(line)))
+            .collect()
+    }
+
+    /// The bwrap command running `command` in `profile`, with the target
+    /// environment built from `host_env` (§9).
+    pub(crate) fn command(
+        &self,
+        profile: &CompiledProfile,
+        command: &[OsString],
+        host_env: impl IntoIterator<Item = (OsString, OsString)>,
+        terminal: TerminalSession,
+    ) -> Result<BwrapCommand, RunError> {
+        let env = profile.spec.target_env(host_env);
+        let sandbox_cwd = working_dir(&profile.spec, self.config.workspace.mount.as_path());
+        Ok(BwrapCommand::for_init(
+            &profile.spec,
+            &self.session,
+            &self.provisioned,
+            &sandbox_cwd,
+            &env,
+            command,
+            terminal,
+        )?)
+    }
+
+    /// The OSC 52 policy for the session's output filter.
+    pub(crate) fn clipboard(&self) -> ClipboardPolicy {
+        match self.config.terminal.clipboard_write {
+            ClipboardWrite::Allow => ClipboardPolicy::Allow,
+            // TODO(§5.2): `ask` needs a prompt; until then it blocks.
+            ClipboardWrite::Block | ClipboardWrite::Ask => ClipboardPolicy::Block,
+        }
+    }
 }
 
 // --- Signals ---
@@ -769,7 +901,7 @@ extern "C" fn record_winch(_: libc::c_int) {
 
 /// Catches `SIGWINCH` with [`record_winch`]. Like [`CAUGHT`], it is blocked
 /// except while waiting in `ppoll`, and goes back to its default on `exec`.
-fn catch_winch() -> io::Result<()> {
+pub(crate) fn catch_winch() -> io::Result<()> {
     // SAFETY: `sigaction` on a zeroed, then filled, local struct; the
     // handler only stores to an atomic.
     unsafe {
@@ -837,7 +969,7 @@ pub(crate) fn drain_signal_pipe() {
 }
 
 /// The last caught signal not yet handled, if any, now handled.
-fn take_signal() -> Option<libc::c_int> {
+pub(crate) fn take_signal() -> Option<libc::c_int> {
     let signal = RECEIVED.swap(0, Ordering::SeqCst);
     drain_signal_pipe();
     match signal {
@@ -873,7 +1005,7 @@ fn init_signal_pipe() -> io::Result<()> {
 /// the script providers inherit nothing from this. A signal ignored when
 /// stopit started (`nohup`'s `SIGHUP`) stays ignored, as shells leave it,
 /// and is then inherited ignored.
-fn catch_signals() -> io::Result<()> {
+pub(crate) fn catch_signals() -> io::Result<()> {
     init_signal_pipe()?;
     for signal in CAUGHT {
         // SAFETY: `sigaction` on a zeroed, then filled, local struct. The
@@ -911,7 +1043,7 @@ fn catch_signals() -> io::Result<()> {
 /// Keys such as Ctrl-Z go to the sandbox's own line discipline anyway, so
 /// the supervisor cannot be stopped by the terminal, and refuses to start
 /// in the background ([`check_foreground`]).
-fn ignore_job_control() {
+pub(crate) fn ignore_job_control() {
     for signal in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
         // SAFETY: `signal` with `SIG_IGN` installs no handler code; it only
         // changes this process's disposition. It cannot fail for these
@@ -925,7 +1057,7 @@ fn ignore_job_control() {
 /// controlling terminal. A terminal that is not its controlling terminal
 /// has no foreground for it (the kernel's job control does not apply), and
 /// passes.
-fn check_foreground(stdio: [bool; 3]) -> Result<(), RunError> {
+pub(crate) fn check_foreground(stdio: [bool; 3]) -> Result<(), RunError> {
     let own = rustix::process::getpgrp();
     for fd in stdio_fds(stdio) {
         foreground(rustix::termios::tcgetpgrp(fd), own)?;
@@ -962,7 +1094,7 @@ fn stdio_fds(stdio: [bool; 3]) -> impl Iterator<Item = BorrowedFd<'static>> {
 
 /// The PTY a sandbox runs on when the supervisor's stdio includes a
 /// terminal (DESIGN.md §5.1), with the host terminal it is relayed to.
-struct SandboxTerminal {
+pub(crate) struct SandboxTerminal {
     /// The PTY's master, until the relay takes it.
     master: Option<OwnedFd>,
     /// The PTY's slave, until the relay takes it once the sandbox has its
@@ -987,7 +1119,10 @@ impl SandboxTerminal {
     /// it is a terminal, which is put into raw mode before the sandbox
     /// starts; the sandbox's output goes to the first of stdout, stderr and
     /// stdin that is one.
-    fn open(stdio: [bool; 3], clipboard: ClipboardPolicy) -> io::Result<SandboxTerminal> {
+    pub(crate) fn open(
+        stdio: [bool; 3],
+        clipboard: ClipboardPolicy,
+    ) -> io::Result<SandboxTerminal> {
         let fds: Vec<BorrowedFd<'static>> = stdio_fds([true; 3]).collect();
         let input = stdio[0].then_some(fds[0]);
         let output = [1, 2, 0]
@@ -1006,6 +1141,27 @@ impl SandboxTerminal {
             raw: None,
             clipboard,
         })
+    }
+
+    /// The slave, while the sandbox still needs copies of it.
+    pub(crate) fn slave_fd(&self) -> Option<BorrowedFd<'_>> {
+        self.slave.as_ref().map(AsFd::as_fd)
+    }
+
+    /// Sets the OSC 52 policy of the output filter the relay will use.
+    pub(crate) fn set_clipboard(&mut self, clipboard: ClipboardPolicy) {
+        self.clipboard = clipboard;
+    }
+
+    /// Starts relaying, once the sandbox has its copies of the slave: the
+    /// relay takes the master, the slave and the host terminal.
+    pub(crate) fn start_relay(&mut self) -> Option<PtyRelay> {
+        Some(PtyRelay::new(
+            self.master.take()?,
+            self.slave.take()?,
+            self.host.take()?,
+            OutputFilter::new(self.clipboard),
+        ))
     }
 }
 
@@ -1084,14 +1240,7 @@ fn wait_foreground(
     // sees EOF when bwrap finishes or execs `__init`, and of the slaves
     // given to the sandbox.
     drop(command);
-    let mut relay = terminal.as_mut().and_then(|t| {
-        Some(PtyRelay::new(
-            t.master.take()?,
-            t.slave.take()?,
-            t.host.take()?,
-            OutputFilter::new(t.clipboard),
-        ))
-    });
+    let mut relay = terminal.as_mut().and_then(SandboxTerminal::start_relay);
     if let Some(r) = &relay {
         r.resize();
     }
@@ -1120,55 +1269,14 @@ fn wait_foreground(
         // Signals are then only forwarded once bwrap is done.
         Err(_) => None,
     };
-    if let Some(pidfd) = &pidfd {
-        loop {
-            if let Some(signal) = take_signal() {
-                kill_child(signal);
-            }
-            if WINCH.swap(false, Ordering::SeqCst)
-                && let Some(r) = &relay
-            {
-                r.resize();
-            }
-            let mut fds = vec![libc::pollfd {
-                fd: pidfd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            }];
-            let mut slots = [None; 3];
-            if let Some(interest) = relay.as_ref().map(PtyRelay::poll_fds) {
-                let wanted = [interest.master, interest.input, interest.output];
-                for (slot, wanted) in slots.iter_mut().zip(wanted) {
-                    if let Some((fd, events)) = wanted {
-                        *slot = Some(fds.len());
-                        fds.push(libc::pollfd {
-                            fd,
-                            events,
-                            revents: 0,
-                        });
-                    }
-                }
-            }
-            match mask.wait(&mut fds) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    if let Some(r) = relay {
-                        kill_child(libc::SIGKILL);
-                        let _ = child.wait();
-                        r.finish();
-                        return Err(RunError::Pty(e));
-                    }
-                    break;
-                }
-            }
-            if let Some(r) = &mut relay {
-                let revents = |slot: Option<usize>| slot.map_or(0, |i| fds[i].revents);
-                r.handle(revents(slots[0]), revents(slots[1]), revents(slots[2]));
-            }
-            if fds[0].revents != 0 {
-                break;
-            }
+    if let Some(pidfd) = &pidfd
+        && let Err(e) = relay_until(&mask, pidfd.as_fd(), relay.as_mut(), kill_child)
+    {
+        if let Some(r) = relay {
+            kill_child(libc::SIGKILL);
+            let _ = child.wait();
+            r.finish();
+            return Err(RunError::Pty(e));
         }
     }
     let status = child.wait().map_err(RunError::Spawn)?;
@@ -1181,7 +1289,59 @@ fn wait_foreground(
     Ok(bwrap_exit_code(status, &json_status))
 }
 
-fn read_nonblocking_status(mut reader: File) -> String {
+/// Waits until `until` is ready, passing caught signals to `on_signal`
+/// and relaying the PTY with `relay` meanwhile, if given. Only the caught
+/// signals and `SIGWINCH` interrupt the wait, as `mask` arranges.
+pub(crate) fn relay_until(
+    mask: &BlockedSignals,
+    until: BorrowedFd<'_>,
+    mut relay: Option<&mut PtyRelay>,
+    mut on_signal: impl FnMut(libc::c_int),
+) -> io::Result<()> {
+    loop {
+        if let Some(signal) = take_signal() {
+            on_signal(signal);
+        }
+        if WINCH.swap(false, Ordering::SeqCst)
+            && let Some(r) = &relay
+        {
+            r.resize();
+        }
+        let mut fds = vec![libc::pollfd {
+            fd: until.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let mut slots = [None; 3];
+        if let Some(interest) = relay.as_ref().map(|r| r.poll_fds()) {
+            let wanted = [interest.master, interest.input, interest.output];
+            for (slot, wanted) in slots.iter_mut().zip(wanted) {
+                if let Some((fd, events)) = wanted {
+                    *slot = Some(fds.len());
+                    fds.push(libc::pollfd {
+                        fd,
+                        events,
+                        revents: 0,
+                    });
+                }
+            }
+        }
+        match mask.wait(&mut fds) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+        if let Some(r) = &mut relay {
+            let revents = |slot: Option<usize>| slot.map_or(0, |i| fds[i].revents);
+            r.handle(revents(slots[0]), revents(slots[1]), revents(slots[2]));
+        }
+        if fds[0].revents != 0 {
+            return Ok(());
+        }
+    }
+}
+
+pub(crate) fn read_nonblocking_status(mut reader: File) -> String {
     let mut raw = Vec::new();
     let mut chunk = [0u8; 512];
     while raw.len() < 4096 {
@@ -1199,7 +1359,7 @@ fn read_nonblocking_status(mut reader: File) -> String {
 /// lines read from `--json-status-fd`. When bwrap exits non-zero without
 /// emitting both `"child-pid"` and `"exit-code"`, bwrap itself failed during
 /// setup and we return [`EXIT_SUPERVISOR_FAILED`].
-fn bwrap_exit_code(status: ExitStatus, json_status: &str) -> u8 {
+pub(crate) fn bwrap_exit_code(status: ExitStatus, json_status: &str) -> u8 {
     match status.code() {
         None => exit_code(status),
         Some(0) => 0,
@@ -1230,13 +1390,13 @@ fn bwrap_exit_code(status: ExitStatus, json_status: &str) -> u8 {
 }
 
 /// [`CAUGHT`] blocked, until dropped.
-struct BlockedSignals {
+pub(crate) struct BlockedSignals {
     /// The mask before blocking them.
     old: libc::sigset_t,
 }
 
 impl BlockedSignals {
-    fn block() -> io::Result<Self> {
+    pub(crate) fn block() -> io::Result<Self> {
         // SAFETY: plain libc calls on local, initialized signal sets.
         unsafe {
             let mut set: libc::sigset_t = std::mem::zeroed();
@@ -1255,7 +1415,7 @@ impl BlockedSignals {
     /// Waits until one of `fds` is ready, with [`CAUGHT`] and `SIGWINCH`
     /// unblocked meanwhile: `Interrupted` if one of them (or another
     /// signal) arrived.
-    fn wait(&self, fds: &mut [libc::pollfd]) -> io::Result<()> {
+    pub(crate) fn wait(&self, fds: &mut [libc::pollfd]) -> io::Result<()> {
         // SAFETY: plain libc calls on a local signal set and valid pollfds.
         unsafe {
             let mut waiting = self.old;
@@ -1285,7 +1445,7 @@ impl Drop for BlockedSignals {
 
 /// The exit status for a process killed by `signal`: `128 + N`, as shells
 /// report it.
-fn signal_exit_code(signal: libc::c_int) -> u8 {
+pub(crate) fn signal_exit_code(signal: libc::c_int) -> u8 {
     u8::try_from(128 + signal).unwrap_or(u8::MAX)
 }
 
@@ -1313,7 +1473,7 @@ pub fn needs_new_session(stdio_is_terminal: [bool; 3], has_controlling_terminal:
 }
 
 /// Whether each of the supervisor's stdin, stdout and stderr is a terminal.
-fn stdio_terminals() -> [bool; 3] {
+pub(crate) fn stdio_terminals() -> [bool; 3] {
     [
         io::stdin().is_terminal(),
         io::stdout().is_terminal(),

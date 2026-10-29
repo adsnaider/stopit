@@ -5,6 +5,7 @@
 pub mod bwrap;
 pub mod cli;
 pub mod config;
+pub mod control;
 mod env;
 pub mod error;
 pub mod escape;
@@ -21,6 +22,7 @@ pub mod pty;
 pub mod resolve;
 pub mod seccomp;
 mod serde_util;
+pub mod server;
 pub mod session;
 pub mod spec;
 pub mod state;

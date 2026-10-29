@@ -2624,3 +2624,250 @@ fn signal_during_script_provider_kills_its_process_group_and_cleans_up() {
         }
     }
 }
+
+// --- stopit server ---
+
+/// A running `stopit server` for a setup's workspace, with everything it
+/// writes to stderr collected.
+struct Server {
+    child: Option<Child>,
+    log: std::sync::Arc<std::sync::Mutex<String>>,
+    /// The session id it announced.
+    id: String,
+}
+
+impl Server {
+    /// Starts `stopit server` in `s`'s workspace and waits until it serves.
+    fn start(s: &Setup) -> Server {
+        let mut command = s.stopit(&["server"]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = log.clone();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = stderr.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                sink.lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
+        let mut server = Server {
+            child: Some(child),
+            log,
+            id: String::new(),
+        };
+        let line = server.wait_for_log("serving ");
+        let id = line
+            .split(" as session ")
+            .nth(1)
+            .and_then(|rest| rest.split(';').next())
+            .unwrap_or_else(|| panic!("no session id in {line:?}"));
+        server.id = id.to_owned();
+        server
+    }
+
+    fn pid(&self) -> i32 {
+        self.child.as_ref().unwrap().id() as i32
+    }
+
+    fn log(&self) -> String {
+        self.log.lock().unwrap().clone()
+    }
+
+    /// Waits until the log has a line containing `needle`, and returns it.
+    #[track_caller]
+    fn wait_for_log(&self, needle: &str) -> String {
+        wait_until(|| {
+            self.log()
+                .lines()
+                .find(|l| l.contains(needle))
+                .map(str::to_owned)
+        })
+    }
+
+    /// Stops the server with `SIGTERM` and returns its exit status.
+    fn stop(&mut self) -> i32 {
+        let child = self.child.take().unwrap();
+        kill(child.id() as i32, libc::SIGTERM);
+        code(&finish(child))
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[test]
+fn runs_attached_to_a_server_share_its_session() {
+    let s = Setup::with_config("");
+    let mut server = Server::start(&s);
+    // One run writes the session's `/tmp`, the next reads it.
+    let results = s.probe(&[], &[write("/tmp/shared", "from run 1")]);
+    assert_eq!(ok(&results[0]), &Data::Done);
+    let results = s.probe(&[], &[read("/tmp/shared")]);
+    assert_eq!(contents(&results[0]), "from run 1");
+    // The same through `--server`, from outside the workspace.
+    let mut command = s.run_probe_command(&["--server", &server.id]);
+    command.current_dir(s.root.join("home"));
+    let results = s.probe_with(command, &[read("/tmp/shared")]);
+    assert_eq!(contents(&results[0]), "from run 1");
+    // A standalone run has a session of its own.
+    let results = s.probe(&["--standalone"], &[read("/tmp/shared")]);
+    assert_eq!(errno(&results[0]), "ENOENT");
+    server.wait_for_log("run 3 ended with status 0");
+    // Stopped, it removes its session.
+    assert_eq!(server.stop(), 128 + libc::SIGTERM);
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn an_attached_run_reports_the_commands_status_and_the_servers_errors() {
+    let s = Setup::with_config("[profiles.other]\n");
+    let _server = Server::start(&s);
+    // The probe's own failure.
+    let out = output(s.run_probe_command(&[]), b"not json");
+    assert_eq!(code(&out), 2, "{out:?}");
+    assert!(
+        stderr(&out).contains("stdin is not a JSON array"),
+        "{out:?}"
+    );
+    // The summary comes from the server, unless quiet.
+    let out = output(s.run_probe_command_with_summary(&[]), b"[]");
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert!(stderr(&out).starts_with(&summary_header(&s)), "{out:?}");
+    // An unknown profile.
+    let out = output(s.run_probe_command(&["--profile", "nope"]), b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert_eq!(
+        stderr(&out),
+        "stopit: error: the stopit server says: there is no profile \"nope\"; the profiles \
+         are: main, other\n"
+    );
+}
+
+#[test]
+fn server_lookup_errors() {
+    let s = Setup::with_config("");
+    let out = output(s.run_probe_command(&["--server", "0123"]), b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert_eq!(
+        stderr(&out),
+        "stopit: error: no stopit server runs as session 0123; start one with `stopit server` \
+         in the workspace, or leave out --server\n"
+    );
+    let server = Server::start(&s);
+    let out = output(s.stopit(&["server"]), b"");
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert!(
+        stderr(&out).contains(&format!(
+            "a stopit server already serves {:?} as session {}",
+            s.ws(),
+            server.id
+        )),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn signals_to_an_attached_client_end_only_its_sandbox() {
+    let s = Setup::with_config("");
+    let server = Server::start(&s);
+    for signal in [libc::SIGTERM, libc::SIGKILL] {
+        let mut child = spawn_waiting_probe(&s, |_| {});
+        let stdin = child.stdin.take();
+        let client = child.id() as i32;
+        // The probe runs under the server, not the client.
+        let probe = wait_for_probe(server.pid());
+        assert!(!descendants(client).contains(&probe));
+        kill(client, signal);
+        let out = finish(child);
+        drop(stdin);
+        use std::os::unix::process::ExitStatusExt;
+        let got = out.status.signal().or(out.status.code().map(|c| c - 128));
+        assert_eq!(got, Some(signal), "{out:?}");
+        wait_gone(probe);
+    }
+    // The server still serves.
+    let results = s.probe(&[], &[Op::Cwd]);
+    assert_eq!(ok(&results[0]), &Data::Cwd("/workspace".into()));
+}
+
+#[test]
+fn stopping_the_server_ends_the_sandboxes_it_runs() {
+    let s = Setup::with_config("");
+    let mut server = Server::start(&s);
+    let mut child = spawn_waiting_probe(&s, |_| {});
+    let stdin = child.stdin.take();
+    server.wait_for_log("run 1 started");
+    assert_eq!(server.stop(), 128 + libc::SIGTERM);
+    let out = finish(child);
+    drop(stdin);
+    assert_eq!(code(&out), 128 + libc::SIGKILL, "{out:?}");
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn stale_session_directories_are_removed() {
+    let s = Setup::with_config("");
+    // A session killed with SIGKILL left its directory, lock file and all,
+    // and one without a lock file may belong to an older stopit.
+    let base = s.runtime().join("stopit");
+    fs::create_dir_all(&base).unwrap();
+    fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+    let stale = base.join("0123456789abcdef0123456789abcdef");
+    let unlocked = base.join("fedcba9876543210fedcba9876543210");
+    for dir in [&stale, &unlocked] {
+        fs::create_dir(dir).unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(dir.join("ephemeral")).unwrap();
+    }
+    fs::write(stale.join("lock"), "").unwrap();
+    let results = s.probe(&[], &[Op::Cwd]);
+    assert_eq!(ok(&results[0]), &Data::Cwd("/workspace".into()));
+    assert!(!stale.exists());
+    assert!(unlocked.exists());
+    // A live server's session is not stale.
+    let server = Server::start(&s);
+    s.probe(&["--standalone"], &[Op::Cwd]);
+    assert!(base.join(&server.id).exists());
+}
+
+#[test]
+fn an_attached_run_gets_the_clients_terminal() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((master, slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::with_config(&config);
+    let server = Server::start(&s);
+    // The client's PTY and filter: kitty keyboard passes, a clipboard read
+    // does not, and the sandbox's controlling terminal is not the server's.
+    let script = "printf 'A\\033[>1uB\\033]52;c;?\\007C'; [ -t 0 ] && echo ' tty'; exit 5";
+    let command = s.stopit(&["run", "--quiet", "/bin/sh", "-c", script]);
+    let mut t = OnTerminal::spawn(command, master, slave);
+    let out = t.finish();
+    assert_eq!(code(&out), 5, "{out:?}");
+    t.wait_for(b" tty", 0);
+    let seen = String::from_utf8_lossy(&t.seen()).into_owned();
+    assert!(seen.starts_with("A\x1b[>1uBC tty"), "{seen:?}");
+    assert!(
+        server.log().contains("run 1 ended with status 5"),
+        "{}",
+        server.log()
+    );
+}

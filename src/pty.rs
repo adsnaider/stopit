@@ -679,13 +679,18 @@ mod tests {
         // and keep its terminal busy.
         let (host, sandbox, relay) = relayed();
         let writer = sandbox.slave.try_clone().unwrap();
+        // Non-blocking, so the writer sees `stop` even once nothing drains
+        // the master any more.
+        set_nonblocking(writer.as_fd()).unwrap();
         drop(sandbox.slave);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_writer = stop.clone();
         let busy = std::thread::spawn(move || {
             let chunk = vec![b'y'; 4096];
             while !stop_writer.load(std::sync::atomic::Ordering::SeqCst) {
-                let _ = rustix::io::write(&writer, &chunk);
+                if rustix::io::write(&writer, &chunk) == Err(Errno::AGAIN) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
             }
         });
         let reader = std::thread::spawn(move || {
