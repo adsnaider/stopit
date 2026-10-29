@@ -4389,6 +4389,59 @@ fn a_server_and_its_runs_share_one_scope() {
     assert_eq!(server.stop(), 128 + libc::SIGTERM);
 }
 
+/// A directory holding bwrap and a `busctl` script running `body`, for a
+/// PATH of its own.
+fn fake_busctl(body: &str) -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let bwrap = std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|d| d.join("bwrap"))
+                .find(|p| p.exists())
+        })
+        .unwrap();
+    symlink(&bwrap, dir.path().join("bwrap")).unwrap();
+    let script = dir.path().join("busctl");
+    fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    dir
+}
+
+#[test]
+fn a_scope_systemd_refuses_or_never_starts_stops_the_session() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+        eprintln!("skipping: no cgroup v2 hierarchy at /sys/fs/cgroup");
+        return;
+    }
+    let s = Setup::with_config(&format!("{config}[limits]\npids = 24\n"));
+    // Refused, with an error that holds a terminal escape.
+    let dir = fake_busctl("printf 'boom \\033]52;c;AAAA\\007\\n' >&2; exit 1");
+    let mut command = s.stopit(&["run", "--quiet", "/bin/sh", "-c", "echo ran"]);
+    command.env("PATH", dir.path());
+    let out = output(command, b"");
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    let err = stderr(&out);
+    assert!(err.contains("did not start the scope stopit-"), "{err}");
+    assert!(err.contains("boom \\u{1b}]52"), "{err}");
+    assert!(!err.contains('\u{1b}'), "{err:?}");
+    assert!(!s.runtime().join("stopit").exists());
+    // Accepted, but stopit never moves.
+    let dir = fake_busctl("exit 0");
+    let mut command = s.stopit(&["run", "--quiet", "/bin/sh", "-c", "echo ran"]);
+    command.env("PATH", dir.path());
+    let out = output(command, b"");
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert!(
+        stderr(&out).contains("did not move stopit into the scope"),
+        "{out:?}"
+    );
+    assert!(!s.runtime().join("stopit").exists());
+}
+
 #[test]
 fn limits_without_busctl_fail_before_the_session() {
     let Some(config) = shell_config() else {

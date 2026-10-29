@@ -78,12 +78,12 @@ pub fn enter_scope(limits: &Limits) -> Result<(), LimitsError> {
     if *limits == Limits::default() {
         return Ok(());
     }
-    if !is_cgroup2(Path::new(CGROUP_ROOT)) {
-        return Err(LimitsError::NotCgroup2);
-    }
     let busctl = std::env::var_os("PATH")
         .and_then(|path| crate::net::find_program_in("busctl", &path))
         .ok_or(LimitsError::NoBusctl)?;
+    if !is_cgroup2(Path::new(CGROUP_ROOT)) {
+        return Err(LimitsError::NotCgroup2);
+    }
     let unit = unit_name();
     let refused = |why: String| LimitsError::Refused {
         unit: unit.clone(),
@@ -342,6 +342,9 @@ mod tests {
     fn the_hierarchy_must_be_cgroup2() {
         assert!(!is_cgroup2(Path::new("/proc")));
         assert!(!is_cgroup2(Path::new("/nonexistent")));
+        if Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+            assert!(is_cgroup2(Path::new(CGROUP_ROOT)));
+        }
     }
 
     #[test]
