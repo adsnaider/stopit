@@ -215,7 +215,8 @@ pub fn read_request(sock: &UnixStream) -> io::Result<Option<ClientMessage>> {
                 io::ErrorKind::InvalidData,
                 format!(
                     "the stopit server speaks protocol {PROTOCOL_VERSION} and this stopit \
-                     speaks {version}; stop the server and start it again with this stopit"
+                     speaks {version}: they come from different builds, so run both from the \
+                     same build"
                 ),
             ));
         }
@@ -401,7 +402,7 @@ mod tests {
             current.replace(&format!(r#""version":{PROTOCOL_VERSION}"#), r#""version":99,"new":1"#),
         ] {
             let e = send(&body).unwrap_err();
-            assert!(e.to_string().contains("start it again"), "{body}: {e}");
+            assert!(e.to_string().contains("from the same build"), "{body}: {e}");
         }
         // Other requests and the end of the stream pass through.
         assert_eq!(

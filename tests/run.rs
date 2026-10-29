@@ -3128,7 +3128,7 @@ fn clipboard_writes_are_asked_about_on_the_server_terminal() {
     let (seen, log) = run(CLIPBOARD_SCRIPT, Some((b"y", "allowed once")));
     assert!(seen.starts_with(&format!("A{write}B")), "{seen:?}");
     assert!(
-        log.contains("(profile \"main\", /bin/sh -c printf"),
+        log.contains("(profile \"main\", /bin/sh -c 'printf "),
         "{log}"
     );
     assert!(
@@ -3136,6 +3136,30 @@ fn clipboard_writes_are_asked_about_on_the_server_terminal() {
         "{log}"
     );
     assert!(log.contains("content: hi"), "{log}");
+
+    // Writes the run's last output holds are asked about even after the
+    // sandbox has ended: here the second prompt comes after it ends.
+    let (master, slave) = open_pty().unwrap();
+    let command = s.stopit(&["run", "--quiet", "/bin/sh", "-c", TWO_WRITES_SCRIPT]);
+    let mut t = OnTerminal::spawn(command, master, slave);
+    for answered in 1..=2 {
+        wait_until(|| (server.log().matches("asks to").count() >= answered).then_some(()));
+        if answered == 1 {
+            thread::sleep(Duration::from_secs(1));
+        }
+        let deadline = Instant::now() + BWRAP_DEADLINE;
+        while server.log().matches("allowed once").count() < answered {
+            assert!(Instant::now() < deadline, "{}", server.log());
+            (&server_master).write_all(b"y").unwrap();
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+    let out = t.finish();
+    assert_eq!(code(&out), 0, "{out:?}");
+    t.wait_for(b"done", 0);
+    let seen = String::from_utf8_lossy(&t.seen()).into_owned();
+    assert!(seen.starts_with(&format!("A{write}B{write}C")), "{seen:?}");
+    server.log.lock().unwrap().clear();
 
     // Denied: neither write passes, and the second is denied without a
     // prompt, as the denial quiets requests for a while. The run says so.
@@ -3162,38 +3186,81 @@ fn a_server_without_its_terminal_in_the_foreground_denies() {
         return;
     };
     let s = Setup::with_config(&format!("{config}[terminal]\nclipboard_write = \"ask\"\n"));
-    // First on the terminal, but not as its controlling terminal, as for a
-    // server whose shell moved it to the background: it must not touch the
-    // terminal. Then with stdin not a terminal at all. Both deny at once.
-    // The default timeout is off, so a prompt would hang.
-    for on_terminal in [true, false] {
+    // Three ways a server cannot ask. Each denies at once, and the server
+    // says why. The default timeout is off, so a prompt would hang.
+    let pidfile = s.root.join("server.pid");
+    for case in ["background", "not controlling", "no terminal"] {
         // A terminal for each server, as each one's log reader reads it.
         let Some((server_master, server_slave)) = open_pty() else {
             return;
         };
-        let mut command = s.stopit(&["server"]);
-        if on_terminal {
-            command.stdin(server_slave.try_clone().unwrap());
-        } else {
-            command.stdin(Stdio::null());
-        }
+        let stopit = s.stopit(&["server"]);
+        let mut command = match case {
+            // Moved to the background by a shell with job control: its
+            // controlling terminal has another process group in front.
+            "background" => {
+                let mut sh = Command::new("/bin/sh");
+                sh.args(["-c", "set -m; \"$0\" server & echo $! > \"$1\"; wait $!"])
+                    .arg(stopit.get_program())
+                    .arg(&pidfile)
+                    .current_dir(s.ws())
+                    .env_clear();
+                for (k, v) in stopit.get_envs() {
+                    if let Some(v) = v {
+                        sh.env(k, v);
+                    }
+                }
+                sh.stdin(server_slave.try_clone().unwrap());
+                with_controlling_terminal(&mut sh, &server_slave);
+                sh
+            }
+            // On the terminal, which is not its controlling terminal.
+            "not controlling" => {
+                let mut c = stopit;
+                c.stdin(server_slave.try_clone().unwrap());
+                without_controlling_terminal(&mut c);
+                c
+            }
+            _ => {
+                let mut c = stopit;
+                c.stdin(Stdio::null());
+                without_controlling_terminal(&mut c);
+                c
+            }
+        };
         command
             .stdout(Stdio::null())
             .stderr(server_slave.try_clone().unwrap());
-        without_controlling_terminal(&mut command);
         let child = command.spawn().unwrap();
         drop(command);
         let mut server = Server::collect(child, server_master.try_clone().unwrap());
         let (master, slave) = open_pty().unwrap();
-        let command = s.stopit(&["run", "--quiet", "/bin/sh", "-c", CLIPBOARD_SCRIPT]);
+        let command = s.stopit(&["run", "--quiet", "/bin/sh", "-c", TWO_WRITES_SCRIPT]);
         let mut t = OnTerminal::spawn(command, master, slave);
         let out = t.finish();
-        assert_eq!(code(&out), 0, "{on_terminal}: {out:?}");
+        assert_eq!(code(&out), 0, "{case}: {out:?}");
         let at = t.wait_for(b"done", 0);
-        t.wait_for(b"1 clipboard write blocked", at);
-        assert!(t.seen().starts_with(b"AB"), "{on_terminal}");
-        assert!(!server.log().contains("asks to"), "{}", server.log());
-        assert_eq!(server.stop(), 128 + libc::SIGTERM, "{on_terminal}");
+        t.wait_for(b"2 clipboard writes blocked", at);
+        assert!(t.seen().starts_with(b"ABC"), "{case}");
+        let log = server.log();
+        assert!(!log.contains("asks to"), "{case}: {log}");
+        let why = match case {
+            "no terminal" => "the server's stdin is not a terminal",
+            _ => "the server is not in the foreground of its controlling terminal",
+        };
+        assert_eq!(log.matches(why).count(), 1, "{case}: {log}");
+        if case == "background" {
+            let pid: i32 = fs::read_to_string(&pidfile)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            kill(pid, libc::SIGTERM);
+            let sh = server.child.take().unwrap();
+            assert_eq!(code(&finish(sh)), 128 + libc::SIGTERM, "{case}");
+        } else {
+            assert_eq!(server.stop(), 128 + libc::SIGTERM, "{case}");
+        }
     }
 }
 

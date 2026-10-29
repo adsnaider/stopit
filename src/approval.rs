@@ -6,7 +6,7 @@
 //! 300 ms, so keystrokes meant for something else cannot answer it. "For
 //! this session" answers are remembered until the server stops, and after
 //! the user denies a request, requests in its scope are denied without a
-//! prompt for a few seconds.
+//! prompt for five seconds.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -27,9 +27,11 @@ const ARMING_DELAY: Duration = Duration::from_millis(300);
 /// denied one in it, so a sandbox cannot bury the user in prompts.
 pub const QUIET_AFTER_DENY: Duration = Duration::from_secs(5);
 
-/// The most characters of escaped clipboard content a prompt shows: the
-/// start and the end, with `...` between when it is longer.
+/// The most characters of escaped clipboard content a prompt shows from
+/// its start. Longer content shows `...` and then [`PREVIEW_TAIL`].
 const PREVIEW_HEAD: usize = 160;
+/// The most characters of escaped clipboard content a prompt shows from
+/// its end, after [`PREVIEW_HEAD`] and `...`.
 const PREVIEW_TAIL: usize = 40;
 
 /// Something a sandbox asks the user to allow.
@@ -99,7 +101,8 @@ pub struct Asker {
     pub run: u64,
     /// The profile the run's sandbox has.
     pub profile: String,
-    /// The run's command, escaped.
+    /// The run's command, each argument quoted for a shell with every
+    /// control character escaped.
     pub command: String,
 }
 
@@ -135,6 +138,9 @@ struct State {
     prompting: bool,
     /// Log lines held back while a prompt is up.
     held: Vec<String>,
+    /// Runs already told about in the log that the server cannot ask
+    /// for them, so the log says it once per run.
+    told_unasked: HashSet<u64>,
 }
 
 /// The server's prompter.
@@ -145,6 +151,9 @@ pub struct Approver {
     terminal: Option<OwnedFd>,
     timeout: ApprovalTimeout,
     quiet_after: Duration,
+    /// How long a prompt ignores keys after it appears, [`ARMING_DELAY`]
+    /// but in tests.
+    arming_delay: Duration,
     /// Whether the server must be in the terminal's foreground to ask.
     /// Only tests, whose terminal is no controlling terminal, turn it off.
     require_foreground: bool,
@@ -184,6 +193,7 @@ impl Approver {
             terminal,
             timeout,
             quiet_after,
+            arming_delay: ARMING_DELAY,
             require_foreground: true,
             prompt: Mutex::new(()),
             state: Mutex::new(State::default()),
@@ -197,11 +207,25 @@ impl Approver {
     /// Prints `line` to stderr, or holds it until the prompt on the
     /// terminal is answered, so log lines never cut into a prompt.
     pub fn log(&self, line: &str) {
-        let mut state = self.state();
-        if state.prompting {
-            state.held.push(line.to_owned());
-        } else {
-            eprintln!("{line}");
+        {
+            let mut state = self.state();
+            if state.prompting {
+                state.held.push(line.to_owned());
+                return;
+            }
+        }
+        // Printed without the lock, so a stalled stderr holds up no
+        // prompt.
+        eprintln!("{line}");
+    }
+
+    /// Logs once per run of `asker` that the server cannot ask, and why.
+    fn tell_unasked(&self, asker: &Asker, why: &str) {
+        if self.state().told_unasked.insert(asker.run) {
+            self.log(&format!(
+                "stopit: denied a clipboard write from run {} without asking: {why}",
+                asker.run
+            ));
         }
     }
 
@@ -245,15 +269,24 @@ impl Approver {
             return Verdict::Denied;
         }
         let Some(terminal) = &self.terminal else {
+            self.tell_unasked(asker, "the server's stdin is not a terminal");
             return Verdict::Denied;
         };
         // In the background, touching the terminal would stop the server.
+        // A terminal that is not the server's controlling terminal has no
+        // foreground of the server's either.
         if self.require_foreground
             && rustix::termios::tcgetpgrp(terminal).ok() != Some(rustix::process::getpgrp())
         {
+            self.tell_unasked(
+                asker,
+                "the server is not in the foreground of its controlling terminal",
+            );
             return Verdict::Denied;
         }
         self.state().prompting = true;
+        // Lets held log lines out even if asking panics.
+        let prompting = Prompting(self);
         let verdict = self
             .ask(terminal.as_fd(), asker, &description, cancel)
             .unwrap_or(Verdict::Denied);
@@ -263,7 +296,7 @@ impl Approver {
             Verdict::DeniedByUser | Verdict::Denied => "denied",
         };
         let _ = write_all(terminal.as_fd(), format!("{said}\r\n").as_bytes());
-        let held = {
+        {
             let mut state = self.state();
             match verdict {
                 Verdict::Session => {
@@ -274,12 +307,8 @@ impl Approver {
                 }
                 Verdict::Once | Verdict::Denied => {}
             }
-            state.prompting = false;
-            std::mem::take(&mut state.held)
         };
-        for line in held {
-            eprintln!("{line}");
-        }
+        drop(prompting);
         verdict
     }
 
@@ -305,7 +334,7 @@ impl Approver {
         // Keys typed before the prompt, and during its first moment, do not
         // count.
         flush_input(terminal);
-        std::thread::sleep(ARMING_DELAY);
+        std::thread::sleep(self.arming_delay);
         flush_input(terminal);
         let deadline = match self.timeout {
             ApprovalTimeout::Off => None,
@@ -364,6 +393,23 @@ impl Approver {
         };
         drop(raw);
         Ok(verdict)
+    }
+}
+
+/// Marks the end of a prompt when dropped, and prints the log lines held
+/// meanwhile.
+struct Prompting<'a>(&'a Approver);
+
+impl Drop for Prompting<'_> {
+    fn drop(&mut self) {
+        let held = {
+            let mut state = self.0.state();
+            state.prompting = false;
+            std::mem::take(&mut state.held)
+        };
+        for line in held {
+            eprintln!("{line}");
+        }
     }
 }
 
@@ -689,10 +735,12 @@ mod tests {
 
     #[test]
     fn keys_typed_before_or_during_the_arming_delay_do_not_answer() {
-        let t = on_pty(
-            ApprovalTimeout::After(Duration::from_secs(1)),
+        let mut t = on_pty(
+            ApprovalTimeout::After(Duration::from_millis(500)),
             QUIET_AFTER_DENY,
         );
+        // Long enough that the typist below always types within it.
+        t.approver.arming_delay = Duration::from_secs(2);
         // Typed before the prompt.
         rustix::io::write(&t.master, b"y").unwrap();
         // And typed as soon as the prompt shows, within the arming delay.
@@ -707,7 +755,7 @@ mod tests {
             t.approver.decide(&asker("main"), &hi(), t.cancel.as_fd()),
             Verdict::Denied
         );
-        assert!(start.elapsed() >= Duration::from_secs(1));
+        assert!(start.elapsed() >= Duration::from_millis(2500));
         assert!(typist.join().unwrap().contains("denied"));
         // A timeout is not the user's denial: no quiet period.
         assert_eq!(t.approver.remembered(&hi().scope("main")), None);
@@ -796,13 +844,14 @@ mod tests {
 
     #[test]
     fn remembered_answers_decide_without_the_lock_and_quiet_ends() {
-        let approver =
-            Approver::with_terminal(None, ApprovalTimeout::Off, Duration::from_millis(50));
+        let approver = Approver::with_terminal(None, ApprovalTimeout::Off, QUIET_AFTER_DENY);
         let (cancel, _other) = std::os::unix::net::UnixStream::pair().unwrap();
         approver.state().allowed.insert(hi().scope("main"));
+        // Long enough that a slow test thread cannot outlive it, which would
+        // make `decide` wait for the lock this thread holds.
         approver.state().quiet.insert(
             hi().scope("other"),
-            Instant::now() + Duration::from_millis(50),
+            Instant::now() + Duration::from_secs(60),
         );
         // Held by a prompt elsewhere: remembered answers still come at once.
         let busy = approver.prompt.lock().unwrap();
@@ -815,8 +864,23 @@ mod tests {
             Verdict::Denied
         );
         drop(busy);
-        std::thread::sleep(Duration::from_millis(60));
+        // A quiet period that has ended no longer decides.
+        approver
+            .state()
+            .quiet
+            .insert(hi().scope("other"), Instant::now());
         assert_eq!(approver.remembered(&hi().scope("other")), None);
+    }
+
+    #[test]
+    fn a_panicking_prompt_lets_held_lines_out() {
+        let approver = Approver::with_terminal(None, ApprovalTimeout::Off, QUIET_AFTER_DENY);
+        approver.state().prompting = true;
+        approver.log("held");
+        drop(Prompting(&approver));
+        let state = approver.state();
+        assert!(!state.prompting);
+        assert!(state.held.is_empty());
     }
 
     #[test]

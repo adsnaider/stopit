@@ -335,12 +335,19 @@ fn serve_client(
         }
         Err(e) => Err(RunError::Client(e)),
     };
-    lock(runs).by_number.remove(&run);
     match result {
         Ok(code) => {
             let _ = write_frame(&conn, &ServerMessage::Exit { code });
+            // The client may still relay the sandbox's last output, and ask
+            // about clipboard writes in it, so the run stays known until
+            // the client hangs up. A stopping server shuts the connection
+            // down, which ends this wait.
+            let _ = conn.set_read_timeout(None);
+            while let Ok(Some(_)) = read_frame::<ClientMessage>(&conn) {}
+            lock(runs).by_number.remove(&run);
         }
         Err(e) => {
+            lock(runs).by_number.remove(&run);
             if !quiet {
                 approver.log(&format!(
                     "stopit: run {run} failed: {}",
@@ -482,13 +489,11 @@ fn run_for_client(
         let asker = Asker {
             run,
             profile: profile_name.as_str().to_owned(),
-            command: escape_message(
-                &command
-                    .iter()
-                    .map(|a| String::from_utf8_lossy(a.as_bytes()).into_owned())
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            ),
+            command: command
+                .iter()
+                .map(|a| crate::escape::shell_quote(a.as_bytes()))
+                .collect::<Vec<_>>()
+                .join(" "),
         };
         if let Some(entry) = runs.by_number.get_mut(&run) {
             entry.pidfd = pidfd.try_clone().ok();
@@ -859,7 +864,7 @@ pub(crate) fn attach(attached: Attached, invocation: &Invocation) -> Result<u8, 
     drop(terminal);
     if denied > 0 {
         eprintln!(
-            "stopit: warning: {}; they need a yes on the stopit server's terminal",
+            "stopit: warning: {}; approve them on the stopit server's terminal",
             blocked_writes(denied)
         );
     }
