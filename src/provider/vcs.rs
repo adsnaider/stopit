@@ -37,16 +37,28 @@ use crate::policy::Decision;
 pub const VCS_PROVIDER_NAME: &str = "vcs";
 
 /// The git configuration every brokered git command gets, over any file:
-/// no hooks, no filesystem monitor, no pager, no `ext::` transport, and no
-/// bare repository git was not pointed at. Other keys of the repository's
-/// own configuration still apply.
-const SAFE_GIT_CONFIG: [(&str, &str); 5] = [
+/// no hooks, no filesystem monitor, no pager, no `ext::` transport, no
+/// bare repository git was not pointed at, and no signing or signature
+/// checks, whose programs read their own configuration. Other keys of the
+/// repository's own configuration still apply.
+const SAFE_GIT_CONFIG: [(&str, &str); 11] = [
     ("core.hooksPath", "/dev/null"),
     ("core.fsmonitor", "false"),
     ("core.pager", "cat"),
     ("protocol.ext.allow", "never"),
     ("safe.bareRepository", "explicit"),
+    ("gpg.program", "false"),
+    ("gpg.ssh.program", "false"),
+    ("gpg.x509.program", "false"),
+    ("commit.gpgSign", "false"),
+    ("tag.gpgSign", "false"),
+    ("log.showSignature", "false"),
 ];
+
+/// The `HOME` of the VCS profiles, an empty directory of their own, so no
+/// program they start reads configuration `main` wrote to the session's
+/// shared home.
+const VCS_HOME: &str = "/home/vcs";
 
 /// The `vcs` provider.
 #[derive(Debug, Clone)]
@@ -177,7 +189,12 @@ pub fn discover(workspace: &Path) -> Layout {
     match fs::symlink_metadata(&dot_jj) {
         Ok(m) if m.is_dir() => {
             match jj_repo(workspace, &dot_jj) {
-                Ok(()) => layout.jj_supported = true,
+                // jj writes the workspace's `.git` then, which must be a
+                // layout git is brokered for, with its config locked.
+                Ok(true) if layout.git_dirs.is_empty() => layout.unsupported.push(format!(
+                    "the jj repository at {workspace:?}, whose colocated .git is not supported"
+                )),
+                Ok(_) => layout.jj_supported = true,
                 Err(why) => layout.unsupported.push(why),
             }
             layout.dot_jj = Some(dot_jj);
@@ -216,8 +233,9 @@ fn is_real_dir(path: &Path) -> bool {
 
 /// Checks that the `.jj` directory `dot_jj` holds a whole repository: a
 /// `repo` directory, whose git store, if it has one, is the workspace's
-/// own `.git` or inside the store.
-fn jj_repo(workspace: &Path, dot_jj: &Path) -> Result<(), String> {
+/// own `.git` directory or inside the store. Returns whether it is the
+/// workspace's `.git`.
+fn jj_repo(workspace: &Path, dot_jj: &Path) -> Result<bool, String> {
     let repo = dot_jj.join("repo");
     match fs::symlink_metadata(&repo) {
         Ok(m) if m.is_dir() => {}
@@ -229,17 +247,25 @@ fn jj_repo(workspace: &Path, dot_jj: &Path) -> Result<(), String> {
         Err(_) => return Err(format!("{dot_jj:?}, which has no repo directory")),
     }
     let store = repo.join("store");
+    if !is_real_dir(&store) {
+        return Err(format!("{dot_jj:?}, whose repo has no store directory"));
+    }
     let target_file = store.join("git_target");
     if !is_present(&target_file) {
-        return Ok(());
+        return Ok(false);
     }
     let target = read_small(&target_file).map_err(|why| format!("the jj repository: {why}"))?;
     let resolved = fs::canonicalize(store.join(target.trim_end()))
         .map_err(|e| format!("the jj repository's git store cannot be resolved: {e}"))?;
     let store = fs::canonicalize(&store).map_err(|e| e.to_string())?;
-    let own_git = fs::canonicalize(workspace.join(".git")).ok();
-    if Some(&resolved) == own_git.as_ref() || resolved.starts_with(&store) {
-        Ok(())
+    let dot_git = workspace.join(".git");
+    let own_git = is_real_dir(&dot_git)
+        .then(|| fs::canonicalize(&dot_git).ok())
+        .flatten();
+    if Some(&resolved) == own_git.as_ref() {
+        Ok(true)
+    } else if resolved.starts_with(&store) {
+        Ok(false)
     } else {
         Err(format!(
             "the jj repository at {workspace:?}, whose git store {resolved:?} is elsewhere"
@@ -286,21 +312,29 @@ fn worktree_dirs(workspace: &Path, dot_git: &Path) -> Result<Vec<PathBuf>, Strin
 }
 
 /// The text of the small regular file at `path`, opened without following
-/// a link and without waiting on a FIFO.
+/// a link and without opening anything else.
 fn read_small(path: &Path) -> Result<String, String> {
     use rustix::fs::{FileType, Mode, OFlags};
     use std::io::Read;
     let cannot = |e: &dyn std::fmt::Display| format!("cannot read {path:?}: {e}");
-    let fd = rustix::fs::open(
+    // An `O_PATH` descriptor first, which opens no device or FIFO, then
+    // the file itself through it once it is known to be a regular one.
+    let handle = rustix::fs::open(
         path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|e| cannot(&e))?;
-    let stat = rustix::fs::fstat(&fd).map_err(|e| cannot(&e))?;
+    let stat = rustix::fs::fstat(&handle).map_err(|e| cannot(&e))?;
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || stat.st_size > 4096 {
         return Err(format!("{path:?} is not a small file"));
     }
+    let fd = rustix::fs::open(
+        format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&handle)),
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| cannot(&e))?;
     let mut text = String::new();
     fs::File::from(fd)
         .take(4097)
@@ -373,12 +407,17 @@ impl VcsProvider {
         if !git && !jj {
             return manifest_from(root);
         }
-        let metadata: Vec<String> = [&layout.dot_git, &layout.dot_jj]
-            .into_iter()
-            .flatten()
-            .map(|p| path(p))
-            .collect::<Result<_, _>>()?;
-        // What the VCS profiles see: the metadata and the backing storage.
+        // What the VCS profiles see: the metadata of the tools brokered
+        // here and the backing storage. An unsupported `.git` stays out
+        // even when jj is brokered, since nothing in it is locked.
+        let metadata: Vec<String> = [
+            layout.dot_git.as_ref().filter(|_| git),
+            layout.dot_jj.as_ref().filter(|_| jj),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|p| path(p))
+        .collect::<Result<_, _>>()?;
         let mut storage = metadata.clone();
         for dir in &layout.git_dirs {
             let p = path(dir)?;
@@ -437,6 +476,8 @@ impl VcsProvider {
         set("GIT_PAGER", "cat".into());
         set("JJ_CONFIG", "/dev/null".into());
         set("JJ_EDITOR", "false".into());
+        set("HOME", VCS_HOME.into());
+        set("GNUPGHOME", format!("{VCS_HOME}/.gnupg-unused"));
         let mut config: Vec<(&str, &str)> = SAFE_GIT_CONFIG.to_vec();
         for (key, value) in identity {
             config.push((key, value));
@@ -457,18 +498,22 @@ impl VcsProvider {
         // (`git --no-pager push` takes the default) still reaches no remote
         // over the network.
         let offline = || Value::Table(table([("mode", "none".into())]));
+        let home = || list(vec![VCS_HOME.to_owned()]);
         let mut ro = toml::Table::new();
         ro.insert("network".into(), offline());
         ro.insert(
             "fs".into(),
-            Value::Table(table([("ro", list(storage.clone()))])),
+            Value::Table(table([
+                ("ro", list(storage.clone())),
+                ("ephemeral", home()),
+            ])),
         );
         ro.insert(
             "env".into(),
             Value::Table(table([("set", Value::Table(env.clone()))])),
         );
         profiles.insert("ro".into(), Value::Table(ro));
-        let mut local_fs = table([("rw", list(storage))]);
+        let mut local_fs = table([("rw", list(storage)), ("ephemeral", home())]);
         if !locked.is_empty() {
             local_fs.insert("ro".into(), list(locked));
         }
@@ -504,8 +549,12 @@ impl VcsProvider {
 
     /// The view of the workspace's own metadata in `main`, which every
     /// layout gets: masked, or read-only with `view = "ro"`.
+    ///
+    /// A worktree's admin and common directories get the same view, so a
+    /// grant of `main` that covers them does not expose them either. One
+    /// whose path no rule can name is left out.
     fn main_view(&self, workspace: &Path, layout: &Layout) -> Result<toml::Table, String> {
-        let metadata: Vec<toml::Value> = [&layout.dot_git, &layout.dot_jj]
+        let mut metadata: Vec<toml::Value> = [&layout.dot_git, &layout.dot_jj]
             .into_iter()
             .flatten()
             .map(|p| {
@@ -514,6 +563,11 @@ impl VcsProvider {
                     .ok_or_else(|| format!("no rule can name {p:?}"))
             })
             .collect::<Result<_, _>>()?;
+        for dir in layout.git_dirs.iter().filter(|d| !d.starts_with(workspace)) {
+            if let Some(p) = rule_path(workspace, dir) {
+                metadata.push(toml::Value::String(p));
+            }
+        }
         let mut root = toml::Table::new();
         if metadata.is_empty() {
             return Ok(root);
@@ -843,10 +897,16 @@ mod tests {
             assert_eq!(env(p, "JJ_EDITOR"), Some("false"));
             assert_eq!(env(p, "JJ_USER"), Some("Ann"));
             // The safe settings, then the identity.
-            assert_eq!(env(p, "GIT_CONFIG_COUNT"), Some("6"));
+            assert_eq!(env(p, "GIT_CONFIG_COUNT"), Some("12"));
             assert_eq!(env(p, "GIT_CONFIG_KEY_4"), Some("safe.bareRepository"));
-            assert_eq!(env(p, "GIT_CONFIG_KEY_5"), Some("user.name"));
-            assert_eq!(env(p, "GIT_CONFIG_VALUE_5"), Some("Ann"));
+            assert_eq!(env(p, "GIT_CONFIG_KEY_5"), Some("gpg.program"));
+            assert_eq!(env(p, "GIT_CONFIG_VALUE_5"), Some("false"));
+            assert_eq!(env(p, "GIT_CONFIG_KEY_11"), Some("user.name"));
+            assert_eq!(env(p, "GIT_CONFIG_VALUE_11"), Some("Ann"));
+            // A home of their own, which `main` never sees.
+            assert_eq!(env(p, "HOME"), Some(VCS_HOME));
+            assert_eq!(env(p, "GNUPGHOME"), Some("/home/vcs/.gnupg-unused"));
+            assert_eq!(patterns(&p.grants.fs.ephemeral), [VCS_HOME]);
         }
         // No jj repository, no jj shim.
         assert_eq!(
@@ -896,8 +956,17 @@ mod tests {
         let layout = discover(&wt);
         assert!(layout.unsupported.is_empty(), "{:?}", layout.unsupported);
         assert_eq!(layout.git_dirs, [admin.clone(), root.join("main/.git")]);
-        // GIT_DIR is the admin directory, at its own path.
+        // GIT_DIR is the admin directory, at its own path, and `main`
+        // gets both directories masked too.
         let m = manifest(&wt, &[]);
+        assert_eq!(
+            patterns(&m.grants.fs.masked),
+            [
+                "{workspace}/.git",
+                admin.to_str().unwrap(),
+                root.join("main/.git").to_str().unwrap()
+            ]
+        );
         assert_eq!(
             env(profile(&m, "local"), "GIT_DIR"),
             Some(admin.to_str().unwrap())
@@ -1046,6 +1115,22 @@ mod tests {
             "{:?}",
             layout.unsupported
         );
+        // A store that is a link is not followed.
+        fs::write(ws.join(".jj/repo/store/git_target"), "../../../.git").unwrap();
+        fs::rename(ws.join(".jj/repo/store"), ws.join("real-store")).unwrap();
+        std::os::unix::fs::symlink(ws.join("real-store"), ws.join(".jj/repo/store")).unwrap();
+        assert!(!discover(&ws).jj_supported);
+        fs::remove_file(ws.join(".jj/repo/store")).unwrap();
+        fs::rename(ws.join("real-store"), ws.join(".jj/repo/store")).unwrap();
+        assert!(discover(&ws).jj_supported);
+        // Colocated with a `.git` git is not brokered for: jj would write it
+        // with nothing locked, so jj is not brokered either.
+        fs::write(ws.join(".git/commondir"), "/elsewhere\n").unwrap();
+        let layout = discover(&ws);
+        assert!(!layout.jj_supported && layout.git_dirs.is_empty());
+        assert_eq!(layout.unsupported.len(), 2, "{:?}", layout.unsupported);
+        let m = manifest(&ws, &[]);
+        assert!(m.profiles.is_empty() && m.grants.shims.is_empty());
         // A secondary workspace: masked, nothing brokered.
         let (_o, other) = workspace();
         fs::create_dir_all(other.join(".jj")).unwrap();

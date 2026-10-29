@@ -4116,6 +4116,7 @@ fn git_runs_through_the_broker_while_main_sees_no_metadata() {
                   git log --format=%s; \
                   (cd sub && git log --format=%s); \
                   git commit -q --allow-empty 2>/dev/null; echo \"editor=$?\"; \
+                  git commit -q -S --allow-empty -m signed 2>/dev/null; echo \"sign=$?\"; \
                   git rebase main; echo \"rebase=$?\"; \
                   git push origin main; echo \"push=$?\"; \
                   echo 'x' > .git/config; echo \"write=$?\"";
@@ -4128,6 +4129,12 @@ fn git_runs_through_the_broker_while_main_sees_no_metadata() {
     // From `sub`, git still uses the workspace's repository, and it starts
     // no editor.
     assert!(shown.contains("commit=0\none\none\neditor=1\n"), "{shown}");
+    // Nor a signing program, which would read configuration from a home
+    // `main` can write.
+    assert!(
+        shown.contains("sign=") && !shown.contains("sign=0"),
+        "{shown}"
+    );
     // Asked about, with no server to ask; denied outright.
     assert!(shown.contains("rebase=126\n"), "{shown}");
     assert!(shown.contains("push=126\n"), "{shown}");
