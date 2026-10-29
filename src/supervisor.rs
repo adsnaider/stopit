@@ -1013,34 +1013,54 @@ impl LoadedSession {
     /// profile of a `stopit-grant` request (§7.5), which every check of
     /// the compiler then applies to. Warnings are dropped.
     ///
-    /// First adds `rw`, the request's canonical `rw` paths, to the paths
-    /// every later compile of the session treats as untrusted roots,
-    /// whatever the user answers. Returns the compiled session and the
-    /// generation of those paths it saw, for
-    /// [`current_grant`](Self::current_grant).
+    /// `rw`, the request's canonical `rw` paths, count as untrusted roots
+    /// here along with those of earlier requests, but join the session's
+    /// only through [`admit_grant`](Self::admit_grant), once the request
+    /// has passed its checks. Returns the compiled session and the
+    /// generation of the session's paths it saw.
     pub(crate) fn compile_with(
         &self,
         extra: (ProviderName, ProviderOutput),
         rw: &[PathBuf],
     ) -> Result<(CompiledSession, u64), RunError> {
-        let (granted, generation) = {
-            let mut state = self.granted();
-            let before = state.paths.len();
-            state.paths.extend(rw.iter().cloned());
-            if state.paths.len() != before {
-                state.generation += 1;
-            }
+        let (mut granted, generation) = {
+            let state = self.granted();
             (state.paths.clone(), state.generation)
         };
+        granted.extend(rw.iter().cloned());
         let mut outputs = self.outputs.clone();
         outputs.push(extra);
         Ok((self.compile_granted(outputs, &granted)?, generation))
     }
 
-    /// `compiled`, from [`compile_with`](Self::compile_with) at
-    /// `generation`, if no other request has added `rw` paths since.
-    /// Otherwise compiles `extra` again with them, so a command another
-    /// grant let write there since cannot have moved what this one mounts.
+    /// Adds `rw`, the `rw` paths of a request that passed its checks, to
+    /// the paths every later compile of the session treats as untrusted
+    /// roots, whatever the user answers. A path that passed cannot break a
+    /// later compile, since no profile reaches below it by path.
+    ///
+    /// Returns the generation for [`current_grant`](Self::current_grant):
+    /// the new one, or `generation`, from
+    /// [`compile_with`](Self::compile_with), if another request added
+    /// paths since, so the request is compiled again with them.
+    pub(crate) fn admit_grant(&self, rw: &[PathBuf], generation: u64) -> u64 {
+        let mut state = self.granted();
+        let unchanged = state.generation == generation;
+        let before = state.paths.len();
+        state.paths.extend(rw.iter().cloned());
+        if state.paths.len() != before {
+            state.generation += 1;
+        }
+        match unchanged {
+            true => state.generation,
+            false => generation,
+        }
+    }
+
+    /// `compiled`, of a request admitted at `generation`, if no other
+    /// request has added `rw` paths since. Otherwise compiles `extra`
+    /// again with them, so a command another grant let write there since
+    /// cannot have moved what this one mounts. The paths stay locked
+    /// meanwhile, which holds up other compiles for one compile's time.
     pub(crate) fn current_grant(
         &self,
         extra: (ProviderName, ProviderOutput),

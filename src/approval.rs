@@ -351,8 +351,8 @@ impl Approver {
 
     /// Logs `line`, a request run `run` made that was refused without
     /// asking, as [`log`](Self::log) does, for the first
-    /// [`MAX_REFUSALS_LOGGED`] of the run. The next one logs that the run's
-    /// later refusals go unlogged, and later ones log nothing.
+    /// [`MAX_REFUSALS_LOGGED`] of the run. The last of them comes with a
+    /// line saying so, and later ones log nothing.
     pub fn log_refusal(&self, run: u64, line: &str) {
         let count = {
             let mut state = self.state();
@@ -362,12 +362,22 @@ impl Approver {
         };
         if count <= MAX_REFUSALS_LOGGED {
             self.log(line);
-        } else if count == MAX_REFUSALS_LOGGED + 1 {
+        }
+        if count == MAX_REFUSALS_LOGGED {
             self.log(&format!(
-                "stopit: run {run} has had {MAX_REFUSALS_LOGGED} requests refused without \
-                 asking; its later ones are not logged"
+                "stopit: run {run} has had {MAX_REFUSALS_LOGGED} requests refused; it gets no \
+                 more stopit-grant, and later refusals are not logged"
             ));
         }
+    }
+
+    /// Whether run `run` has had [`MAX_REFUSALS_LOGGED`] refusals logged,
+    /// so another would go unseen.
+    pub fn refusals_exhausted(&self, run: u64) -> bool {
+        self.state()
+            .refusals
+            .get(&run)
+            .is_some_and(|&n| n >= MAX_REFUSALS_LOGGED)
     }
 
     /// Whether a denial from `asker`'s profile still quiets `request`, so
@@ -1127,12 +1137,15 @@ mod tests {
             approver.log_refusal(7, "refused");
         }
         approver.log_refusal(8, "other run");
+        assert!(approver.refusals_exhausted(7));
+        assert!(!approver.refusals_exhausted(8));
+        assert!(!approver.refusals_exhausted(9));
         let state = approver.state();
         let n = MAX_REFUSALS_LOGGED as usize;
         assert_eq!(state.held.len(), n + 2);
         assert!(state.held[..n].iter().all(|l| l == "refused"));
         assert!(
-            state.held[n].contains("run 7 has had 20 requests refused"),
+            state.held[n].contains("run 7 has had 20 requests refused; it gets no more"),
             "{:?}",
             state.held[n]
         );

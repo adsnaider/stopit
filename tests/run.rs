@@ -4262,6 +4262,7 @@ fn grants_the_host_refuses_say_why_only_on_the_server_terminal() {
         "x/hidden",
         "data",
         "rw/keep",
+        "rw/scratch",
         "cargo/registry",
         "ws/sub",
     ] {
@@ -4278,6 +4279,7 @@ fn grants_the_host_refuses_say_why_only_on_the_server_terminal() {
         "{config}[approval]\ntimeout = \"20s\"\n\
          [[provider]]\ntype = \"config\"\nname = \"mask\"\n[provider.sandbox]\n\
          fs.ro = [\"{x}\", \"{rw}/keep\"]\nfs.masked = [\"{x}/hidden\"]\nfs.rw = [\"{rw}\"]\n\
+         fs.ephemeral = [\"{rw}/scratch\"]\n\
          [profiles.publish]\n\
          [[provider]]\ntype = \"config\"\nname = \"pub\"\nprofile = \"publish\"\n\
          [provider.sandbox]\nfs.ro = [\"{cfg}/f\", \"{cargo}\"]\n\
@@ -4305,6 +4307,10 @@ fn grants_the_host_refuses_say_why_only_on_the_server_terminal() {
         (
             format!("+rw:{}/rw/keep", root.display()),
             "would replace the ro rule of provider \"mask\"",
+        ),
+        (
+            format!("+ro:{}/rw/scratch", root.display()),
+            "would replace the ephemeral rule of provider \"mask\"",
         ),
         (
             format!("+ro:{}/sub", s.ws().display()),
@@ -4417,6 +4423,83 @@ fn a_later_grant_follows_no_link_where_an_earlier_one_could_write() {
     server.wait_for_log(&format!("read-only {}", target.display()));
     answer(&server, &server_master, b"n", "denied");
     child.join().unwrap();
+}
+
+#[test]
+fn a_refused_grant_leaves_later_runs_alone() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((server_master, server_slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::new();
+    let root = s.root.clone();
+    fs::create_dir_all(root.join("cfg")).unwrap();
+    fs::create_dir_all(root.join("store/nvim")).unwrap();
+    symlink(root.join("store/nvim"), root.join("cfg/nvim")).unwrap();
+    // A rule through a link, as home-manager makes them.
+    s.write_config(&format!(
+        "{config}[approval]\ntimeout = \"20s\"\n\
+         [[provider]]\ntype = \"config\"\nname = \"hm\"\n[provider.sandbox]\n\
+         fs.ro = [\"{}/cfg/nvim\"]\n",
+        root.display()
+    ));
+    let server = Server::start_on_terminal(&s, &server_master, server_slave);
+    let run = |line: &str| {
+        output(
+            s.stopit(&[
+                "run",
+                "--quiet",
+                "/bin/sh",
+                "-c",
+                &format!("{line}; echo \"rc=$?\""),
+            ]),
+            b"",
+        )
+    };
+    // Writable, cfg would let the command move the link the rule follows.
+    let out = run(&format!("stopit-grant +rw:{}/cfg -- true", root.display()));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "rc=126\n", "{out:?}");
+    server.wait_for_log("stopit-grant refused without asking");
+    // The refused request left nothing behind: runs start, and the rule
+    // still follows its link.
+    let out = run(&format!("ls -d {}/cfg/nvim/.", root.display()));
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).ends_with("rc=0\n"),
+        "{out:?}"
+    );
+    assert!(!server.log().contains("[n] deny: "), "{}", server.log());
+}
+
+#[test]
+fn a_run_with_too_many_refused_grants_gets_no_more() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((server_master, server_slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::with_config(&format!("{config}[approval]\ntimeout = \"20s\"\n"));
+    let server = Server::start_on_terminal(&s, &server_master, server_slave);
+    // 20 refusals the server logs, then one it refuses unseen, without a
+    // look at the host.
+    let script = format!(
+        "i=0; while [ $i -lt 20 ]; do stopit-grant +ro:{}/missing$i -- true 2>/dev/null; \
+         i=$((i+1)); done; stopit-grant +ro:/etc -- true; echo \"rc=$?\"",
+        s.root.display()
+    );
+    let out = output(s.stopit(&["run", "--quiet", "/bin/sh", "-c", &script]), b"");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "rc=126\n", "{out:?}");
+    assert!(
+        stderr(&out).contains("too many requests refused; stopit-grant takes no more"),
+        "{out:?}"
+    );
+    server.wait_for_log("run 1 has had 20 requests refused; it gets no more stopit-grant");
+    let log = server.log();
+    assert_eq!(log.matches("refused without asking").count(), 20, "{log}");
+    assert!(log.contains("missing19 does not exist"), "{log}");
 }
 
 #[test]

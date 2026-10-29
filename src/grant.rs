@@ -411,6 +411,9 @@ fn check_path(path: &str) -> Result<String, String> {
         return Err(format!("the path {path:?} must not hold a glob character"));
     }
     let path = path.trim_end_matches('/');
+    if path.is_empty() {
+        return Err("`/` is the whole host and cannot be granted".to_owned());
+    }
     if path == "~" {
         return Err("a path under `~/` must name something below the home".to_owned());
     }
@@ -531,7 +534,8 @@ mod tests {
             (&["+ro:/a/*", "--", "a"], "glob"),
             (&["+ro:/a/../b", "--", "a"], "`..`"),
             (&["+ro:~/./b", "--", "a"], "`..`"),
-            (&["+ro:/", "--", "a"], "path"),
+            (&["+ro:/", "--", "a"], "the whole host"),
+            (&["+rw:///", "--", "a"], "the whole host"),
             (&["+ro:/a", "+rw:/a", "--", "a"], "both"),
             (&["+ro:/a", "--", "./tool"], "program name"),
             (&["+ro:/a", "--", "/bin/sh"], "program name"),

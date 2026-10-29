@@ -702,6 +702,11 @@ fn run_grant(
         say("denied by user a moment ago; wait before asking again");
         return Ok(EXIT_DENIED);
     }
+    // Past the cap, refusals go unlogged, so the host is not looked at.
+    if approver.refusals_exhausted(ctx.run) {
+        say("this run has had too many requests refused; stopit-grant takes no more");
+        return Ok(EXIT_DENIED);
+    }
     let refuse_when = |when: &str, why: &str| {
         approver.log_refusal(
             ctx.run,
@@ -764,6 +769,7 @@ fn run_grant(
     if let Err(why) = check(&compiled) {
         return refuse(&why);
     }
+    let generation = ctx.loaded.admit_grant(&rw, generation);
     let network = mode.map(|_| &compiled.get(&target).expect("checked above").spec.network);
     let ask = ApprovalRequest::Grant {
         grants: GrantRequest::describe(home, network, &paths),
@@ -827,7 +833,7 @@ fn run_grant(
 ///   later sandboxes would follow.
 /// * A grant must not land on or inside the workspace mount, which is the
 ///   sandbox's to write already, or a path the caller masks or protects,
-///   or a read-only path inside a writable one. A profile's own rule beats
+///   or a read-only or ephemeral path inside a writable one. A profile's own rule beats
 ///   an inherited one, so the grant would lift the caller's rule.
 /// * The grant must add no compile warning to the caller's, since a
 ///   warning means a rule did not take as the prompt would show it.
@@ -875,7 +881,7 @@ fn check_grant(
         };
         match c.mode {
             PathMode::Masked | PathMode::Protected => {}
-            PathMode::Ro if inside_rw() => {}
+            PathMode::Ro | PathMode::Ephemeral if inside_rw() => {}
             _ => return None,
         }
         Some(format!(
@@ -940,7 +946,8 @@ fn reached_by_path<'a>(
         .map(|m| (m.sandbox.as_path(), m))
         .collect();
     // The host paths `m` reaches through the host tree of `base`, a mount
-    // at or above it, by path.
+    // at or above it, by path. A masked directory above traverses no host
+    // path, but counts all the same, which refuses more, never less.
     let reached = |m: &crate::resolve::PlannedMount, base: &crate::resolve::PlannedMount| {
         let MountSource::Host { path, .. } = &base.source else {
             return Vec::new();
