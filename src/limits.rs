@@ -1,20 +1,19 @@
-//! Resource limits (DESIGN.md §10). With `[limits]` set, stopit runs itself
-//! again in a transient systemd scope of its own, through
-//! `systemd-run --user --scope`, before any provider runs. Everything the
-//! session starts, its sandboxes, pasta and the proxy bridges, stays in
-//! that scope, so the limits hold for the whole session, and the user's
-//! other processes do not count against them.
+//! Resource limits (DESIGN.md §10). With `[limits]` set, stopit moves
+//! itself into a transient systemd scope of its own before any provider
+//! runs, by asking the user's systemd over D-Bus through `busctl`
+//! (`StartTransientUnit` with its own pid). Its pid, descriptors, locks
+//! and signal handlers stay as they are. What the session starts after
+//! that, its sandboxes, the commands its brokers start, pasta and the
+//! proxy bridges, inherits the scope, so the limits hold for the session
+//! as a whole, and the user's other processes do not count against them.
 //!
-//! `systemd-run --scope` runs the command in its own process, so stopit
-//! keeps its pid, its process group and its terminal. Once in the scope,
-//! stopit reads the cgroup's `pids.max`, `memory.max` and `cpu.max` and
-//! refuses to go on unless each configured limit is there.
+//! Once in the scope, stopit reads the cgroup's `pids.max`, `memory.max`
+//! and `cpu.max` and refuses to go on unless each configured limit is
+//! there.
 
-use std::ffi::OsString;
-use std::io;
-use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
@@ -23,39 +22,44 @@ use crate::config::Limits;
 /// What the names of stopit's scopes start with.
 const UNIT_PREFIX: &str = "stopit-";
 
-/// Set in the environment of the stopit that runs in a scope, to the
-/// scope's name, so a scope that did not take is an error, not a loop.
-const SCOPE_ENV: &str = "STOPIT_SCOPE";
-
 /// Where the cgroup v2 hierarchy is mounted.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// How long systemd may take to move stopit into its scope.
+const MOVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Error applying `[limits]`.
 #[derive(Debug, Error)]
 pub enum LimitsError {
-    /// No `systemd-run` in `PATH`.
-    #[error("[limits] needs systemd-run to give the session a scope of its own, and PATH has none")]
-    NoSystemdRun,
-    /// stopit's own executable cannot be named.
-    #[error("cannot find stopit's own executable to run it again in a scope: {0}")]
-    OwnExe(#[source] io::Error),
-    /// `systemd-run` did not start.
-    #[error("cannot run {path:?}: {source}")]
-    Exec {
-        /// The `systemd-run` run.
-        path: PathBuf,
-        /// What went wrong.
-        #[source]
-        source: io::Error,
-    },
-    /// stopit runs again, but not in the scope it asked for.
+    /// No `busctl` in `PATH`.
     #[error(
-        "systemd-run did not put stopit in the scope {0}; is cgroup v2 mounted at /sys/fs/cgroup?"
+        "[limits] needs busctl, from systemd, to give the session a scope of its own, and PATH has none"
     )]
-    NotInScope(String),
+    NoBusctl,
+    /// `busctl` did not start, or systemd refused the scope.
+    #[error("the user's systemd did not start the scope {unit}: {why}")]
+    Refused {
+        /// The scope's name.
+        unit: String,
+        /// What went wrong, escaped.
+        why: String,
+    },
+    /// systemd took the scope but did not move stopit into it.
+    #[error("systemd did not move stopit into the scope {unit}; it is in {got:?}")]
+    NotInScope {
+        /// The scope's name.
+        unit: String,
+        /// The cgroup stopit is in.
+        got: String,
+    },
+    /// `/sys/fs/cgroup` is not a cgroup v2 hierarchy.
+    #[error(
+        "[limits] needs the cgroup v2 hierarchy at /sys/fs/cgroup, and it is not mounted there"
+    )]
+    NotCgroup2,
     /// A limit is missing from the scope.
     #[error(
-        "the session's scope has {file} {got:?}, not the {want} of [limits]; your user's systemd \
+        "the session's scope has {file} {got:?}, not the {want} of [limits]; the user's systemd \
          may not have that controller"
     )]
     NotApplied {
@@ -68,44 +72,61 @@ pub enum LimitsError {
     },
 }
 
-/// Runs stopit again in a scope with `limits`, unless it already runs in
-/// one or no limit is set. Returns only when stopit is in its scope with
-/// the limits applied, or when no limit is set.
+/// Moves stopit into a new scope with `limits`, unless no limit is set,
+/// and checks that the limits hold there.
 pub fn enter_scope(limits: &Limits) -> Result<(), LimitsError> {
     if *limits == Limits::default() {
         return Ok(());
     }
-    let cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
-    if let Some(scope) = std::env::var_os(SCOPE_ENV) {
-        let scope = scope.to_string_lossy().into_owned();
-        let Some(path) = own_cgroup(&cgroup).filter(|p| p.ends_with(&format!("/{scope}"))) else {
-            return Err(LimitsError::NotInScope(scope));
-        };
-        return check_applied(
-            &Path::new(CGROUP_ROOT).join(path.trim_start_matches('/')),
-            limits,
-        );
+    if !is_cgroup2(Path::new(CGROUP_ROOT)) {
+        return Err(LimitsError::NotCgroup2);
     }
-    let systemd_run = std::env::var_os("PATH")
-        .and_then(|path| crate::net::find_program_in("systemd-run", &path))
-        .ok_or(LimitsError::NoSystemdRun)?;
-    let exe = std::env::current_exe().map_err(LimitsError::OwnExe)?;
+    let busctl = std::env::var_os("PATH")
+        .and_then(|path| crate::net::find_program_in("busctl", &path))
+        .ok_or(LimitsError::NoBusctl)?;
     let unit = unit_name();
-    let source = Command::new(&systemd_run)
-        .args(scope_args(limits, &unit))
-        .arg("--")
-        .arg(exe)
-        .args(std::env::args_os().skip(1))
-        .env(SCOPE_ENV, &unit)
-        .exec();
-    Err(LimitsError::Exec {
-        path: systemd_run,
-        source,
-    })
+    let refused = |why: String| LimitsError::Refused {
+        unit: unit.clone(),
+        why: crate::escape::escape_message(&why),
+    };
+    let out = Command::new(&busctl)
+        .args(busctl_args(limits, &unit, std::process::id()))
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| refused(format!("cannot run {busctl:?}: {e}")))?;
+    if !out.status.success() {
+        return Err(refused(
+            String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        ));
+    }
+    // The job runs after the call returns.
+    let deadline = Instant::now() + MOVE_TIMEOUT;
+    let path = loop {
+        let cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+        if let Some(path) = scope_path(&cgroup, &unit) {
+            break path.to_owned();
+        }
+        if Instant::now() > deadline {
+            return Err(LimitsError::NotInScope {
+                unit,
+                got: own_cgroup(&cgroup).unwrap_or("").to_owned(),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    check_applied(
+        &Path::new(CGROUP_ROOT).join(path.trim_start_matches('/')),
+        limits,
+    )
+}
+
+/// Whether `path` is the root of a cgroup v2 hierarchy.
+fn is_cgroup2(path: &Path) -> bool {
+    rustix::fs::statfs(path).is_ok_and(|s| s.f_type as u64 == libc::CGROUP2_SUPER_MAGIC as u64)
 }
 
 /// A unit name for a new scope: the prefix, the pid and the time, which
-/// no other scope of this user has.
+/// are unlikely to clash. systemd refuses a name it already has.
 fn unit_name() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -114,31 +135,64 @@ fn unit_name() -> String {
     format!("{UNIT_PREFIX}{}-{nanos}.scope", std::process::id())
 }
 
-/// `systemd-run`'s arguments for the scope `unit` with `limits`, up to the
-/// command.
-fn scope_args(limits: &Limits, unit: &str) -> Vec<OsString> {
-    let mut args: Vec<OsString> = ["--user", "--scope", "--quiet", "--collect", "--unit", unit]
-        .map(OsString::from)
-        .to_vec();
-    let mut property = |p: String| {
-        args.push("--property".into());
-        args.push(p.into());
-    };
+/// `busctl`'s arguments to start the scope `unit` holding `pid`, with
+/// `limits`. `CPUQuota=N%` is `CPUQuotaPerSecUSec` of N * 10000.
+fn busctl_args(limits: &Limits, unit: &str, pid: u32) -> Vec<String> {
+    let mut properties: Vec<[String; 3]> = vec![
+        ["PIDs".into(), "au".into(), format!("1 {pid}")],
+        [
+            "CollectMode".into(),
+            "s".into(),
+            "inactive-or-failed".into(),
+        ],
+    ];
     if let Some(pids) = limits.pids {
-        property(format!("TasksMax={pids}"));
+        properties.push(["TasksMax".into(), "t".into(), pids.to_string()]);
     }
     if let Some(memory) = limits.memory {
-        property(format!("MemoryMax={}", memory.bytes()));
+        properties.push(["MemoryMax".into(), "t".into(), memory.bytes().to_string()]);
     }
     if let Some(cpu) = limits.cpu {
-        property(format!("CPUQuota={}%", cpu.percent()));
+        properties.push([
+            "CPUQuotaPerSecUSec".into(),
+            "t".into(),
+            (u64::from(cpu.percent()) * 10_000).to_string(),
+        ]);
     }
+    let mut args: Vec<String> = [
+        "--user",
+        "--timeout=10",
+        "call",
+        "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+        "StartTransientUnit",
+        "ssa(sv)a(sa(sv))",
+        unit,
+        "fail",
+    ]
+    .map(String::from)
+    .to_vec();
+    args.push(properties.len().to_string());
+    for [name, signature, value] in properties {
+        args.push(name);
+        args.push(signature);
+        // `au` takes its count and items as separate arguments.
+        args.extend(value.split(' ').map(String::from));
+    }
+    // No auxiliary units.
+    args.push("0".into());
     args
 }
 
 /// The cgroup v2 path in `/proc/self/cgroup`'s contents, `cgroup`.
 fn own_cgroup(cgroup: &str) -> Option<&str> {
     cgroup.lines().find_map(|line| line.strip_prefix("0::"))
+}
+
+/// The cgroup path in `cgroup` if it is the scope `unit`.
+fn scope_path<'a>(cgroup: &'a str, unit: &str) -> Option<&'a str> {
+    own_cgroup(cgroup).filter(|path| path.rsplit('/').next() == Some(unit))
 }
 
 /// Checks that the cgroup at `dir` holds every limit in `limits`.
@@ -203,52 +257,91 @@ mod tests {
 
     #[test]
     fn no_limit_needs_no_scope() {
+        // Returns before looking for busctl or a cgroup.
         assert!(enter_scope(&Limits::default()).is_ok());
     }
 
     #[test]
     fn each_limit_becomes_a_property() {
-        let args = scope_args(
+        let args = busctl_args(
             &limits("pids = 64\nmemory = \"2G\"\ncpu = \"150%\""),
             "stopit-1-2.scope",
+            42,
         );
-        let args: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
         assert_eq!(
-            args,
+            args[..10],
             [
                 "--user",
-                "--scope",
-                "--quiet",
-                "--collect",
-                "--unit",
+                "--timeout=10",
+                "call",
+                "org.freedesktop.systemd1",
+                "/org/freedesktop/systemd1",
+                "org.freedesktop.systemd1.Manager",
+                "StartTransientUnit",
+                "ssa(sv)a(sa(sv))",
                 "stopit-1-2.scope",
-                "--property",
-                "TasksMax=64",
-                "--property",
-                "MemoryMax=2147483648",
-                "--property",
-                "CPUQuota=150%",
+                "fail",
+            ]
+        );
+        assert_eq!(
+            args[10..],
+            [
+                "5",
+                "PIDs",
+                "au",
+                "1",
+                "42",
+                "CollectMode",
+                "s",
+                "inactive-or-failed",
+                "TasksMax",
+                "t",
+                "64",
+                "MemoryMax",
+                "t",
+                "2147483648",
+                "CPUQuotaPerSecUSec",
+                "t",
+                "1500000",
+                "0",
             ]
         );
         // Only what is set.
-        let args = scope_args(&limits("pids = 1"), "u");
-        assert_eq!(args.len(), 8);
+        let args = busctl_args(&limits("pids = 1"), "u", 7);
+        assert_eq!(args[10], "3");
+        assert_eq!(args.len(), 10 + 1 + 4 + 3 + 3 + 1);
         assert!(unit_name().starts_with(UNIT_PREFIX));
         assert!(unit_name().ends_with(".scope"));
     }
 
     #[test]
-    fn the_v2_line_names_the_cgroup() {
+    fn the_scope_is_the_last_part_of_the_v2_path() {
+        let unit = "stopit-1-2.scope";
         assert_eq!(
-            own_cgroup("0::/user.slice/stopit-1-2.scope\n"),
-            Some("/user.slice/stopit-1-2.scope")
+            scope_path("0::/user.slice/app.slice/stopit-1-2.scope\n", unit),
+            Some("/user.slice/app.slice/stopit-1-2.scope")
         );
         // Hybrid hierarchies list v1 controllers too.
         assert_eq!(
-            own_cgroup("12:pids:/user.slice\n0::/a.scope\n"),
-            Some("/a.scope")
+            scope_path("12:pids:/user.slice\n0::/stopit-1-2.scope\n", unit),
+            Some("/stopit-1-2.scope")
         );
-        assert_eq!(own_cgroup("12:pids:/user.slice\n"), None);
+        for other in [
+            "0::/user.slice/tmux.scope\n",
+            "0::/user.slice/stopit-1-2.scope/child\n",
+            "0::/user.slice/xstopit-1-2.scope\n",
+            "0::/\n",
+            "12:pids:/stopit-1-2.scope\n",
+            "",
+        ] {
+            assert_eq!(scope_path(other, unit), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn the_hierarchy_must_be_cgroup2() {
+        assert!(!is_cgroup2(Path::new("/proc")));
+        assert!(!is_cgroup2(Path::new("/nonexistent")));
     }
 
     #[test]

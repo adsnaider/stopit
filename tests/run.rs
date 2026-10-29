@@ -4229,19 +4229,56 @@ fn jj_runs_through_the_broker_while_main_sees_no_metadata() {
 
 // --- Resource limits ---
 
-/// The user's session bus, for `systemd-run --user`, if the user's systemd
-/// runs scopes.
-fn user_bus() -> Option<String> {
-    let runtime = std::env::var("XDG_RUNTIME_DIR").ok()?;
-    let bus = format!("unix:path={runtime}/bus");
-    let ok = Command::new("systemd-run")
-        .args(["--user", "--scope", "--quiet", "--collect", "true"])
-        .env("DBUS_SESSION_BUS_ADDRESS", &bus)
+/// Whether the user's systemd starts transient scopes through `busctl`.
+fn user_systemd() -> bool {
+    Command::new("busctl")
+        .args([
+            "--user",
+            "call",
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.DBus.Peer",
+            "Ping",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .is_ok_and(|s| s.success());
-    ok.then_some(bus)
+        .is_ok_and(|s| s.success())
+}
+
+/// `s` with `[limits]` set to `limits`, and the user's bus in its private
+/// `XDG_RUNTIME_DIR`, where busctl looks for it.
+fn limits_setup(config: &str, limits: &str) -> Setup {
+    let s = Setup::with_config(&format!("{config}[limits]\n{limits}"));
+    let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+    symlink(runtime.join("bus"), s.runtime().join("bus")).unwrap();
+    s
+}
+
+/// The cgroup v2 directory of process `pid`.
+fn cgroup_of(pid: u32) -> PathBuf {
+    let text = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
+    let path = text
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .unwrap_or("");
+    PathBuf::from(format!("/sys/fs/cgroup{path}"))
+}
+
+/// Waits until process `pid` is in a stopit scope, and returns its
+/// directory.
+#[track_caller]
+fn wait_for_scope(pid: u32) -> PathBuf {
+    let deadline = Instant::now() + BWRAP_DEADLINE;
+    loop {
+        let cgroup = cgroup_of(pid);
+        let name = cgroup.file_name().unwrap_or_default().to_string_lossy();
+        if name.starts_with("stopit-") && name.ends_with(".scope") {
+            return cgroup;
+        }
+        assert!(Instant::now() < deadline, "not in a scope: {cgroup:?}");
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
@@ -4249,46 +4286,25 @@ fn limits_put_the_session_in_a_scope_of_its_own() {
     let Some(config) = shell_config() else {
         return;
     };
-    let Some(bus) = user_bus() else {
-        eprintln!("skipping: systemd-run --user --scope does not work here");
+    if !user_systemd() {
+        eprintln!("skipping: the user's systemd does not answer on its bus");
         return;
-    };
-    let s = Setup::with_config(&format!(
-        "{config}[limits]\npids = 24\nmemory = \"512M\"\ncpu = \"50%\"\n"
-    ));
-    // systemd-run finds the user's systemd through `XDG_RUNTIME_DIR`, which
-    // is the test's own here.
-    let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
-    for name in ["systemd", "bus"] {
-        symlink(runtime.join(name), s.runtime().join(name)).unwrap();
     }
+    let s = limits_setup(&config, "pids = 24\nmemory = \"512M\"\ncpu = \"50%\"\n");
+    // The shell's message for a fork that fails differs (dash: "Cannot
+    // fork", bash: "fork: retry"), but both say fork.
     let script =
         "sleep 2; i=0; while [ $i -lt 40 ]; do sleep 3 & i=$((i+1)); done; wait; echo ended";
-    let mut child = s
+    let child = s
         .stopit(&["run", "--quiet", "/bin/sh", "-c", script])
-        .env("DBUS_SESSION_BUS_ADDRESS", &bus)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    // stopit keeps its pid in the scope, whose limits are the ones asked.
-    let deadline = Instant::now() + BWRAP_DEADLINE;
-    let cgroup = loop {
-        let text = fs::read_to_string(format!("/proc/{}/cgroup", child.id())).unwrap_or_default();
-        let path = text
-            .lines()
-            .find_map(|l| l.strip_prefix("0::"))
-            .unwrap_or("");
-        if path.contains("/stopit-") && path.ends_with(".scope") {
-            break PathBuf::from(format!("/sys/fs/cgroup{path}"));
-        }
-        if Instant::now() > deadline || child.try_wait().unwrap().is_some() {
-            let _ = child.kill();
-            panic!("not in a scope: {text}: {:?}", child.wait_with_output());
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
+    // stopit itself moves into the scope, keeping its pid, and the scope
+    // has the limits asked.
+    let cgroup = wait_for_scope(child.id());
     let read = |file: &str| {
         fs::read_to_string(cgroup.join(file))
             .unwrap()
@@ -4298,6 +4314,13 @@ fn limits_put_the_session_in_a_scope_of_its_own() {
     assert_eq!(read("pids.max"), "24");
     assert_eq!(read("memory.max"), "536870912");
     assert_eq!(read("cpu.max"), "50000 100000");
+    assert!(
+        read("cgroup.procs")
+            .lines()
+            .any(|p| p == child.id().to_string()),
+        "{}",
+        read("cgroup.procs")
+    );
     let out = child.wait_with_output().unwrap();
     // Forks beyond the limit fail, and the session still ends.
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ended\n");
@@ -4308,15 +4331,64 @@ fn limits_put_the_session_in_a_scope_of_its_own() {
         "{out:?}"
     );
     assert!(s.no_session_left());
+    // The command reaches the sandbox byte for byte.
+    let out = output(
+        s.stopit(&[
+            "run", "--quiet", "printf", "%s|", "${HOME}", "$$", "$HOME", "$",
+        ]),
+        b"",
+    );
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "${HOME}|$$|$HOME|$|");
 }
 
 #[test]
-fn limits_without_systemd_run_fail_before_the_sandbox() {
+fn a_server_and_its_runs_share_one_scope() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    if !user_systemd() {
+        eprintln!("skipping: the user's systemd does not answer on its bus");
+        return;
+    }
+    let s = limits_setup(&config, "pids = 64\n");
+    let mut server = Server::start(&s);
+    let cgroup = wait_for_scope(server.pid() as u32);
+    assert_eq!(
+        fs::read_to_string(cgroup.join("pids.max")).unwrap().trim(),
+        "64"
+    );
+    // An attached run's sandbox starts in the server's scope.
+    let child = s
+        .stopit(&["run", "--quiet", "/bin/sh", "-c", "sleep 2"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + BWRAP_DEADLINE;
+    while fs::read_to_string(cgroup.join("cgroup.procs"))
+        .unwrap()
+        .lines()
+        .count()
+        < 2
+    {
+        assert!(Instant::now() < deadline, "the run is not in the scope");
+        thread::sleep(Duration::from_millis(20));
+    }
+    // The client stays where it was.
+    assert_ne!(cgroup_of(child.id()), cgroup);
+    assert_eq!(code(&finish(child)), 0);
+    assert_eq!(server.stop(), 128 + libc::SIGTERM);
+}
+
+#[test]
+fn limits_without_busctl_fail_before_the_session() {
     let Some(config) = shell_config() else {
         return;
     };
     let s = Setup::with_config(&format!("{config}[limits]\npids = 24\n"));
-    // A PATH with bwrap but no systemd-run.
+    // A PATH with bwrap but no busctl.
     let dir = TempDir::new().unwrap();
     let bwrap = std::env::var_os("PATH")
         .and_then(|path| {
@@ -4331,10 +4403,7 @@ fn limits_without_systemd_run_fail_before_the_sandbox() {
     let out = output(command, b"");
     assert_eq!(code(&out), 125, "{out:?}");
     assert!(out.stdout.is_empty(), "{out:?}");
-    assert!(
-        stderr(&out).contains("[limits] needs systemd-run"),
-        "{out:?}"
-    );
+    assert!(stderr(&out).contains("[limits] needs busctl"), "{out:?}");
     // Before any session directory.
     assert!(!s.runtime().join("stopit").exists());
 }
