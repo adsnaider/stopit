@@ -131,6 +131,77 @@ pub enum Op {
         #[serde(default)]
         stdin: Option<String>,
     },
+    /// Reads the `SIOCGIFFLAGS` interface flags of `lo`.
+    LoFlags,
+    /// Binds `127.0.0.1:0`, connects to it, and exchanges one byte.
+    TcpLoopbackRoundtrip,
+    /// Connects a Unix stream socket to the abstract address `\0<name>` and
+    /// closes it.
+    ConnectAbstract {
+        /// Abstract socket name after the leading NUL byte.
+        name: String,
+    },
+    /// Opens a raw socket with `socket(2)` and closes it on success.
+    Socket {
+        /// Address family such as `AF_UNIX`, `AF_INET`, or `AF_VSOCK`.
+        domain: i32,
+        /// Socket type such as `SOCK_STREAM` or `SOCK_RAW`.
+        ty: i32,
+        /// Protocol number within `domain`.
+        protocol: i32,
+    },
+    /// Invokes a raw syscall to observe whether seccomp or the kernel blocks
+    /// it.
+    Syscall {
+        /// Which syscall probe to invoke.
+        call: SyscallProbe,
+    },
+}
+
+/// Raw syscalls exercised by [`Op::Syscall`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyscallProbe {
+    /// `clone3(NULL, 0)`.
+    Clone3,
+    /// `unshare(CLONE_NEWUSER)`.
+    UnshareUser,
+    /// `clone(CLONE_NEWUSER | SIGCHLD, ...)`.
+    CloneNewuser,
+    /// `setns(-1, 0)`.
+    Setns,
+    /// `mount(NULL, NULL, NULL, 0, NULL)`.
+    Mount,
+    /// `umount2("/", 0)`.
+    Umount2,
+    /// `open_tree(-1, NULL, 0)`.
+    OpenTree,
+    /// `fsopen(NULL, 0)`.
+    Fsopen,
+    /// `io_uring_setup(0, NULL)`.
+    IoUringSetup,
+    /// `bpf(0, NULL, 0)`.
+    Bpf,
+    /// `perf_event_open(NULL, 0, -1, -1, 0)`.
+    PerfEventOpen,
+    /// `userfaultfd(0)`.
+    Userfaultfd,
+    /// `keyctl(0, 0, 0, 0, 0)`.
+    Keyctl,
+    /// `add_key(NULL, NULL, NULL, 0, 0)`.
+    AddKey,
+    /// `request_key(NULL, NULL, NULL, 0)`.
+    RequestKey,
+    /// `ptrace(PTRACE_TRACEME, 0, NULL, NULL)` in a short-lived child process.
+    PtraceTraceme,
+    /// `ioctl(0, TIOCSTI, "x")`.
+    IoctlTiocsti,
+    /// `ioctl(0, (1 << 32) | TIOCSTI, "x")`.
+    IoctlTiocstiHighBit,
+    /// `ioctl(0, TIOCLINUX, "x")`.
+    IoctlTioclinux,
+    /// `ioctl(0, (1 << 32) | TIOCLINUX, "x")`.
+    IoctlTioclinuxHighBit,
 }
 
 /// The result of one [`Op`]: what it observed, or why it failed.
@@ -173,6 +244,8 @@ pub enum Data {
     Mounts(String),
     /// [`Op::Exec`].
     Exec(ExecOutput),
+    /// [`Op::LoFlags`].
+    Flags(i32),
 }
 
 /// The kind of a directory entry.

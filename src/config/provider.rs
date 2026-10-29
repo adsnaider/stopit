@@ -339,10 +339,8 @@ mount = "/workspace"
 
 [approval]
 timeout = "off"
-masked_writes = "deny"
 
 [terminal]
-hotkey = "ctrl-]"
 clipboard_write = "block"
 
 # --- What the built-in default `config` provider grants ---

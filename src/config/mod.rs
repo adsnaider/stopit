@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
-use serde::{Deserialize, Deserializer, de::Error as _};
+use serde::Deserialize;
 use thiserror::Error;
 
 use crate::error::ValueError;
@@ -335,8 +335,6 @@ impl TryFrom<String> for CpuLimit {
 pub struct Approval {
     /// How long a pending approval waits before being auto-denied.
     pub timeout: ApprovalTimeout,
-    /// What to do about writes to masked files.
-    pub masked_writes: MaskedWrites,
 }
 
 /// Deserialization shape of [`Approval`]; see [`MapOnly`].
@@ -344,14 +342,12 @@ pub struct Approval {
 #[serde(deny_unknown_fields, default)]
 struct RawApproval {
     timeout: ApprovalTimeout,
-    masked_writes: MaskedWrites,
 }
 
 impl From<MapOnly<RawApproval>> for Approval {
     fn from(MapOnly(raw): MapOnly<RawApproval>) -> Self {
         Approval {
             timeout: raw.timeout,
-            masked_writes: raw.masked_writes,
         }
     }
 }
@@ -408,73 +404,27 @@ impl TryFrom<String> for ApprovalTimeout {
     }
 }
 
-/// Policy for writes to masked files (DESIGN.md §4.3).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MaskedWrites {
-    /// Deny without prompting.
-    #[default]
-    Deny,
-    /// Prompt the user.
-    Ask,
-}
-
 /// `[terminal]` table (DESIGN.md §5).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(from = "MapOnly<RawTerminal>")]
 pub struct Terminal {
-    /// Key that opens the supervisor menu. Not parsed yet; must be non-empty.
-    pub hotkey: String,
     /// Policy for OSC 52 clipboard writes (§5.3).
     pub clipboard_write: ClipboardWrite,
 }
 
-impl Default for Terminal {
-    fn default() -> Self {
-        Terminal {
-            hotkey: "ctrl-]".to_owned(),
-            clipboard_write: ClipboardWrite::default(),
-        }
-    }
-}
-
 /// Deserialization shape of [`Terminal`]; see [`MapOnly`].
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct RawTerminal {
-    #[serde(deserialize_with = "deserialize_hotkey")]
-    hotkey: String,
     clipboard_write: ClipboardWrite,
-}
-
-impl Default for RawTerminal {
-    fn default() -> Self {
-        let Terminal {
-            hotkey,
-            clipboard_write,
-        } = Terminal::default();
-        RawTerminal {
-            hotkey,
-            clipboard_write,
-        }
-    }
 }
 
 impl From<MapOnly<RawTerminal>> for Terminal {
     fn from(MapOnly(raw): MapOnly<RawTerminal>) -> Self {
         Terminal {
-            hotkey: raw.hotkey,
             clipboard_write: raw.clipboard_write,
         }
     }
-}
-
-fn deserialize_hotkey<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    let s = String::deserialize(d)?;
-    if s.is_empty() {
-        return Err(D::Error::custom("invalid hotkey \"\": must not be empty"));
-    }
-    Ok(s)
 }
 
 /// Policy for OSC 52 clipboard writes from the sandbox (DESIGN.md §5.3).
@@ -507,10 +457,8 @@ mod tests {
             },
             approval: Approval {
                 timeout: ApprovalTimeout::Off,
-                masked_writes: MaskedWrites::Deny,
             },
             terminal: Terminal {
-                hotkey: "ctrl-]".to_owned(),
                 clipboard_write: ClipboardWrite::Block,
             },
             profiles: BTreeMap::new(),
@@ -553,10 +501,8 @@ mod tests {
 
             [approval]
             timeout = "5m"
-            masked_writes = "ask"
 
             [terminal]
-            hotkey = "ctrl-]"
             clipboard_write = "ask"
         "#;
         let expected = Config {
@@ -571,10 +517,8 @@ mod tests {
             },
             approval: Approval {
                 timeout: ApprovalTimeout::After(Duration::from_secs(300)),
-                masked_writes: MaskedWrites::Ask,
             },
             terminal: Terminal {
-                hotkey: "ctrl-]".to_owned(),
                 clipboard_write: ClipboardWrite::Ask,
             },
             profiles: BTreeMap::new(),
@@ -591,9 +535,7 @@ mod tests {
             mount = "/workspace"
             [approval]
             timeout = "off"
-            masked_writes = "deny"
             [terminal]
-            hotkey = "ctrl-]"
             clipboard_write = "block"
         "#;
         let cfg = Config::from_toml_str(src).unwrap();
@@ -611,13 +553,6 @@ mod tests {
         for (s, v) in [("default", Base::Default), ("none", Base::None)] {
             let cfg = Config::from_toml_str(&format!("base = \"{s}\"")).unwrap();
             assert_eq!(cfg.base, v);
-        }
-        for (s, v) in [("deny", MaskedWrites::Deny), ("ask", MaskedWrites::Ask)] {
-            let src = format!("[approval]\nmasked_writes = \"{s}\"");
-            assert_eq!(
-                Config::from_toml_str(&src).unwrap().approval.masked_writes,
-                v
-            );
         }
         for (s, v) in [
             ("block", ClipboardWrite::Block),
@@ -640,8 +575,6 @@ mod tests {
         for src in [
             "base = \"all\"",
             "base = \"Default\"",
-            "[approval]\nmasked_writes = \"allow\"",
-            "[approval]\nmasked_writes = \"Deny\"",
             "[terminal]\nclipboard_write = \"yes\"",
             "[terminal]\nclipboard_write = \"BLOCK\"",
         ] {
@@ -841,20 +774,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_hotkey_is_rejected() {
-        let msg = err("[terminal]\nhotkey = \"\"");
-        assert!(msg.contains("hotkey"), "{msg}");
-        let cfg = Config::from_toml_str("[terminal]\nhotkey = \"ctrl-a\"").unwrap();
-        assert_eq!(cfg.terminal.hotkey, "ctrl-a");
-    }
-
-    #[test]
     fn unknown_keys_are_rejected() {
         for (src, key) in [
             ("bse = \"none\"", "bse"),
             ("[workspace]\nmoutn = \"/w\"", "moutn"),
             ("[limits]\npid = 4", "pid"),
             ("[approval]\ntimout = \"5m\"", "timout"),
+            ("[approval]\nmasked_writes = \"deny\"", "masked_writes"),
+            ("[terminal]\nhotkey = \"ctrl-]\"", "hotkey"),
             ("[terminal]\nhotkeys = \"x\"", "hotkeys"),
             ("[unknown]\nx = 1", "unknown"),
             ("[[providers]]\ntype = \"config\"", "providers"),
@@ -872,9 +799,9 @@ mod tests {
             "workspace = [\"/w\"]",
             "workspace = []",
             "approval = []",
-            "approval = [\"5m\", \"deny\"]",
+            "approval = [\"5m\"]",
             "terminal = []",
-            "terminal = [\"ctrl-]\", \"block\"]",
+            "terminal = [\"block\"]",
             "profiles = []",
             "profiles = [\"harness\"]",
             "[profiles]\nharness = []",

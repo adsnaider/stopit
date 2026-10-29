@@ -7,7 +7,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize, Serializer};
 
 use crate::error::ValueError;
 use crate::serde_util::MapOnly;
@@ -147,6 +147,12 @@ impl OptInSyscall {
             OptInSyscall::Bpf => "bpf",
             OptInSyscall::Keyctl => "keyctl",
         }
+    }
+}
+
+impl Serialize for OptInSyscall {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
     }
 }
 
@@ -349,6 +355,9 @@ mod tests {
             assert_eq!(sc.to_string(), name);
             assert_eq!(sc.as_str(), name);
             assert_eq!(OptInSyscall::try_from(name.to_owned()).unwrap(), *sc);
+            let json = serde_json::to_string(sc).unwrap();
+            assert_eq!(json, format!("{name:?}"));
+            assert_eq!(serde_json::from_str::<OptInSyscall>(&json).unwrap(), *sc);
             let m = toml_ok(&format!("sandbox.allow_syscalls = [{name:?}]"));
             assert_eq!(m.grants.sandbox.allow_syscalls, vec![*sc]);
             let j = jv_ok(&format!(r#""sandbox": {{"allow_syscalls": [{name:?}]}}"#));

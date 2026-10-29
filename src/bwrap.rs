@@ -29,17 +29,22 @@
 //! `--json-status-fd FD` with a non-blocking pipe so the supervisor can tell
 //! bwrap setup failures apart from the sandboxed command's exit status.
 //!
-//! In the forked child before `exec`, `pre_exec` reopens each memfd from the
-//! start, duplicates the memfds, bind descriptors, and optional status pipe
-//! onto their target numbers without `FD_CLOEXEC`, and calls `close_range`
-//! with `CLOSE_RANGE_CLOEXEC` on every other descriptor above stdio so parent
-//! descriptors never leak into bwrap.
+//! In the forked child before `exec`, `pre_exec` first calls `close_range`
+//! with `CLOSE_RANGE_CLOEXEC` on every open descriptor above stdio
+//! (`3..=u32::MAX`) so parent descriptors never leak into bwrap. Next it
+//! reopens each memfd through `/proc/self/fd/N` at offset 0 and moves it onto
+//! its target number with `dup2`, clearing `FD_CLOEXEC`. Finally `fcntl` with
+//! `F_SETFD` clears `FD_CLOEXEC` in place on each `O_PATH` bind descriptor and
+//! any status pipe descriptor.
 //!
-//! [`BwrapCommand::for_init`] runs `stopit __init` (step 8): the target's
-//! environment goes in one more sealed memfd, inherited the same way, which
-//! bwrap does not read but passes on to `__init` (it passes every inherited
-//! descriptor through to its command), and whose number `__init` is given
-//! on its argv (`__init --env-fd N -- <cmd…>`).
+//! [`BwrapCommand::for_init`] runs `stopit __init` (step 8). The target's
+//! environment and the JSON [`init::InitSpec`] go into two more sealed memfds
+//! that bwrap passes through to `__init`, named on its argv as
+//! `__init --env-fd N --spec-fd M -- <cmd...>`. When `InitSpec::lo_down` is
+//! set, `for_init` also passes `--cap-add CAP_SYS_ADMIN --cap-add CAP_NET_ADMIN
+//! --cap-add CAP_SETPCAP` so `__init` can unshare into a fresh network
+//! namespace inside bwrap's inner user namespace, verify `lo` is down, and
+//! clear its capability bounding set before running the target.
 //!
 //! bwrap leaves its root tmpfs writable; the last option remounts it
 //! read-only (step 2), so the sandbox writes only where a mount lets it.
@@ -63,7 +68,7 @@ use thiserror::Error;
 use crate::config::ProviderName;
 use crate::etc::{self, SandboxIds};
 use crate::expand::EntryKind;
-use crate::init::{self, EnvError};
+use crate::init::{self, EnvError, SpecError};
 use crate::manifest::{DevMode, ShareableNamespace};
 use crate::policy::PathMode;
 use crate::provision::Provisioned;
@@ -266,6 +271,10 @@ pub enum BwrapError {
     #[error("cannot pass the environment to the sandbox: {0}")]
     Env(#[source] EnvError),
 
+    /// The init policy specification cannot be handed to `__init`.
+    #[error("cannot pass the init specification to the sandbox: {0}")]
+    Spec(#[source] SpecError),
+
     /// `__init` was given no command to run.
     #[error("no command to run in the sandbox")]
     NoCommand,
@@ -275,14 +284,11 @@ pub enum BwrapError {
 ///
 /// Until the supervisor runs sandboxes on a PTY of its own (DESIGN.md §5.1),
 /// their stdio is the host's, and so may be the controlling terminal they
-/// inherit. A process with access to the host terminal can push input into
-/// it with `TIOCSTI` on kernels that allow it, and seccomp, which will block
-/// that ioctl (§6.3 step 4), is not installed yet. bwrap's `--new-session`
-/// runs the sandbox in a new session, with no controlling terminal, where
-/// `TIOCSTI` on the host terminal fails. The kernel's job control then no
-/// longer covers the sandbox, so the supervisor disables it (Ctrl-Z is
-/// ignored, a background start refused); it is only used while the sandbox
-/// can reach a terminal, and goes away with the PTY (§6.2 step 1).
+/// inherit. Seccomp blocks `TIOCSTI` and `TIOCLINUX` (§6.3 step 4), and
+/// bwrap's `--new-session` also detaches the sandbox from the caller's
+/// controlling terminal so `/dev/tty` and foreground process-group operations
+/// cannot reach the host session. The kernel's job control then no longer
+/// covers the sandbox, so the supervisor disables it until the PTY lands.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TerminalSession {
     /// Stay in the caller's session (no `--new-session`).
@@ -323,6 +329,9 @@ pub struct BwrapCommand {
     /// The memfd holding the target's environment for `__init`, if the
     /// command runs it ([`for_init`](Self::for_init)).
     env_fd: Option<OwnedFd>,
+    /// The memfd holding the JSON [`init::InitSpec`] for `__init`, if the
+    /// command runs it ([`for_init`](Self::for_init)).
+    spec_fd: Option<OwnedFd>,
     /// Mount count and largest provider for [`BwrapError::TooManyArgs`].
     mounts_summary: (usize, Option<ProviderName>, usize),
 }
@@ -330,16 +339,15 @@ pub struct BwrapCommand {
 impl BwrapCommand {
     /// Builds the bwrap invocation that runs `stopit __init` in the sandbox
     /// `spec` of `session`, through the stopit binary `provisioned` into the
-    /// session directory, starting in `cwd` (see [`working_dir`]); `__init`
-    /// then runs `target` (its argv, `target[0]` being the command) with
-    /// exactly the environment `env` (DESIGN.md §6.2 steps 7 and 8, §6.3).
+    /// session directory, starting in `cwd` (see [`working_dir`]). `__init`
+    /// then enforces [`init::InitSpec`] and runs `target` with the environment
+    /// `env` (DESIGN.md §6.2 steps 7 and 8, §6.3).
     ///
-    /// `env` is put in a sealed memfd ([`init::encode_env`]) that bwrap
-    /// passes on to `__init`, whose number the command names:
-    /// `<prefix> __init --env-fd N -- <target…>`. Its names must be
-    /// non-empty, unique and free of `=` and NUL, its values free of NUL.
+    /// `env` and the compiled [`init::InitSpec`] are written to sealed memfds
+    /// that bwrap passes through to `__init`, named on its argv as
+    /// `<prefix> __init --env-fd N --spec-fd M -- <target...>`.
     ///
-    /// `terminal` says whether the sandbox gets a new session (see
+    /// `terminal` selects whether bwrap creates a new session (see
     /// [`TerminalSession`]).
     pub fn for_init(
         spec: &SandboxSpec,
@@ -355,18 +363,30 @@ impl BwrapCommand {
         }
         let encoded = init::encode_env(env.iter().map(|(k, v)| (k, v))).map_err(BwrapError::Env)?;
         let env_fd = sealed_memfd("stopit-init-env", &encoded).map_err(BwrapError::DataFd)?;
-        let argv = init::init_argv(env_fd.as_raw_fd(), target);
-        let mut command = Self::new(spec, session, provisioned, cwd, &argv, terminal)?;
+        let init_spec = init::InitSpec::from_sandbox_spec(spec);
+        let encoded_spec = init::encode_spec(&init_spec).map_err(BwrapError::Spec)?;
+        let spec_fd =
+            sealed_memfd("stopit-init-spec", &encoded_spec).map_err(BwrapError::DataFd)?;
+        let argv = init::init_argv(env_fd.as_raw_fd(), spec_fd.as_raw_fd(), target);
+        let mut command = Self::build(
+            spec,
+            session,
+            provisioned,
+            cwd,
+            &argv,
+            terminal,
+            init_spec.lo_down,
+        )?;
         command.env_fd = Some(env_fd);
+        command.spec_fd = Some(spec_fd);
         Ok(command)
     }
 
     /// Builds the bwrap invocation that runs `argv_after_prefix` in the
     /// sandbox `spec` of `session`, through the binary `provisioned` into
     /// the session directory, starting in `cwd` (see [`working_dir`]).
-    /// [`for_init`](Self::for_init) is what runs stopit's `__init`; this
-    /// runs any provisioned binary with any arguments (the tests run a probe
-    /// in stopit's place).
+    /// [`for_init`](Self::for_init) runs `stopit __init`, while `new` runs any
+    /// provisioned binary directly without `--cap-add`.
     ///
     /// Creates each ephemeral mount's backing directory if missing, and the
     /// memfds the arguments name.
@@ -377,6 +397,26 @@ impl BwrapCommand {
         cwd: &Path,
         argv_after_prefix: &[OsString],
         terminal: TerminalSession,
+    ) -> Result<BwrapCommand, BwrapError> {
+        Self::build(
+            spec,
+            session,
+            provisioned,
+            cwd,
+            argv_after_prefix,
+            terminal,
+            false,
+        )
+    }
+
+    fn build(
+        spec: &SandboxSpec,
+        session: &SessionDir,
+        provisioned: &Provisioned,
+        cwd: &Path,
+        argv_after_prefix: &[OsString],
+        terminal: TerminalSession,
+        retain_init_caps: bool,
     ) -> Result<BwrapCommand, BwrapError> {
         let runtime = RuntimeBinds {
             exe: provisioned.exe().to_path_buf(),
@@ -399,7 +439,7 @@ impl BwrapCommand {
                 untrusted_roots.insert(canon);
             }
         }
-        let plan = plan(
+        let plan = plan_with_caps(
             spec,
             &untrusted_roots,
             &runtime,
@@ -407,6 +447,7 @@ impl BwrapCommand {
             cwd,
             argv_after_prefix,
             terminal,
+            retain_init_caps,
             &|path| path.symlink_metadata().is_ok(),
             &|path| Some(fs::symlink_metadata(path)),
             &mut |sandbox, key| {
@@ -445,6 +486,7 @@ impl BwrapCommand {
             data_fds,
             bind_fds,
             env_fd: None,
+            spec_fd: None,
             mounts_summary: (spec.mounts.len(), provider, provider_mounts),
         })
     }
@@ -470,15 +512,22 @@ impl BwrapCommand {
         self.env_fd.as_ref().map(AsRawFd::as_raw_fd)
     }
 
-    /// Every descriptor bwrap inherits: [`args_fd`](Self::args_fd), then
-    /// the data descriptors in the order the arguments name them, then
-    /// the bind descriptors in the order the arguments name them, then
-    /// [`env_fd`](Self::env_fd) if any.
+    /// The descriptor holding the JSON [`init::InitSpec`] for `__init`, if the
+    /// command runs it ([`for_init`](Self::for_init)).
+    pub fn spec_fd(&self) -> Option<RawFd> {
+        self.spec_fd.as_ref().map(AsRawFd::as_raw_fd)
+    }
+
+    /// Every descriptor bwrap inherits: [`args_fd`](Self::args_fd), then the
+    /// data descriptors in argument order, then the bind descriptors in
+    /// argument order, then [`env_fd`](Self::env_fd) and
+    /// [`spec_fd`](Self::spec_fd) if present.
     pub fn inherited_fds(&self) -> Vec<RawFd> {
         std::iter::once(&self.args_fd)
             .chain(&self.data_fds)
             .chain(&self.bind_fds)
             .chain(&self.env_fd)
+            .chain(&self.spec_fd)
             .map(AsRawFd::as_raw_fd)
             .collect()
     }
@@ -528,10 +577,11 @@ impl BwrapCommand {
             .arg(self.args_fd.as_raw_fd().to_string())
             .arg("--")
             .args(&self.command);
-        // Built before the fork: the child must not allocate.
+        // Built before the fork so the child never allocates.
         let mut reopen_fds: Vec<(OwnedFd, CString)> = std::iter::once(self.args_fd)
             .chain(self.data_fds)
             .chain(self.env_fd)
+            .chain(self.spec_fd)
             .map(|fd| {
                 let path = CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd()))
                     .expect("no NUL in a number");
@@ -811,6 +861,7 @@ fn checked(arg: &OsStr) -> Result<OsString, BwrapError> {
 /// provides the backing directory of an ephemeral mount at a sandbox path.
 // The host-dependent inputs are parameters so that the unit tests can fake
 // them; grouping them would only rename the list.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn plan(
     spec: &SandboxSpec,
@@ -820,6 +871,35 @@ fn plan(
     cwd: &Path,
     argv_after_prefix: &[OsString],
     terminal: TerminalSession,
+    proc_has: &dyn Fn(&Path) -> bool,
+    host_meta: &dyn Fn(&Path) -> Option<io::Result<fs::Metadata>>,
+    ephemeral_dir: &mut dyn FnMut(&Path, &EphemeralKey) -> Result<PathBuf, BwrapError>,
+) -> Result<Plan, BwrapError> {
+    plan_with_caps(
+        spec,
+        untrusted_roots,
+        runtime,
+        ids,
+        cwd,
+        argv_after_prefix,
+        terminal,
+        false,
+        proc_has,
+        host_meta,
+        ephemeral_dir,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_with_caps(
+    spec: &SandboxSpec,
+    untrusted_roots: &BTreeSet<PathBuf>,
+    runtime: &RuntimeBinds,
+    ids: SandboxIds,
+    cwd: &Path,
+    argv_after_prefix: &[OsString],
+    terminal: TerminalSession,
+    retain_init_caps: bool,
     proc_has: &dyn Fn(&Path) -> bool,
     host_meta: &dyn Fn(&Path) -> Option<io::Result<fs::Metadata>>,
     ephemeral_dir: &mut dyn FnMut(&Path, &EphemeralKey) -> Result<PathBuf, BwrapError>,
@@ -858,11 +938,17 @@ fn plan(
             plan.push([flag])?;
         }
     }
-    // TODO(§8, §11): bwrap brings `lo` up in a new network namespace; for
-    // `network = "none"` it must be taken down again (by `__init`, before
-    // seccomp, or by a netlink call from the supervisor into the namespace).
-    // Until then `none` behaves like `loopback`.
     plan.push(["--disable-userns", "--die-with-parent"])?;
+    if retain_init_caps {
+        plan.push([
+            "--cap-add",
+            "CAP_SYS_ADMIN",
+            "--cap-add",
+            "CAP_NET_ADMIN",
+            "--cap-add",
+            "CAP_SETPCAP",
+        ])?;
+    }
     // TODO(§5.1, Phase 2): once the sandbox's stdio is a PTY of the
     // supervisor's, `__init` sets up the controlling terminal (§6.3 step 1)
     // and `--new-session` is never used. Until then it keeps the sandbox off
@@ -2504,11 +2590,14 @@ mod tests {
     }
 
     #[test]
-    fn for_init_runs_init_with_the_env_fd_on_its_argv() {
+    fn for_init_runs_init_with_env_and_spec_fds_on_its_argv() {
         let f = Fixture::new();
         let env = vars(&[("PATH", "/bin"), ("A", "x=y z")]);
+        let sb = spec(vec![host("/a", "/h/a", EntryKind::File, Masked)]);
         let cmd = init_command(&f, &env, &["sh", "--", "-c"]).unwrap();
         let env_fd = cmd.env_fd().expect("an environment descriptor");
+        let spec_fd = cmd.spec_fd().expect("a spec descriptor");
+        assert_ne!(env_fd, spec_fd);
         assert_eq!(
             cmd.command(),
             [
@@ -2519,6 +2608,8 @@ mod tests {
                 "__init",
                 "--env-fd",
                 &env_fd.to_string(),
+                "--spec-fd",
+                &spec_fd.to_string(),
                 "--",
                 "sh",
                 "--",
@@ -2528,24 +2619,46 @@ mod tests {
         // Inherited last, after the `--args` and data descriptors, all
         // distinct.
         let fds = cmd.inherited_fds();
-        assert_eq!(fds.len(), 3);
-        assert_eq!(fds.last(), Some(&env_fd));
-        assert_eq!(fds.iter().collect::<BTreeSet<_>>().len(), 3);
+        assert_eq!(fds.len(), 4);
+        assert_eq!(&fds[fds.len() - 2..], &[env_fd, spec_fd]);
+        assert_eq!(fds.iter().collect::<BTreeSet<_>>().len(), 4);
         assert!(env_fd >= MIN_FD);
-        // bwrap does not read it: no argument names it.
-        let number = OsString::from(env_fd.to_string());
-        assert!(!cmd.args().contains(&number));
+        assert!(spec_fd >= MIN_FD);
+        // bwrap does not read either init descriptor.
+        for init_fd in [env_fd, spec_fd] {
+            let number = OsString::from(init_fd.to_string());
+            assert!(!cmd.args().contains(&number));
+        }
+        // `network = "none"` with unshared `net` retains CAP_SYS_ADMIN,
+        // CAP_NET_ADMIN, and CAP_SETPCAP for `__init` to create an inner netns
+        // with `lo` down and clear its bounding set.
+        assert!(cmd.args().windows(6).any(|w| {
+            w == [
+                OsStr::new("--cap-add"),
+                OsStr::new("CAP_SYS_ADMIN"),
+                OsStr::new("--cap-add"),
+                OsStr::new("CAP_NET_ADMIN"),
+                OsStr::new("--cap-add"),
+                OsStr::new("CAP_SETPCAP"),
+            ]
+        }));
 
         assert_eq!(read_fd(env_fd), b"PATH=/bin\0A=x=y z\0");
-        // SAFETY: `cmd` owns `env_fd` and outlives the borrow.
-        let borrowed = unsafe { BorrowedFd::borrow_raw(env_fd) };
-        assert!(
-            rustix::io::fcntl_getfd(borrowed)
-                .unwrap()
-                .contains(rustix::io::FdFlags::CLOEXEC)
+        assert_eq!(
+            init::decode_spec(&read_fd(spec_fd)).unwrap(),
+            init::InitSpec::from_sandbox_spec(&sb)
         );
-        let seals = rustix::fs::fcntl_get_seals(borrowed).unwrap();
-        assert!(seals.contains(SealFlags::WRITE | SealFlags::GROW | SealFlags::SEAL));
+        for init_fd in [env_fd, spec_fd] {
+            // SAFETY: `cmd` owns both descriptors and outlives the borrow.
+            let borrowed = unsafe { BorrowedFd::borrow_raw(init_fd) };
+            assert!(
+                rustix::io::fcntl_getfd(borrowed)
+                    .unwrap()
+                    .contains(rustix::io::FdFlags::CLOEXEC)
+            );
+            let seals = rustix::fs::fcntl_get_seals(borrowed).unwrap();
+            assert!(seals.contains(SealFlags::WRITE | SealFlags::GROW | SealFlags::SEAL));
+        }
 
         // And it reaches the child with the others.
         let command = cmd.into_command();
@@ -2556,6 +2669,42 @@ mod tests {
     }
 
     #[test]
+    fn for_init_adds_caps_only_when_lo_down_is_needed() {
+        let f = Fixture::new();
+        let target = [OsString::from("/bin/true")];
+
+        let mut loopback = SandboxSpec {
+            network: NetworkSpec::Loopback,
+            ..SandboxSpec::default()
+        };
+        let cmd_loopback = BwrapCommand::for_init(
+            &loopback,
+            &f.session,
+            &f.provisioned,
+            Path::new("/"),
+            &[],
+            &target,
+            TerminalSession::Keep,
+        )
+        .unwrap();
+        assert!(!cmd_loopback.args().contains(&OsString::from("--cap-add")));
+
+        loopback.network = NetworkSpec::None;
+        loopback.namespaces.shared.insert(ShareableNamespace::Net);
+        let cmd_shared_net = BwrapCommand::for_init(
+            &loopback,
+            &f.session,
+            &f.provisioned,
+            Path::new("/"),
+            &[],
+            &target,
+            TerminalSession::Keep,
+        )
+        .unwrap();
+        assert!(!cmd_shared_net.args().contains(&OsString::from("--cap-add")));
+    }
+
+    #[test]
     fn for_init_with_an_empty_environment() {
         let f = Fixture::new();
         let cmd = init_command(&f, &[], &["/bin/true"]).unwrap();
@@ -2563,11 +2712,13 @@ mod tests {
     }
 
     #[test]
-    fn new_has_no_env_fd() {
+    fn new_has_no_init_fds_or_caps() {
         let f = Fixture::new();
         let cmd = f.command(&SandboxSpec::default());
         assert_eq!(cmd.env_fd(), None);
+        assert_eq!(cmd.spec_fd(), None);
         assert_eq!(cmd.inherited_fds(), [cmd.args_fd()]);
+        assert!(!cmd.args().contains(&OsString::from("--cap-add")));
     }
 
     #[test]

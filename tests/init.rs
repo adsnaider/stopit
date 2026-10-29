@@ -10,7 +10,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -542,23 +542,432 @@ fn bad_init_arguments_fail_before_running_anything() {
         .unwrap();
         run_bwrap(cmd.into_command(), None)
     };
-    let out = run(&["__init", "--env-fd", "x", "--", "/proc"]);
+    let out = run(&["__init", "--env-fd", "x", "--spec-fd", "4", "--", "/proc"]);
     assert_eq!(code(&out), i32::from(EXIT_INIT_FAILED), "{out:?}");
     assert!(
         stderr(&out).starts_with("stopit __init: --env-fd \"x\" is not a descriptor number"),
         "{out:?}"
     );
-    let out = run(&["__init", "--env-fd", "3", "--"]);
+    let out = run(&["__init", "--env-fd", "3", "--", "/proc"]);
+    assert_eq!(code(&out), i32::from(EXIT_INIT_FAILED), "{out:?}");
+    assert!(
+        stderr(&out).contains("expected --spec-fd M after --env-fd N"),
+        "{out:?}"
+    );
+    let out = run(&["__init", "--env-fd", "3", "--spec-fd", "3", "--", "/proc"]);
+    assert_eq!(code(&out), i32::from(EXIT_INIT_FAILED), "{out:?}");
+    assert!(
+        stderr(&out).contains("name the same descriptor 3"),
+        "{out:?}"
+    );
+    let out = run(&["__init", "--env-fd", "3", "--spec-fd", "4", "--"]);
     assert_eq!(code(&out), i32::from(EXIT_INIT_FAILED), "{out:?}");
     assert!(stderr(&out).contains("no command after --"), "{out:?}");
-    // A number that cannot be open: far above any RLIMIT_NOFILE. A small one
-    // such as 42 can be one of the command's own descriptors, which the
-    // spawn moves onto their numbers in the child.
-    let out = run(&["__init", "--env-fd", "2147483647", "--", "/proc"]);
+    // Descriptor numbers far above RLIMIT_NOFILE cannot collide with bwrap's
+    // own inherited descriptors.
+    let out = run(&[
+        "__init",
+        "--env-fd",
+        "2147483646",
+        "--spec-fd",
+        "2147483647",
+        "--",
+        "/proc",
+    ]);
     assert_eq!(code(&out), i32::from(EXIT_INIT_FAILED), "{out:?}");
     assert!(
         stderr(&out)
-            .starts_with("stopit __init: cannot read the environment from descriptor 2147483647"),
+            .starts_with("stopit __init: cannot read the environment from descriptor 2147483646"),
         "{out:?}"
     );
+}
+
+// --- Network loopback teardown and capability zeroing ---
+
+/// Asserts that all five capability masks in `/proc/self/status` are zero.
+#[track_caller]
+fn assert_all_capabilities_zero(status: &str) {
+    for field in ["CapInh:", "CapPrm:", "CapEff:", "CapBnd:", "CapAmb:"] {
+        let value = status
+            .lines()
+            .find_map(|line| line.strip_prefix(field))
+            .unwrap_or_else(|| panic!("missing {field} in status:\n{status}"))
+            .trim();
+        assert_eq!(value, "0000000000000000", "{field} non-zero in:\n{status}");
+    }
+}
+
+#[test]
+fn network_none_takes_loopback_down_blocks_tcp_and_zeros_capabilities() {
+    let init = Init::new();
+    let results = init.probe(
+        &[],
+        &[],
+        &[
+            Op::LoFlags,
+            Op::TcpLoopbackRoundtrip,
+            read("/proc/self/status"),
+        ],
+    );
+    let Data::Flags(flags) = ok(&results[0]) else {
+        panic!("expected flags, got {:?}", results[0]);
+    };
+    assert_eq!(
+        flags & libc::IFF_UP,
+        0,
+        "expected lo down for network = none, got flags {flags:#x}"
+    );
+    let tcp_err = errno(&results[1]);
+    assert!(
+        matches!(tcp_err, "EACCES" | "ENETUNREACH" | "EADDRNOTAVAIL"),
+        "unexpected loopback TCP error: {:?}",
+        results[1]
+    );
+    assert_all_capabilities_zero(contents(&results[2]));
+}
+
+#[test]
+fn network_loopback_keeps_lo_up_allows_tcp_and_zeros_capabilities() {
+    let mut init = Init::new();
+    init.spec = init
+        .f
+        .compile(&init_config(&[], "network = { mode = \"loopback\" }"));
+    let results = init.probe(
+        &[],
+        &[],
+        &[
+            Op::LoFlags,
+            Op::TcpLoopbackRoundtrip,
+            read("/proc/self/status"),
+        ],
+    );
+    let Data::Flags(flags) = ok(&results[0]) else {
+        panic!("expected flags, got {:?}", results[0]);
+    };
+    assert_ne!(
+        flags & libc::IFF_UP,
+        0,
+        "expected lo up for network = loopback, got flags {flags:#x}"
+    );
+    assert_eq!(ok(&results[1]), &Data::Done);
+    assert_all_capabilities_zero(contents(&results[2]));
+}
+
+// --- Seccomp enforcement ---
+
+#[test]
+fn seccomp_blocks_clone3_with_enosys_while_child_spawning_works() {
+    let init = Init::new();
+    let mut nested_cmd = init.probe.clone();
+    let nested_prog = nested_cmd.remove(0).into_string().unwrap();
+    let nested_args: Vec<String> = nested_cmd
+        .into_iter()
+        .map(|a| a.into_string().unwrap())
+        .collect();
+    let nested_stdin = serde_json::to_string(&[Op::Cwd]).unwrap();
+
+    let results = init.probe(
+        &[],
+        &[],
+        &[
+            Op::Syscall {
+                call: SyscallProbe::Clone3,
+            },
+            Op::Exec {
+                path: nested_prog,
+                args: nested_args,
+                stdin: Some(nested_stdin),
+            },
+        ],
+    );
+    assert_eq!(errno(&results[0]), "ENOSYS");
+    let Data::Exec(out) = ok(&results[1]) else {
+        panic!("expected exec output, got {:?}", results[1]);
+    };
+    assert_eq!(out.code, Some(0), "{out:?}");
+    let nested: Vec<OpResult> = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(nested, [Ok(Data::Cwd("/".into()))]);
+}
+
+#[test]
+fn seccomp_blocks_namespace_and_mount_syscalls() {
+    let init = Init::new();
+    let probes = [
+        SyscallProbe::UnshareUser,
+        SyscallProbe::CloneNewuser,
+        SyscallProbe::Setns,
+        SyscallProbe::Mount,
+        SyscallProbe::Umount2,
+        SyscallProbe::OpenTree,
+        SyscallProbe::Fsopen,
+    ];
+    let ops: Vec<Op> = probes.iter().map(|&call| Op::Syscall { call }).collect();
+    let results = init.probe(&[], &[], &ops);
+    for (call, result) in probes.iter().zip(&results) {
+        assert_eq!(errno(result), "EPERM", "{call:?}: {result:?}");
+    }
+}
+
+#[test]
+fn seccomp_blocks_opt_in_syscalls_by_default_and_allows_selected_group_only() {
+    let mut init = Init::new();
+    let gated = [
+        SyscallProbe::IoUringSetup,
+        SyscallProbe::Bpf,
+        SyscallProbe::PerfEventOpen,
+        SyscallProbe::Userfaultfd,
+        SyscallProbe::Keyctl,
+        SyscallProbe::AddKey,
+        SyscallProbe::RequestKey,
+        SyscallProbe::PtraceTraceme,
+    ];
+    let ops: Vec<Op> = gated.iter().map(|&call| Op::Syscall { call }).collect();
+    let default_results = init.probe(&[], &[], &ops);
+    for (call, result) in gated.iter().zip(&default_results) {
+        assert_eq!(errno(result), "EPERM", "{call:?}: {result:?}");
+    }
+
+    init.spec = init
+        .f
+        .compile(&init_config(&[], "sandbox.allow_syscalls = [\"ptrace\"]"));
+    let ptrace_results = init.probe(&[], &[], &ops);
+    for (call, result) in gated[..7].iter().zip(&ptrace_results[..7]) {
+        assert_eq!(errno(result), "EPERM", "{call:?}: {result:?}");
+    }
+    assert_eq!(ok(&ptrace_results[7]), &Data::Done);
+}
+
+#[test]
+fn seccomp_blocks_terminal_injection_ioctls_including_high_bit_stuffing() {
+    let init = Init::new();
+    let probes = [
+        SyscallProbe::IoctlTiocsti,
+        SyscallProbe::IoctlTiocstiHighBit,
+        SyscallProbe::IoctlTioclinux,
+        SyscallProbe::IoctlTioclinuxHighBit,
+    ];
+    let ops: Vec<Op> = probes.iter().map(|&call| Op::Syscall { call }).collect();
+    let results = init.probe(&[], &[], &ops);
+    for (call, result) in probes.iter().zip(&results) {
+        assert_eq!(errno(result), "EPERM", "{call:?}: {result:?}");
+    }
+}
+
+#[test]
+fn seccomp_restricts_socket_families_and_netlink_protocols() {
+    let init = Init::new();
+    let results = init.probe(
+        &[],
+        &[],
+        &[
+            Op::Socket {
+                domain: libc::AF_VSOCK,
+                ty: libc::SOCK_STREAM,
+                protocol: 0,
+            },
+            Op::Socket {
+                domain: libc::AF_PACKET,
+                ty: libc::SOCK_RAW,
+                protocol: 0,
+            },
+            Op::Socket {
+                domain: libc::AF_NETLINK,
+                ty: libc::SOCK_RAW,
+                protocol: libc::NETLINK_KOBJECT_UEVENT,
+            },
+            Op::Socket {
+                domain: libc::AF_UNIX,
+                ty: libc::SOCK_STREAM,
+                protocol: 0,
+            },
+            Op::Socket {
+                domain: libc::AF_INET,
+                ty: libc::SOCK_DGRAM,
+                protocol: 0,
+            },
+            Op::Socket {
+                domain: libc::AF_INET6,
+                ty: libc::SOCK_DGRAM,
+                protocol: 0,
+            },
+            Op::Socket {
+                domain: libc::AF_NETLINK,
+                ty: libc::SOCK_RAW,
+                protocol: libc::NETLINK_ROUTE,
+            },
+        ],
+    );
+    assert_eq!(errno(&results[0]), "EPERM", "{:?}", results[0]);
+    assert_eq!(errno(&results[1]), "EPERM", "{:?}", results[1]);
+    assert_eq!(errno(&results[2]), "EPERM", "{:?}", results[2]);
+    for result in &results[3..] {
+        assert_eq!(ok(result), &Data::Done, "{result:?}");
+    }
+}
+
+// --- Landlock enforcement ---
+
+#[test]
+fn landlock_allows_cross_directory_rename_in_rw_workspace() {
+    let mut init = Init::new();
+    init.spec = init
+        .f
+        .compile(&init_config(&[], "fs.rw = [\"{workspace}\"]"));
+    let results = init.probe(
+        &[],
+        &[],
+        &[
+            mkdir("/workspace/a"),
+            mkdir("/workspace/b"),
+            write("/workspace/a/file", "moved across directories"),
+            rename("/workspace/a/file", "/workspace/b/file"),
+            read("/workspace/b/file"),
+        ],
+    );
+    for result in &results[..4] {
+        assert_eq!(ok(result), &Data::Done, "{result:?}");
+    }
+    assert_eq!(contents(&results[4]), "moved across directories");
+    assert_eq!(
+        fs::read_to_string(init.f.workspace().join("b/file")).unwrap(),
+        "moved across directories"
+    );
+    assert!(!init.f.workspace().join("a/file").exists());
+}
+
+#[test]
+fn landlock_handles_single_file_ro_mount_and_minimal_dev_null_writes() {
+    let f = SpecFixture::new();
+    let single = f.file("outside/single.txt", "single file content");
+    let unmounted = f.file("outside/unmounted.txt", "hidden");
+    let spec = f.compile(&init_config(&[&single], "system.dev = \"minimal\""));
+    let session = f.init_session();
+    let (_, probe) = probe_at_host_path();
+    let results = session.run_probe(
+        &spec,
+        &[],
+        &probe,
+        &[
+            read(&single),
+            write(&single, "blocked"),
+            write("/dev/null", "discarded"),
+            read(&unmounted),
+        ],
+    );
+    assert_eq!(contents(&results[0]), "single file content");
+    let write_err = errno(&results[1]);
+    assert!(
+        matches!(write_err, "EROFS" | "EACCES"),
+        "expected read-only failure on single file mount, got {:?}",
+        results[1]
+    );
+    assert_eq!(ok(&results[2]), &Data::Done);
+    assert_eq!(errno(&results[3]), "ENOENT");
+}
+
+/// Binds an abstract Unix stream listener `\0<name>` on the host and keeps it
+/// open until dropped.
+fn bind_abstract_listener(name: &str) -> std::os::fd::OwnedFd {
+    // SAFETY: `socket` creates a fresh descriptor or returns `-1`.
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    assert!(
+        raw >= 0,
+        "socket failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: `raw` is owned exclusively here.
+    let sock = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+    // SAFETY: zeroed `sockaddr_un` sets `sun_path[0] = 0` for abstract names.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    unsafe {
+        let base = std::ptr::addr_of_mut!(addr.sun_path).cast::<u8>();
+        std::ptr::copy_nonoverlapping(name.as_ptr(), base.add(1), name.len());
+    }
+    let addrlen =
+        (std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name.len()) as libc::socklen_t;
+    // SAFETY: valid socket and abstract `sockaddr_un`.
+    let bind_rc = unsafe {
+        libc::bind(
+            sock.as_raw_fd(),
+            std::ptr::addr_of!(addr).cast::<libc::sockaddr>(),
+            addrlen,
+        )
+    };
+    assert_eq!(
+        bind_rc,
+        0,
+        "bind abstract socket {name:?} failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: valid bound stream socket.
+    let listen_rc = unsafe { libc::listen(sock.as_raw_fd(), 4) };
+    assert_eq!(
+        listen_rc,
+        0,
+        "listen abstract socket {name:?} failed: {}",
+        std::io::Error::last_os_error()
+    );
+    sock
+}
+
+#[test]
+fn landlock_and_netns_block_host_abstract_unix_socket() {
+    let unique = format!(
+        "stopit-abstract-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _listener = bind_abstract_listener(&unique);
+
+    let mut init = Init::new();
+    init.spec = init
+        .f
+        .compile(&init_config(&[], "network = { mode = \"loopback\" }"));
+    let loopback_res = init.probe(
+        &[],
+        &[],
+        &[Op::ConnectAbstract {
+            name: unique.clone(),
+        }],
+    );
+    let loopback_err = errno(&loopback_res[0]);
+    assert!(
+        matches!(loopback_err, "ECONNREFUSED" | "EPERM"),
+        "expected host abstract socket to be unreachable in loopback mode, got {:?}",
+        loopback_res[0]
+    );
+
+    // Network mode `full` currently shares the host network namespace, so only
+    // Landlock ABI v6+ abstract-socket scoping stands between the sandbox and
+    // the host listener when the kernel supports ABI v6+.
+    let abi = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<u8>(),
+            0usize,
+            1u32,
+        )
+    };
+    if abi >= 6 {
+        init.spec = init
+            .f
+            .compile(&init_config(&[], "network = { mode = \"full\" }"));
+        let full_res = init.probe(
+            &[],
+            &[],
+            &[Op::ConnectAbstract {
+                name: unique.clone(),
+            }],
+        );
+        assert_eq!(
+            errno(&full_res[0]),
+            "EPERM",
+            "expected Landlock ABI v6+ scope to reject host abstract socket, got {:?}",
+            full_res[0]
+        );
+    }
 }

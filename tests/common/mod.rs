@@ -31,7 +31,7 @@ use stopit::state::{DataDirs, StateDirs, StatePath};
 use tempfile::TempDir;
 
 #[allow(unused_imports)]
-pub use protocol::{Data, ExecOutput, FileKind, Ids, Op, OpError, OpResult, Stat};
+pub use protocol::{Data, ExecOutput, FileKind, Ids, Op, OpError, OpResult, Stat, SyscallProbe};
 
 /// The bwrap arguments every sandbox run starts with: every namespace
 /// unshared, killed with its parent, and an empty environment.

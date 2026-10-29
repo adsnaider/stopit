@@ -17,6 +17,8 @@ mod protocol;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
+use std::net::{TcpListener, TcpStream};
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
@@ -25,7 +27,9 @@ use std::process::{Command, ExitCode, Stdio};
 
 use rustix::io::Errno;
 
-use protocol::{Data, ExecOutput, FileKind, Ids, MAX_READ, Op, OpError, OpResult, Stat};
+use protocol::{
+    Data, ExecOutput, FileKind, Ids, MAX_READ, Op, OpError, OpResult, Stat, SyscallProbe,
+};
 
 fn main() -> ExitCode {
     let mut input = Vec::new();
@@ -117,6 +121,15 @@ fn run(op: &Op) -> OpResult {
             .map(|bytes| Data::Mounts(String::from_utf8_lossy(&bytes).into_owned()))
             .map_err(op_error),
         Op::Exec { path, args, stdin } => exec(path, args, stdin.as_deref()),
+        Op::LoFlags => lo_flags(),
+        Op::TcpLoopbackRoundtrip => done(tcp_loopback_roundtrip()),
+        Op::ConnectAbstract { name } => done(connect_abstract(name)),
+        Op::Socket {
+            domain,
+            ty,
+            protocol,
+        } => done(open_socket(*domain, *ty, *protocol).map(drop)),
+        Op::Syscall { call } => done(syscall_probe(*call)),
     }
 }
 
@@ -215,6 +228,333 @@ fn exec(path: &str, args: &[String], stdin: Option<&str>) -> OpResult {
     }))
 }
 
+fn open_socket(domain: i32, ty: i32, protocol: i32) -> io::Result<OwnedFd> {
+    // SAFETY: `SYS_socket` takes three integer arguments and returns a fresh
+    // file descriptor on non-negative return or `-1` with `errno` set.
+    let raw = unsafe {
+        libc::syscall(
+            libc::SYS_socket,
+            domain as libc::c_long,
+            (ty | libc::SOCK_CLOEXEC) as libc::c_long,
+            protocol as libc::c_long,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a newly created descriptor owned exclusively here.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw as i32) })
+}
+
+fn lo_flags() -> OpResult {
+    let sock = open_socket(libc::AF_INET, libc::SOCK_DGRAM, 0).map_err(op_error)?;
+    // SAFETY: zero-initializing `libc::ifreq` produces valid C storage.
+    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+    ifr.ifr_name[0] = b'l' as libc::c_char;
+    ifr.ifr_name[1] = b'o' as libc::c_char;
+    // SAFETY: `sock` is a valid socket descriptor and `ifr` points to writable
+    // `ifreq` storage for `SIOCGIFFLAGS`.
+    let rc = unsafe {
+        libc::ioctl(
+            std::os::fd::AsRawFd::as_raw_fd(&sock),
+            libc::SIOCGIFFLAGS as _,
+            &mut ifr,
+        )
+    };
+    if rc != 0 {
+        return Err(op_error(io::Error::last_os_error()));
+    }
+    // SAFETY: `SIOCGIFFLAGS` populated the `ifru_flags` union member.
+    let flags = unsafe { ifr.ifr_ifru.ifru_flags };
+    Ok(Data::Flags(i32::from(flags)))
+}
+
+fn tcp_loopback_roundtrip() -> io::Result<()> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let addr = listener.local_addr()?;
+    let mut client = TcpStream::connect(addr)?;
+    let (mut server, _) = listener.accept()?;
+    client.write_all(&[0x5a])?;
+    let mut byte = [0u8; 1];
+    server.read_exact(&mut byte)?;
+    if byte != [0x5a] {
+        return Err(io::Error::other("unexpected loopback payload"));
+    }
+    Ok(())
+}
+
+fn connect_abstract(name: &str) -> io::Result<()> {
+    let sock = open_socket(libc::AF_UNIX, libc::SOCK_STREAM, 0)?;
+    // SAFETY: zero-initializing `sockaddr_un` sets `sun_path[0] = 0` for the
+    // Linux abstract socket namespace.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let max_name = addr.sun_path.len().saturating_sub(1);
+    if name.len() > max_name {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    // SAFETY: `addr.sun_path` has room for the leading NUL plus `name.len()`
+    // bytes.
+    unsafe {
+        let base = std::ptr::addr_of_mut!(addr.sun_path).cast::<u8>();
+        std::ptr::copy_nonoverlapping(name.as_ptr(), base.add(1), name.len());
+    }
+    let addrlen =
+        (std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name.len()) as libc::socklen_t;
+    // SAFETY: `sock` is a valid `AF_UNIX` socket and `(addr, addrlen)` names a
+    // valid abstract `sockaddr_un`.
+    let rc = unsafe {
+        libc::connect(
+            std::os::fd::AsRawFd::as_raw_fd(&sock),
+            std::ptr::addr_of!(addr).cast::<libc::sockaddr>(),
+            addrlen,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn syscall_probe(call: SyscallProbe) -> io::Result<()> {
+    let check = |rc: libc::c_long| {
+        if rc < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    };
+    match call {
+        SyscallProbe::Clone3 => {
+            // SAFETY: passing `(NULL, 0)` makes the kernel reject `clone3`
+            // with `EINVAL` if seccomp did not already reject it with `ENOSYS`.
+            check(unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<u8>(), 0usize) })
+        }
+        SyscallProbe::UnshareUser => {
+            // SAFETY: `unshare` takes integer flags only.
+            let rc = unsafe { libc::unshare(libc::CLONE_NEWUSER) };
+            check(libc::c_long::from(rc))
+        }
+        SyscallProbe::CloneNewuser => {
+            let flags = (libc::CLONE_NEWUSER | libc::SIGCHLD) as libc::c_ulong;
+            // SAFETY: if `SYS_clone` were ever permitted outside a sandbox and
+            // created a child (`rc == 0`), the child exits immediately via
+            // `_exit(0)` without touching Rust state.
+            let rc =
+                unsafe { libc::syscall(libc::SYS_clone, flags, 0usize, 0usize, 0usize, 0usize) };
+            if rc == 0 {
+                // SAFETY: async-signal-safe immediate process exit in child.
+                unsafe { libc::_exit(0) };
+            }
+            if rc > 0 {
+                let mut status = 0;
+                // SAFETY: `rc` is the child pid returned by `clone`.
+                unsafe {
+                    let _ = libc::waitpid(rc as libc::pid_t, &mut status, 0);
+                }
+                return Ok(());
+            }
+            Err(io::Error::last_os_error())
+        }
+        SyscallProbe::Setns => {
+            // SAFETY: `setns` with `-1` has no side effects.
+            let rc = unsafe { libc::setns(-1, 0) };
+            check(libc::c_long::from(rc))
+        }
+        SyscallProbe::Mount => {
+            // SAFETY: null pointers make `mount` fail without side effects.
+            let rc = unsafe {
+                libc::mount(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            check(libc::c_long::from(rc))
+        }
+        SyscallProbe::Umount2 => {
+            // SAFETY: `c"/"` is a valid NUL-terminated string.
+            let rc = unsafe { libc::umount2(c"/".as_ptr(), 0) };
+            check(libc::c_long::from(rc))
+        }
+        SyscallProbe::OpenTree => {
+            // SAFETY: `-1` and `NULL` make `open_tree` fail without side effects.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_open_tree,
+                    -1i32,
+                    std::ptr::null::<libc::c_char>(),
+                    0u32,
+                )
+            };
+            if rc >= 0 {
+                // SAFETY: closes unexpected descriptor if ever returned.
+                unsafe {
+                    libc::close(rc as i32);
+                }
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+        SyscallProbe::Fsopen => {
+            // SAFETY: `NULL` makes `fsopen` fail without side effects.
+            let rc =
+                unsafe { libc::syscall(libc::SYS_fsopen, std::ptr::null::<libc::c_char>(), 0u32) };
+            if rc >= 0 {
+                // SAFETY: closes unexpected descriptor if ever returned.
+                unsafe {
+                    libc::close(rc as i32);
+                }
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+        SyscallProbe::IoUringSetup => {
+            // SAFETY: `0` entries and `NULL` params fail without side effects.
+            check(unsafe {
+                libc::syscall(libc::SYS_io_uring_setup, 0u32, std::ptr::null_mut::<u8>())
+            })
+        }
+        SyscallProbe::Bpf => {
+            // SAFETY: zero attr size fails without side effects.
+            check(unsafe { libc::syscall(libc::SYS_bpf, 0i32, std::ptr::null::<u8>(), 0u32) })
+        }
+        SyscallProbe::PerfEventOpen => {
+            // SAFETY: `NULL` attr fails without side effects.
+            check(unsafe {
+                libc::syscall(
+                    libc::SYS_perf_event_open,
+                    std::ptr::null::<u8>(),
+                    0i32,
+                    -1i32,
+                    -1i32,
+                    0usize,
+                )
+            })
+        }
+        SyscallProbe::Userfaultfd => {
+            // SAFETY: `userfaultfd` takes integer flags and returns an fd or `-1`.
+            let rc = unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC) };
+            if rc >= 0 {
+                // SAFETY: `rc` is a newly created userfaultfd descriptor.
+                unsafe {
+                    libc::close(rc as i32);
+                }
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+        SyscallProbe::Keyctl => {
+            // SAFETY: invalid command `0` (`KEYCTL_GET_KEYRING_ID` with 0) has
+            // no persistent side effects; seccomp blocks `SYS_keyctl` first.
+            check(unsafe { libc::syscall(libc::SYS_keyctl, -1i32, 0usize, 0usize, 0usize, 0usize) })
+        }
+        SyscallProbe::AddKey => {
+            // SAFETY: `NULL` arguments fail without side effects.
+            check(unsafe {
+                libc::syscall(
+                    libc::SYS_add_key,
+                    std::ptr::null::<libc::c_char>(),
+                    std::ptr::null::<libc::c_char>(),
+                    std::ptr::null::<u8>(),
+                    0usize,
+                    0i32,
+                )
+            })
+        }
+        SyscallProbe::RequestKey => {
+            // SAFETY: `NULL` arguments fail without side effects.
+            check(unsafe {
+                libc::syscall(
+                    libc::SYS_request_key,
+                    std::ptr::null::<libc::c_char>(),
+                    std::ptr::null::<libc::c_char>(),
+                    std::ptr::null::<libc::c_char>(),
+                    0i32,
+                )
+            })
+        }
+        SyscallProbe::PtraceTraceme => ptrace_traceme_in_child(),
+        SyscallProbe::IoctlTiocsti => raw_ioctl_byte(0x5412),
+        SyscallProbe::IoctlTiocstiHighBit => raw_ioctl_byte((1u64 << 32) | 0x5412),
+        SyscallProbe::IoctlTioclinux => raw_ioctl_byte(0x541c),
+        SyscallProbe::IoctlTioclinuxHighBit => raw_ioctl_byte((1u64 << 32) | 0x541c),
+    }
+}
+
+fn raw_ioctl_byte(request: u64) -> io::Result<()> {
+    let byte = b'x';
+    // SAFETY: passes a valid pointer to a local byte for `TIOCSTI`/`TIOCLINUX`
+    // probing; seccomp rejects both requests before the kernel inspects fd 0.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_ioctl,
+            0i32,
+            request as libc::c_ulong,
+            std::ptr::addr_of!(byte),
+        )
+    };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn ptrace_traceme_in_child() -> io::Result<()> {
+    let mut fds = [0i32; 2];
+    // SAFETY: `fds` is a valid two-element array for `pipe2`.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fds[0]` and `fds[1]` are fresh pipe descriptors.
+    let (mut reader, writer) = unsafe { (File::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    // SAFETY: the child runs only async-signal-safe syscalls (`close`,
+    // `syscall(SYS_ptrace, ...)`, `write`, `_exit`) before terminating.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if pid == 0 {
+        let write_fd = std::os::fd::AsRawFd::as_raw_fd(&writer);
+        // SAFETY: async-signal-safe syscalls in the forked child.
+        unsafe {
+            libc::close(std::os::fd::AsRawFd::as_raw_fd(&reader));
+            let rc = libc::syscall(
+                libc::SYS_ptrace,
+                libc::PTRACE_TRACEME as libc::c_long,
+                0usize,
+                0usize,
+                0usize,
+            );
+            let err: i32 = if rc < 0 { *libc::__errno_location() } else { 0 };
+            let bytes = err.to_ne_bytes();
+            let _ = libc::write(write_fd, bytes.as_ptr().cast(), bytes.len());
+            libc::_exit(0);
+        }
+    }
+    drop(writer);
+    let mut buf = [0u8; 4];
+    let read_res = reader.read_exact(&mut buf);
+    let mut status = 0;
+    // SAFETY: `pid` is our child process.
+    unsafe {
+        let _ = libc::waitpid(pid, &mut status, 0);
+    }
+    read_res?;
+    let err = i32::from_ne_bytes(buf);
+    if err == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(err))
+    }
+}
+
 /// Symbolic names of the error numbers tests are likely to meet.
 const ERRNO_NAMES: &[(Errno, &str)] = &[
     (Errno::PERM, "EPERM"),
@@ -251,8 +591,16 @@ const ERRNO_NAMES: &[(Errno, &str)] = &[
     (Errno::LOOP, "ELOOP"),
     (Errno::NODATA, "ENODATA"),
     (Errno::NOTSOCK, "ENOTSOCK"),
+    (Errno::PROTONOSUPPORT, "EPROTONOSUPPORT"),
     (Errno::OPNOTSUPP, "EOPNOTSUPP"),
+    (Errno::AFNOSUPPORT, "EAFNOSUPPORT"),
+    (Errno::ADDRINUSE, "EADDRINUSE"),
+    (Errno::ADDRNOTAVAIL, "EADDRNOTAVAIL"),
+    (Errno::NETDOWN, "ENETDOWN"),
+    (Errno::NETUNREACH, "ENETUNREACH"),
+    (Errno::TIMEDOUT, "ETIMEDOUT"),
     (Errno::CONNREFUSED, "ECONNREFUSED"),
+    (Errno::HOSTUNREACH, "EHOSTUNREACH"),
     (Errno::NOTCONN, "ENOTCONN"),
     (Errno::STALE, "ESTALE"),
     (Errno::DQUOT, "EDQUOT"),
@@ -679,7 +1027,12 @@ mod tests {
                 {"op": "rename", "from": "/a", "to": "/b"},
                 {"op": "symlink", "target": "t", "link": "/l"},
                 {"op": "env"},
-                {"op": "exec", "path": "/bin/true"}]"#,
+                {"op": "exec", "path": "/bin/true"},
+                {"op": "lo_flags"},
+                {"op": "tcp_loopback_roundtrip"},
+                {"op": "connect_abstract", "name": "sock"},
+                {"op": "socket", "domain": 1, "ty": 1, "protocol": 0},
+                {"op": "syscall", "call": "clone3"}]"#,
         )
         .unwrap();
         assert_eq!(ops[1], Op::StatFollow { path: "/a".into() });
@@ -692,6 +1045,28 @@ mod tests {
                 stdin: None,
             }
         );
+        assert_eq!(ops[7], Op::LoFlags);
+        assert_eq!(ops[8], Op::TcpLoopbackRoundtrip);
+        assert_eq!(
+            ops[9],
+            Op::ConnectAbstract {
+                name: "sock".into()
+            }
+        );
+        assert_eq!(
+            ops[10],
+            Op::Socket {
+                domain: 1,
+                ty: 1,
+                protocol: 0,
+            }
+        );
+        assert_eq!(
+            ops[11],
+            Op::Syscall {
+                call: SyscallProbe::Clone3,
+            }
+        );
         // Typos are errors, not silently ignored fields.
         assert!(serde_json::from_str::<Op>(r#"{"op": "stat", "pth": "/a"}"#).is_err());
         assert!(serde_json::from_str::<Op>(r#"{"op": "frobnicate"}"#).is_err());
@@ -699,6 +1074,7 @@ mod tests {
         let results: Vec<OpResult> = vec![
             Ok(Data::Done),
             Ok(Data::Readlink("t".into())),
+            Ok(Data::Flags(0x49)),
             Err(OpError {
                 errno: Some(2),
                 name: Some("ENOENT".into()),
@@ -708,7 +1084,7 @@ mod tests {
         let json = serde_json::to_string(&results).unwrap();
         assert_eq!(
             json,
-            r#"[{"Ok":"done"},{"Ok":{"readlink":"t"}},{"Err":{"errno":2,"name":"ENOENT","message":"No such file or directory"}}]"#
+            r#"[{"Ok":"done"},{"Ok":{"readlink":"t"}},{"Ok":{"flags":73}},{"Err":{"errno":2,"name":"ENOENT","message":"No such file or directory"}}]"#
         );
         assert_eq!(
             serde_json::from_str::<Vec<OpResult>>(&json).unwrap(),
