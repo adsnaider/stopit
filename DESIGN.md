@@ -1,4 +1,4 @@
-# `stopit` — System Architecture & Security Design Document
+# `stopit`: system architecture and security design
 
 **Status:** Draft  
 **Target Platform:** Linux (unprivileged user namespaces, Landlock ABI ≥ 4, seccomp user-notify, FUSE)  
@@ -30,11 +30,11 @@
 
 These are the guarantees of `base = "default"`. Under `base = "none"` the same mechanisms exist but every grant must be added explicitly (§3.2).
 
-* **I1 — Allowlist-First Visibility:** The sandbox filesystem starts as an empty `tmpfs` root. Nothing from the host — including `HOME` and `/run/user/$UID` — exists unless explicitly granted.
-* **I2 — Irreversible Privilege Drop:** Every sandboxed process runs with all capabilities dropped, `PR_SET_NO_NEW_PRIVS` set, user-namespace creation disabled, and a seccomp filter installed. A sandboxed process cannot unmount, remount, or otherwise alter its mount table.
-* **I3 — No Deferred Host Execution Without Approval:** Files that host tools execute *automatically* (on `cd`, on a VCS operation, on opening an editor) are **masked** or **protected** (§3.4). They change only with explicit user approval.
-* **I4 — Trusted Terminal Ownership:** The sandbox never holds the host terminal. The supervisor owns it, filters sandbox output through an escape-sequence allowlist (§5.3), and renders approval prompts the sandbox cannot forge.
-* **I5 — Explicit, Additive Policy:** `base = "none"` grants nothing. Every grant comes from a **provider** (§3.6), and everything `base = "default"` grants can be written out manually as providers (Appendix A).
+* **I1. Allowlist-first visibility.** The sandbox filesystem starts as an empty `tmpfs` root. Nothing from the host, `HOME` and `/run/user/$UID` included, exists unless a grant names it.
+* **I2. Irreversible privilege drop.** Every sandboxed process runs with all capabilities dropped, `PR_SET_NO_NEW_PRIVS` set, user-namespace creation disabled, and a seccomp filter installed. A sandboxed process cannot unmount, remount, or otherwise alter its mount table.
+* **I3. No deferred host execution without approval.** Files that host tools execute *automatically* (on `cd`, on a VCS operation, on opening an editor) are **masked** or **protected** (§3.4). They change only with explicit user approval.
+* **I4. Trusted terminal ownership.** The sandbox never holds the host terminal. The supervisor owns it, filters sandbox output through an escape-sequence allowlist (§5.3), and renders approval prompts the sandbox cannot forge.
+* **I5. Explicit, additive policy.** `base = "none"` grants nothing. Every grant comes from a **provider** (§3.6), and everything `base = "default"` grants can be written out manually as providers (Appendix A).
 
 ### 1.4 Attacker Capabilities in Scope
 
@@ -239,7 +239,7 @@ The design rule is: **restrictions default on, grants default off.** A base is a
 | Filesystem | Empty `tmpfs` root | `/proc` (masked subset), minimal `/dev`, synthesized `/etc`, workspace RW + default path rules (§3.4), ephemeral `/tmp` and `HOME`, tool binds from user providers |
 | Environment | `HOME`, `USER`, `LOGNAME` only (§9) | Identity (`HOME`, `USER`, `LOGNAME`); `TERM`, `LANG`, `COLORTERM` passed through; secret patterns denied (§9) |
 | Namespaces | All unshared (user, mount, pid, net, ipc, uts, cgroup) | Same |
-| Network | **None** — no interfaces up | Loopback only |
+| Network | **None**, no interfaces up | Loopback only |
 | Hardening (seccomp, Landlock, `nosuid`/`nodev`, no caps, `NO_NEW_PRIVS`, no nested userns) | On | On |
 | Terminal output filter | On | On |
 | Brokered tools | None | `jj`, `git` via the `vcs` provider (§7.4) |
@@ -294,8 +294,8 @@ Semantics:
 * **New files matching a protected glob** (e.g. a new `nix/foo.nix`) are written through directly: every pre-existing file that could reference them is itself protected. See §11 for the auto-import caveat.
 
 Path syntax (in any provider):
-* `{workspace}` — the host workspace directory, mounted at `workspace.mount` (default `/workspace`).
-* `~/…` — host `$HOME/…` on the host side, sandbox `HOME` on the sandbox side (`/home/user` unless a provider sets `system.home`; the default base leaves it unset).
+* `{workspace}` is the host workspace directory, mounted at `workspace.mount` (default `/workspace`).
+* `~/…` is host `$HOME/…` on the host side and sandbox `HOME` on the sandbox side (`/home/user` unless a provider sets `system.home`; the default base leaves it unset).
 * Absolute paths map to the same path inside the sandbox; `fs.bind` entries remap explicitly.
 * Built-in providers may resolve additional concrete host paths internally (e.g. `vcs` resolves git worktree and jj workspace storage, §7.3). These are not user-facing placeholders.
 * **Syntactic validation (at load time):** no `.`/`..`/empty components, no NUL, no trailing `/`; the bare `/` is rejected; a glob is not allowed as the first component directly below `/` or `~` (`/*` and `~/**` are rejected; `{workspace}/**` is fine). Globs are validated too: `**` only as an entire component, no `/` (or range spanning `/`) in a `[...]` class, and the glob must compile. `?` and `[...]` match a single byte, so they do not match a non-ASCII character as a whole (e.g. a `masked` rule `?.env` does not match `é.env`; use `*`). `fs.ephemeral` entries must be literal paths, without glob characters (each rule is backed by one session directory).
@@ -324,7 +324,7 @@ All providers' manifests are merged per profile, in order: base providers first,
 
 When `.stopit.toml` sets `base = "none"`, the global layer does not apply, though stopit still checks it (§3).
 
-**Path rules** — for each path, the effective mode is decided by:
+**Path rules.** For each path, these decide the effective mode:
 1. **Most specific path wins.** An exact path beats a glob; a deeper path beats a shallower one (`{workspace}/.git` beats `{workspace}`; `{workspace}/flake.nix` beats `{workspace}/**/*.nix`).
 2. **A profile's own rules beat inherited rules** at equal specificity. This is what lets `vcs.local` (inheriting `main`) make `.git` writable although `main` masks it.
 3. **Strictest mode wins** among the remaining ties: `masked` > `protected` > `ro` > `ephemeral` > `rw`.
@@ -408,7 +408,7 @@ view = "masked"
 * **Reference rule:** within a manifest, a plain profile reference (`inherit = "local"`, shim `profile = "ro"`) resolves first to that manifest's own contributed profile, then to a user-declared profile. `main` and other providers' profiles are referenced by their full names. A full name (e.g. `vcs.local`) always resolves globally, including to the manifest's own profiles; plain names are preferred inside a manifest because the provider `name` can change.
 * **Validation:** every manifest table accepts only maps (array forms are rejected) and unknown keys are rejected. A JSON manifest from a script **must** include `"version"`; an inline `[provider.sandbox]` may omit it (defaults to 1). Bind `mode` is one of `ro`, `rw`, `protected` only (`masked` and `ephemeral` have no host content to bind). Bind `host`/`sandbox` paths contain no globs (glob characters are `*`, `?`, `[`, `]`), and a bind's `sandbox` side additionally allows no `{workspace}` placeholder. Path rules are also validated syntactically at load time (§3.4).
 * **Script providers** receive on stdin a JSON object containing their `[provider.config]` and a context (`workspace` host path, `workspace_mount`, `home`, `session_dir`, provider `name`, target `profile`), and print a manifest on stdout. A non-zero exit or invalid manifest aborts startup.
-* **Scripts run on the host with the user's privileges.** With `protect = true` (default) the script — and its directory, if it sources other files (not implemented yet: only the script itself is protected, §11) — is `protected` so the sandbox cannot rewrite code that runs on the host next session. `protect = false` is allowed but flagged in the startup summary.
+* **Scripts run on the host with the user's privileges.** With `protect = true` (default) the script is `protected`, and so is its directory if it sources other files (not implemented yet, since only the script itself is protected, §11), so the sandbox cannot rewrite code that runs on the host next session. `protect = false` is allowed but flagged in the startup summary.
 * **How a source is protected.** The script is resolved once to its canonical path, which is both the file run and the file protected (protecting a link would leave its target writable). That protection is the supervisor's rule, not a grant, so it is not a path rule competing in precedence (§3.5), where an exact `rw` rule of the same path, or a profile's own rule, would beat it, and no provider's output can lift it. Instead, once a profile's mounts are planned and checked (§6.2, after the restricted-content covers), the source P is protected wherever the profile lets the sandbox write it, in **every** profile of the session: for every `rw` mount M whose canonical source S is P or an ancestor of it, M shows P at X, M's sandbox path joined with P's path below S; unless another mount lies between M's path and X (mounted on top: a mask there hides P, a read-only or protected mount shows it read-only, an `rw` one is compared in turn), X gets a `protected` mount of P, attributed to the script provider, replacing M if X is M's own path. So the source is protected at its aligned path when it lies in the workspace, and at every other path an `rw` grant shows it (a `~` grant, a bind); a profile where it is not visible, masked or read-only gets nothing. Like the covers of Restricted content exposure (§6.2), these mounts need no other checks: P is canonical and lies inside S, and X lies below M's path, reached through M's tree along P. A directory P is protected as a directory, and an `rw` mount whose source lies strictly inside it is not the narrower grant it would be under a protected rule: it is mounted `protected` too, with a warning naming both providers. A source that cannot be inspected when the session is compiled is an error naming the provider, and so is a regular file with more than one hard link that the user owns or can write (`faccessat`, so ACLs count; a Nix store file deduplicated by `auto-optimise-store`, owned by root and read-only, cannot be rewritten through any name and is accepted): the sandbox could rewrite it through another name inside an `rw` tree, which no mount at the protected name prevents, so there is no safe outcome (§1.5); give the script a single link. A script provider checks this right after resolving its path, before the script runs (it may already have been rewritten that way), and the session compiler checks every protected source again. Hard links to files inside a protected directory are not detected (§11). The supervisor protects the loaded `.stopit.toml` the same way (§3). These protected mounts are checked and mounted by path like every other, so they inherit its gap (§11, Path resolution is path-based; Literal restrictive rules rely on pinned parents): another session of the same workspace could swap a parent directory between the compile and the mount.
 * **Script paths through writable links are refused.** Before a script runs, its path as declared (`source` joined to the configuration's directory) is resolved one component at a time like a host source (§6.2, Untrusted links), and that one lookup gives the canonical path that is run and protected; if it runs through a symlink inside the workspace or inside a directory that a `config` provider grants `rw` (in any profile: an `fs.rw` path, a glob's literal prefix, or the host side of an `rw` bind), the final component included, the provider is refused with an error naming it, the link and that directory. This holds even when the lookup fails after following the link, as a planted link may be why it fails. The sandbox can plant or replace such a link (only the link's target is protected), and the next session would run whatever it leads to. There is no safe outcome (running it is host code execution; skipping the provider changes the grants), so this is an error (§1.5): point `source` at a path without links inside them. These are the untrusted roots known before any script runs: `config` providers' rules are static, while the `rw` grants of script providers are known only once they have run (§11). Renaming a parent directory of a protected source away is covered by pinned parents, still pending (§11, Literal restrictive rules rely on pinned parents).
 * Manifests are cached, keyed by a hash of the provider's protected inputs and config.
@@ -436,9 +436,9 @@ Built-in providers can implement `handlers` in Rust (the `vcs` provider parses `
 | `vcs` | v1 | Repository-root resolution, `.git`/`.jj` masking, VCS profiles and `jj`/`git` shims (§7.3) |
 | `nix` | later | `devshell = "<name>"`: runtime closure of the devShell's `inputDerivation` plus `nix print-dev-env --json`, resolved on the host |
 
-**Host daemons.** A provider may grant access to a host daemon's socket (e.g. a future `buck2` provider talking to the buck2 daemon). Such daemons run *outside* the sandbox — buck2 executes build rules on the host — so granting the socket is equivalent to granting host code execution (the same reason the Nix daemon is never exposed). This is allowed as a deliberate choice; socket grants are flagged as **delegates to host** in the startup summary.
+**Host daemons.** A provider may grant access to a host daemon's socket (e.g. a future `buck2` provider talking to the buck2 daemon). Such daemons run *outside* the sandbox (buck2 executes build rules on the host), so granting the socket is equivalent to granting host code execution (the same reason the Nix daemon is never exposed). This is allowed as a deliberate choice; socket grants are flagged as **delegates to host** in the startup summary.
 
-**Nix guidance (outside `stopit` core):** define a comprehensive `devShells.agent` (or similar) in your flake and expose it through a `script` provider (later the `nix` provider). The closure-only manifest means only the store paths that environment needs are visible, not all of `/nix/store`, which on NixOS can contain secrets (e.g. `access-tokens` rendered into `nix.conf`). The `nix` provider refuses closures that pull in paths named `*-etc`, `*-home-manager-files`, or `*nix.conf*`. The sandbox has **no access to the Nix daemon**; changing the tool environment requires the user to edit the (protected) flake and restart or reload the session.
+**Nix guidance (outside `stopit` core).** Define a `devShells.agent` (or similar) with every tool the agent needs in your flake and expose it through a `script` provider (later the `nix` provider). The closure-only manifest means only the store paths that environment needs are visible, not all of `/nix/store`, which on NixOS can contain secrets (e.g. `access-tokens` rendered into `nix.conf`). The `nix` provider refuses closures that pull in paths named `*-etc`, `*-home-manager-files`, or `*nix.conf*`. The sandbox has **no access to the Nix daemon**; changing the tool environment requires the user to edit the (protected) flake and restart or reload the session.
 
 ---
 
@@ -453,12 +453,12 @@ Any attempt to modify a protected file triggers an approval prompt showing the d
 | In place | `open(O_TRUNC)` → `write`… → `close` | At `close` | Harness Edit/Write tools, shell `>`, Rust `fs::write` |
 | Atomic rename | write `tmp` → `rename(tmp, target)` | At `rename` | `sed -i`, vim (often), formatters |
 
-**In-place writes — narrow FUSE.** The supervisor mounts a small FUSE filesystem (via `fusermount3`, on the host, under the session dir) exposing a shadow copy of each protected file. Each shadow is bind-mounted over the real path inside the sandbox. The filesystem implements only `getattr`, `setattr` (truncate, mode), `open`, `read`, `write`, `flush`:
+**In-place writes through a narrow FUSE.** The supervisor mounts a small FUSE filesystem (via `fusermount3`, on the host, under the session dir) exposing a shadow copy of each protected file. Each shadow is bind-mounted over the real path inside the sandbox. The filesystem implements only `getattr`, `setattr` (truncate, mode), `open`, `read`, `write`, `flush`:
 * The prompt fires in **`flush`** (called on every `close()`), not `release` (asynchronous; its error never reaches the program). It fires only when content or mode changed since the last decision.
-* **Allow:** the supervisor writes the new content into the host file **in place** (truncate + write — never rename, which would break the inode pinned by single-file bind mounts), and `close()` returns 0.
+* **Allow:** the supervisor writes the new content into the host file **in place** (truncate and write, never rename, which would break the inode pinned by single-file bind mounts), and `close()` returns 0.
 * **Deny:** the shadow reverts to the host content and `close()` returns `EROFS`.
 
-**Atomic renames — seccomp user-notify.** `rename(tmp, flake.nix)` never reaches FUSE: the target is a mount point (the VFS returns `EBUSY`) and the source lives on a different filesystem. So the init helper's seccomp filter sends `rename`/`renameat`/`renameat2` to the supervisor:
+**Atomic renames through seccomp user-notify.** `rename(tmp, flake.nix)` never reaches FUSE: the target is a mount point (the VFS returns `EBUSY`) and the source lives on a different filesystem. So the init helper's seccomp filter sends `rename`/`renameat`/`renameat2` to the supervisor:
 1. The supervisor resolves the target via `/proc/<pid>/root` and `/proc/<pid>/fd/<dirfd>`.
 2. Not protected → `SECCOMP_USER_NOTIF_FLAG_CONTINUE` (the kernel still enforces all mounts).
 3. Protected → copy the source content **into memory**, show the diff, and on **allow** write that exact copy into the host file in place and unlink the temp file (the sandbox cannot swap content between review and write). On **deny**, return `EROFS`.
@@ -555,7 +555,7 @@ TIOCSTI from inside the sandbox only reaches the sandbox's own PTY and is harmle
 
 ### 5.4 Approval Prompt Safeguards
 
-Approval prompts appear on the terminal of `stopit server`, which no sandbox can write to. A run attached to the server sends each request over a connection of its own to the control socket, naming the run number the server gave it, and the server asks about one request at a time. Only OSC 52 clipboard writes under `clipboard_write = "ask"` ask today. Brokered commands and `stopit-grant` will use the same prompt (§7). A standalone run has no one to ask, so it denies every request and says how many it denied after the command. An attached run says so too.
+Approval prompts appear on the terminal of `stopit server`, which no sandbox can write to. A run attached to the server sends each request over a connection of its own to the control socket, naming the run number the server gave it, and the server asks about one request at a time. OSC 52 clipboard writes under `clipboard_write = "ask"` and brokered commands whose rule says `ask` (§7.1) use it today, and `stopit-grant` will (§7.5). A brokered command's prompt comes from the broker, which sends it to the server for the run. A standalone run has no one to ask, so it denies every request and says how many it denied after the command. An attached run says so too.
 
 * **Ground truth:** prompts display resolved facts, not sandbox claims. The server looks up the run by its number and shows the run number, its profile and its command. A clipboard write shows its byte count, its newline count and its selections, and its content with every byte visible: newlines, tabs, control characters and invalid UTF-8 are escaped (`\n`, `\xff`). Content over 200 characters shows its first 160 and its last 40. The filter passes only strict base64, so what the prompt shows is what the host terminal decodes, and content that does not decode is denied without a prompt. Planned prompts show the exact binary path, arguments, working directory and capability delta; for pushes, the resolved remote URL plus the commits and bookmarks being pushed.
 * **No typeahead:** the prompt rings the bell, discards pending input on the server's terminal, waits 300 ms, and discards it again before reading one key, so keystrokes meant for something else cannot land on `y`. The server reads keys from its own non-blocking descriptor of the terminal, so a key another reader takes cannot wedge the prompt.
@@ -736,9 +736,9 @@ The code so far reads the layout itself and runs no tool (Implemented so far, ab
 
 | Layout | What `{workspace}` contains | Additional storage outside `{workspace}` |
 | :--- | :--- | :--- |
-| Plain git repo | `.git/` directory | — |
+| Plain git repo | `.git/` directory | None |
 | Git worktree | `.git` **file** (`gitdir: …`) | Per-worktree admin dir (`<common>/.git/worktrees/<name>`: `HEAD`, `index`) and the **common dir** (`<common>/.git`: objects, refs, config) |
-| jj repo (incl. colocated) | `.jj/` (`working_copy/`, `repo/`), plus `.git/` if colocated | — |
+| jj repo (incl. colocated) | `.jj/` (`working_copy/`, `repo/`), plus `.git/` if colocated | None |
 | jj secondary workspace | `.jj/working_copy/`, `.jj/repo` **file** pointing to the main workspace's `.jj/repo` | The main `.jj/repo` directory, and its git backend directory if the store is git-backed (e.g. the main workspace's colocated `.git`) |
 | Workspace is a subdirectory of a checkout | No VCS metadata | The checkout root and its metadata |
 
@@ -756,7 +756,7 @@ Pointer files (`.git` gitfiles, `.jj/repo`) live in the agent-writable workspace
 
 | Profile | Workspace metadata + backing storage | Locked read-only even when RW | Checkout root (if outside `{workspace}`) | Network |
 | :--- | :--- | :--- | :--- | :--- |
-| `vcs.ro` | RO | — | RO | None |
+| `vcs.ro` | RO | None | RO | None |
 | `vcs.local` | RW | Git config files in every resolved git dir (`config`, `config.worktree`, `info/attributes`; `hooks/` masked as an empty stub), submodule configs/hooks (`modules/*/config`, `modules/*/hooks/`), worktree configs (`worktrees/*/config.worktree`); legacy `.jj/repo/config.toml` if present | RW | None (filtered signing agent if `signing = true`, §7.3.4) |
 | `vcs.remote` | RW | Same as `vcs.local` | RW | Per-command tunnel to the resolved remote + filtered SSH agent (§7.3.3). Only created if `fetch` or `push` is not `"deny"` |
 
@@ -793,7 +793,7 @@ HTTPS remotes (proxy environment plus a credential helper) are future work.
 
 #### 7.3.4 Commit Signing (`signing`)
 
-With `signing = true`, `vcs.local` (and `vcs.remote`) get a filtered SSH agent socket offering **only the signing key** — no network. The supervisor reads the signing configuration from the user's host config (git: `gpg.format = ssh`, `user.signingKey`, `commit.gpgSign`; jj: `signing.backend = "ssh"`, `signing.key`, `signing.behavior`) and carries it into the safe git/jj configs. `ssh-keygen` must be present in the tool environment.
+With `signing = true`, `vcs.local` (and `vcs.remote`) get a filtered SSH agent socket offering **only the signing key**, and no network. The supervisor reads the signing configuration from the user's host config (git: `gpg.format = ssh`, `user.signingKey`, `commit.gpgSign`; jj: `signing.backend = "ssh"`, `signing.key`, `signing.behavior`) and carries it into the safe git/jj configs. `ssh-keygen` must be present in the tool environment.
 
 #### 7.3.5 Details
 
@@ -853,7 +853,7 @@ stopit run --profile harness claude
 Trade-offs to be aware of:
 * The harness's built-in file tools run in the `harness` profile and see its credentials directory, but nothing else from the host.
 * Model API domains are **exfiltration-capable** (a hostile program can use an attacker's API key to upload data), and are tagged as such (§8).
-* The alternative — harness on the host with `SHELL` pointing at `stopit shell` — sandboxes only shell commands; the harness's own file tools can still read host secrets.
+* The alternative, the harness on the host with `SHELL` pointing at `stopit shell`, sandboxes only shell commands; the harness's own file tools can still read host secrets.
 
 ---
 
@@ -869,7 +869,7 @@ allow_domains = ["cache.nixos.org", "index.crates.io", "static.crates.io"]
 
 | Mode | Behavior |
 | :--- | :--- |
-| `none` | Network namespace with no interfaces up — no connectivity at all, not even `lo`. **The `base = "none"` state.** |
+| `none` | Network namespace with no interfaces up, so no connectivity at all, not even `lo`. **The `base = "none"` state.** |
 | `loopback` | Only `lo` (`127.0.0.1`/`::1`). Local servers, databases and tests work. **The `base = "default"` setting.** |
 | `proxy` | `loopback` plus an HTTP `CONNECT` and SOCKS5 proxy on `proxy.sock`, which a bridge in the sandbox serves on `127.0.0.1:1080` and `[::1]:1080`. The proxy variables point there. Domain allowlist enforced |
 | `full` | A network namespace of the sandbox's own, which `pasta` (from passt) connects to the host's network. The host's loopback stays unreachable. No domain filtering; flagged in the startup summary |
@@ -1013,6 +1013,14 @@ Session-wide, so not a provider setting. Off unless configured. Mitigates forkbo
 ---
 
 ## 12. Phased Implementation Plan & Verification
+
+Where the phases stand:
+
+* Phase 1 is done.
+* Phase 2 has the PTY proxy, the output filter and window-size forwarding. Prompts appear on the terminal of `stopit server` instead of an overlay (§5.4, §5.5).
+* Phase 3 has the broker, declarative shims with `args`, and the `vcs` provider for local work (§7.3, Implemented so far). Handlers, `vcs.remote` with remote access and signing, and `stopit-grant` are not built.
+* Phase 4 is not built. Protected files are read-only.
+* Phase 5 has the proxy (SNI matching, an uploads list in the startup summary) and `[limits]` (§10). The `nix` provider is not built.
 
 ### Phase 1: Scaffold, Configuration, Providers, `BwrapEngine`
 * Cargo package (a library plus the `stopit` binary) + `flake.nix` dev environment (Rust toolchain, bubblewrap, jujutsu, git).
