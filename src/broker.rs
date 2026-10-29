@@ -23,7 +23,7 @@
 //!   when the shim's connection closes, and sends back its exit status. A
 //!   refused command exits with 126 and says why on its stderr.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
@@ -619,10 +619,16 @@ struct GrantCall<'a> {
     rel: &'a Path,
 }
 
-/// Serves a `stopit-grant` call (§7.5): parses it, refuses what cannot be
-/// granted before anyone is asked, compiles the temporary profile with
-/// the session's providers so every check of a rule applies, asks on the
-/// server's terminal, and runs the command in that profile.
+/// Serves a `stopit-grant` call (§7.5).
+///
+/// What the sandbox can check on its own, its arguments and its own
+/// profile, is refused with the reason on its stderr. Without a server to
+/// ask, every other call is refused before the host is looked at. Then refusals that depend on the
+/// host, such as a missing path or what the compiler rejects, give the
+/// sandbox only a generic line, so it cannot learn host paths or probe
+/// for them unseen, and the server's log gets the reason. The temporary
+/// profile is compiled with the session's providers, so every check of a
+/// rule applies, and is then checked against the session as it is.
 fn run_grant(
     call: GrantCall<'_>,
     args: Vec<Vec<u8>>,
@@ -647,7 +653,6 @@ fn run_grant(
             return Ok(EXIT_DENIED);
         }
     };
-    let home = ctx.loaded.host_home();
     let sandbox_home = Path::new(caller.spec.system.home.as_str());
     for (path, _) in request.paths() {
         if let Ok(rest) = Path::new(path).strip_prefix(sandbox_home) {
@@ -657,26 +662,15 @@ fn run_grant(
             ));
             return Ok(EXIT_DENIED);
         }
-        let host = GrantRequest::host_path(path, home);
-        if std::fs::metadata(&host).is_err() {
-            say(&format!("{} does not exist on the host", host.display()));
-            return Ok(EXIT_DENIED);
-        }
     }
-    let (output, target) = match request.output(&shared.caller, caller.spec.network.mode()) {
-        Ok(built) => built,
+    let shares_net = caller
+        .spec
+        .namespaces
+        .is_shared(crate::manifest::ShareableNamespace::Net);
+    let mode = match request.network_mode(caller.spec.network.mode(), shares_net) {
+        Ok(mode) => mode,
         Err(why) => {
             say(&why);
-            return Ok(EXIT_DENIED);
-        }
-    };
-    let provider = crate::provider::SUPERVISOR_PROVIDER_NAME
-        .parse()
-        .expect("the supervisor's name is a valid provider name");
-    let compiled = match ctx.loaded.compile_with((provider, output)) {
-        Ok(compiled) => compiled,
-        Err(e) => {
-            say(&format!("cannot grant this: {e}"));
             return Ok(EXIT_DENIED);
         }
     };
@@ -684,22 +678,85 @@ fn run_grant(
         say("this needs a yes on a stopit server's terminal; run `stopit server` in the workspace");
         return Ok(EXIT_DENIED);
     };
-    let ask = ApprovalRequest::Grant {
-        grants: request.describe(home),
-        key: request.key(home),
-        scope: request.scope.text(),
-        command: request
-            .command
-            .iter()
-            .map(|a| crate::escape::shell_quote(a))
-            .collect::<Vec<_>>()
-            .join(" "),
-        cwd: crate::escape::escape_bytes(cwd.as_os_str().as_bytes()),
-    };
     let asker = Asker {
         run: ctx.run,
         profile: shared.caller.as_str().to_owned(),
         command: ctx.command.clone(),
+    };
+    let command_line = request
+        .command
+        .iter()
+        .map(|a| crate::escape::shell_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let probe = ApprovalRequest::Grant {
+        grants: Vec::new(),
+        key: String::new(),
+        scope: request.scope.text(),
+        profile: String::new(),
+        command: command_line.clone(),
+        cwd: String::new(),
+    };
+    if approver.is_quiet(&asker, &probe) {
+        say("denied by user a moment ago; wait before asking again");
+        return Ok(EXIT_DENIED);
+    }
+    let refuse = |why: &str| {
+        approver.log(&format!(
+            "stopit: run {} ({}): stopit-grant refused without asking: {}",
+            ctx.run,
+            crate::escape::escape_message(&format!("profile {:?}", shared.caller.as_str())),
+            crate::escape::escape_message(why)
+        ));
+        say("refused; the stopit server's terminal says why");
+        Ok(EXIT_DENIED)
+    };
+    let home = ctx.loaded.host_home();
+    let mut paths = Vec::new();
+    for (path, rw) in request.paths() {
+        let host = GrantRequest::host_path(path, home);
+        let meta = match std::fs::metadata(&host) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return refuse(&format!("{} does not exist", host.display()));
+            }
+            Err(e) => return refuse(&format!("cannot read {}: {e}", host.display())),
+        };
+        if std::os::unix::fs::FileTypeExt::is_socket(&meta.file_type()) {
+            return refuse(&format!("{} is a socket", host.display()));
+        }
+        let canonical = std::fs::canonicalize(&host)
+            .map_err(|e| format!("cannot resolve {}: {e}", host.display()));
+        match canonical {
+            Ok(canonical) => paths.push((canonical, rw)),
+            Err(why) => return refuse(&why),
+        }
+    }
+    let (output, target) = match request.output(&shared.caller, mode) {
+        Ok(built) => built,
+        Err(why) => return refuse(&why),
+    };
+    let provider = crate::provider::SUPERVISOR_PROVIDER_NAME
+        .parse()
+        .expect("the supervisor's name is a valid provider name");
+    let compiled = match ctx.loaded.compile_with((provider, output)) {
+        Ok(compiled) => compiled,
+        Err(e) => return refuse(&e.to_string()),
+    };
+    let Some(granted) = compiled.get(&target) else {
+        return refuse("the temporary profile did not compile");
+    };
+    if let Err(why) = check_grant(&ctx.compiled, caller, granted, &paths) {
+        return refuse(&why);
+    }
+    let network = mode.map(|_| &granted.spec.network);
+    let ask = ApprovalRequest::Grant {
+        grants: GrantRequest::describe(home, network, &paths),
+        key: GrantRequest::key(network, &paths),
+        scope: request.scope.text(),
+        profile: target.to_string(),
+        command: command_line,
+        cwd: crate::escape::escape_bytes(cwd.as_os_str().as_bytes()),
     };
     if !approver.decide(&asker, &ask, conn.as_fd()).allows() {
         say("denied by user");
@@ -717,6 +774,81 @@ fn run_grant(
     start_and_wait(
         conn, shared, number, &granted, &target, &command, stdio, cwd_fd, rel,
     )
+}
+
+/// Checks the compiled temporary profile `granted` against the session as
+/// compiled for the run, `session`, and the caller's profile `caller`,
+/// for what the compiler cannot see from one profile. `paths` are the
+/// grant's canonical host paths, with whether each is read-write.
+///
+/// * A read-write path must not hold the host source of a mount that some
+///   profile makes by path, outside its untrusted roots (§3.4, §6.2). The
+///   granted command could swap a link in there, which later sandboxes,
+///   compiled without this grant, would follow.
+/// * A grant must not land on or inside a path the caller masks or
+///   protects, where a profile's own rule would lift the caller's.
+/// * The grant must add no compile warning to the caller's, since a
+///   warning means a rule did not take as the prompt would show it.
+fn check_grant(
+    session: &CompiledSession,
+    caller: &crate::spec::CompiledProfile,
+    granted: &crate::spec::CompiledProfile,
+    paths: &[(PathBuf, bool)],
+) -> Result<(), String> {
+    use crate::policy::PathMode;
+    use crate::resolve::MountSource;
+    for (granted_path, _) in paths.iter().filter(|(_, rw)| *rw) {
+        for (name, profile) in session.iter() {
+            let spec = &profile.spec;
+            for m in &spec.mounts {
+                let MountSource::Host { path, .. } = &m.source else {
+                    continue;
+                };
+                let sources = [Some(path), spec.canonical_sources.get(&m.sandbox)];
+                for source in sources.into_iter().flatten() {
+                    let trusted_by_fd = spec.untrusted_roots.iter().any(|r| source.starts_with(r));
+                    if source.starts_with(granted_path) && !trusted_by_fd {
+                        return Err(format!(
+                            "{} would be writable, and profile {:?} mounts {} below it by path",
+                            granted_path.display(),
+                            name.as_str(),
+                            source.display()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let stopit = crate::provider::SUPERVISOR_PROVIDER_NAME;
+    for m in &granted.spec.mounts {
+        let from_grant = m.provider.as_str() == stopit
+            && matches!(m.mode, PathMode::Ro | PathMode::Rw | PathMode::Protected);
+        if !from_grant {
+            continue;
+        }
+        if let Some(restricted) = caller.spec.mounts.iter().find(|c| {
+            matches!(c.mode, PathMode::Masked | PathMode::Protected)
+                && c.provider.as_str() != stopit
+                && m.sandbox.starts_with(&c.sandbox)
+        }) {
+            return Err(format!(
+                "it would replace the {} rule of provider {:?} at {}",
+                restricted.mode.as_str(),
+                restricted.provider.as_str(),
+                restricted.sandbox.display()
+            ));
+        }
+    }
+    let before: BTreeSet<String> = caller.warnings.iter().map(ToString::to_string).collect();
+    if let Some(new) = granted
+        .warnings
+        .iter()
+        .map(ToString::to_string)
+        .find(|w| !before.contains(w))
+    {
+        return Err(format!("a rule would not take as asked: {new}"));
+    }
+    Ok(())
 }
 
 /// One of a run's [`MAX_LIVE`] shim commands, given back on drop.

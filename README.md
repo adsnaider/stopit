@@ -302,9 +302,10 @@ stopit-grant +net:crates.io +ro:~/.cargo/credentials.toml -- cargo publish
 
 - `+net:<domain>` reaches a domain through the proxy, and `+net:full` gives the full network.
 - `+rw:<path>` and `+ro:<path>` mount a host path. The path is absolute, or `~/…` for your home.
-- The command runs in a sandbox like the caller's, plus the grants, and gets nothing else.
-- stopit refuses, before asking you, what it would refuse in your configuration, such as your project at a second path or stopit's own state.
+- The command runs in a sandbox like the caller's, plus the grants, and gets nothing else. It cannot call `stopit-grant` again.
+- stopit refuses, before asking you, what it would refuse in your configuration, such as your project at a second path or stopit's own state. It also refuses a writable path holding files another profile mounts, and a path the caller's profile masks. The sandbox is told only that it was refused, and your server's terminal says why.
 - `s` allows the same grants again for the rest of the session, for commands in a scope. The agent can propose the scope with `--scope 'cargo publish'`. Otherwise it is the program and its subcommand words. The prompt shows it.
+- After you say no, every `stopit-grant` from that profile is refused for five seconds without asking.
 - `sandbox.grant = false` in a provider removes `stopit-grant` from that profile and the ones inheriting it.
 
 ### Limit processes, memory and CPU

@@ -378,10 +378,17 @@ fn approve_for_client(conn: &UnixStream, approver: &Approver, runs: &SharedRuns)
     // A client asks only about its terminal's clipboard. Brokered commands
     // and grants come from the brokers in this process, and an answer for
     // the session to a client's copy of one would cover the real one.
-    let from_client = matches!(request, ApprovalRequest::ClipboardWrite { .. });
+    let clipboard_write = matches!(request, ApprovalRequest::ClipboardWrite { .. });
     let verdict = match asker {
-        Some(asker) if from_client => approver.decide(&asker, &request, conn.as_fd()),
-        _ => Verdict::Denied,
+        Some(asker) if clipboard_write => approver.decide(&asker, &request, conn.as_fd()),
+        Some(_) => {
+            approver.log(&format!(
+                "stopit: run {run}: refused a client's approval request that was not a \
+                 clipboard write"
+            ));
+            Verdict::Denied
+        }
+        None => Verdict::Denied,
     };
     let _ = write_frame(
         conn,

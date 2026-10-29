@@ -508,9 +508,13 @@ impl VcsProvider {
         // inherit, whose backing directory `main` shares.
         let home = || list(vec![VCS_HOME.to_owned()]);
         let system = || Value::Table(table([("home", VCS_HOME.into())]));
+        // A VCS command has no use for `stopit-grant`, and a grant on top
+        // of these profiles would mount host paths beside the metadata.
+        let no_grant = || Value::Table(table([("grant", false.into())]));
         let mut ro = toml::Table::new();
         ro.insert("network".into(), offline());
         ro.insert("system".into(), system());
+        ro.insert("sandbox".into(), no_grant());
         ro.insert(
             "fs".into(),
             Value::Table(table([
@@ -533,6 +537,7 @@ impl VcsProvider {
         let mut local = toml::Table::new();
         local.insert("network".into(), offline());
         local.insert("system".into(), system());
+        local.insert("sandbox".into(), no_grant());
         local.insert("fs".into(), Value::Table(local_fs));
         local.insert(
             "env".into(),
@@ -922,6 +927,8 @@ mod tests {
             assert_eq!(env(p, "GNUPGHOME"), Some("/home/vcs/.gnupg-unused"));
             assert_eq!(env(p, "XDG_CONFIG_HOME"), Some(VCS_XDG_CONFIG));
             assert_eq!(patterns(&p.grants.fs.ephemeral), [VCS_HOME]);
+            // No `stopit-grant` in a VCS command.
+            assert_eq!(p.grants.sandbox.grant, Some(false));
         }
         // No jj repository, no jj shim.
         assert_eq!(

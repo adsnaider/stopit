@@ -4048,18 +4048,26 @@ fn a_grant_runs_once_the_server_terminal_says_yes() {
         return;
     };
     let s = Setup::with_config(&format!("{config}[approval]\ntimeout = \"20s\"\n"));
-    // Host directories the sandbox does not see.
+    // Host directories the sandbox does not see, one asked for through a
+    // link, and a socket in it, which the grant masks.
     let secret = s.root.join("secret");
     fs::create_dir(&secret).unwrap();
     fs::write(secret.join("note"), "granted\n").unwrap();
+    let _socket = std::os::unix::net::UnixListener::bind(secret.join("s.sock")).unwrap();
+    let link = s.root.join("link");
+    std::os::unix::fs::symlink(&secret, &link).unwrap();
     let out_dir = s.root.join("out");
     fs::create_dir(&out_dir).unwrap();
     let server = Server::start_on_terminal(&s, &server_master, server_slave);
     let script = format!(
-        "cat {secret}/note 2>/dev/null || echo hidden; \
-         stopit-grant +ro:{secret} +rw:{out} -- sh -c 'cat {secret}/note; echo written > {out}/f'; \
+        "cat {link}/note 2>/dev/null || echo hidden; \
+         stopit-grant +ro:{link} +rw:{out} -- sh -c '\
+           cat {link}/note; \
+           [ -S {link}/s.sock ] && echo socket || echo no socket; \
+           command -v stopit-grant || echo no stopit-grant; \
+           echo written > {out}/f'; \
          echo \"rc=$?\"",
-        secret = secret.display(),
+        link = link.display(),
         out = out_dir.display(),
     );
     let child = command_output_async(s.stopit(&["run", "--quiet", "/bin/sh", "-c", &script]));
@@ -4069,19 +4077,25 @@ fn a_grant_runs_once_the_server_terminal_says_yes() {
     assert_eq!(code(&out), 0, "{out:?}");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "hidden\ngranted\nrc=0\n"
+        "hidden\ngranted\nno socket\nno stopit-grant\nrc=0\n"
     );
     assert_eq!(fs::read_to_string(out_dir.join("f")).unwrap(), "written\n");
     let log = server.log();
     for want in [
         "run sh -c ".to_owned(),
-        "from /workspace, in this run's sandbox plus:".to_owned(),
+        "in profile \"stopit.grant\", from /workspace".to_owned(),
+        "which is this run's sandbox plus these grants:".to_owned(),
         format!("read-write {}", out_dir.display()),
+        // The link's target, which is what gets mounted.
         format!("read-only {}", secret.display()),
         "[s] covers these grants for sh ... until the session ends".to_owned(),
     ] {
         assert!(log.contains(&want), "{want}: {log}");
     }
+    assert!(
+        !log.contains(&format!("read-only {}", link.display())),
+        "{log}"
+    );
 }
 
 #[test]
@@ -4096,50 +4110,56 @@ fn a_session_answer_covers_the_scope_and_the_grants_only() {
     let secret = s.root.join("secret");
     fs::create_dir(&secret).unwrap();
     fs::write(secret.join("note"), "granted\n").unwrap();
+    let other = s.root.join("other");
+    fs::create_dir(&other).unwrap();
     let server = Server::start_on_terminal(&s, &server_master, server_slave);
-    let grant = |command: &str| {
-        format!(
-            "stopit-grant +ro:{} -- {command}; echo \"rc=$?\"",
-            secret.display()
-        )
-    };
-    let note = format!("{}/note", secret.display());
-    // The first call asks, and `s` covers `cat` with this grant.
-    let child = command_output_async(s.stopit(&[
-        "run",
-        "--quiet",
-        "/bin/sh",
-        "-c",
-        &grant(&format!("cat {note}")),
-    ]));
-    answer(&server, &server_master, b"s", "allowed for this session");
-    let out = child.join().unwrap();
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "granted\nrc=0\n");
-    // The same program and grant run without asking again.
-    let prompts = server.log().matches("[n] deny: ").count();
-    let out = output(
+    let run = |line: &str| {
         s.stopit(&[
             "run",
             "--quiet",
             "/bin/sh",
             "-c",
-            &grant(&format!("cat -n {note}")),
-        ]),
-        b"",
-    );
+            &format!("{line}; echo \"rc=$?\""),
+        ])
+    };
+    let grant = |command: &str| format!("stopit-grant +ro:{} -- {command}", secret.display());
+    let prompts = || server.log().matches("[n] deny: ").count();
+    let note = format!("{}/note", secret.display());
+    // The first call asks, and `s` covers `cat` with this grant, the scope
+    // the call names.
+    let child = command_output_async(run(&format!(
+        "stopit-grant --scope cat +ro:{} -- cat {note}",
+        secret.display()
+    )));
+    server.wait_for_log("grants for cat ...");
+    answer(&server, &server_master, b"s", "allowed for this session");
+    let out = child.join().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "granted\nrc=0\n");
+    // The same program and grant run without asking again, with the scope
+    // left to its default.
+    let asked = prompts();
+    let out = output(run(&grant(&format!("cat -n {note}"))), b"");
     assert!(
         String::from_utf8_lossy(&out.stdout).ends_with("granted\nrc=0\n"),
         "{out:?}"
     );
-    assert_eq!(server.log().matches("[n] deny: ").count(), prompts);
+    assert_eq!(prompts(), asked);
+    // The same program with one more grant asks again.
+    let child = command_output_async(run(&format!(
+        "stopit-grant +ro:{} +ro:{} -- cat {note}",
+        secret.display(),
+        other.display()
+    )));
+    let deadline = Instant::now() + BWRAP_DEADLINE;
+    while prompts() == asked {
+        assert!(Instant::now() < deadline, "{}", server.log());
+        thread::sleep(Duration::from_millis(20));
+    }
+    answer(&server, &server_master, b"y", "allowed once");
+    let out = child.join().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "granted\nrc=0\n");
     // Another program asks again, and `n` refuses it.
-    let child = command_output_async(s.stopit(&[
-        "run",
-        "--quiet",
-        "/bin/sh",
-        "-c",
-        &grant(&format!("head -n1 {note}")),
-    ]));
+    let child = command_output_async(run(&grant(&format!("head -n1 {note}"))));
     server.wait_for_log("grants for head ...");
     answer(&server, &server_master, b"n", "denied");
     let out = child.join().unwrap();
@@ -4148,6 +4168,22 @@ fn a_session_answer_covers_the_scope_and_the_grants_only() {
         stderr(&out).contains("stopit-grant: denied by user"),
         "{out:?}"
     );
+    // For a few seconds after, no grant from the profile asks, whatever it
+    // names.
+    let asked = prompts();
+    let out = output(
+        run(&format!(
+            "stopit-grant +ro:{} -- tail {note}",
+            other.display()
+        )),
+        b"",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "rc=126\n");
+    assert!(
+        stderr(&out).contains("denied by user a moment ago"),
+        "{out:?}"
+    );
+    assert_eq!(prompts(), asked);
 }
 
 #[test]
@@ -4174,24 +4210,14 @@ fn grants_are_refused_before_anyone_is_asked() {
         assert_eq!(String::from_utf8_lossy(&out.stdout), "rc=126\n", "{line}");
         stderr(&out)
     };
+    let needs_a_yes = "needs a yes on a stopit server's terminal";
     let cases = [
+        // What the sandbox can see for itself gets the reason.
         ("stopit-grant -- true".to_owned(), "nothing to grant"),
         ("stopit-grant +ro:/x".to_owned(), "usage: stopit-grant"),
         (
             "stopit-grant +ro:/home/user/.cargo -- true".to_owned(),
             "is in this sandbox's home, not a host path; write it as ~/.cargo",
-        ),
-        (
-            format!("stopit-grant +ro:{}/missing -- true", s.root.display()),
-            "does not exist on the host",
-        ),
-        (
-            format!("stopit-grant +ro:{} -- true", s.ws().display()),
-            "cannot grant this",
-        ),
-        (
-            format!("stopit-grant +rw:{} -- true", s.state_dir().display()),
-            "cannot grant this",
         ),
         (
             format!(
@@ -4200,14 +4226,136 @@ fn grants_are_refused_before_anyone_is_asked() {
             ),
             "not in the scope",
         ),
+        // Anything that would need a look at the host is not looked at.
         (
             format!("stopit-grant +ro:{} -- true", secret.display()),
-            "needs a yes on a stopit server's terminal",
+            needs_a_yes,
+        ),
+        (
+            format!("stopit-grant +ro:{}/missing -- true", s.root.display()),
+            needs_a_yes,
+        ),
+        (
+            format!("stopit-grant +rw:{} -- true", s.state_dir().display()),
+            needs_a_yes,
         ),
     ];
     for (line, want) in cases {
         let err = run(&line);
         assert!(err.contains(want), "{line}: {err}");
+        assert!(!err.contains("does not exist"), "{line}: {err}");
+    }
+}
+
+#[test]
+fn grants_the_host_refuses_say_why_only_on_the_server_terminal() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((server_master, server_slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::new();
+    let root = s.root.clone();
+    for dir in ["cfg", "x/hidden", "data"] {
+        fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    fs::write(root.join("cfg/f"), "").unwrap();
+    let _socket = std::os::unix::net::UnixListener::bind(root.join("s.sock")).unwrap();
+    // `main` masks x/hidden, and the profile `publish` mounts cfg/f by
+    // path.
+    s.write_config(&format!(
+        "{config}[approval]\ntimeout = \"20s\"\n\
+         [[provider]]\ntype = \"config\"\nname = \"mask\"\n[provider.sandbox]\n\
+         fs.ro = [\"{x}\"]\nfs.masked = [\"{x}/hidden\"]\n\
+         [profiles.publish]\n\
+         [[provider]]\ntype = \"config\"\nname = \"pub\"\nprofile = \"publish\"\n\
+         [provider.sandbox]\nfs.ro = [\"{cfg}/f\"]\n",
+        x = root.join("x").display(),
+        cfg = root.join("cfg").display(),
+    ));
+    let server = Server::start_on_terminal(&s, &server_master, server_slave);
+    let cases = [
+        (format!("+ro:{}/missing", root.display()), "does not exist"),
+        (format!("+ro:{}/s.sock", root.display()), "is a socket"),
+        (
+            format!("+rw:{}/cfg", root.display()),
+            "and profile \"publish\" mounts",
+        ),
+        (
+            format!("+ro:{}/x/hidden", root.display()),
+            "would replace the masked rule of provider \"mask\"",
+        ),
+        (
+            format!("+rw:{}", s.state_dir().display()),
+            "is stopit's data directory",
+        ),
+        // The runtime directory under a read-only grant gets a mask and a
+        // warning, so the grant would not show what the prompt says.
+        (
+            format!("+ro:{}", s.runtime().display()),
+            "a rule would not take as asked",
+        ),
+    ];
+    for (grant, why) in cases {
+        let line = format!("stopit-grant {grant} -- true; echo \"rc=$?\"");
+        let out = output(s.stopit(&["run", "--quiet", "/bin/sh", "-c", &line]), b"");
+        assert_eq!(code(&out), 0, "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "rc=126\n", "{grant}");
+        let err = stderr(&out);
+        assert!(
+            err.contains("refused; the stopit server's terminal says why"),
+            "{grant}: {err}"
+        );
+        // The sandbox learns nothing about the host path.
+        assert!(!err.contains(why), "{grant}: {err}");
+        assert!(!err.contains(&*root.to_string_lossy()), "{grant}: {err}");
+        let logged = server.wait_for_log(why);
+        assert!(
+            logged.contains("stopit-grant refused without asking"),
+            "{logged}"
+        );
+    }
+    // Nothing asked.
+    assert!(!server.log().contains("[n] deny: "), "{}", server.log());
+    // A file under the read-write grant that no profile mounts is fine,
+    // and the grant asks.
+    let line = format!(
+        "stopit-grant +rw:{} -- true; echo \"rc=$?\"",
+        root.join("data").display()
+    );
+    let child = command_output_async(s.stopit(&["run", "--quiet", "/bin/sh", "-c", &line]));
+    server.wait_for_log("[n] deny: ");
+    answer(&server, &server_master, b"y", "allowed once");
+    let out = child.join().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "rc=0\n", "{out:?}");
+}
+
+#[test]
+fn a_sandbox_sharing_the_host_network_gets_no_network_grant() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let s = Setup::with_config(&format!(
+        "{config}[[provider]]\ntype = \"config\"\nname = \"net\"\n[provider.sandbox]\n\
+         sandbox.share = [\"net\"]\n"
+    ));
+    for grant in ["+net:crates.io", "+net:full"] {
+        let out = output(
+            s.stopit(&[
+                "run",
+                "--quiet",
+                "/bin/sh",
+                "-c",
+                &format!("stopit-grant {grant} -- true; echo \"rc=$?\""),
+            ]),
+            b"",
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "rc=126\n", "{out:?}");
+        assert!(
+            stderr(&out).contains("shares the host's network already"),
+            "{out:?}"
+        );
     }
 }
 
@@ -4219,12 +4367,18 @@ fn a_network_grant_puts_the_command_behind_the_proxy() {
     let Some((server_master, server_slave)) = open_pty() else {
         return;
     };
-    let s = Setup::with_config(&format!("{config}[approval]\ntimeout = \"20s\"\n"));
+    // Domains the sandbox's profile names without the proxy come along
+    // once the grant turns it on, so the prompt lists them too.
+    let s = Setup::with_config(&format!(
+        "{config}[approval]\ntimeout = \"20s\"\n\
+         [[provider]]\ntype = \"config\"\nname = \"net\"\n[provider.sandbox]\n\
+         network.allow_domains = [\"example.org\"]\n"
+    ));
     let server = Server::start_on_terminal(&s, &server_master, server_slave);
     let script = "echo \"before [${HTTPS_PROXY:-}]\"; \
                   stopit-grant +net:crates.io -- sh -c 'echo \"after [$HTTPS_PROXY]\"'";
     let child = command_output_async(s.stopit(&["run", "--quiet", "/bin/sh", "-c", script]));
-    server.wait_for_log("network through the proxy to crates.io");
+    server.wait_for_log("network through the proxy to crates.io, example.org");
     answer(&server, &server_master, b"y", "allowed once");
     let out = child.join().unwrap();
     assert_eq!(code(&out), 0, "{out:?}");
@@ -4252,7 +4406,7 @@ fn a_full_network_grant_gives_the_command_pasta() {
     let script = "cat /etc/resolv.conf 2>/dev/null || echo none; \
                   stopit-grant +net:full -- cat /etc/resolv.conf";
     let child = command_output_async(s.stopit(&["run", "--quiet", "/bin/sh", "-c", script]));
-    server.wait_for_log("the full network: whatever this machine reaches");
+    server.wait_for_log("the full network, which reaches whatever this machine reaches");
     answer(&server, &server_master, b"y", "allowed once");
     let out = child.join().unwrap();
     assert_eq!(code(&out), 0, "{out:?}");

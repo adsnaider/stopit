@@ -509,6 +509,48 @@ mod tests {
     }
 
     #[test]
+    fn the_shim_directory_comes_first_in_path_once() {
+        let path_of = |spec: &SandboxSpec| {
+            spec.target_env(vars(&[("PATH", "/host/bin")]))
+                .into_iter()
+                .find(|(k, _)| k == PATH)
+                .map(|(_, v)| v.into_string().unwrap())
+        };
+        let mut spec = SandboxSpec {
+            grant: true,
+            ..SandboxSpec::default()
+        };
+        // No `PATH` of the profile's: the shim directory alone.
+        assert_eq!(path_of(&spec).as_deref(), Some("/run/stopit/bin"));
+        spec.env = policy(&[], &[], &[], &["/usr/bin", "/bin"]);
+        assert_eq!(
+            path_of(&spec).as_deref(),
+            Some("/run/stopit/bin:/usr/bin:/bin")
+        );
+        // A `PATH` that names the directory, or has empty entries, which
+        // would mean the current directory, gets neither twice.
+        for set in [
+            "/run/stopit/bin:/usr/bin",
+            "/usr/bin:/run/stopit/bin",
+            ":/usr/bin::",
+            "/usr/bin:/run/stopit/bin:",
+        ] {
+            spec.env = policy(&[], &[], &[("PATH", set)], &[]);
+            assert_eq!(
+                path_of(&spec).as_deref(),
+                Some("/run/stopit/bin:/usr/bin"),
+                "{set:?}"
+            );
+        }
+        spec.env = policy(&[], &[], &[("PATH", "")], &[]);
+        assert_eq!(path_of(&spec).as_deref(), Some("/run/stopit/bin"));
+        // Without shims or `stopit-grant`, `PATH` is the profile's.
+        spec.grant = false;
+        spec.env = policy(&[], &[], &[("PATH", ":/usr/bin")], &[]);
+        assert_eq!(path_of(&spec).as_deref(), Some(":/usr/bin"));
+    }
+
+    #[test]
     fn deny_ignores_ascii_case_but_pass_does_not() {
         let env = policy(&["*"], &["*_TOKEN", "aws_*"], &[], &[]);
         let host = vars(&[

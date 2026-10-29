@@ -1518,10 +1518,13 @@ fn check_host_sources(
     Ok((mounts, canonical_sources))
 }
 
-/// Scans every kept `rw` host directory mount for Unix domain sockets without
-/// following symlinks, skips subtrees covered by another mount of the profile,
+/// Scans every kept `rw` host directory mount for Unix domain sockets
+/// without following symlinks, and every `ro` one that a `stopit-grant`
+/// request added (attributed to [`SUPERVISOR_PROVIDER_NAME`], DESIGN.md
+/// §7.5), since its prompt says "read-only" and a socket in it would still
+/// connect. Skips subtrees covered by another mount of the profile,
 /// and emits `masked` mounts attributed to [`SUPERVISOR_PROVIDER_NAME`]. Masks
-/// unreadable or unsearchable directories inside an `rw` mount as directories
+/// unreadable or unsearchable directories inside a scanned mount as directories
 /// with [`SpecWarning::SocketScanMasked`] so the sandbox cannot uncover sockets
 /// hidden inside them.
 fn mask_rw_sockets(
@@ -1538,7 +1541,8 @@ fn mask_rw_sockets(
     let mut replace_rw: BTreeSet<PathBuf> = BTreeSet::new();
 
     for m in &mounts {
-        if m.mode != PathMode::Rw {
+        let granted_ro = m.mode == PathMode::Ro && m.provider == stopit;
+        if m.mode != PathMode::Rw && !granted_ro {
             continue;
         }
         let MountSource::Host { path: host, kind } = &m.source else {

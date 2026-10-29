@@ -1,4 +1,4 @@
-//! `stopit-grant` (DESIGN.md §7.5): a command in a sandbox asks for more
+//! `stopit-grant` (DESIGN.md §7.5). A command in a sandbox asks for more
 //! than its profile grants, for one command, and the user answers on the
 //! server's terminal.
 //!
@@ -15,12 +15,13 @@
 //! applies to a grant too.
 
 use std::collections::BTreeSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use crate::config::{ProfileName, ProfileRef, ProviderName, ProviderOrigin};
 use crate::manifest::{BinaryName, Domain, Manifest, PathPattern, SubcommandPattern};
 use crate::policy::NetworkMode;
 use crate::provider::{ProviderOutput, SUPERVISOR_PROVIDER_NAME};
+use crate::spec::NetworkSpec;
 
 /// The usage line the broker prints with a refusal.
 pub const USAGE: &str = "usage: stopit-grant [--scope '<program> [<words>]'] +net:<domain> \
@@ -160,8 +161,8 @@ impl GrantRequest {
                 let scope = parse_scope(&text)?;
                 if !scope.covers(&command) {
                     return Err(format!(
-                        "the command is not in the scope {:?}: the scope's words must match \
-                         the command's words before its first flag",
+                        "the command is not in the scope {:?}. The scope's words must match \
+                         the command's words before its first flag.",
                         scope.text()
                     ));
                 }
@@ -196,35 +197,49 @@ impl GrantRequest {
         }
     }
 
-    /// The network mode of the temporary profile, given the caller's:
-    /// `None` if the request does not change it. An error if `+net:` asks
-    /// for nothing the caller lacks.
-    pub fn network_mode(&self, caller: NetworkMode) -> Result<Option<NetworkMode>, String> {
-        if self.full {
-            return Ok(Some(NetworkMode::Full));
-        }
-        if self.net.is_empty() {
+    /// The network mode of the temporary profile, given the caller's mode
+    /// and whether it shares the host's network namespace. `None` if the
+    /// request does not change it. An error if `+net:` asks for nothing
+    /// the caller lacks.
+    pub fn network_mode(
+        &self,
+        caller: NetworkMode,
+        shares_net: bool,
+    ) -> Result<Option<NetworkMode>, String> {
+        if !self.full && self.net.is_empty() {
             return Ok(None);
+        }
+        if shares_net {
+            return Err("this sandbox shares the host's network already".to_owned());
         }
         if caller == NetworkMode::Full {
             return Err("this sandbox already has the full network".to_owned());
         }
-        Ok(Some(NetworkMode::Proxy))
+        Ok(Some(if self.full {
+            NetworkMode::Full
+        } else {
+            NetworkMode::Proxy
+        }))
     }
 
     /// The provider output adding a profile that inherits `caller` with the
-    /// grants, and that profile's full name. `caller_mode` is the caller's
-    /// network mode.
+    /// grants, and that profile's full name. `mode` is its network mode
+    /// from [`network_mode`](Self::network_mode). The profile has no
+    /// `stopit-grant` of its own, so a granted command cannot ask again
+    /// from on top of its grants.
     pub fn output(
         &self,
         caller: &ProfileRef,
-        caller_mode: NetworkMode,
+        mode: Option<NetworkMode>,
     ) -> Result<(ProviderOutput, ProfileRef), String> {
         use toml::Value;
         let strings =
             |items: &mut dyn Iterator<Item = &str>| Value::Array(items.map(Value::from).collect());
         let mut profile = toml::Table::new();
         profile.insert("inherit".into(), caller.as_str().into());
+        let mut sandbox = toml::Table::new();
+        sandbox.insert("grant".into(), false.into());
+        profile.insert("sandbox".into(), Value::Table(sandbox));
         let mut fs = toml::Table::new();
         if !self.rw.is_empty() {
             fs.insert(
@@ -241,7 +256,7 @@ impl GrantRequest {
         if !fs.is_empty() {
             profile.insert("fs".into(), Value::Table(fs));
         }
-        if let Some(mode) = self.network_mode(caller_mode)? {
+        if let Some(mode) = mode {
             let mut network = toml::Table::new();
             network.insert("mode".into(), mode.as_str().into());
             if mode == NetworkMode::Proxy {
@@ -270,40 +285,56 @@ impl GrantRequest {
         Ok((output, full))
     }
 
-    /// What the prompt lists for the grants, with paths as `home` resolves
-    /// them, unescaped.
-    pub fn describe(&self, home: &Path) -> Vec<String> {
+    /// What the prompt lists for the grants, escaped: the network of the
+    /// compiled temporary profile, `network`, which holds the domains it
+    /// inherits too, and `paths`, the canonical host paths with whether
+    /// each is read-write. Paths in or containing `home` say so.
+    pub fn describe(
+        home: &Path,
+        network: Option<&NetworkSpec>,
+        paths: &[(PathBuf, bool)],
+    ) -> Vec<String> {
         let mut lines = Vec::new();
-        if self.full {
-            lines.push("the full network: whatever this machine reaches".to_owned());
-        } else if !self.net.is_empty() {
-            let names: Vec<&str> = self.net.iter().map(Domain::as_str).collect();
-            lines.push(format!("network through the proxy to {}", names.join(", ")));
+        match network {
+            Some(NetworkSpec::Full) => lines
+                .push("the full network, which reaches whatever this machine reaches".to_owned()),
+            Some(NetworkSpec::Proxy { allow_domains }) => {
+                let names: Vec<&str> = allow_domains.iter().map(Domain::as_str).collect();
+                lines.push(format!("network through the proxy to {}", names.join(", ")));
+            }
+            _ => {}
         }
-        for (path, rw) in self.paths() {
-            let host = Self::host_path(path, home);
-            let mode = if rw { "read-write" } else { "read-only" };
+        for (host, rw) in paths {
+            let mode = if *rw { "read-write" } else { "read-only" };
             let note = if host.starts_with(home) {
                 " (in your home)"
+            } else if home.starts_with(host) {
+                " (holds your home)"
             } else {
                 ""
             };
-            lines.push(format!("{mode} {}{note}", host.display()));
+            lines.push(format!(
+                "{mode} {}{note}",
+                crate::escape::escape_bytes(host.as_os_str().as_encoded_bytes())
+            ));
         }
         lines
     }
 
-    /// The grants as one canonical string, with paths as `home` resolves
-    /// them, for the session key.
-    pub fn key(&self, home: &Path) -> String {
+    /// The grants as one canonical string, for the session key: the same
+    /// network and `paths` as [`describe`](Self::describe) shows.
+    pub fn key(network: Option<&NetworkSpec>, paths: &[(PathBuf, bool)]) -> String {
         let mut parts: Vec<String> = Vec::new();
-        if self.full {
-            parts.push("net:full".to_owned());
+        match network {
+            Some(NetworkSpec::Full) => parts.push("net:full".to_owned()),
+            Some(NetworkSpec::Proxy { allow_domains }) => {
+                parts.extend(allow_domains.iter().map(|d| format!("net:{d}")))
+            }
+            _ => {}
         }
-        parts.extend(self.net.iter().map(|d| format!("net:{d}")));
-        for (path, rw) in self.paths() {
-            let mode = if rw { "rw" } else { "ro" };
-            parts.push(format!("{mode}:{}", Self::host_path(path, home).display()));
+        for (host, rw) in paths {
+            let mode = if *rw { "rw" } else { "ro" };
+            parts.push(format!("{mode}:{}", host.display()));
         }
         parts.join("\0")
     }
@@ -362,23 +393,28 @@ fn default_scope(program: BinaryName, args: &[Vec<u8>]) -> Scope {
     Scope { program, pattern }
 }
 
-/// Checks a grant path: absolute or `~/…`, a valid path rule, and no glob,
-/// `{workspace}`, `.` or `..`.
+/// Checks a grant path: absolute or `~/…` below the home, a valid path
+/// rule, and no glob, `{workspace}`, `.`, `..` or control character, which
+/// a prompt would have to show.
 fn check_path(path: &str) -> Result<String, String> {
     if !(path.starts_with('/') || path.starts_with("~/")) {
         return Err(format!(
             "the path {path:?} must be absolute or start with `~/`"
         ));
     }
+    if path.chars().any(char::is_control) {
+        return Err(format!(
+            "the path {path:?} must not hold a control character"
+        ));
+    }
     if path.contains(['*', '?', '[', ']', '{', '}', '\\']) {
         return Err(format!("the path {path:?} must not hold a glob character"));
     }
     let path = path.trim_end_matches('/');
-    let rest = path.trim_start_matches("~/");
-    if Path::new(rest)
-        .components()
-        .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
-    {
+    if path == "~" {
+        return Err("a path under `~/` must name something below the home".to_owned());
+    }
+    if path.split('/').any(|c| c == "." || c == "..") {
         return Err(format!("the path {path:?} must not hold `.` or `..`"));
     }
     path.parse::<PathPattern>().map_err(|e| e.to_string())?;
@@ -529,35 +565,55 @@ mod tests {
     fn the_network_mode_follows_the_caller() {
         let net = parse(&["+net:crates.io", "--", "a"]).unwrap();
         assert_eq!(
-            net.network_mode(NetworkMode::Loopback),
+            net.network_mode(NetworkMode::Loopback, false),
             Ok(Some(NetworkMode::Proxy))
         );
         assert_eq!(
-            net.network_mode(NetworkMode::Proxy),
+            net.network_mode(NetworkMode::None, false),
             Ok(Some(NetworkMode::Proxy))
         );
-        assert!(net.network_mode(NetworkMode::Full).is_err());
+        assert_eq!(
+            net.network_mode(NetworkMode::Proxy, false),
+            Ok(Some(NetworkMode::Proxy))
+        );
+        assert!(net.network_mode(NetworkMode::Full, false).is_err());
         let full = parse(&["+net:full", "+net:crates.io", "--", "a"]).unwrap();
         assert_eq!(
-            full.network_mode(NetworkMode::Full),
+            full.network_mode(NetworkMode::Proxy, false),
             Ok(Some(NetworkMode::Full))
         );
+        // A full caller has nothing more to get, `+net:full` included.
+        let e = full.network_mode(NetworkMode::Full, false).unwrap_err();
+        assert!(e.contains("already has the full network"), "{e}");
+        // A sandbox in the host's network namespace is refused any `+net:`,
+        // whatever its mode says.
+        for mode in [NetworkMode::Loopback, NetworkMode::Proxy] {
+            for g in [&net, &full] {
+                let e = g.network_mode(mode, true).unwrap_err();
+                assert!(e.contains("shares the host's network"), "{e}");
+            }
+        }
+        // Paths alone leave the network alone, shared or not.
         let paths = parse(&["+ro:/x", "--", "a"]).unwrap();
-        assert_eq!(paths.network_mode(NetworkMode::Full), Ok(None));
+        assert_eq!(paths.network_mode(NetworkMode::Full, false), Ok(None));
+        assert_eq!(paths.network_mode(NetworkMode::Loopback, true), Ok(None));
     }
 
     #[test]
     fn the_temporary_profile_inherits_the_caller_and_adds_the_grants() {
         let g = parse(&["+net:crates.io", "+rw:/var/x", "+ro:~/.y", "--", "a"]).unwrap();
         let caller: ProfileRef = "vcs.local".parse().unwrap();
-        let (output, name) = g.output(&caller, NetworkMode::Loopback).unwrap();
+        let (output, name) = g.output(&caller, Some(NetworkMode::Proxy)).unwrap();
         assert_eq!(name.as_str(), "stopit.grant");
         assert_eq!(output.profile, ProfileRef::main());
+        assert_eq!(output.origin, ProviderOrigin::Workspace);
         let profile = &output.manifest.profiles[&"grant".parse().unwrap()];
         assert_eq!(
             profile.inherit,
             crate::config::Inherit::Profile(caller.clone())
         );
+        // No `stopit-grant` inside a granted command.
+        assert_eq!(profile.grants.sandbox.grant, Some(false));
         let fs = &profile.grants.fs;
         assert_eq!(
             fs.rw.iter().map(PathPattern::as_str).collect::<Vec<_>>(),
@@ -568,16 +624,31 @@ mod tests {
             ["~/.y"]
         );
         assert_eq!(profile.grants.network.mode, Some(NetworkMode::Proxy));
-        assert_eq!(profile.grants.network.allow_domains.len(), 1);
+        assert_eq!(
+            profile
+                .grants
+                .network
+                .allow_domains
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>(),
+            ["crates.io"]
+        );
+        // `+net:full` sets the mode and no domains.
+        let full = parse(&["+net:full", "--", "a"]).unwrap();
+        let (output, _) = full.output(&caller, Some(NetworkMode::Full)).unwrap();
+        let profile = &output.manifest.profiles[&"grant".parse().unwrap()];
+        assert_eq!(profile.grants.network.mode, Some(NetworkMode::Full));
+        assert!(profile.grants.network.allow_domains.is_empty());
+        assert!(profile.grants.fs.rw.is_empty() && profile.grants.fs.ro.is_empty());
         // Paths alone leave the network as the caller has it.
         let g = parse(&["+ro:/x", "--", "a"]).unwrap();
-        let (output, _) = g.output(&caller, NetworkMode::Full).unwrap();
+        let (output, _) = g.output(&caller, None).unwrap();
         let profile = &output.manifest.profiles[&"grant".parse().unwrap()];
         assert_eq!(profile.grants.network.mode, None);
+        assert!(profile.grants.network.allow_domains.is_empty());
         // A user profile named `grant` does not inherit itself.
-        let (output, name) = g
-            .output(&"grant".parse().unwrap(), NetworkMode::Loopback)
-            .unwrap();
+        let (output, name) = g.output(&"grant".parse().unwrap(), None).unwrap();
         assert_eq!(name.as_str(), "stopit.grant-for-grant");
         assert!(
             output
@@ -587,45 +658,96 @@ mod tests {
         );
     }
 
+    fn proxy(domains: &[&str]) -> NetworkSpec {
+        NetworkSpec::Proxy {
+            allow_domains: domains.iter().map(|d| d.parse().unwrap()).collect(),
+        }
+    }
+
     #[test]
-    fn prompts_and_keys_resolve_paths() {
+    fn prompts_and_keys_show_the_compiled_network_and_canonical_paths() {
         let home = Path::new("/home/me");
-        let g = parse(&[
-            "+net:b.io",
-            "+net:a.io",
-            "+ro:~/.cargo/c",
-            "+rw:/opt/x",
-            "--",
-            "cargo",
-        ])
-        .unwrap();
+        let network = proxy(&["b.io", "a.io"]);
+        let paths = [
+            (PathBuf::from("/opt/x"), true),
+            (PathBuf::from("/home/me/.cargo/c"), false),
+            (PathBuf::from("/home"), false),
+            (PathBuf::from("/home/me"), true),
+            (PathBuf::from("/home/meet"), false),
+        ];
         assert_eq!(
-            g.describe(home),
+            GrantRequest::describe(home, Some(&network), &paths),
             [
                 "network through the proxy to a.io, b.io",
                 "read-write /opt/x",
                 "read-only /home/me/.cargo/c (in your home)",
+                "read-only /home (holds your home)",
+                "read-write /home/me (in your home)",
+                "read-only /home/meet",
             ]
         );
         assert_eq!(
-            g.key(home),
+            GrantRequest::key(Some(&network), &paths[..2]),
             "net:a.io\0net:b.io\0rw:/opt/x\0ro:/home/me/.cargo/c"
         );
-        let full = parse(&["+net:full", "--", "x"]).unwrap();
         assert_eq!(
-            full.describe(home),
-            ["the full network: whatever this machine reaches"]
+            GrantRequest::describe(home, Some(&NetworkSpec::Full), &[]),
+            ["the full network, which reaches whatever this machine reaches"]
         );
-        // The same grants written in another order give the same key.
-        let again = parse(&[
-            "+rw:/opt/x",
-            "+ro:~/.cargo/c",
-            "+net:a.io",
-            "+net:b.io",
-            "--",
-            "y",
-        ])
-        .unwrap();
-        assert_eq!(again.key(home), g.key(home));
+        assert_eq!(GrantRequest::key(Some(&NetworkSpec::Full), &[]), "net:full");
+        // A network the grant leaves alone is not listed.
+        for network in [None, Some(&NetworkSpec::Loopback), Some(&NetworkSpec::None)] {
+            assert_eq!(
+                GrantRequest::describe(home, network, &paths[..1]),
+                ["read-write /opt/x"]
+            );
+            assert_eq!(GrantRequest::key(network, &paths[..1]), "rw:/opt/x");
+        }
+        // Control bytes in a host path are escaped, not printed.
+        let odd = [(PathBuf::from("/tmp/a\x1b[2Jb\nc"), false)];
+        let line = &GrantRequest::describe(home, None, &odd)[0];
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        // A different domain set or mode gives a different key.
+        assert_ne!(
+            GrantRequest::key(Some(&proxy(&["a.io"])), &[]),
+            GrantRequest::key(Some(&proxy(&["a.io", "b.io"])), &[])
+        );
+        assert_ne!(
+            GrantRequest::key(None, &[(PathBuf::from("/x"), true)]),
+            GrantRequest::key(None, &[(PathBuf::from("/x"), false)])
+        );
+    }
+
+    #[test]
+    fn grant_paths_are_plain_absolute_or_home_paths() {
+        for (path, why) in [
+            ("~/", "below the home"),
+            ("~//", "below the home"),
+            ("~", "absolute"),
+            ("~user/x", "absolute"),
+            ("/a/b\n/c", "control character"),
+            ("/a\tb", "control character"),
+            ("/a\x1bb", "control character"),
+            ("/a/.", "`..`"),
+            ("/a/./b", "`..`"),
+            ("~/..", "`..`"),
+            ("/a/..", "`..`"),
+            ("/a?", "glob"),
+            ("/a\\b", "glob"),
+        ] {
+            let e = parse(&[&format!("+ro:{path}"), "--", "a"]).unwrap_err();
+            assert!(e.contains(why), "{path:?}: {e}");
+        }
+        // Trailing slashes go; dots inside a name are fine.
+        let g = parse(&["+ro:~/.cargo/", "+rw:/a/b..c//", "+ro:/a/.x", "--", "a"]).unwrap();
+        assert_eq!(g.ro.iter().collect::<Vec<_>>(), ["/a/.x", "~/.cargo"]);
+        assert_eq!(g.rw.iter().collect::<Vec<_>>(), ["/a/b..c"]);
+        // `~/x` maps onto the host home; absolute paths stay.
+        let home = Path::new("/home/me");
+        assert_eq!(
+            GrantRequest::host_path("~/.cargo", home),
+            Path::new("/home/me/.cargo")
+        );
+        assert_eq!(GrantRequest::host_path("/opt", home), Path::new("/opt"));
     }
 }

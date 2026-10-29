@@ -61,13 +61,15 @@ pub enum ApprovalRequest {
     },
     /// A command through `stopit-grant` (DESIGN.md §7.5).
     Grant {
-        /// What is granted, one line each, unescaped.
+        /// What is granted, one line each, with paths escaped.
         grants: Vec<String>,
         /// The grants as one canonical string, which a session answer
         /// covers.
         key: String,
         /// The commands a session answer covers, as written, unescaped.
         scope: String,
+        /// The temporary profile the command runs in.
+        profile: String,
         /// The command line, each argument quoted for a shell, escaped.
         command: String,
         /// The working directory in the sandbox, escaped.
@@ -89,6 +91,16 @@ impl ApprovalRequest {
             ApprovalRequest::Grant { key, scope, .. } => {
                 format!("{profile}\0grant\0{scope}\0{key}")
             }
+        }
+    }
+
+    /// What a denial quiets for [`QUIET_AFTER_DENY`] in `profile`: the
+    /// request's [`scope`](Self::scope), but every grant from the profile
+    /// for a grant, so another path in each request cannot get past it.
+    fn quiet_scope(&self, profile: &str) -> String {
+        match self {
+            ApprovalRequest::Grant { .. } => format!("{profile}\0grant"),
+            _ => self.scope(profile),
         }
     }
 
@@ -135,13 +147,18 @@ impl ApprovalRequest {
             ApprovalRequest::Grant {
                 grants,
                 scope,
+                profile,
                 command,
                 cwd,
                 ..
             } => {
                 let mut lines = vec![
                     format!("run {command}"),
-                    format!("from {cwd}, in this run's sandbox plus:"),
+                    format!(
+                        "in profile {}, from {cwd}",
+                        escape_message(&format!("{profile:?}"))
+                    ),
+                    "which is this run's sandbox plus these grants:".to_owned(),
                 ];
                 lines.extend(grants.iter().map(|g| format!("  {}", escape_message(g))));
                 lines.push(format!(
@@ -302,17 +319,28 @@ impl Approver {
         }
     }
 
-    /// The verdict a remembered answer gives `scope`, if any.
-    fn remembered(&self, scope: &str) -> Option<Verdict> {
+    /// The verdict a remembered answer gives a request whose scope is
+    /// `scope` and whose quiet scope is `quiet`, if any.
+    fn remembered(&self, scope: &str, quiet: &str) -> Option<Verdict> {
         let state = self.state();
         if state.allowed.contains(scope) {
             return Some(Verdict::Session);
         }
         state
             .quiet
-            .get(scope)
+            .get(quiet)
             .is_some_and(|until| Instant::now() < *until)
             .then_some(Verdict::Denied)
+    }
+
+    /// Whether a denial from `asker`'s profile still quiets `request`, so
+    /// it would be denied without a prompt.
+    pub fn is_quiet(&self, asker: &Asker, request: &ApprovalRequest) -> bool {
+        let quiet = request.quiet_scope(&asker.profile);
+        self.state()
+            .quiet
+            .get(&quiet)
+            .is_some_and(|until| Instant::now() < *until)
     }
 
     /// Decides `request` from `asker`'s sandbox. Asks on the terminal
@@ -326,7 +354,8 @@ impl Approver {
         cancel: BorrowedFd<'_>,
     ) -> Verdict {
         let scope = request.scope(&asker.profile);
-        if let Some(verdict) = self.remembered(&scope) {
+        let quiet = request.quiet_scope(&asker.profile);
+        if let Some(verdict) = self.remembered(&scope, &quiet) {
             return verdict;
         }
         let Some(description) = request.describe() else {
@@ -335,7 +364,7 @@ impl Approver {
         let _prompt = self.prompt.lock().unwrap_or_else(|e| e.into_inner());
         // Again under the lock: the answer to an earlier prompt may cover it,
         // and its client may have gone while it waited.
-        if let Some(verdict) = self.remembered(&scope) {
+        if let Some(verdict) = self.remembered(&scope, &quiet) {
             return verdict;
         }
         if readable(cancel) {
@@ -376,7 +405,7 @@ impl Approver {
                     state.allowed.insert(scope);
                 }
                 Verdict::DeniedByUser => {
-                    state.quiet.insert(scope, Instant::now() + self.quiet_after);
+                    state.quiet.insert(quiet, Instant::now() + self.quiet_after);
                 }
                 Verdict::Once | Verdict::Denied => {}
             }
@@ -631,6 +660,7 @@ mod tests {
             grants: vec!["read-only /home/me/x\x1b[2J (in your home)".into()],
             key: key.into(),
             scope: scope.into(),
+            profile: "stopit.grant".into(),
             command: "cargo publish".into(),
             cwd: "/workspace".into(),
         }
@@ -643,7 +673,8 @@ mod tests {
             lines,
             [
                 "run cargo publish",
-                "from /workspace, in this run's sandbox plus:",
+                "in profile \"stopit.grant\", from /workspace",
+                "which is this run's sandbox plus these grants:",
                 "  read-only /home/me/x\\u{1b}[2J (in your home)",
                 "[s] covers these grants for cargo publish ... until the session ends",
             ]
@@ -888,7 +919,11 @@ mod tests {
         assert!(start.elapsed() >= Duration::from_millis(2500));
         assert!(typist.join().unwrap().contains("denied"));
         // A timeout is not the user's denial: no quiet period.
-        assert_eq!(t.approver.remembered(&hi().scope("main")), None);
+        assert_eq!(
+            t.approver
+                .remembered(&hi().scope("main"), &hi().scope("main")),
+            None
+        );
     }
 
     #[test]
@@ -906,7 +941,11 @@ mod tests {
             Verdict::Denied
         );
         closer.join().unwrap();
-        assert_eq!(t.approver.remembered(&hi().scope("main")), None);
+        assert_eq!(
+            t.approver
+                .remembered(&hi().scope("main"), &hi().scope("main")),
+            None
+        );
         // Already gone: no prompt at all.
         let start = Instant::now();
         assert_eq!(
@@ -999,7 +1038,10 @@ mod tests {
             .state()
             .quiet
             .insert(hi().scope("other"), Instant::now());
-        assert_eq!(approver.remembered(&hi().scope("other")), None);
+        assert_eq!(
+            approver.remembered(&hi().scope("other"), &hi().scope("other")),
+            None
+        );
     }
 
     #[test]
