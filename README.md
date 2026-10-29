@@ -69,7 +69,7 @@ imports = [ stopit.homeModules.default ];   # adds stopit to home.packages
    env.path_prepend = ["/run/current-system/sw/bin"]
    ```
 
-   `/usr/bin/env` and `/bin/sh` are there for scripts that start with `#!/usr/bin/env`. For packages from Home Manager, add your profile (`/etc/profiles/per-user/<you>`, or `~/.nix-profile`, which the rule follows) to `fs.ro` and its `bin` to `env.path_prepend`, both as absolute paths. Granting all of `/nix/store` is fine for trying stopit out. On NixOS the store can hold rendered secrets, so a careful setup grants only the paths a development shell needs (DESIGN.md section 3.6).
+   `/usr/bin/env` and `/bin/sh` are there for scripts that start with `#!/usr/bin/env`. For packages from Home Manager, add your profile (`/etc/profiles/per-user/<you>`, or `~/.nix-profile`) to `fs.ro`, and its `bin` as the sandbox sees it (`/etc/profiles/per-user/<you>/bin` or `/home/user/.nix-profile/bin`) to `env.path_prepend`. Granting all of `/nix/store` is fine for trying stopit out. On NixOS the store can hold rendered secrets, so a careful setup grants only the paths a development shell needs (DESIGN.md section 3.6).
 
    This file needs no `stopit allow`. stopit trusts it because only you can write it, and it checks that no sandbox can.
 
@@ -347,7 +347,7 @@ Before the sandbox starts, `stopit run` and `stopit shell` print to stderr what 
 - A prompt holds up the run's output until you answer it.
 - `tty` and `ttyname` fail inside the sandbox.
 - Script providers are not hashed by `stopit allow`. A script you change after allowing still runs.
-- A sandbox can create files that host tools run or trust where none existed when the session started: a `.git` in a subdirectory (or in the project when it has none), or agent and editor settings such as `.claude/`, `.gemini/`, `.mcp.json`, `opencode.json`, `.opencode/`, `.codex/` and `.vscode/`. Look before running git or an agent on the host there.
+- A sandbox can create files that host tools run or trust where none existed when the session started: a `.git` in a subdirectory, or in the project when it has none, or agent and editor settings such as `.claude/`, `.gemini/`, `.mcp.json`, `opencode.json`, `.opencode/`, `.codex/` and `.vscode/`. Look before running git or an agent on the host there.
 
 DESIGN.md section 11 has the complete list.
 

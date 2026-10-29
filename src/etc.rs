@@ -167,15 +167,16 @@ pub fn passwd(ids: SandboxIds, home: &SandboxHome) -> String {
     out
 }
 
-/// `/etc/group`: the sandbox user's primary group, then `nogroup` unless
-/// that group has its gid, then each of `extra` (`system.groups`) as
-/// another name for the overflow gid, for programs that look a group up by
-/// a name the file does not otherwise have.
+/// `/etc/group`: the sandbox user's primary group, then, unless that group
+/// has the overflow gid, `nogroup` and each of `extra` (`system.groups`)
+/// as other names for it, for programs that look a group up by a name the
+/// file does not otherwise have.
 pub fn group(ids: SandboxIds, extra: &BTreeSet<GroupName>) -> String {
     let mut out = format!("{SANDBOX_USER}:x:{}:\n", ids.gid);
-    if ids.gid != OVERFLOW_ID {
-        writeln!(out, "{OVERFLOW_GROUP}:x:{OVERFLOW_ID}:").expect("writing to a String");
+    if ids.gid == OVERFLOW_ID {
+        return out;
     }
+    writeln!(out, "{OVERFLOW_GROUP}:x:{OVERFLOW_ID}:").expect("writing to a String");
     for name in extra.iter().filter(|n| n.as_str() != OVERFLOW_GROUP) {
         writeln!(out, "{name}:x:{OVERFLOW_ID}:").expect("writing to a String");
     }
@@ -240,6 +241,9 @@ mod tests {
             "user:x:65534:65534::/home/user:/bin/sh\n"
         );
         assert_eq!(group(ids, &none()), "user:x:65534:\n");
+        // Extra names would alias the user's own group, so they stay out.
+        let extra: BTreeSet<GroupName> = ["nobody".parse().unwrap()].into();
+        assert_eq!(group(ids, &extra), "user:x:65534:\n");
         // Only the one that collides is left out.
         let ids = SandboxIds {
             uid: 1000,
