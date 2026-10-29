@@ -581,18 +581,7 @@ impl OutputFilter {
             // switches that the restore does not undo.
             (b'h' | b'l', Some(b'>' | b'=' | b'<'), _) => return,
             (b'n' | b'f', Some(b'>'), []) => return,
-            // XTRESTORE can bring back any saved mode: each tracked one it
-            // names counts as changed, and the restore undoes it either way.
-            (b'r', Some(b'?'), []) => {
-                for mode in numbers.iter().flatten() {
-                    if OFF_BY_DEFAULT.contains(mode) {
-                        self.left.on.insert(*mode);
-                    } else if ON_BY_DEFAULT.contains(mode) {
-                        self.left.off.insert(*mode);
-                    }
-                }
-            }
-            (b'h' | b'l', Some(b'?'), []) => {
+            (b'h' | b'l' | b'r', Some(b'?'), []) => {
                 let was_alt = self.left.on_alt_screen();
                 for mode in numbers.iter().flatten() {
                     let (set, set_when_on) = if OFF_BY_DEFAULT.contains(mode) {
@@ -602,7 +591,10 @@ impl OutputFilter {
                     } else {
                         continue;
                     };
-                    if (fin == b'h') == set_when_on {
+                    // XTRESTORE (`r`) can bring back either state: the mode
+                    // counts as changed, and the restore undoes it either
+                    // way.
+                    if fin == b'r' || (fin == b'h') == set_when_on {
                         set.insert(*mode);
                     } else {
                         set.remove(mode);

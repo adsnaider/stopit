@@ -68,36 +68,30 @@ fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
     Ok(())
 }
 
-/// A non-blocking descriptor of the terminal `fd`, and whether it shares
-/// its file description with `fd`.
+/// A non-blocking descriptor of the terminal `fd`, and the file status
+/// flags to put back when it shares its file description with `fd`.
 ///
 /// The file description behind the supervisor's stdio is shared with the
 /// shell that started it, so setting `O_NONBLOCK` there would change the
 /// shell's too. Opening the terminal again through `/proc/self/fd` gives a
 /// new file description. If that fails, a duplicate of `fd` is made
-/// non-blocking instead, and [`HostTerminal`] makes it blocking again when
-/// dropped.
-fn own_terminal_fd(fd: BorrowedFd<'_>) -> io::Result<(OwnedFd, bool)> {
+/// non-blocking instead, and [`HostTerminal`] puts its earlier flags back
+/// when dropped.
+fn own_terminal_fd(fd: BorrowedFd<'_>) -> io::Result<(OwnedFd, Option<rustix::fs::OFlags>)> {
     use rustix::fs::{Mode, OFlags, open};
     match open(
         format!("/proc/self/fd/{}", fd.as_raw_fd()).as_str(),
         OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC | OFlags::NONBLOCK,
         Mode::empty(),
     ) {
-        Ok(own) if rustix::termios::isatty(&own) => Ok((own, false)),
+        Ok(own) if rustix::termios::isatty(&own) => Ok((own, None)),
         _ => {
             let dup = rustix::io::fcntl_dupfd_cloexec(fd, 3)?;
+            let flags = rustix::fs::fcntl_getfl(&dup)?;
             set_nonblocking(dup.as_fd())?;
-            Ok((dup, true))
+            Ok((dup, Some(flags)))
         }
     }
-}
-
-fn set_blocking(fd: BorrowedFd<'_>) -> io::Result<()> {
-    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
-    let flags = fcntl_getfl(fd)?;
-    fcntl_setfl(fd, flags - OFlags::NONBLOCK)?;
-    Ok(())
 }
 
 /// The host terminal in raw mode, restored to its earlier settings when
@@ -140,8 +134,8 @@ pub struct HostTerminal {
     input: Option<OwnedFd>,
     output: OwnedFd,
     /// Descriptors sharing a file description with the supervisor's stdio,
-    /// made blocking again when dropped.
-    shared: Vec<BorrowedFd<'static>>,
+    /// with the flags they get back when dropped.
+    shared: Vec<(BorrowedFd<'static>, rustix::fs::OFlags)>,
 }
 
 impl HostTerminal {
@@ -158,12 +152,12 @@ impl HostTerminal {
         // SAFETY: the descriptors are owned by `terminal`, which drops
         // `shared` before them.
         let borrow = |fd: &OwnedFd| unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) };
-        if output_shared {
-            terminal.shared.push(borrow(&terminal.output));
+        if let Some(flags) = output_shared {
+            terminal.shared.push((borrow(&terminal.output), flags));
         }
         if let Some((input, input_shared)) = input {
-            if input_shared {
-                terminal.shared.push(borrow(&input));
+            if let Some(flags) = input_shared {
+                terminal.shared.push((borrow(&input), flags));
             }
             terminal.input = Some(input);
         }
@@ -173,8 +167,8 @@ impl HostTerminal {
 
 impl Drop for HostTerminal {
     fn drop(&mut self) {
-        for fd in self.shared.drain(..) {
-            let _ = set_blocking(fd);
+        for (fd, flags) in self.shared.drain(..) {
+            let _ = rustix::fs::fcntl_setfl(fd, flags);
         }
     }
 }
@@ -326,10 +320,14 @@ impl PtyRelay {
         self.filter.finish(&mut tail);
         tail.extend_from_slice(&self.filter.restore_sequence());
         self.queued.extend_from_slice(&tail);
+        // The restore gets a short extra chance at the terminal past the
+        // deadline, and no more.
+        let restore_deadline = deadline + std::time::Duration::from_millis(500);
         while self.output_open && !self.queued.is_empty() {
-            // The restore always gets a fresh chance at the terminal.
-            let wait = left().max(FINISH_TIMEOUT_MS / 4);
-            if !self.wait_writable(wait) {
+            let wait = restore_deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis() as i32;
+            if wait <= 0 || !self.wait_writable(wait) {
                 break;
             }
             self.write_queued();
