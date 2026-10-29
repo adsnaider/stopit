@@ -36,12 +36,8 @@ fn main() {
         .args(["-C", "link-arg=-static", "-C", "link-arg=-no-pie"])
         .args(["--target", &target]);
     // The linker cargo uses for the target, if one is set.
-    let linker_var = format!(
-        "CARGO_TARGET_{}_LINKER",
-        target.to_uppercase().replace('-', "_")
-    );
-    println!("cargo:rerun-if-env-changed={linker_var}");
-    if let Some(linker) = env::var_os(&linker_var) {
+    println!("cargo:rerun-if-env-changed=RUSTC_LINKER");
+    if let Some(linker) = env::var_os("RUSTC_LINKER") {
         let mut arg = std::ffi::OsString::from("linker=");
         arg.push(linker);
         command.arg("-C").arg(arg);

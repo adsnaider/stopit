@@ -729,7 +729,7 @@ impl OutputFilter {
             }
             ("4", Some(rest)) => {
                 let parts: Vec<&str> = rest.split(';').collect();
-                parts.len() % 2 == 0
+                parts.len().is_multiple_of(2)
                     && parts.chunks(2).all(|pair| {
                         !pair[0].is_empty()
                             && pair[0].bytes().all(|b| b.is_ascii_digit())
@@ -1400,7 +1400,7 @@ mod tests {
                 x ^= x << 13;
                 x ^= x >> 7;
                 x ^= x << 17;
-                if x % 7 == 0 {
+                if x.is_multiple_of(7) {
                     (x >> 8) as u8
                 } else {
                     PICKS[(x >> 16) as usize % PICKS.len()]

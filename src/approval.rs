@@ -506,7 +506,7 @@ pub fn is_strict_base64(text: &str) -> bool {
     let padding = text.len() - body.len();
     body.len() % 4 != 1
         && padding <= 2
-        && (padding == 0 || text.len() % 4 == 0)
+        && (padding == 0 || text.len().is_multiple_of(4))
         && body
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
@@ -578,7 +578,7 @@ mod tests {
                 out.push(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize] as char);
             }
         }
-        while out.len() % 4 != 0 {
+        while !out.len().is_multiple_of(4) {
             out.push('=');
         }
         out

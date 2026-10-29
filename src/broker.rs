@@ -67,6 +67,7 @@ const FORWARDED: [libc::c_int; 4] = [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM,
 static NEXT_COMMAND: AtomicU64 = AtomicU64::new(1);
 
 /// What a run gives its brokers.
+#[derive(Clone)]
 pub(crate) struct RunContext {
     /// The session.
     pub(crate) loaded: Arc<LoadedSession>,
@@ -78,7 +79,48 @@ pub(crate) struct RunContext {
     pub(crate) approver: Option<Arc<Approver>>,
     /// The run's number, for prompts.
     pub(crate) run: u64,
+    /// The run's command, each argument quoted for a shell, for prompts.
+    pub(crate) command: String,
+    /// How many shim calls deep this context is: 0 for the run's own
+    /// sandbox.
+    pub(crate) depth: usize,
+    /// The commands the run's brokers run, at every depth.
+    pub(crate) live: Arc<std::sync::atomic::AtomicUsize>,
 }
+
+impl RunContext {
+    /// A context for `run`, whose command is `command`.
+    pub(crate) fn new(
+        loaded: Arc<LoadedSession>,
+        compiled: Arc<CompiledSession>,
+        host_env: Vec<(OsString, OsString)>,
+        approver: Option<Arc<Approver>>,
+        run: u64,
+        command: &[OsString],
+    ) -> Self {
+        RunContext {
+            loaded,
+            compiled,
+            host_env,
+            approver,
+            run,
+            command: command
+                .iter()
+                .map(|a| crate::escape::shell_quote(a.as_bytes()))
+                .collect::<Vec<_>>()
+                .join(" "),
+            depth: 0,
+            live: Arc::default(),
+        }
+    }
+}
+
+/// How many shim calls deep a command may run: a shim in a command a shim
+/// started, and so on.
+const MAX_DEPTH: usize = 4;
+
+/// The most commands a run's brokers run at once, at every depth.
+const MAX_LIVE: usize = 128;
 
 /// The outcome of [`decide`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,17 +136,19 @@ pub enum Outcome {
 /// What the rules of `spec` decide for `args`, and the rule that matched,
 /// its subcommand pattern or `default`.
 ///
-/// A refused flag anywhere in the arguments denies: an argument equal to
-/// it, one starting with it and `=`, and, for a one-letter flag such as
-/// `-c`, a cluster of one-letter flags that holds its letter. Otherwise the
-/// rule whose pattern matches the most leading arguments that are not
-/// flags wins. A word beats a `*` in its place, and among patterns alike
-/// the strictest decision wins. No match takes the shim's `default`.
+/// A refused flag anywhere in the arguments denies ([`flag_matches`]).
+/// Otherwise the rule whose pattern matches the most leading arguments
+/// wins, the words before the first flag. A word beats a `*` in its place,
+/// and among patterns alike the strictest decision wins. No match takes
+/// the shim's `default`.
 pub fn decide(spec: &ShimSpec, args: &[Vec<u8>]) -> (Outcome, String) {
+    // The leading arguments up to the first flag. A flag before a word
+    // may take a value that would read as one, so the pattern must match
+    // from the start.
     let words: Vec<&[u8]> = args
         .iter()
         .map(Vec::as_slice)
-        .filter(|a| !a.starts_with(b"-"))
+        .take_while(|a| !a.starts_with(b"-"))
         .collect();
     // The best match so far, ranked by its words, then its tokens, then
     // its strictness.
@@ -153,7 +197,10 @@ pub fn decide(spec: &ShimSpec, args: &[Vec<u8>]) -> (Outcome, String) {
     let outcome = match (decision, profile) {
         (Decision::Allow, Some(p)) => Outcome::Allow(p),
         (Decision::Ask, Some(p)) => Outcome::Ask(p),
-        _ => Outcome::Deny("the shim's rules deny it".to_owned()),
+        _ => Outcome::Deny(match name.as_str() {
+            "default" => "the shim's rules deny it".to_owned(),
+            rule => format!("the shim's rules deny `{rule}`"),
+        }),
     };
     (outcome, name)
 }
@@ -166,11 +213,21 @@ fn strictness(decision: Decision) -> u8 {
     }
 }
 
-/// Whether the argument `arg` uses the refused flag `flag`.
+/// Whether the argument `arg` uses the refused flag `flag`. It does when
+/// it equals the flag, starts with it and `=`, abbreviates a long flag to
+/// three bytes or more as git and others accept (`--upl` for
+/// `--upload-pack`), or, for a one-letter flag such as `-c`, is a cluster
+/// of one-letter flags that holds its letter.
 fn flag_matches(flag: &str, arg: &[u8]) -> bool {
     let flag = flag.as_bytes();
     if arg == flag || (arg.starts_with(flag) && arg.get(flag.len()) == Some(&b'=')) {
         return true;
+    }
+    if flag.starts_with(b"--") && arg.starts_with(b"--") {
+        let name = arg.split(|&b| b == b'=').next().unwrap_or(arg);
+        if name.len() >= 3 && flag.starts_with(name) {
+            return true;
+        }
     }
     // `-c` within a cluster such as `-xc`, or with its value attached.
     flag.len() == 2
@@ -356,26 +413,31 @@ fn serve_shim(conn: &UnixStream, shared: &Shared, number: u64) {
 type Failure = String;
 
 fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failure> {
+    let deadline = std::time::Instant::now() + HANDSHAKE_TIMEOUT;
     let _ = conn.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
     let fds = recv_fds(conn, HELLO, 4).map_err(|e| format!("bad shim request: {e}"))?;
     let [stdin, stdout, stderr, cwd_fd]: [OwnedFd; 4] =
         fds.try_into().map_err(|_| "bad shim request".to_owned())?;
-    let Some(ShimMessage::Run {
-        version,
+    let request = crate::control::read_frame_by::<serde_json::Value>(conn, deadline)
+        .map_err(|e| format!("bad shim request: {e}"))?
+        .ok_or("bad shim request: no command")?;
+    let version = request.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+    if version != u64::from(PROTOCOL_VERSION) {
+        return Err(format!(
+            "the shim speaks protocol {version} and the broker {PROTOCOL_VERSION}. They come \
+             from different builds."
+        ));
+    }
+    let Ok(ShimMessage::Run {
+        version: _,
         shim,
         args,
         cwd,
-    }) = read_frame::<ShimMessage>(conn).map_err(|e| format!("bad shim request: {e}"))?
+    }) = serde_json::from_value::<ShimMessage>(request)
     else {
         return Err("bad shim request: no command".to_owned());
     };
     let _ = conn.set_read_timeout(None);
-    if version != PROTOCOL_VERSION {
-        return Err(format!(
-            "the shim speaks protocol {version} and the broker {PROTOCOL_VERSION}; they come \
-             from different builds"
-        ));
-    }
     let ctx = &shared.ctx;
     let (_, caller) =
         profile_in(&ctx.compiled, Some(shared.caller.as_str())).map_err(|e| e.to_string())?;
@@ -385,9 +447,7 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
     let Some((spec, _)) = caller.spec.shims.get(&name) else {
         return Err(format!("no shim {name} in this sandbox"));
     };
-    let say = |text: &str| {
-        let _ = rustix::io::write(&stderr, format!("[stopit: {text}]\n").as_bytes());
-    };
+    let say = |text: &str| say_to(stderr.as_fd(), text);
     let (outcome, rule) = decide(spec, &args);
     let cwd = PathBuf::from(OsString::from_vec(cwd));
     let rel = workspace_relative(&cwd, ctx.loaded.workspace_mount()).ok_or_else(|| {
@@ -396,7 +456,8 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
             crate::escape::escape_bytes(cwd.as_os_str().as_bytes())
         )
     })?;
-    let command_line: String = std::iter::once(name.as_str().as_bytes())
+    // What runs, the shim's binary with the arguments.
+    let command_line: String = std::iter::once(spec.binary.as_str().as_bytes())
         .chain(args.iter().map(Vec::as_slice))
         .map(crate::escape::shell_quote)
         .collect::<Vec<_>>()
@@ -417,7 +478,10 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
             };
             let request = ApprovalRequest::Command {
                 shim: name.to_string(),
-                rule: rule.clone(),
+                rule: match rule.as_str() {
+                    "default" => "default, for every subcommand no rule lists".to_owned(),
+                    rule => rule.to_owned(),
+                },
                 profile: profile.as_str().to_owned(),
                 command: command_line.clone(),
                 cwd: crate::escape::escape_bytes(cwd.as_os_str().as_bytes()),
@@ -425,7 +489,7 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
             let asker = Asker {
                 run: ctx.run,
                 profile: shared.caller.as_str().to_owned(),
-                command: command_line.clone(),
+                command: ctx.command.clone(),
             };
             if !approver.decide(&asker, &request, conn.as_fd()).allows() {
                 say(&format!("{name}: denied by user"));
@@ -434,13 +498,36 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
             profile
         }
     };
-    check_cwd(ctx.loaded.workspace_dir(), &rel, cwd_fd.as_fd())?;
+    let (dev, ino) = check_cwd(ctx.loaded.workspace_dir(), &rel, cwd_fd.as_fd())?;
     drop(cwd_fd);
     let mut command = vec![OsString::from(spec.binary.as_str())];
     command.extend(args.into_iter().map(OsString::from_vec));
-    let sandbox_cwd = ctx.loaded.workspace_mount().join(&rel);
-    let launched = launch(ctx, &target, &command, [stdin, stdout, stderr], sandbox_cwd)
-        .map_err(|e| e.to_string())?;
+    let start = crate::init::StartDir {
+        path: ctx.loaded.workspace_mount().join(&rel),
+        dev,
+        ino,
+    };
+    if ctx.depth >= MAX_DEPTH {
+        say(&format!(
+            "{name}: shims call each other more than {MAX_DEPTH} deep"
+        ));
+        return Ok(EXIT_DENIED);
+    }
+    if ctx.live.fetch_add(1, Ordering::SeqCst) >= MAX_LIVE {
+        ctx.live.fetch_sub(1, Ordering::SeqCst);
+        say(&format!(
+            "{name}: the run already has {MAX_LIVE} shim commands"
+        ));
+        return Ok(EXIT_DENIED);
+    }
+    let launched = launch(ctx, &target, &command, [stdin, stdout, stderr], start);
+    let launched = match launched {
+        Ok(launched) => launched,
+        Err(e) => {
+            ctx.live.fetch_sub(1, Ordering::SeqCst);
+            return Err(e.to_string());
+        }
+    };
     lock(&shared.commands).insert(
         number,
         launched.pidfd.try_clone().map_err(|e| e.to_string())?,
@@ -451,7 +538,25 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
     }
     let code = launched.wait(conn);
     lock(&shared.commands).remove(&number);
+    ctx.live.fetch_sub(1, Ordering::SeqCst);
     Ok(code)
+}
+
+/// Writes `[stopit: <text>]` to the shim's stderr, `fd`, if it takes it
+/// within a second. A full pipe must not hold the broker up.
+fn say_to(fd: BorrowedFd<'_>, text: &str) {
+    let mut pollfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd for the duration of the call.
+    if unsafe { libc::poll(&mut pollfd, 1, 1000) } <= 0 {
+        return;
+    }
+    // Short enough that a ready pipe takes it whole.
+    let line: String = format!("[stopit: {text}]\n").chars().take(512).collect();
+    let _ = rustix::io::write(fd, line.as_bytes());
 }
 
 /// `cwd` relative to the workspace `mount`, if it is inside it and holds no
@@ -464,10 +569,15 @@ fn workspace_relative(cwd: &Path, mount: &Path) -> Option<PathBuf> {
 }
 
 /// Checks that `dir`, a directory the shim sent, is `rel` below the host
-/// workspace `workspace`, opened without following a link.
-fn check_cwd(workspace: &Path, rel: &Path, dir: BorrowedFd<'_>) -> Result<(), Failure> {
+/// workspace `workspace`, opened without following a link, and returns its
+/// device and inode.
+fn check_cwd(workspace: &Path, rel: &Path, dir: BorrowedFd<'_>) -> Result<(u64, u64), Failure> {
     use rustix::fs::{Mode, OFlags, ResolveFlags, fstat, open, openat2};
-    let mismatch = || "the shim's working directory is not the one it names".to_owned();
+    let mismatch = || {
+        "the shim's working directory is not the workspace's own directory at that path, \
+         as in an ephemeral or masked directory"
+            .to_owned()
+    };
     let root = open(
         workspace,
         OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
@@ -494,7 +604,7 @@ fn check_cwd(workspace: &Path, rel: &Path, dir: BorrowedFd<'_>) -> Result<(), Fa
     if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino) {
         return Err(mismatch());
     }
-    Ok(())
+    Ok((a.st_dev, a.st_ino))
 }
 
 /// A command's sandbox, running.
@@ -561,24 +671,31 @@ impl Launched {
 }
 
 /// Starts `command` in a sandbox of `profile` on `stdio`, entering
-/// `cwd`, with its proxy, its own broker and pasta as its profile needs.
+/// `cwd`. The sandbox gets a proxy in proxy mode, a broker of its own if
+/// the profile has shims, and pasta with `network = "full"`. Its command
+/// is never looked up among its own shims.
 fn launch(
     ctx: &Arc<RunContext>,
     profile: &ProfileRef,
     command: &[OsString],
     stdio: [OwnedFd; 3],
-    cwd: PathBuf,
+    cwd: crate::init::StartDir,
 ) -> Result<Launched, RunError> {
     let loaded = &ctx.loaded;
     let (name, compiled) = profile_in(&ctx.compiled, Some(profile.as_str()))?;
     let label = format!("t{}", NEXT_COMMAND.fetch_add(1, Ordering::SeqCst));
     let proxy = loaded.start_proxy(compiled, &label)?;
-    let broker = start_broker(ctx, &name, compiled, &label)?;
+    let deeper = Arc::new(RunContext {
+        depth: ctx.depth + 1,
+        ..(**ctx).clone()
+    });
+    let broker = start_broker(&deeper, &name, compiled, &label)?;
     let extras = RunExtras {
         proxy_socket: proxy.as_ref().map(|p| p.path().to_owned()),
         broker_socket: broker.as_ref().map(|b| b.path().to_owned()),
         shims: loaded.shim_binds(&name, compiled)?,
         cwd: Some(cwd),
+        skip_shims: true,
     };
     let bwrap = loaded.command(
         compiled,
@@ -714,11 +831,10 @@ mod tests {
         );
         let d = |a: &[&str]| decide(&s, &args(a));
         assert_eq!(d(&["status"]), (Outcome::Allow(pr("ro")), "status".into()));
-        // Flags before and between words do not count as words.
-        assert_eq!(
-            d(&["--no-pager", "log", "-n", "3"]).0,
-            Outcome::Allow(pr("ro"))
-        );
+        // Flags after the words are fine; a flag before them, whose value
+        // could read as a word, takes the default.
+        assert_eq!(d(&["log", "-n", "3"]).0, Outcome::Allow(pr("ro")));
+        assert_eq!(d(&["--no-pager", "log"]).1, "default");
         assert_eq!(
             d(&["op", "log"]),
             (Outcome::Allow(pr("ro")), "op log".into())
@@ -779,6 +895,103 @@ mod tests {
         assert!(matches!(
             decide(&s, &args(&["show", "--amend"])).0,
             Outcome::Allow(_)
+        ));
+    }
+
+    #[test]
+    fn a_flags_value_never_reads_as_a_subcommand() {
+        // Appendix A's git and jj rules, without their refused flags.
+        let git = spec(
+            &[],
+            vec![
+                rule(&["status"], Decision::Allow, Some("local"), &[]),
+                rule(&["reset"], Decision::Ask, Some("local"), &[]),
+            ],
+            (Decision::Ask, Some("local")),
+        );
+        for args_ in [
+            &["-C", "status", "reset"][..],
+            &["--git-dir", "x", "status"],
+        ] {
+            assert_eq!(decide(&git, &args(args_)).1, "default", "{args_:?}");
+        }
+        let jj = spec(
+            &[],
+            vec![
+                rule(&["git fetch"], Decision::Ask, Some("remote"), &[]),
+                rule(&["git push"], Decision::Deny, None, &[]),
+            ],
+            (Decision::Ask, Some("local")),
+        );
+        assert!(matches!(
+            decide(&jj, &args(&["git", "push"])).0,
+            Outcome::Deny(_)
+        ));
+        // `-R fetch` between the words cannot turn a push into a fetch.
+        let (outcome, rule) = decide(&jj, &args(&["git", "-R", "fetch", "push"]));
+        assert_eq!(rule, "default");
+        assert_eq!(outcome, Outcome::Ask(pr("local")));
+    }
+
+    #[test]
+    fn abbreviated_long_flags_are_refused_too() {
+        let s = spec(
+            &["--upload-pack", "--receive-pack", "-c"],
+            vec![rule(
+                &["commit"],
+                Decision::Allow,
+                Some("local"),
+                &["--amend"],
+            )],
+            (Decision::Allow, Some("local")),
+        );
+        for bad in [
+            &["fetch", "--upl=x"][..],
+            &["fetch", "--upload-pa", "x"],
+            &["push", "--rec=x"],
+            &["commit", "--amen"],
+            &["commit", "--ame"],
+            &["status", "-c", "core.pager=x"],
+            // An argument after `--` is still checked; refusing too much
+            // is the safe side.
+            &["commit", "--", "--amend"],
+        ] {
+            assert!(
+                matches!(decide(&s, &args(bad)).0, Outcome::Deny(_)),
+                "{bad:?}"
+            );
+        }
+        // Even one letter after the dashes may abbreviate a flag, but `--`
+        // alone ends the options, and other flags pass.
+        assert!(matches!(
+            decide(&s, &args(&["fetch", "--u"])).0,
+            Outcome::Deny(_)
+        ));
+        for ok in [
+            &["fetch", "--"][..],
+            &["fetch", "--quiet"],
+            &["push", "--all"],
+        ] {
+            assert!(
+                !matches!(decide(&s, &args(ok)).0, Outcome::Deny(_)),
+                "{ok:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn odd_arguments_are_matched_as_bytes() {
+        let s = spec(
+            &["--config"],
+            vec![rule(&["status"], Decision::Allow, Some("ro"), &[])],
+            (Decision::Ask, Some("local")),
+        );
+        assert_eq!(decide(&s, &[]).1, "default");
+        assert_eq!(decide(&s, &[b"status\0x".to_vec()]).1, "default");
+        assert_eq!(decide(&s, &[vec![0xff, b's']]).1, "default");
+        assert!(matches!(
+            decide(&s, &[b"status".to_vec(), b"--config=\xff".to_vec()]).0,
+            Outcome::Deny(_)
         ));
     }
 

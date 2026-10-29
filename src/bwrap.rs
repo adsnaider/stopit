@@ -409,7 +409,9 @@ impl BwrapCommand {
         let mut init_spec = init::InitSpec::from_sandbox_spec(spec);
         init_spec.pty_slave = terminal == TerminalSession::Pty;
         init_spec.cwd = extras.cwd.clone();
-        // `__init` goes to `extras.cwd` itself, safely, from the root.
+        init_spec.skip_shims = extras.skip_shims;
+        // `__init` enters `extras.cwd` itself, from the root, with
+        // `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS)`.
         let cwd = if extras.cwd.is_some() {
             Path::new("/")
         } else {
@@ -477,6 +479,8 @@ impl BwrapCommand {
         retain_init_caps: bool,
         extras: &RunExtras,
     ) -> Result<BwrapCommand, BwrapError> {
+        // A sandbox without shims gets the session's `bin`, which stays
+        // empty: the profiles' shims live elsewhere in the session.
         let (bin, shim) = match &extras.shims {
             Some((bin, shim)) => (bin.clone(), Some(shim.clone())),
             None => (session.bin(), None),
@@ -994,7 +998,10 @@ pub struct RunExtras {
     pub shims: Option<(PathBuf, PathBuf)>,
     /// The directory the target starts in, which `__init` opens itself
     /// ([`init::InitSpec::cwd`]).
-    pub cwd: Option<PathBuf>,
+    pub cwd: Option<init::StartDir>,
+    /// Look the command up without the shim directory
+    /// ([`init::InitSpec::skip_shims`]).
+    pub skip_shims: bool,
 }
 
 /// The generated invocation, before any descriptor exists.

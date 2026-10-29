@@ -134,14 +134,14 @@ fn escape_str(s: &str) -> String {
 fn path_text(path: &Path, host_home: &Path, sandbox_home: Option<&Path>) -> String {
     let home = sandbox_home.unwrap_or(host_home);
     // A `HOME` of `/` would make every path `~/…`.
-    if home != Path::new("/") {
-        if let Ok(rest) = path.strip_prefix(home) {
-            return if rest.as_os_str().is_empty() {
-                "~".to_owned()
-            } else {
-                format!("~/{}", escape_bytes(rest.as_os_str().as_bytes()))
-            };
-        }
+    if home != Path::new("/")
+        && let Ok(rest) = path.strip_prefix(home)
+    {
+        return if rest.as_os_str().is_empty() {
+            "~".to_owned()
+        } else {
+            format!("~/{}", escape_bytes(rest.as_os_str().as_bytes()))
+        };
     }
     escape_bytes(path.as_os_str().as_bytes())
 }

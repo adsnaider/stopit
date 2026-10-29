@@ -621,12 +621,12 @@ fn revoke_file(given: &Path) -> Result<Vec<String>, RunError> {
 /// link, so it is not followed).
 pub fn config_keys(path: &Path) -> Vec<PathBuf> {
     let mut keys = vec![path.to_path_buf()];
-    if let (Some(dir), Some(name)) = (path.parent(), path.file_name()) {
-        if let Ok(dir) = resolve_allowing_missing(dir) {
-            let resolved = dir.path.join(name);
-            if resolved != path {
-                keys.push(resolved);
-            }
+    if let (Some(dir), Some(name)) = (path.parent(), path.file_name())
+        && let Ok(dir) = resolve_allowing_missing(dir)
+    {
+        let resolved = dir.path.join(name);
+        if resolved != path {
+            keys.push(resolved);
         }
     }
     keys
@@ -677,19 +677,21 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     let stdio = stdio_terminals();
     let terminal = terminal_session(stdio);
     let proxy = loaded.start_proxy(profile, "run")?;
-    let ctx = Arc::new(crate::broker::RunContext {
-        loaded: loaded.clone(),
-        compiled: loaded.compiled.clone(),
-        host_env: std::env::vars_os().collect(),
-        approver: None,
-        run: 0,
-    });
+    let ctx = Arc::new(crate::broker::RunContext::new(
+        loaded.clone(),
+        loaded.compiled.clone(),
+        std::env::vars_os().collect(),
+        None,
+        0,
+        &invocation.command,
+    ));
     let broker = crate::broker::start_broker(&ctx, &profile_name, profile, "run")?;
     let extras = crate::bwrap::RunExtras {
         proxy_socket: proxy.as_ref().map(|p| p.path().to_owned()),
         broker_socket: broker.as_ref().map(|b| b.path().to_owned()),
         shims: loaded.shim_binds(&profile_name, profile)?,
         cwd: None,
+        skip_shims: false,
     };
     let command = loaded.command(
         profile,
@@ -1532,13 +1534,12 @@ fn wait_foreground(
     };
     if let Some(pidfd) = &pidfd
         && let Err(e) = relay_until(&mask, pidfd.as_fd(), relay.as_mut(), kill_child)
+        && let Some(r) = relay
     {
-        if let Some(r) = relay {
-            kill_child(libc::SIGKILL);
-            let _ = child.wait();
-            r.finish();
-            return Err(RunError::Pty(e));
-        }
+        kill_child(libc::SIGKILL);
+        let _ = child.wait();
+        r.finish();
+        return Err(RunError::Pty(e));
     }
     let status = child.wait().map_err(RunError::Spawn)?;
     let denied = relay.map_or(0, PtyRelay::finish);

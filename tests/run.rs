@@ -3766,14 +3766,16 @@ fn an_attached_run_gets_the_proxy_and_the_server_logs_refusals() {
 
 // --- Shims and the broker ---
 
-/// [`shell_config`] with `main` setting `WHICH=main`, and a `harness`
-/// profile setting `WHICH=harness` with three shims of `sh`: `sh-main`
-/// allowed in `main`, `nope` denied, and `asking` asked about for `main`.
+/// [`shell_config`] with `main` setting `WHICH=main` and having a shim
+/// `cat` of `cat` in `main` itself, and a `harness` profile setting
+/// `WHICH=harness` with three shims of `sh`: `sh-main` allowed in `main`,
+/// `nope` denied, and `asking` asked about for `main`.
 fn harness_config() -> Option<String> {
     let config = shell_config()?;
     Some(format!(
         "{config}[[provider]]\ntype = \"config\"\nname = \"which\"\n\
          [provider.sandbox]\nenv.set = {{ WHICH = \"main\" }}\n\
+         shims.cat = {{ binary = \"cat\", default = {{ decision = \"allow\", profile = \"main\" }} }}\n\
          [profiles.harness]\n\
          [[provider]]\ntype = \"config\"\nname = \"harness\"\nprofile = \"harness\"\n\
          [provider.sandbox]\nenv.set = {{ WHICH = \"harness\" }}\n\
@@ -3790,7 +3792,10 @@ fn a_shim_runs_its_command_in_the_profile_its_rules_name() {
     };
     let s = Setup::with_config(&config);
     fs::create_dir(s.ws().join("sub")).unwrap();
+    // `cat` in `main` is a shim running `cat` in `main`, which must run
+    // the real `cat`, not the shim again.
     let script = "echo \"harness [$WHICH] $(command -v sh-main)\"; \
+                  echo $(ls /run/stopit/bin); \
                   cd sub && sh-main -c 'echo \"tool [$WHICH] $(pwd)\"; \
                   command -v sh-main || echo \"no shims\"; exit 7'; echo \"rc=$?\"; \
                   echo piped | sh-main -c 'cat'";
@@ -3810,10 +3815,43 @@ fn a_shim_runs_its_command_in_the_profile_its_rules_name() {
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "harness [harness] /run/stopit/bin/sh-main\n\
+         asking cat nope sh-main\n\
          tool [main] /workspace/sub\n\
          no shims\n\
          rc=7\n\
          piped\n"
+    );
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn shims_calling_shims_stop_four_deep() {
+    let Some(config) = harness_config() else {
+        return;
+    };
+    let s = Setup::with_config(&format!(
+        "{config}[[provider]]\ntype = \"config\"\nname = \"deep\"\n\
+         [provider.sandbox]\n\
+         shims.deep = {{ binary = \"sh\", default = {{ decision = \"allow\", profile = \"main\" }} }}\n"
+    ));
+    // Each level calls the shim again, and says how the call ended.
+    fs::write(
+        s.ws().join("again.sh"),
+        "echo in; deep /workspace/again.sh; echo \"rc=$?\"\n",
+    )
+    .unwrap();
+    let out = output(
+        s.stopit(&["run", "--quiet", "/bin/sh", "/workspace/again.sh"]),
+        b"",
+    );
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "in\nin\nin\nin\nin\nrc=126\nrc=0\nrc=0\nrc=0\nrc=0\n"
+    );
+    assert!(
+        stderr(&out).contains("deep: shims call each other more than 4 deep"),
+        "{out:?}"
     );
     assert!(s.no_session_left());
 }
@@ -3890,7 +3928,7 @@ fn an_asking_shim_runs_once_the_server_terminal_says_yes() {
     assert_eq!(code(&out), 0, "{out:?}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ran [main]\nrc=0\n");
     let log = server.log();
-    assert!(log.contains("run asking -c"), "{log}");
+    assert!(log.contains("run sh -c 'echo \"ran [$WHICH]\"'"), "{log}");
     assert!(
         log.contains("in profile \"main\", from /workspace"),
         "{log}"

@@ -6,13 +6,16 @@
 //! --library-path /run/stopit/lib /run/stopit/stopit`, or
 //! `/run/stopit/stopit` alone for a static build).
 //!
-//! stopit writes the prefix into [`PREFIX`] of its copy when it provisions
-//! a session, after [`MARKER`]: arguments ending with NUL, then an empty
-//! one. The program has no allocator, no unwinding and no `std`. It talks
-//! to the kernel with raw system calls.
+//! stopit writes the prefix over [`MARKER`] in [`PREFIX`] of its copy when
+//! it provisions a session: arguments ending with NUL, then an empty one.
+//! The program has no allocator, no unwinding and no `std`. It talks to
+//! the kernel with raw system calls.
 
 #![no_std]
 #![no_main]
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("the shim trampoline supports x86_64 and aarch64 only");
 
 use core::arch::global_asm;
 
@@ -154,6 +157,10 @@ unsafe fn strlen(s: *const u8) -> usize {
     n
 }
 
+/// The `AT_EXECFN` entry of the auxiliary vector: the path the program was
+/// run as.
+const AT_EXECFN: usize = 31;
+
 unsafe extern "C" fn main(sp: *const usize) -> ! {
     unsafe {
         let argc = *sp;
@@ -162,8 +169,23 @@ unsafe extern "C" fn main(sp: *const usize) -> ! {
         if argc == 0 {
             fail(b"stopit shim: no program name\n");
         }
-        // The shim's name: what follows the last `/` of `argv[0]`.
-        let arg0 = *argv;
+        // The auxiliary vector follows the environment's NULL.
+        let mut env_end = envp;
+        while !(*env_end).is_null() {
+            env_end = env_end.add(1);
+        }
+        let mut aux = env_end.add(1) as *const usize;
+        let mut execfn: *const u8 = core::ptr::null();
+        while *aux != 0 {
+            if *aux == AT_EXECFN {
+                execfn = *aux.add(1) as *const u8;
+            }
+            aux = aux.add(2);
+        }
+        // The shim's name: what follows the last `/` of the path it was run
+        // as, which the caller cannot set apart from the file, unlike
+        // `argv[0]`.
+        let arg0 = if execfn.is_null() { *argv } else { execfn };
         let len = strlen(arg0);
         let mut start = 0;
         let mut i = 0;
@@ -175,8 +197,12 @@ unsafe extern "C" fn main(sp: *const usize) -> ! {
         }
         let name = arg0.add(start);
 
+        // A provisioned prefix runs a program by its absolute path, so it
+        // starts with `/`, which the marker does not. Comparing against the
+        // whole marker would put a second copy of it into the program, and
+        // stopit looks for the one in `PREFIX`.
         let prefix = core::ptr::addr_of!(PREFIX) as *const u8;
-        if *prefix == MARKER[0] && *prefix.add(1) == MARKER[1] {
+        if core::ptr::read_volatile(prefix) != b'/' {
             fail(b"stopit shim: this copy was never provisioned\n");
         }
         // Count the prefix's arguments.
@@ -206,9 +232,11 @@ unsafe extern "C" fn main(sp: *const usize) -> ! {
         *out.add(n + 1) = name;
         *out.add(n + 2) = b"--\0".as_ptr();
         n += 3;
+        // Volatile writes, so the compiler calls no `memcpy`, which there
+        // is none of.
         let mut i = 1;
         while i < argc {
-            *out.add(n) = *argv.add(i);
+            core::ptr::write_volatile(out.add(n), *argv.add(i));
             n += 1;
             i += 1;
         }

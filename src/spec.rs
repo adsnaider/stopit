@@ -2370,11 +2370,11 @@ fn check_destination_links(
     let mut underneath: BTreeMap<PathBuf, Underneath> = BTreeMap::new();
     let mut kept = Vec::with_capacity(mounts.len());
     for m in mounts {
-        if m.glob_link {
-            if let Some(found) = glob_link_in_root(&m, roots) {
-                warnings.push(SpecWarning::GlobLink(found));
-                continue;
-            }
+        if m.glob_link
+            && let Some(found) = glob_link_in_root(&m, roots)
+        {
+            warnings.push(SpecWarning::GlobLink(found));
+            continue;
         }
         // The canonical host source of a mount that shows one. A masked
         // mount shows nothing of its source; `check_host_sources` resolves
@@ -2505,12 +2505,12 @@ fn check_destination_links(
                 // never an ancestor: the mounts below it are checked against
                 // what is really underneath. A restrictive one is kept, and
                 // refused there.
-                if m.mode == PathMode::Rw {
-                    if let Some(followed) = resolved.untrusted.first() {
-                        let found = link_followed(&m, path, &resolved.path, followed);
-                        warnings.push(SpecWarning::SourceLink(found));
-                        continue;
-                    }
+                if m.mode == PathMode::Rw
+                    && let Some(followed) = resolved.untrusted.first()
+                {
+                    let found = link_followed(&m, path, &resolved.path, followed);
+                    warnings.push(SpecWarning::SourceLink(found));
+                    continue;
                 }
                 Underneath::Host {
                     mode: m.mode,

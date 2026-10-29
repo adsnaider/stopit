@@ -218,8 +218,26 @@ pub struct InitSpec {
     pub proxy_bridge: bool,
     /// The directory to start the target in, opened from `/` with
     /// `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS`, so no link the sandbox
-    /// planted leads it elsewhere. `None` keeps the one bwrap set.
-    pub cwd: Option<std::path::PathBuf>,
+    /// planted leads it elsewhere, and which must be the directory the
+    /// broker checked ([`StartDir`]). `None` keeps the one bwrap set.
+    pub cwd: Option<StartDir>,
+    /// Look the command up in `PATH` without the shim directory
+    /// ([`crate::shim::SANDBOX_BIN`]), as a shim's own binary must never
+    /// be a shim again.
+    pub skip_shims: bool,
+}
+
+/// A directory to start the target in, and the identity on the host of
+/// the directory it must be.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartDir {
+    /// Its path in the sandbox.
+    pub path: std::path::PathBuf,
+    /// The device of the directory the broker checked.
+    pub dev: u64,
+    /// The inode of the directory the broker checked.
+    pub ino: u64,
 }
 
 impl InitSpec {
@@ -233,6 +251,7 @@ impl InitSpec {
             allow_syscalls: spec.allow_syscalls.clone(),
             proxy_bridge: spec.proxy_domains().is_some(),
             cwd: None,
+            skip_shims: false,
         }
     }
 }
@@ -438,7 +457,7 @@ pub fn run(args: &[OsString]) -> u8 {
     {
         report(format_args!(
             "cannot enter {}: {e}",
-            escape_bytes(cwd.as_os_str().as_bytes())
+            escape_bytes(cwd.path.as_os_str().as_bytes())
         ));
         return EXIT_INIT_FAILED;
     }
@@ -486,7 +505,7 @@ pub fn run(args: &[OsString]) -> u8 {
         return EXIT_INIT_FAILED;
     }
 
-    let error = exec(&args.command, &env);
+    let error = exec(&args.command, &env, spec.skip_shims);
     report(format_args!(
         "{}: {error}",
         escape_bytes(args.command[0].as_bytes())
@@ -691,23 +710,32 @@ fn set_no_new_privs() -> io::Result<()> {
     }
 }
 
-/// Changes to the directory `path`, resolved from `/` without following a
-/// symbolic link, and refusing `..` past the root.
-fn enter_directory(path: &std::path::Path) -> io::Result<()> {
+/// Changes to the directory `dir`, resolved from `/` without following a
+/// symbolic link and refusing `..` past the root, if it is the directory
+/// the broker checked. A rename in between makes it another one, and the
+/// target does not start.
+fn enter_directory(dir: &StartDir) -> io::Result<()> {
+    let path = dir.path.as_path();
     use rustix::fs::{Mode, OFlags, ResolveFlags, open, openat2};
     let root = open(
         "/",
         OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
-    let dir = openat2(
+    let opened = openat2(
         &root,
         path,
         OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
         ResolveFlags::IN_ROOT | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
     )?;
-    rustix::process::fchdir(&dir)?;
+    let stat = rustix::fs::fstat(&opened)?;
+    if (stat.st_dev as u64, stat.st_ino as u64) != (dir.dev, dir.ino) {
+        return Err(io::Error::other(
+            "it is not the directory the broker checked; it was moved meanwhile",
+        ));
+    }
+    rustix::process::fchdir(&opened)?;
     Ok(())
 }
 
@@ -856,7 +884,7 @@ impl std::fmt::Display for ExecError {
     }
 }
 
-fn exec(command: &[CString], env: &[CString]) -> ExecError {
+fn exec(command: &[CString], env: &[CString], skip_shims: bool) -> ExecError {
     let argv = null_terminated(command);
     let envp = null_terminated(env);
     let execve = |path: &CStr| {
@@ -877,6 +905,11 @@ fn exec(command: &[CString], env: &[CString]) -> ExecError {
     }
     match env_value(env, b"PATH") {
         None => ExecError::NoPath,
+        Some(path) if skip_shims => {
+            let bin = crate::shim::SANDBOX_BIN.as_bytes();
+            let kept: Vec<&[u8]> = path.split(|&b| b == b':').filter(|d| *d != bin).collect();
+            search_path(name, &kept.join(&b':'), execve)
+        }
         Some(path) => search_path(name, path, execve),
     }
 }
@@ -1059,6 +1092,28 @@ mod tests {
     }
 
     // --- InitSpec encoding ---
+
+    #[test]
+    fn a_start_directory_must_be_the_one_checked() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wrong = StartDir {
+            path: dir.path().to_owned(),
+            dev: 0,
+            ino: 0,
+        };
+        let e = enter_directory(&wrong).unwrap_err();
+        assert!(e.to_string().contains("moved meanwhile"), "{e}");
+        // A link on the way is refused, whatever it leads to.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        let meta = std::fs::metadata(dir.path()).unwrap();
+        let through = StartDir {
+            path: link,
+            dev: std::os::unix::fs::MetadataExt::dev(&meta),
+            ino: std::os::unix::fs::MetadataExt::ino(&meta),
+        };
+        assert!(enter_directory(&through).is_err());
+    }
 
     #[test]
     fn only_proxy_mode_in_its_own_namespace_starts_the_bridge() {

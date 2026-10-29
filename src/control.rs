@@ -116,7 +116,7 @@ pub(crate) mod hex_list {
     }
 
     pub(super) fn decode<E: serde::de::Error>(s: &str) -> Result<Vec<u8>, E> {
-        if s.len() % 2 != 0 {
+        if !s.len().is_multiple_of(2) {
             return Err(E::custom("odd-length hex string"));
         }
         (0..s.len())
@@ -211,6 +211,51 @@ pub fn read_frame<T: DeserializeOwned>(mut sock: &UnixStream) -> io::Result<Opti
     }
     let mut body = vec![0u8; len];
     sock.read_exact(&mut body)?;
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// [`read_frame`], giving up with `TimedOut` at `deadline` however the
+/// sender spreads its bytes.
+pub fn read_frame_by<T: DeserializeOwned>(
+    sock: &UnixStream,
+    deadline: std::time::Instant,
+) -> io::Result<Option<T>> {
+    let read = |buf: &mut [u8], eof_ok: bool| -> io::Result<bool> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            sock.set_read_timeout(Some(left))?;
+            match (&*sock).read(&mut buf[filled..]) {
+                Ok(0) if filled == 0 && eof_ok => return Ok(false),
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
+    };
+    let mut len = [0u8; 4];
+    if !read(&mut len, true)? {
+        return Ok(None);
+    }
+    let len = u32::from_be_bytes(len) as usize;
+    if len > MAX_FRAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "control message too large",
+        ));
+    }
+    let mut body = vec![0u8; len];
+    read(&mut body, false)?;
     serde_json::from_slice(&body)
         .map(Some)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
@@ -353,7 +398,9 @@ pub fn recv_fds(sock: &UnixStream, byte: u8, count: usize) -> io::Result<Vec<Own
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "expected one byte with {count} descriptors, got {} descriptors",
+                "expected the byte {:?} with {count} descriptors, got {} with {}",
+                char::from(byte),
+                got.map_or("nothing".to_owned(), |b| format!("{:?}", char::from(b))),
                 fds.len()
             ),
         ));
@@ -587,5 +634,25 @@ mod tests {
             let e = recv_hello(&b).unwrap_err();
             assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{byte} {count}: {e}");
         }
+    }
+
+    #[test]
+    fn a_shim_hello_needs_its_byte_and_exactly_four_descriptors() {
+        let (r, _w) = std::io::pipe().unwrap();
+        let fd = r.as_raw_fd();
+        let (a, b) = UnixStream::pair().unwrap();
+        send_raw(&a, b'S', &[fd; 4]);
+        assert_eq!(recv_fds(&b, b'S', 4).unwrap().len(), 4);
+        for (byte, count) in [(b'S', 3), (b'S', 5), (b'S', 0), (b'F', 4), (b'A', 4)] {
+            let (a, b) = UnixStream::pair().unwrap();
+            send_raw(&a, byte, &vec![fd; count]);
+            let e = recv_fds(&b, b'S', 4).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{byte} {count}: {e}");
+        }
+        // A peer that hangs up first sends nothing.
+        let (a, b) = UnixStream::pair().unwrap();
+        drop(a);
+        let e = recv_fds(&b, b'S', 4).unwrap_err();
+        assert!(e.to_string().contains("got nothing"), "{e}");
     }
 }

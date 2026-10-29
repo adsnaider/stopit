@@ -125,6 +125,8 @@ impl SandboxSpec {
         if !self.shims.is_empty() {
             let bin = OsString::from(crate::shim::SANDBOX_BIN);
             match env.iter_mut().find(|(k, _)| k == PATH) {
+                // An empty entry would mean the current directory.
+                Some((_, path)) if path.is_empty() => *path = bin,
                 Some((_, path)) => {
                     let mut joined = bin;
                     joined.push(":");

@@ -441,19 +441,21 @@ fn run_for_client(
         TerminalSession::Detach
     };
     let proxy = loaded.start_proxy(profile, &run.to_string())?;
-    let ctx = Arc::new(crate::broker::RunContext {
-        loaded: loaded.clone(),
-        compiled: compiled.clone(),
-        host_env: env,
-        approver: Some(approver.clone()),
+    let ctx = Arc::new(crate::broker::RunContext::new(
+        loaded.clone(),
+        compiled.clone(),
+        env,
+        Some(approver.clone()),
         run,
-    });
+        &command,
+    ));
     let broker = crate::broker::start_broker(&ctx, &profile_name, profile, &run.to_string())?;
     let extras = crate::bwrap::RunExtras {
         proxy_socket: proxy.as_ref().map(|p| p.path().to_owned()),
         broker_socket: broker.as_ref().map(|b| b.path().to_owned()),
         shims: loaded.shim_binds(&profile_name, profile)?,
         cwd: None,
+        skip_shims: false,
     };
     let bwrap = loaded.command(
         profile,
