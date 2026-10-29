@@ -3763,3 +3763,181 @@ fn an_attached_run_gets_the_proxy_and_the_server_logs_refusals() {
     assert_eq!(server.stop(), 128 + libc::SIGTERM);
     assert!(s.no_session_left());
 }
+
+// --- Shims and the broker ---
+
+/// [`shell_config`] with `main` setting `WHICH=main`, and a `harness`
+/// profile setting `WHICH=harness` with three shims of `sh`: `sh-main`
+/// allowed in `main`, `nope` denied, and `asking` asked about for `main`.
+fn harness_config() -> Option<String> {
+    let config = shell_config()?;
+    Some(format!(
+        "{config}[[provider]]\ntype = \"config\"\nname = \"which\"\n\
+         [provider.sandbox]\nenv.set = {{ WHICH = \"main\" }}\n\
+         [profiles.harness]\n\
+         [[provider]]\ntype = \"config\"\nname = \"harness\"\nprofile = \"harness\"\n\
+         [provider.sandbox]\nenv.set = {{ WHICH = \"harness\" }}\n\
+         shims.sh-main = {{ binary = \"sh\", default = {{ decision = \"allow\", profile = \"main\" }} }}\n\
+         shims.nope = {{ binary = \"sh\", default = {{ decision = \"deny\" }} }}\n\
+         shims.asking = {{ binary = \"sh\", default = {{ decision = \"ask\", profile = \"main\" }} }}\n"
+    ))
+}
+
+#[test]
+fn a_shim_runs_its_command_in_the_profile_its_rules_name() {
+    let Some(config) = harness_config() else {
+        return;
+    };
+    let s = Setup::with_config(&config);
+    fs::create_dir(s.ws().join("sub")).unwrap();
+    let script = "echo \"harness [$WHICH] $(command -v sh-main)\"; \
+                  cd sub && sh-main -c 'echo \"tool [$WHICH] $(pwd)\"; \
+                  command -v sh-main || echo \"no shims\"; exit 7'; echo \"rc=$?\"; \
+                  echo piped | sh-main -c 'cat'";
+    let out = output(
+        s.stopit(&[
+            "run",
+            "--quiet",
+            "--profile",
+            "harness",
+            "/bin/sh",
+            "-c",
+            script,
+        ]),
+        b"",
+    );
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "harness [harness] /run/stopit/bin/sh-main\n\
+         tool [main] /workspace/sub\n\
+         no shims\n\
+         rc=7\n\
+         piped\n"
+    );
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn refused_shim_calls_exit_126_and_say_why() {
+    let Some(config) = harness_config() else {
+        return;
+    };
+    let s = Setup::with_config(&config);
+    let script = "nope -c 'echo ran'; echo \"nope=$?\"; \
+                  asking -c 'echo ran'; echo \"asking=$?\"; \
+                  cd /tmp && sh-main -c 'echo ran'; echo \"outside=$?\"";
+    let out = output(
+        s.stopit(&[
+            "run",
+            "--quiet",
+            "--profile",
+            "harness",
+            "/bin/sh",
+            "-c",
+            script,
+        ]),
+        b"",
+    );
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "nope=126\nasking=126\noutside=125\n"
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("[stopit: nope: the shim's rules deny it]"),
+        "{err}"
+    );
+    assert!(
+        err.contains("needs a yes on a stopit server's terminal"),
+        "{err}"
+    );
+    assert!(
+        err.contains("shims run only from inside the workspace"),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_asking_shim_runs_once_the_server_terminal_says_yes() {
+    let Some(config) = harness_config() else {
+        return;
+    };
+    let Some((server_master, server_slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::with_config(&format!("{config}[approval]\ntimeout = \"20s\"\n"));
+    let server = Server::start_on_terminal(&s, &server_master, server_slave);
+    let command = s.stopit(&[
+        "run",
+        "--quiet",
+        "--profile",
+        "harness",
+        "/bin/sh",
+        "-c",
+        "asking -c 'echo \"ran [$WHICH]\"'; echo \"rc=$?\"",
+    ]);
+    let child = command_output_async(command);
+    server.wait_for_log("[n] deny: ");
+    let deadline = Instant::now() + BWRAP_DEADLINE;
+    while !server.log().contains("allowed once") {
+        assert!(Instant::now() < deadline, "{}", server.log());
+        (&server_master).write_all(b"y").unwrap();
+        thread::sleep(Duration::from_millis(200));
+    }
+    let out = child.join().unwrap();
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ran [main]\nrc=0\n");
+    let log = server.log();
+    assert!(log.contains("run asking -c"), "{log}");
+    assert!(
+        log.contains("in profile \"main\", from /workspace"),
+        "{log}"
+    );
+    assert!(log.contains("through shim asking, rule default"), "{log}");
+}
+
+/// Runs `command` without a terminal in a thread, and returns its output
+/// when joined.
+fn command_output_async(command: Command) -> thread::JoinHandle<Output> {
+    thread::spawn(move || output(command, b""))
+}
+
+#[test]
+fn a_shims_signals_and_its_end_reach_the_command() {
+    let Some(config) = harness_config() else {
+        return;
+    };
+    let s = Setup::with_config(&config);
+    // A command in `main` that counts in the session's shared `/tmp`, for
+    // as long as it runs.
+    let counter = "sh-main -c 'while :; do echo x >> /tmp/$0; sleep 0.05; done'";
+    let script = format!(
+        "{counter} term & pid=$!; sleep 1; kill -TERM $pid; wait $pid; echo \"term=$?\"; \
+         {counter} kill & pid=$!; sleep 1; kill -KILL $pid; wait $pid; \
+         sleep 1; a=$(wc -l < /tmp/kill); sleep 1; b=$(wc -l < /tmp/kill); \
+         [ \"$a\" = \"$b\" ] && echo stopped; \
+         a=$(wc -l < /tmp/term); sleep 1; b=$(wc -l < /tmp/term); \
+         [ \"$a\" = \"$b\" ] && echo stopped"
+    );
+    let out = output(
+        s.stopit(&[
+            "run",
+            "--quiet",
+            "--profile",
+            "harness",
+            "/bin/sh",
+            "-c",
+            &script,
+        ]),
+        b"",
+    );
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "term=143\nstopped\nstopped\n",
+        "{out:?}"
+    );
+    assert!(s.no_session_left());
+}

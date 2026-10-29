@@ -108,7 +108,7 @@ pub enum ServerMessage {
 type BytePairs = Vec<(Vec<u8>, Vec<u8>)>;
 
 /// Hex encoding of byte strings in JSON.
-mod hex_list {
+pub(crate) mod hex_list {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub(super) fn encode(bytes: &[u8]) -> String {
@@ -130,15 +130,30 @@ mod hex_list {
             .collect()
     }
 
-    pub(super) fn serialize<S: Serializer>(list: &[Vec<u8>], s: S) -> Result<S::Ok, S::Error> {
+    pub(crate) fn serialize<S: Serializer>(list: &[Vec<u8>], s: S) -> Result<S::Ok, S::Error> {
         s.collect_seq(list.iter().map(|b| encode(b)))
     }
 
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Vec<u8>>, D::Error> {
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Vec<u8>>, D::Error> {
         Vec::<String>::deserialize(d)?
             .iter()
             .map(|s| decode(s))
             .collect()
+    }
+}
+
+/// Hex encoding of a byte string in JSON.
+pub(crate) mod hex_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::hex_list::{decode, encode};
+
+    pub(crate) fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&encode(bytes))
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        decode(&String::deserialize(d)?)
     }
 }
 
@@ -228,17 +243,34 @@ pub fn read_request(sock: &UnixStream) -> io::Result<Option<ClientMessage>> {
 
 /// Sends `fds` (stdin, stdout and stderr for the sandbox) with one byte.
 pub fn send_stdio(sock: &UnixStream, fds: [BorrowedFd<'_>; 3]) -> io::Result<()> {
-    let raw: [RawFd; 3] = fds.map(|fd| fd.as_raw_fd());
-    let byte = *b"F";
+    send_fds(sock, b'F', &fds)
+}
+
+/// The most descriptors a connection's first byte may carry.
+const MAX_FDS: usize = 4;
+
+/// Sends `byte` with `fds` attached, at most [`MAX_FDS`].
+pub fn send_fds(sock: &UnixStream, byte: u8, fds: &[BorrowedFd<'_>]) -> io::Result<()> {
+    assert!(
+        !fds.is_empty() && fds.len() <= MAX_FDS,
+        "1 to {MAX_FDS} descriptors"
+    );
+    let mut raw = [0 as RawFd; MAX_FDS];
+    for (slot, fd) in raw.iter_mut().zip(fds) {
+        *slot = fd.as_raw_fd();
+    }
+    let raw = &raw[..fds.len()];
+    let bytes = [byte];
     let mut iov = libc::iovec {
-        iov_base: byte.as_ptr() as *mut libc::c_void,
+        iov_base: bytes.as_ptr() as *mut libc::c_void,
         iov_len: 1,
     };
+    let data = std::mem::size_of_val(raw);
     // SAFETY: `CMSG_SPACE` is a pure computation.
-    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&raw) as u32) } as usize;
+    let space = unsafe { libc::CMSG_SPACE(data as u32) } as usize;
     let mut control = vec![0u8; space];
     // SAFETY: `msg` points at `iov` and `control`, both alive for the call;
-    // the control buffer is `CMSG_SPACE` bytes for three descriptors, and
+    // the control buffer is `CMSG_SPACE` bytes for the descriptors, and
     // the header and data are written within it.
     unsafe {
         let mut msg: libc::msghdr = std::mem::zeroed();
@@ -249,12 +281,8 @@ pub fn send_stdio(sock: &UnixStream, fds: [BorrowedFd<'_>; 3]) -> io::Result<()>
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&raw) as u32) as _;
-        std::ptr::copy_nonoverlapping(
-            raw.as_ptr().cast::<u8>(),
-            libc::CMSG_DATA(cmsg),
-            std::mem::size_of_val(&raw),
-        );
+        (*cmsg).cmsg_len = libc::CMSG_LEN(data as u32) as _;
+        std::ptr::copy_nonoverlapping(raw.as_ptr().cast::<u8>(), libc::CMSG_DATA(cmsg), data);
         loop {
             match libc::sendmsg(sock.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) {
                 1 => return Ok(()),
@@ -266,37 +294,21 @@ pub fn send_stdio(sock: &UnixStream, fds: [BorrowedFd<'_>; 3]) -> io::Result<()>
     }
 }
 
-/// Starts an approval connection: one byte, no descriptors.
-pub fn send_approval_hello(mut sock: &UnixStream) -> io::Result<()> {
-    sock.write_all(b"A")
-}
-
-/// What a connection is for, from its first byte.
-#[derive(Debug)]
-pub enum Hello {
-    /// Running a command on these stdin, stdout and stderr.
-    Run([OwnedFd; 3]),
-    /// Asking for an approval.
-    Approve,
-}
-
-/// Receives the first byte of a connection: [`send_stdio`]'s, with exactly
-/// three descriptors, close-on-exec, or [`send_approval_hello`]'s, with
-/// none. Anything else is an error, and every descriptor received is
-/// closed.
-pub fn recv_hello(sock: &UnixStream) -> io::Result<Hello> {
+/// Receives one byte and the descriptors attached to it, each
+/// close-on-exec, and whether the kernel cut the descriptors short.
+fn recv_byte_and_fds(sock: &UnixStream) -> io::Result<(Option<u8>, Vec<OwnedFd>, bool)> {
     let mut byte = [0u8; 1];
     let mut iov = libc::iovec {
         iov_base: byte.as_mut_ptr().cast(),
         iov_len: 1,
     };
-    // Room for more than three, so extra descriptors are seen and closed
-    // rather than truncated away unnoticed.
+    // Room for more than any message has, so extra descriptors are seen
+    // and closed rather than truncated away unnoticed.
     // SAFETY: `CMSG_SPACE` is a pure computation.
     let space = unsafe { libc::CMSG_SPACE((8 * std::mem::size_of::<RawFd>()) as u32) } as usize;
     let mut control = vec![0u8; space];
     let mut received: Vec<OwnedFd> = Vec::new();
-    // SAFETY: as in `send_stdio`; the kernel writes at most `space` bytes of
+    // SAFETY: as in `send_fds`; the kernel writes at most `space` bytes of
     // control data, and every descriptor read from it is taken ownership of
     // exactly once.
     let (n, flags) = unsafe {
@@ -328,10 +340,51 @@ pub fn recv_hello(sock: &UnixStream) -> io::Result<Hello> {
         }
         (n, msg.msg_flags)
     };
-    if n == 1 && byte[0] == b'A' && received.is_empty() && flags & libc::MSG_CTRUNC == 0 {
+    let byte = (n == 1).then_some(byte[0]);
+    Ok((byte, received, flags & libc::MSG_CTRUNC != 0))
+}
+
+/// Receives the first byte of a connection, which must be `byte` with
+/// exactly `count` descriptors. Anything else is an error, and every
+/// descriptor received is closed.
+pub fn recv_fds(sock: &UnixStream, byte: u8, count: usize) -> io::Result<Vec<OwnedFd>> {
+    let (got, fds, truncated) = recv_byte_and_fds(sock)?;
+    if got != Some(byte) || truncated || fds.len() != count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "expected one byte with {count} descriptors, got {} descriptors",
+                fds.len()
+            ),
+        ));
+    }
+    Ok(fds)
+}
+
+/// Starts an approval connection: one byte, no descriptors.
+pub fn send_approval_hello(mut sock: &UnixStream) -> io::Result<()> {
+    sock.write_all(b"A")
+}
+
+/// What a connection is for, from its first byte.
+#[derive(Debug)]
+pub enum Hello {
+    /// Running a command on these stdin, stdout and stderr.
+    Run([OwnedFd; 3]),
+    /// Asking for an approval.
+    Approve,
+}
+
+/// Receives the first byte of a connection: [`send_stdio`]'s, with exactly
+/// three descriptors, close-on-exec, or [`send_approval_hello`]'s, with
+/// none. Anything else is an error, and every descriptor received is
+/// closed.
+pub fn recv_hello(sock: &UnixStream) -> io::Result<Hello> {
+    let (byte, received, truncated) = recv_byte_and_fds(sock)?;
+    if byte == Some(b'A') && received.is_empty() && !truncated {
         return Ok(Hello::Approve);
     }
-    if n != 1 || byte[0] != b'F' || flags & libc::MSG_CTRUNC != 0 {
+    if byte != Some(b'F') || truncated {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "the client did not send its descriptors",

@@ -45,6 +45,20 @@ pub enum ApprovalRequest {
         /// The content, base64 as the sandbox sent it.
         data: String,
     },
+    /// A command through a shim (DESIGN.md §7.1).
+    Command {
+        /// The shim.
+        shim: String,
+        /// The shim rule that matched, its subcommand pattern, or
+        /// `default`. An answer for the session covers the rule.
+        rule: String,
+        /// The profile the command runs in.
+        profile: String,
+        /// The command line, each argument quoted for a shell, escaped.
+        command: String,
+        /// The working directory in the sandbox, escaped.
+        cwd: String,
+    },
 }
 
 impl ApprovalRequest {
@@ -52,6 +66,12 @@ impl ApprovalRequest {
     fn scope(&self, profile: &str) -> String {
         match self {
             ApprovalRequest::ClipboardWrite { .. } => format!("{profile}\0clipboard"),
+            ApprovalRequest::Command {
+                shim,
+                rule,
+                profile: target,
+                ..
+            } => format!("{profile}\0command\0{shim}\0{rule}\0{target}"),
         }
     }
 
@@ -77,6 +97,24 @@ impl ApprovalRequest {
                     format!("content: {}", preview(&content)),
                 ])
             }
+            ApprovalRequest::Command {
+                shim,
+                rule,
+                profile,
+                command,
+                cwd,
+            } => Some(vec![
+                format!("run {command}"),
+                format!(
+                    "in profile {}, from {cwd}",
+                    escape_message(&format!("{profile:?}"))
+                ),
+                format!(
+                    "through shim {}, rule {}",
+                    escape_message(shim),
+                    escape_message(rule)
+                ),
+            ]),
         }
     }
 }
@@ -223,7 +261,7 @@ impl Approver {
     fn tell_unasked(&self, asker: &Asker, why: &str) {
         if self.state().told_unasked.insert(asker.run) {
             self.log(&format!(
-                "stopit: denied a clipboard write from run {} without asking: {why}",
+                "stopit: denied a request from run {} without asking: {why}",
                 asker.run
             ));
         }

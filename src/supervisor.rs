@@ -48,6 +48,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use rustix::io::Errno;
@@ -286,6 +287,20 @@ pub enum RunError {
     /// The sandbox's network cannot be set up.
     #[error(transparent)]
     Network(#[from] crate::net::NetError),
+
+    /// The shims cannot be set up.
+    #[error(transparent)]
+    Shim(#[from] crate::shim::ShimError),
+
+    /// The broker cannot listen.
+    #[error("cannot start the broker on {path:?}: {source}")]
+    Broker {
+        /// Its socket.
+        path: PathBuf,
+        /// What went wrong.
+        #[source]
+        source: io::Error,
+    },
 
     /// The network proxy cannot listen.
     #[error("cannot start the network proxy on {path:?}: {source}")]
@@ -647,7 +662,7 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     if let Some(conn) = crate::server::pick_server(&invocation, &cwd)? {
         return Ok(ExitCode::from(crate::server::attach(conn, &invocation)?));
     }
-    let loaded = LoadedSession::load(&cwd, invocation.workspace.as_deref())?;
+    let loaded = Arc::new(LoadedSession::load(&cwd, invocation.workspace.as_deref())?);
     for line in loaded.warning_lines() {
         eprintln!("{line}");
     }
@@ -662,12 +677,26 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     let stdio = stdio_terminals();
     let terminal = terminal_session(stdio);
     let proxy = loaded.start_proxy(profile, "run")?;
+    let ctx = Arc::new(crate::broker::RunContext {
+        loaded: loaded.clone(),
+        compiled: loaded.compiled.clone(),
+        host_env: std::env::vars_os().collect(),
+        approver: None,
+        run: 0,
+    });
+    let broker = crate::broker::start_broker(&ctx, &profile_name, profile, "run")?;
+    let extras = crate::bwrap::RunExtras {
+        proxy_socket: proxy.as_ref().map(|p| p.path().to_owned()),
+        broker_socket: broker.as_ref().map(|b| b.path().to_owned()),
+        shims: loaded.shim_binds(&profile_name, profile)?,
+        cwd: None,
+    };
     let command = loaded.command(
         profile,
         &invocation.command,
-        std::env::vars_os(),
+        ctx.host_env.iter().cloned(),
         terminal,
-        proxy.as_ref(),
+        &extras,
     )?;
     ignore_job_control();
     if terminal != TerminalSession::Keep {
@@ -679,6 +708,9 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
         None
     };
     let status = wait_foreground(command, pty);
+    // The commands the shims started go with the sandbox.
+    drop(broker);
+    drop(ctx);
     if let Some(proxy) = proxy {
         let (hosts, count) = proxy.denied();
         if let Some(report) = crate::proxy::denied_report(&hosts, count) {
@@ -733,7 +765,7 @@ pub(crate) struct LoadedSession {
     config: Config,
     home: PathBuf,
     /// The session compiled when it was loaded.
-    pub(crate) compiled: CompiledSession,
+    pub(crate) compiled: Arc<CompiledSession>,
     /// Warnings found before compiling, without the `stopit: warning:`
     /// prefix.
     load_warnings: Vec<String>,
@@ -747,6 +779,8 @@ pub(crate) struct LoadedSession {
     state: StateDirs,
     ctx: ExpansionContext,
     provisioned: Provisioned,
+    /// The shim trampoline in the session directory.
+    trampoline: PathBuf,
     /// Dropped last.
     pub(crate) session: SessionDir,
 }
@@ -898,7 +932,12 @@ impl LoadedSession {
             });
         }
         let compile_warnings = warning_lines(&compiled, config.base);
+        let compiled = Arc::new(compiled);
         let provisioned = provision_self(&session)?;
+        let trampoline = crate::shim::write_trampoline(
+            &session,
+            &provisioned.command_prefix(Path::new(crate::spec::SANDBOX_RUNTIME_DIR)),
+        )?;
         Ok(LoadedSession {
             workspace,
             config,
@@ -911,6 +950,7 @@ impl LoadedSession {
             state,
             ctx,
             provisioned,
+            trampoline,
             session,
         })
     }
@@ -978,19 +1018,19 @@ impl LoadedSession {
     }
 
     /// The bwrap command running `command` in `profile`, with the target
-    /// environment built from `host_env` (§9), and `proxy`'s socket
-    /// mounted if given.
+    /// environment built from `host_env` (§9), and what the run adds
+    /// (`extras`).
     pub(crate) fn command(
         &self,
         profile: &CompiledProfile,
         command: &[OsString],
         host_env: impl IntoIterator<Item = (OsString, OsString)>,
         terminal: TerminalSession,
-        proxy: Option<&crate::proxy::Proxy>,
+        extras: &crate::bwrap::RunExtras,
     ) -> Result<BwrapCommand, RunError> {
         let env = profile.spec.target_env(host_env);
         let sandbox_cwd = working_dir(&profile.spec, self.config.workspace.mount.as_path());
-        Ok(BwrapCommand::for_init_with_proxy(
+        Ok(BwrapCommand::for_init_with(
             &profile.spec,
             &self.session,
             &self.provisioned,
@@ -998,8 +1038,32 @@ impl LoadedSession {
             &env,
             command,
             terminal,
-            proxy.map(crate::proxy::Proxy::path),
+            extras,
         )?)
+    }
+
+    /// The shim directory of `profile`, named `name`, and the trampoline,
+    /// if the profile has shims.
+    pub(crate) fn shim_binds(
+        &self,
+        name: &ProfileRef,
+        profile: &CompiledProfile,
+    ) -> Result<Option<(PathBuf, PathBuf)>, RunError> {
+        if profile.spec.shims.is_empty() {
+            return Ok(None);
+        }
+        let dir = crate::shim::shim_dir(&self.session, name, profile.spec.shims.keys())?;
+        Ok(Some((dir, self.trampoline.clone())))
+    }
+
+    /// The workspace's host directory.
+    pub(crate) fn workspace_dir(&self) -> &Path {
+        &self.workspace.dir
+    }
+
+    /// Where the sandbox sees the workspace.
+    pub(crate) fn workspace_mount(&self) -> &Path {
+        self.config.workspace.mount.as_path()
     }
 
     /// The network proxy for a sandbox of `profile`, if it is in proxy

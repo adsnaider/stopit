@@ -292,7 +292,7 @@ impl Drop for Proxy {
 /// Spawns a thread with every signal blocked, which its own threads
 /// inherit. The supervisor relies on catching its signals in the thread
 /// that waits for them, never in a proxy thread.
-fn spawn_without_signals<F>(name: &str, f: F) -> io::Result<JoinHandle<()>>
+pub(crate) fn spawn_without_signals<F>(name: &str, f: F) -> io::Result<JoinHandle<()>>
 where
     F: FnOnce() + Send + 'static,
 {
@@ -324,7 +324,7 @@ where
 }
 
 /// A close-on-exec pipe, the read end and then the write end.
-fn cloexec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+pub(crate) fn cloexec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     use std::os::fd::FromRawFd;
     let mut fds = [0; 2];
     // SAFETY: `fds` has room for the two descriptors `pipe2` writes.
@@ -542,8 +542,8 @@ fn read_by(conn: &mut UnixStream, buf: &mut [u8], deadline: Instant) -> io::Resu
 /// the TLS server name, and then relays both ways until either side
 /// closes.
 ///
-/// `slot` comes after `client`, so it is dropped first: once the client
-/// sees its connection close, the place it held is free.
+/// `slot` is moved into a local, which drops before the parameters, so a
+/// refused client finds its place free once it sees the close.
 fn handle(mut client: UnixStream, slot: Slot<'_>, open: &Open<'_>) -> Result<(), Refusal> {
     let _slot = slot;
     let options = &open.shared.options;

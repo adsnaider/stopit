@@ -14,6 +14,10 @@ fn main() -> ExitCode {
         if subcommand == stopit::init::SUBCOMMAND {
             return ExitCode::from(stopit::init::run(rest));
         }
+        // A shim's call, from the trampoline in a sandbox (DESIGN.md §7.1).
+        if subcommand == stopit::shim::SUBCOMMAND {
+            return ExitCode::from(stopit::shim::run(rest));
+        }
     }
     let cli = match Cli::try_parse_from(&args) {
         Ok(cli) => cli,

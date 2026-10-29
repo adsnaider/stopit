@@ -3,6 +3,7 @@
 //! repository root for the full design.
 
 pub mod approval;
+pub mod broker;
 pub mod bwrap;
 pub mod cli;
 pub mod config;
@@ -27,6 +28,7 @@ pub mod seccomp;
 mod serde_util;
 pub mod server;
 pub mod session;
+pub mod shim;
 pub mod spec;
 pub mod state;
 pub mod summary;

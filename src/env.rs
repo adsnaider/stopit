@@ -120,7 +120,24 @@ impl SandboxSpec {
         } else {
             Vec::new()
         };
-        self.env.apply_with(&self.system.home, host, &defaults)
+        let mut env = self.env.apply_with(&self.system.home, host, &defaults);
+        // The profile's shims come first in `PATH`.
+        if !self.shims.is_empty() {
+            let bin = OsString::from(crate::shim::SANDBOX_BIN);
+            match env.iter_mut().find(|(k, _)| k == PATH) {
+                Some((_, path)) => {
+                    let mut joined = bin;
+                    joined.push(":");
+                    joined.push(&*path);
+                    *path = joined;
+                }
+                None => {
+                    env.push((PATH.into(), bin));
+                    env.sort();
+                }
+            }
+        }
+        env
     }
 }
 

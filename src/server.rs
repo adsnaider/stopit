@@ -315,8 +315,8 @@ pub(crate) fn check_socket_path(path: &Path) -> Result<(), RunError> {
 /// Forgets the connection after. Every error goes back to the client.
 fn serve_client(
     conn: UnixStream,
-    loaded: &LoadedSession,
-    approver: &Approver,
+    loaded: &Arc<LoadedSession>,
+    approver: &Arc<Approver>,
     runs: &SharedRuns,
     run: u64,
     quiet: bool,
@@ -392,8 +392,8 @@ fn approve_for_client(conn: &UnixStream, approver: &Approver, runs: &SharedRuns)
 fn run_for_client(
     conn: &UnixStream,
     stdio: [OwnedFd; 3],
-    loaded: &LoadedSession,
-    approver: &Approver,
+    loaded: &Arc<LoadedSession>,
+    approver: &Arc<Approver>,
     runs: &SharedRuns,
     run: u64,
     quiet: bool,
@@ -421,11 +421,13 @@ fn run_for_client(
             "the client sent no command",
         )));
     }
-    let env = env
+    let env: Vec<(OsString, OsString)> = env
         .into_iter()
-        .map(|(k, v)| (OsString::from_vec(k), OsString::from_vec(v)));
+        .map(|(k, v)| (OsString::from_vec(k), OsString::from_vec(v)))
+        .collect();
     // Compiled for this run, against the filesystem as it is now.
     let (compiled, compile_warnings) = loaded.recompile()?;
+    let compiled = Arc::new(compiled);
     let (profile_name, profile) = profile_in(&compiled, profile.as_deref())?;
     let mut lines = loaded.warning_lines_with(&compile_warnings);
     if !client_quiet {
@@ -439,7 +441,27 @@ fn run_for_client(
         TerminalSession::Detach
     };
     let proxy = loaded.start_proxy(profile, &run.to_string())?;
-    let bwrap = loaded.command(profile, &command, env, terminal, proxy.as_ref())?;
+    let ctx = Arc::new(crate::broker::RunContext {
+        loaded: loaded.clone(),
+        compiled: compiled.clone(),
+        host_env: env,
+        approver: Some(approver.clone()),
+        run,
+    });
+    let broker = crate::broker::start_broker(&ctx, &profile_name, profile, &run.to_string())?;
+    let extras = crate::bwrap::RunExtras {
+        proxy_socket: proxy.as_ref().map(|p| p.path().to_owned()),
+        broker_socket: broker.as_ref().map(|b| b.path().to_owned()),
+        shims: loaded.shim_binds(&profile_name, profile)?,
+        cwd: None,
+    };
+    let bwrap = loaded.command(
+        profile,
+        &command,
+        ctx.host_env.iter().cloned(),
+        terminal,
+        &extras,
+    )?;
     let pasta = match bwrap.needs_pasta() {
         true => Some(crate::net::find_pasta()?),
         false => None,
@@ -538,6 +560,8 @@ fn run_for_client(
     }
     let status = child.wait().map_err(RunError::Spawn)?;
     let code = bwrap_exit_code(status, &read_nonblocking_status(status_reader));
+    // The commands the shims started go with the sandbox.
+    drop(broker);
     if let Some(proxy) = proxy {
         let (hosts, count) = proxy.denied();
         if let Some(report) = crate::proxy::denied_report(&hosts, count) {

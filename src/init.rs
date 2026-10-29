@@ -216,6 +216,10 @@ pub struct InitSpec {
     pub allow_syscalls: BTreeSet<OptInSyscall>,
     /// Start the bridge to the network proxy ([`crate::proxy::run_bridge`]).
     pub proxy_bridge: bool,
+    /// The directory to start the target in, opened from `/` with
+    /// `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS`, so no link the sandbox
+    /// planted leads it elsewhere. `None` keeps the one bwrap set.
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 impl InitSpec {
@@ -228,6 +232,7 @@ impl InitSpec {
             landlock: LandlockSpec::from_sandbox_spec(spec),
             allow_syscalls: spec.allow_syscalls.clone(),
             proxy_bridge: spec.proxy_domains().is_some(),
+            cwd: None,
         }
     }
 }
@@ -425,6 +430,16 @@ pub fn run(args: &[OsString]) -> u8 {
         && let Err(e) = setup_pty_slave()
     {
         report(format_args!("cannot set controlling terminal: {e}"));
+        return EXIT_INIT_FAILED;
+    }
+
+    if let Some(cwd) = &spec.cwd
+        && let Err(e) = enter_directory(cwd)
+    {
+        report(format_args!(
+            "cannot enter {}: {e}",
+            escape_bytes(cwd.as_os_str().as_bytes())
+        ));
         return EXIT_INIT_FAILED;
     }
 
@@ -674,6 +689,26 @@ fn set_no_new_privs() -> io::Result<()> {
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+/// Changes to the directory `path`, resolved from `/` without following a
+/// symbolic link, and refusing `..` past the root.
+fn enter_directory(path: &std::path::Path) -> io::Result<()> {
+    use rustix::fs::{Mode, OFlags, ResolveFlags, open, openat2};
+    let root = open(
+        "/",
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let dir = openat2(
+        &root,
+        path,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::IN_ROOT | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )?;
+    rustix::process::fchdir(&dir)?;
+    Ok(())
 }
 
 /// Starts the bridge to the network proxy in a process of its own, a

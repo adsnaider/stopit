@@ -377,14 +377,21 @@ impl BwrapCommand {
         target: &[OsString],
         terminal: TerminalSession,
     ) -> Result<BwrapCommand, BwrapError> {
-        Self::for_init_with_proxy(spec, session, provisioned, cwd, env, target, terminal, None)
+        Self::for_init_with(
+            spec,
+            session,
+            provisioned,
+            cwd,
+            env,
+            target,
+            terminal,
+            &RunExtras::default(),
+        )
     }
 
-    /// [`for_init`](Self::for_init), with the network proxy's socket at
-    /// `proxy_socket` on the host mounted at
-    /// [`crate::proxy::SANDBOX_PROXY_SOCKET`], if given.
+    /// [`for_init`](Self::for_init), with what a run adds ([`RunExtras`]).
     #[allow(clippy::too_many_arguments)]
-    pub fn for_init_with_proxy(
+    pub fn for_init_with(
         spec: &SandboxSpec,
         session: &SessionDir,
         provisioned: &Provisioned,
@@ -392,7 +399,7 @@ impl BwrapCommand {
         env: &[(OsString, OsString)],
         target: &[OsString],
         terminal: TerminalSession,
-        proxy_socket: Option<&Path>,
+        extras: &RunExtras,
     ) -> Result<BwrapCommand, BwrapError> {
         if target.is_empty() {
             return Err(BwrapError::NoCommand);
@@ -401,6 +408,13 @@ impl BwrapCommand {
         let env_fd = sealed_memfd("stopit-init-env", &encoded).map_err(BwrapError::DataFd)?;
         let mut init_spec = init::InitSpec::from_sandbox_spec(spec);
         init_spec.pty_slave = terminal == TerminalSession::Pty;
+        init_spec.cwd = extras.cwd.clone();
+        // `__init` goes to `extras.cwd` itself, safely, from the root.
+        let cwd = if extras.cwd.is_some() {
+            Path::new("/")
+        } else {
+            cwd
+        };
         let encoded_spec = init::encode_spec(&init_spec).map_err(BwrapError::Spec)?;
         let spec_fd =
             sealed_memfd("stopit-init-spec", &encoded_spec).map_err(BwrapError::DataFd)?;
@@ -413,7 +427,7 @@ impl BwrapCommand {
             &argv,
             terminal,
             init_spec.lo_down,
-            proxy_socket,
+            extras,
         )?;
         command.env_fd = Some(env_fd);
         command.spec_fd = Some(spec_fd);
@@ -448,7 +462,7 @@ impl BwrapCommand {
             argv_after_prefix,
             terminal,
             false,
-            None,
+            &RunExtras::default(),
         )
     }
 
@@ -461,14 +475,20 @@ impl BwrapCommand {
         argv_after_prefix: &[OsString],
         terminal: TerminalSession,
         retain_init_caps: bool,
-        proxy_socket: Option<&Path>,
+        extras: &RunExtras,
     ) -> Result<BwrapCommand, BwrapError> {
+        let (bin, shim) = match &extras.shims {
+            Some((bin, shim)) => (bin.clone(), Some(shim.clone())),
+            None => (session.bin(), None),
+        };
         let runtime = RuntimeBinds {
             exe: provisioned.exe().to_path_buf(),
             lib_dir: provisioned.lib_dir().to_path_buf(),
-            bin: session.bin(),
+            bin,
             prefix: provisioned.command_prefix(Path::new(SANDBOX_RUNTIME_DIR)),
-            proxy_socket: proxy_socket.map(Path::to_path_buf),
+            proxy_socket: extras.proxy_socket.clone(),
+            broker_socket: extras.broker_socket.clone(),
+            shim,
         };
         let mut untrusted_roots = spec.untrusted_roots.clone();
         untrusted_roots.insert(session.ephemeral());
@@ -953,6 +973,28 @@ struct RuntimeBinds {
     prefix: Vec<OsString>,
     /// The network proxy's socket on the host, if the sandbox has one.
     proxy_socket: Option<PathBuf>,
+    /// The broker's socket on the host, if the sandbox has shims.
+    broker_socket: Option<PathBuf>,
+    /// The shim trampoline on the host, if the sandbox has shims.
+    shim: Option<PathBuf>,
+}
+
+/// What a run adds to a sandbox beyond its spec.
+#[derive(Debug, Clone, Default)]
+pub struct RunExtras {
+    /// The network proxy's socket on the host, mounted at
+    /// [`crate::proxy::SANDBOX_PROXY_SOCKET`].
+    pub proxy_socket: Option<PathBuf>,
+    /// The broker's socket on the host, mounted at
+    /// [`crate::shim::SANDBOX_BROKER_SOCKET`].
+    pub broker_socket: Option<PathBuf>,
+    /// The profile's shim directory and the trampoline on the host,
+    /// mounted at [`crate::shim::SANDBOX_BIN`] and
+    /// [`crate::shim::SANDBOX_SHIM`].
+    pub shims: Option<(PathBuf, PathBuf)>,
+    /// The directory the target starts in, which `__init` opens itself
+    /// ([`init::InitSpec::cwd`]).
+    pub cwd: Option<PathBuf>,
 }
 
 /// The generated invocation, before any descriptor exists.
@@ -1231,12 +1273,18 @@ fn plan_with_caps(
         ])?;
     }
     // A socket connects through a read-only mount too.
-    if let Some(socket) = &runtime.proxy_socket {
-        plan.push([
-            OsStr::new("--ro-bind"),
-            socket.as_os_str(),
-            OsStr::new(crate::proxy::SANDBOX_PROXY_SOCKET),
-        ])?;
+    for (host, sandbox) in [
+        (&runtime.shim, crate::shim::SANDBOX_SHIM),
+        (&runtime.broker_socket, crate::shim::SANDBOX_BROKER_SOCKET),
+        (&runtime.proxy_socket, crate::proxy::SANDBOX_PROXY_SOCKET),
+    ] {
+        if let Some(host) = host {
+            plan.push([
+                OsStr::new("--ro-bind"),
+                host.as_os_str(),
+                OsStr::new(sandbox),
+            ])?;
+        }
     }
 
     // Step 2: bwrap leaves its root tmpfs writable, so the sandbox could
@@ -1585,6 +1633,8 @@ mod tests {
             bin: "/s/bin".into(),
             prefix: vec!["/run/stopit/stopit".into()],
             proxy_socket: None,
+            broker_socket: None,
+            shim: None,
         }
     }
 
