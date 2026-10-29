@@ -575,6 +575,11 @@ impl Drop for LiveSlot<'_> {
 /// are: a socket gets a non-blocking send, and a pipe or terminal is
 /// opened again, non-blocking, for one write. A regular file takes the
 /// write as it is. Anything else gets no message.
+///
+/// Opening again checks only the file's mode bits, not the descriptor's
+/// access mode, the mount's or Landlock's, so a pipe or terminal gets the
+/// message only if the sandbox opened it for writing. Otherwise the
+/// broker would write for the sandbox where it may only read.
 fn say_to(fd: BorrowedFd<'_>, text: &str) {
     use rustix::fs::{FileType, Mode, OFlags};
     let line = message_line(text);
@@ -594,7 +599,10 @@ fn say_to(fd: BorrowedFd<'_>, text: &str) {
             let _ = rustix::io::write(fd, line.as_bytes());
         }
         FileType::Fifo | FileType::CharacterDevice => {
-            if file_type == FileType::CharacterDevice && !rustix::termios::isatty(fd) {
+            let writable = rustix::fs::fcntl_getfl(fd)
+                .is_ok_and(|fl| matches!(fl & OFlags::RWMODE, OFlags::WRONLY | OFlags::RDWR));
+            if !writable || (file_type == FileType::CharacterDevice && !rustix::termios::isatty(fd))
+            {
                 return;
             }
             let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
@@ -1112,6 +1120,15 @@ mod tests {
         let mut got = String::new();
         r.read_to_string(&mut got).unwrap();
         assert_eq!(got, "[stopit: hi]\n");
+        // The read end of a pipe gets nothing, even though opening it
+        // again for writing would work.
+        let (r, w) = std::io::pipe().unwrap();
+        say_to(r.as_fd(), "hi");
+        drop(w);
+        let mut got = String::new();
+        let mut r = r;
+        r.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "");
         // A full pipe gets nothing, at once, and keeps its flags.
         let (_r, w) = std::io::pipe().unwrap();
         rustix::fs::fcntl_setfl(&w, rustix::fs::OFlags::NONBLOCK).unwrap();
