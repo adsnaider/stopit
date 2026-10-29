@@ -162,21 +162,7 @@ impl SessionDir {
                 path: runtime_dir.to_path_buf(),
                 source,
             })?;
-        let meta = fs::metadata(&runtime_dir).map_err(|source| SessionError::Inspect {
-            path: runtime_dir.clone(),
-            source,
-        })?;
-        if !meta.is_dir() {
-            return Err(SessionError::NotDirectory { path: runtime_dir });
-        }
-        check_owner(&runtime_dir, &meta)?;
-        let mode = meta.mode() & 0o7777;
-        if mode & 0o022 != 0 {
-            return Err(SessionError::RuntimeDirWritable {
-                path: runtime_dir,
-                mode,
-            });
-        }
+        check_runtime_dir(&runtime_dir)?;
 
         let base = runtime_dir.join("stopit");
         match create_private_dir(&base) {
@@ -313,16 +299,19 @@ pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, Permissions::from_mode(PRIVATE_MODE))
 }
 
-/// Creates the lock file `path` (mode 0600, never an existing one) and
-/// takes an exclusive `flock` on it.
+/// Creates the lock file `path` (mode 0600, never an existing one) with an
+/// exclusive `flock` on it. The file is locked under another name and then
+/// renamed, so [`remove_stale`] never finds it unlocked.
 fn create_lock(path: &Path) -> io::Result<File> {
     use rustix::fs::{FlockOperation, flock};
+    let tmp = path.with_file_name(".lock.new");
     let file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)?;
+        .open(&tmp)?;
     flock(&file, FlockOperation::NonBlockingLockExclusive)?;
+    fs::rename(&tmp, path)?;
     Ok(file)
 }
 
@@ -375,7 +364,8 @@ pub fn remove_stale(base: &Path, keep: &str) {
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
             Mode::empty(),
         ) {
-            // Held while removing, so no other process takes it for live.
+            // Locked while removing. A process looking for servers
+            // meanwhile takes it for live, and finds nothing to connect to.
             if flock(&lock, FlockOperation::NonBlockingLockExclusive).is_ok() {
                 let _ = fs::remove_dir_all(&dir);
             }
@@ -445,6 +435,9 @@ pub fn live_servers(runtime_dir: Option<&OsStr>) -> Vec<LiveServer> {
     let Ok(runtime_dir) = fs::canonicalize(runtime_dir) else {
         return Vec::new();
     };
+    if check_runtime_dir(&runtime_dir).is_err() {
+        return Vec::new();
+    }
     let base = runtime_dir.join("stopit");
     if check_private_dir(&base).is_err() {
         return Vec::new();
@@ -492,6 +485,29 @@ fn read_server_record(root: &Path) -> Option<ServerRecord> {
         .ok()?;
     let record: ServerRecord = serde_json::from_slice(&bytes).ok()?;
     (record.version == 1).then_some(record)
+}
+
+/// Checks the canonical `XDG_RUNTIME_DIR` `runtime_dir`: a directory owned
+/// by the current user, not writable by group or others.
+fn check_runtime_dir(runtime_dir: &Path) -> Result<(), SessionError> {
+    let meta = fs::metadata(runtime_dir).map_err(|source| SessionError::Inspect {
+        path: runtime_dir.to_path_buf(),
+        source,
+    })?;
+    if !meta.is_dir() {
+        return Err(SessionError::NotDirectory {
+            path: runtime_dir.to_path_buf(),
+        });
+    }
+    check_owner(runtime_dir, &meta)?;
+    let mode = meta.mode() & 0o7777;
+    if mode & 0o022 != 0 {
+        return Err(SessionError::RuntimeDirWritable {
+            path: runtime_dir.to_path_buf(),
+            mode,
+        });
+    }
+    Ok(())
 }
 
 /// Checks that `dir` is owned by the current user.

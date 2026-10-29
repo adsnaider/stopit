@@ -5,8 +5,9 @@
 //! `control/` directory and accepts connections only from its own user
 //! ([`peer_uid`]). A client first sends one byte carrying the three
 //! descriptors that become the sandbox's stdin, stdout and stderr
-//! ([`send_stdio`]), then frames: a 4-byte big-endian length and that many
-//! bytes of JSON, at most [`MAX_FRAME`].
+//! ([`send_stdio`]), then frames, each a 4-byte big-endian length and that
+//! many bytes of JSON, at most [`MAX_FRAME`]. Byte strings, which need not
+//! be UTF-8, travel as hex.
 
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -15,8 +16,9 @@ use std::os::unix::net::UnixStream;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-/// The largest frame either side accepts.
-pub const MAX_FRAME: usize = 1 << 20;
+/// The largest frame either side accepts: room for a command line and an
+/// environment as large as the kernel allows (`ARG_MAX`, 2 MiB), in hex.
+pub const MAX_FRAME: usize = 8 << 20;
 
 /// What a client asks of the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,16 +28,19 @@ pub enum ClientMessage {
     Run {
         /// `--profile`, if given.
         profile: Option<String>,
-        /// The command and its arguments, as bytes.
+        /// The command and its arguments.
+        #[serde(with = "hex_list")]
         command: Vec<Vec<u8>>,
-        /// The client's environment, as bytes, filtered by the profile.
+        /// The client's whole environment, which the server filters for the
+        /// profile.
+        #[serde(with = "hex_pairs")]
         env: Vec<(Vec<u8>, Vec<u8>)>,
         /// Whether the descriptors include the slave of the client's PTY.
         pty: bool,
         /// `--quiet`: no startup summary.
         quiet: bool,
     },
-    /// The client caught this signal: pass it to the sandbox.
+    /// A signal the client caught, for the server to pass to the sandbox.
     Signal {
         /// The signal number.
         signal: i32,
@@ -67,11 +72,75 @@ pub enum ServerMessage {
     },
 }
 
+/// Name and value pairs of byte strings, as an environment.
+type BytePairs = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// Hex encoding of byte strings in JSON.
+mod hex_list {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    pub(super) fn decode<E: serde::de::Error>(s: &str) -> Result<Vec<u8>, E> {
+        if s.len() % 2 != 0 {
+            return Err(E::custom("odd-length hex string"));
+        }
+        (0..s.len())
+            .step_by(2)
+            .map(|i| {
+                s.get(i..i + 2)
+                    .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                    .ok_or_else(|| E::custom("invalid hex string"))
+            })
+            .collect()
+    }
+
+    pub(super) fn serialize<S: Serializer>(list: &[Vec<u8>], s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(list.iter().map(|b| encode(b)))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Vec<u8>>, D::Error> {
+        Vec::<String>::deserialize(d)?
+            .iter()
+            .map(|s| decode(s))
+            .collect()
+    }
+}
+
+/// Hex encoding of pairs of byte strings in JSON.
+mod hex_pairs {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::hex_list::{decode, encode};
+
+    pub(super) fn serialize<S: Serializer>(
+        pairs: &[(Vec<u8>, Vec<u8>)],
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        s.collect_seq(pairs.iter().map(|(k, v)| (encode(k), encode(v))))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<super::BytePairs, D::Error> {
+        Vec::<(String, String)>::deserialize(d)?
+            .iter()
+            .map(|(k, v)| Ok((decode(k)?, decode(v)?)))
+            .collect()
+    }
+}
+
 /// Writes `message` as one frame.
 pub fn write_frame<T: Serialize>(mut sock: &UnixStream, message: &T) -> io::Result<()> {
     let body = serde_json::to_vec(message).map_err(io::Error::other)?;
     if body.len() > MAX_FRAME {
-        return Err(io::Error::other("control message too large"));
+        return Err(io::Error::other(format!(
+            "the request is {} bytes, more than the {MAX_FRAME} a control message may have; \
+             the command line or the environment is too large",
+            body.len()
+        )));
     }
     let mut frame = (body.len() as u32).to_be_bytes().to_vec();
     frame.extend_from_slice(&body);
@@ -279,5 +348,72 @@ mod tests {
         a.write_all(b"F").unwrap();
         assert!(recv_stdio(&b).is_err());
         assert_eq!(peer_uid(&b).unwrap(), rustix::process::getuid().as_raw());
+    }
+
+    #[test]
+    fn byte_strings_travel_as_hex() {
+        let run = ClientMessage::Run {
+            profile: None,
+            command: vec![vec![0x00, 0xff, b'a']],
+            env: vec![(b"K".to_vec(), vec![])],
+            pty: false,
+            quiet: true,
+        };
+        let json = serde_json::to_string(&run).unwrap();
+        assert!(json.contains(r#""command":["00ff61"]"#), "{json}");
+        assert!(json.contains(r#""env":[["4b",""]]"#), "{json}");
+        for bad in ["0", "zz", "0g"] {
+            let json = format!(
+                r#"{{"type":"run","profile":null,"command":["{bad}"],"env":[],"pty":false,"quiet":false}}"#
+            );
+            assert!(
+                serde_json::from_str::<ClientMessage>(&json).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// Sends `byte` with `fds` attached, as `send_stdio` does.
+    fn send_raw(sock: &UnixStream, byte: u8, fds: &[RawFd]) {
+        let buf = [byte];
+        let mut iov = libc::iovec {
+            iov_base: buf.as_ptr() as *mut libc::c_void,
+            iov_len: 1,
+        };
+        let data = std::mem::size_of_val(fds) as u32;
+        // SAFETY: as in `send_stdio`, for `fds.len()` descriptors.
+        unsafe {
+            let space = libc::CMSG_SPACE(data) as usize;
+            let mut control = vec![0u8; space.max(1)];
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            if !fds.is_empty() {
+                msg.msg_control = control.as_mut_ptr().cast();
+                msg.msg_controllen = space as _;
+                let cmsg = libc::CMSG_FIRSTHDR(&msg);
+                (*cmsg).cmsg_level = libc::SOL_SOCKET;
+                (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(data) as _;
+                std::ptr::copy_nonoverlapping(
+                    fds.as_ptr().cast::<u8>(),
+                    libc::CMSG_DATA(cmsg),
+                    data as usize,
+                );
+            }
+            assert_eq!(libc::sendmsg(sock.as_raw_fd(), &msg, 0), 1);
+        }
+    }
+
+    #[test]
+    fn anything_but_three_descriptors_and_the_marker_is_refused() {
+        let (r, _w) = std::io::pipe().unwrap();
+        let fd = r.as_raw_fd();
+        for (byte, count) in [(b'F', 2), (b'F', 4), (b'F', 12), (b'X', 3)] {
+            let (a, b) = UnixStream::pair().unwrap();
+            send_raw(&a, byte, &vec![fd; count]);
+            let e = recv_stdio(&b).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{byte} {count}: {e}");
+        }
     }
 }

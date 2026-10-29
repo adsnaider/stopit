@@ -64,8 +64,8 @@ use crate::expand::{ExpandError, ExpansionContext, ResolveWarning};
 use crate::filter::{ClipboardPolicy, OutputFilter};
 use crate::manifest::{Grants, Manifest, SandboxHome};
 use crate::provider::{
-    BASE_PROVIDER_NAME, ProtectedSource, ProviderContext, ProviderError, SUPERVISOR_PROVIDER_NAME,
-    layered_session_providers, protected_sources, static_outputs,
+    BASE_PROVIDER_NAME, ProtectedSource, ProviderContext, ProviderError, ProviderOutput,
+    SUPERVISOR_PROVIDER_NAME, layered_session_providers, protected_sources, static_outputs,
 };
 use crate::provision::{ProvisionError, Provisioned, provision_self};
 use crate::pty::{HostTerminal, Pty, PtyRelay, RawMode};
@@ -354,6 +354,45 @@ pub enum RunError {
     #[error("the stopit server ended before the command did")]
     ServerGone,
 
+    /// The server's record cannot be written.
+    #[error("cannot write the server's record {path:?}: {source}")]
+    ServerRecord {
+        /// The record file.
+        path: PathBuf,
+        /// The underlying error.
+        source: io::Error,
+    },
+
+    /// The server is stopping and starts no more sandboxes.
+    #[error("the stopit server is stopping")]
+    ServerStopping,
+
+    /// `--server` and `--workspace` name different workspaces.
+    #[error(
+        "the stopit server {id} serves {served:?}, not {given:?}; leave out --workspace or \
+         --server"
+    )]
+    ServerWorkspace {
+        /// The session id given.
+        id: String,
+        /// The workspace `--workspace` found.
+        given: PathBuf,
+        /// The workspace the server serves.
+        served: PathBuf,
+    },
+
+    /// A socket path does not fit in a Unix socket address.
+    #[error(
+        "the socket path {path:?} is {len} bytes, more than a Unix socket address holds; set \
+         XDG_RUNTIME_DIR to a shorter path"
+    )]
+    SocketPathTooLong {
+        /// The socket path.
+        path: PathBuf,
+        /// Its length in bytes.
+        len: usize,
+    },
+
     /// Whether stopit is in the foreground of its terminal cannot be told.
     #[error("cannot check that stopit is in the foreground of its terminal: {0}")]
     Foreground(#[source] io::Error),
@@ -581,8 +620,10 @@ fn allowed_entry_line(path: &Path, hash: &str, missing: bool) -> String {
 fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     catch_signals().map_err(RunError::Signals)?;
     let cwd = std::env::current_dir().map_err(RunError::Cwd)?;
-    if let Some(server) = crate::server::pick_server(&invocation, &cwd)? {
-        return Ok(ExitCode::from(crate::server::attach(&server, &invocation)?));
+    // Before anything runs, as for every other mistake in the arguments.
+    parse_profile(invocation.profile.as_deref())?;
+    if let Some(conn) = crate::server::pick_server(&invocation, &cwd)? {
+        return Ok(ExitCode::from(crate::server::attach(conn, &invocation)?));
     }
     let loaded = LoadedSession::load(&cwd, invocation.workspace.as_deref())?;
     for line in loaded.warning_lines() {
@@ -616,6 +657,37 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     Ok(ExitCode::from(status?))
 }
 
+/// `--profile` `name` parsed (`main` if `None`).
+pub(crate) fn parse_profile(name: Option<&str>) -> Result<ProfileRef, RunError> {
+    match name {
+        None => Ok(ProfileRef::main()),
+        Some(name) => name.parse().map_err(|e| RunError::ProfileName {
+            name: name.to_owned(),
+            reason: format!("{e}"),
+        }),
+    }
+}
+
+/// The profile `name` (`main` if `None`) of `compiled`, with its name.
+pub(crate) fn profile_in<'a>(
+    compiled: &'a CompiledSession,
+    name: Option<&str>,
+) -> Result<(ProfileRef, &'a CompiledProfile), RunError> {
+    let profile = parse_profile(name)?;
+    match compiled.get(&profile) {
+        Some(found) => Ok((profile, found)),
+        None => Err(RunError::UnknownProfile {
+            name: profile.as_str().to_owned(),
+            available: compiled
+                .order()
+                .iter()
+                .map(ProfileRef::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+        }),
+    }
+}
+
 /// A workspace's session, ready to run sandboxes in: its configuration
 /// checked and layered, its providers run, every profile compiled, and the
 /// stopit binary provisioned into the session directory. Dropping it
@@ -625,9 +697,20 @@ pub(crate) struct LoadedSession {
     pub(crate) workspace: Workspace,
     config: Config,
     home: PathBuf,
-    compiled: CompiledSession,
-    /// Warnings found while loading, without the `stopit: warning:` prefix.
-    warnings: Vec<String>,
+    /// The session compiled when it was loaded.
+    pub(crate) compiled: CompiledSession,
+    /// Warnings found before compiling, without the `stopit: warning:`
+    /// prefix.
+    load_warnings: Vec<String>,
+    /// The compile warnings of [`compiled`](Self::compiled).
+    compile_warnings: Vec<String>,
+    /// What [`recompile`](Self::recompile) compiles again: the providers'
+    /// outputs, the protected sources, the state directories and the
+    /// expansion context.
+    outputs: Vec<(ProviderName, ProviderOutput)>,
+    protected: Vec<ProtectedSource>,
+    state: StateDirs,
+    ctx: ExpansionContext,
     provisioned: Provisioned,
     /// Dropped last.
     pub(crate) session: SessionDir,
@@ -773,58 +856,68 @@ impl LoadedSession {
             data: data_dirs,
             config: config_dirs,
         };
-        let compiled = compile_session(&config, outputs, &protected, &state, &ctx)?;
+        let compiled = compile_session(&config, outputs.clone(), &protected, &state, &ctx)?;
         if config.base == Base::Default && !has_user_tools {
             return Err(RunError::NoToolsConfigured {
                 global_config: global_config_path,
             });
         }
-        warnings.extend(warning_lines(&compiled, config.base));
+        let compile_warnings = warning_lines(&compiled, config.base);
         let provisioned = provision_self(&session)?;
         Ok(LoadedSession {
             workspace,
             config,
             home,
             compiled,
-            warnings,
+            load_warnings: warnings,
+            compile_warnings,
+            outputs,
+            protected,
+            state,
+            ctx,
             provisioned,
             session,
         })
     }
 
-    /// The warnings as printed, `stopit: warning: …` and escaped.
-    pub(crate) fn warning_lines(&self) -> Vec<String> {
-        self.warnings
+    /// Compiles every profile again from the providers' outputs of
+    /// [`load`](Self::load), against the filesystem as it is now, with the
+    /// compile warnings. A server does this for every run, so globs, masks
+    /// and missing paths are decided when the sandbox starts, as for a
+    /// standalone run. Script providers are not run again.
+    pub(crate) fn recompile(&self) -> Result<(CompiledSession, Vec<String>), RunError> {
+        let compiled = compile_session(
+            &self.config,
+            self.outputs.clone(),
+            &self.protected,
+            &self.state,
+            &self.ctx,
+        )?;
+        let warnings = warning_lines(&compiled, self.config.base);
+        Ok((compiled, warnings))
+    }
+
+    /// The warnings of loading and of `compile_warnings`, as printed,
+    /// `stopit: warning: …` and escaped.
+    pub(crate) fn warning_lines_with(&self, compile_warnings: &[String]) -> Vec<String> {
+        self.load_warnings
             .iter()
+            .chain(compile_warnings)
             .map(|w| format!("stopit: warning: {}", escape_message(w)))
             .collect()
     }
 
-    /// The profile `name` (`main` if `None`), with its name.
+    /// The warnings of loading and compiling, as printed.
+    pub(crate) fn warning_lines(&self) -> Vec<String> {
+        self.warning_lines_with(&self.compile_warnings)
+    }
+
+    /// The profile `name` (`main` if `None`) of the session as loaded.
     pub(crate) fn profile(
         &self,
         name: Option<&str>,
     ) -> Result<(ProfileRef, &CompiledProfile), RunError> {
-        let profile = match name {
-            None => ProfileRef::main(),
-            Some(name) => name.parse().map_err(|e| RunError::ProfileName {
-                name: name.to_owned(),
-                reason: format!("{e}"),
-            })?,
-        };
-        match self.compiled.get(&profile) {
-            Some(compiled) => Ok((profile, compiled)),
-            None => Err(RunError::UnknownProfile {
-                name: profile.as_str().to_owned(),
-                available: self
-                    .compiled
-                    .order()
-                    .iter()
-                    .map(ProfileRef::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            }),
-        }
+        profile_in(&self.compiled, name)
     }
 
     /// The startup summary of `profile`, named `name`, as printed
@@ -1148,12 +1241,23 @@ impl SandboxTerminal {
         self.slave.as_ref().map(AsFd::as_fd)
     }
 
+    /// Puts the host terminal into raw mode, if keys are read from it, until
+    /// the terminal is dropped.
+    pub(crate) fn enter_raw(&mut self) -> io::Result<()> {
+        if let Some(keys) = self.keys_from
+            && self.raw.is_none()
+        {
+            self.raw = Some(RawMode::enter(keys)?);
+        }
+        Ok(())
+    }
+
     /// Sets the OSC 52 policy of the output filter the relay will use.
     pub(crate) fn set_clipboard(&mut self, clipboard: ClipboardPolicy) {
         self.clipboard = clipboard;
     }
 
-    /// Starts relaying, once the sandbox has its copies of the slave: the
+    /// Starts relaying once the sandbox has its copies of the slave. The
     /// relay takes the master, the slave and the host terminal.
     pub(crate) fn start_relay(&mut self) -> Option<PtyRelay> {
         Some(PtyRelay::new(
@@ -1224,10 +1328,8 @@ fn wait_foreground(
     }
     // Raw before the spawn, so no key typed while the sandbox starts is
     // taken by the host terminal's line discipline.
-    if let Some(t) = &mut terminal
-        && let Some(keys) = t.keys_from
-    {
-        t.raw = Some(RawMode::enter(keys).map_err(RunError::Pty)?);
+    if let Some(t) = &mut terminal {
+        t.enter_raw().map_err(RunError::Pty)?;
     }
     let mut child = command.spawn().map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {

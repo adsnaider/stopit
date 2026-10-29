@@ -50,7 +50,7 @@ pub enum CliCommand {
         #[command(flatten)]
         session: SessionArgs,
     },
-    /// Serve the workspace's session: `stopit run` and `stopit shell` there
+    /// Serve the workspace's session. `stopit run` and `stopit shell` there
     /// attach to it and share its temporary directories. Runs until
     /// stopped with Ctrl-C or a signal.
     Server {

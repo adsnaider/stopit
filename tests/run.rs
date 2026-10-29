@@ -177,13 +177,14 @@ impl Setup {
         self.probe_with(self.run_probe_command(options), ops)
     }
 
-    /// Whether the runtime directory holds no session directory.
+    /// Whether the runtime directory holds no session directory. A server's
+    /// workspace lock file may stay.
     fn no_session_left(&self) -> bool {
         let base = self.runtime().join("stopit");
         fs::read_dir(&base)
             .unwrap_or_else(|e| panic!("{base:?}: {e}"))
-            .next()
-            .is_none()
+            .flatten()
+            .all(|e| e.file_name().to_string_lossy().starts_with("server-"))
     }
 }
 
@@ -2869,5 +2870,136 @@ fn an_attached_run_gets_the_clients_terminal() {
         server.log().contains("run 1 ended with status 5"),
         "{}",
         server.log()
+    );
+}
+
+#[test]
+fn an_attached_terminal_is_raw_and_keys_reach_the_sandbox() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((master, slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::with_config(&config);
+    let _server = Server::start(&s);
+    let command = s.stopit(&["run", "--quiet", "/bin/sh", "-i"]);
+    let mut t = OnTerminal::spawn(command, master, slave);
+    let at = t.wait_for(b"sandbox$ ", 0);
+    // Ctrl-C at the prompt reaches the sandbox's shell, which only prints a
+    // new prompt; the client survives it.
+    t.type_keys(b"\x03");
+    let at = t.wait_for(b"sandbox$ ", at);
+    t.type_keys(b"echo $((6*7))\r");
+    let at = t.wait_for(b"42", at);
+    t.wait_for(b"sandbox$ ", at);
+    t.type_keys(b"exit 3\r");
+    let out = t.finish();
+    assert_eq!(code(&out), 3, "{:?}", String::from_utf8_lossy(&t.seen()));
+    // Typed once and echoed once, by the sandbox's terminal.
+    let seen = String::from_utf8_lossy(&t.seen()).into_owned();
+    assert_eq!(seen.matches("echo $((6*7))").count(), 1, "{seen:?}");
+}
+
+#[test]
+fn attached_runs_at_once_each_get_their_own_stdio() {
+    let s = Setup::with_config("");
+    let server = Server::start(&s);
+    let mut a = spawn_waiting_probe(&s, |_| {});
+    let mut b = spawn_waiting_probe(&s, |_| {});
+    server.wait_for_log("run 2 started");
+    let feed = |child: &mut Child, ops: &[Op]| {
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(&serde_json::to_vec(ops).unwrap()).unwrap();
+    };
+    feed(&mut b, &[write("/tmp/b", "from b"), Op::Argv]);
+    feed(&mut a, &[write("/tmp/a", "from a"), Op::Argv]);
+    for (child, name) in [(a, "a"), (b, "b")] {
+        let out = finish(child);
+        assert_eq!(code(&out), 0, "{name}: {out:?}");
+        let results: Vec<OpResult> = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(ok(&results[0]), &Data::Done, "{name}");
+    }
+    let results = s.probe(&[], &[read("/tmp/a"), read("/tmp/b")]);
+    assert_eq!(contents(&results[0]), "from a");
+    assert_eq!(contents(&results[1]), "from b");
+}
+
+#[test]
+fn a_server_compiles_every_run_against_the_filesystem_as_it_is() {
+    // A secret created after the server started is masked like one that was
+    // there before.
+    let s = Setup::with_config("");
+    let _server = Server::start(&s);
+    fs::write(s.ws().join(".env"), "SECRET=1").unwrap();
+    let results = s.probe(&[], &[read("/workspace/.env")]);
+    assert_eq!(errno(&results[0]), "EACCES", "{results:?}");
+}
+
+#[test]
+fn a_sandbox_cannot_reach_the_servers_control_socket() {
+    let s = Setup::new();
+    let config = probe_config(&format!(
+        "[[provider]]\ntype = \"config\"\nname = \"rt\"\n[provider.sandbox]\nfs.ro = [{:?}]\n",
+        s.runtime()
+    ));
+    s.write_raw_config(&config);
+    let server = Server::start(&s);
+    let socket = s
+        .runtime()
+        .join("stopit")
+        .join(&server.id)
+        .join("control/socket");
+    assert!(socket.exists());
+    let ops = [stat(&socket), list(s.runtime().join("stopit"))];
+    let out = output(s.run_probe_command(&[]), &serde_json::to_vec(&ops).unwrap());
+    assert_eq!(code(&out), 0, "{out:?}");
+    let results = probe_results("ro runtime dir", &out, &ops);
+    assert_eq!(errno(&results[0]), "ENOENT", "{results:?}");
+    assert_eq!(ok(&results[1]), &Data::List(vec![]), "{results:?}");
+}
+
+#[test]
+fn a_server_stops_promptly_with_an_idle_client() {
+    let s = Setup::with_config("");
+    let mut server = Server::start(&s);
+    let socket = s
+        .runtime()
+        .join("stopit")
+        .join(&server.id)
+        .join("control/socket");
+    // Connected, but sends nothing.
+    let idle = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    thread::sleep(Duration::from_millis(100));
+    let start = Instant::now();
+    assert_eq!(server.stop(), 128 + libc::SIGTERM);
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+    drop(idle);
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn server_and_workspace_options_must_agree() {
+    let s = Setup::with_config("");
+    let server = Server::start(&s);
+    let other = s.root.join("home/other");
+    fs::create_dir(&other).unwrap();
+    let out = output(
+        s.run_probe_command(&[
+            "--server",
+            &server.id,
+            "--workspace",
+            other.to_str().unwrap(),
+        ]),
+        b"[]",
+    );
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert!(
+        stderr(&out).contains(&format!("serves {:?}, not {:?}", s.ws(), other)),
+        "{out:?}"
     );
 }
