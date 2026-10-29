@@ -55,8 +55,8 @@ use thiserror::Error;
 
 use crate::bwrap::{BwrapCommand, BwrapError, TerminalSession, working_dir};
 use crate::config::{
-    Base, Config, ConfigError, ConfigLayer, LayeredConfig, ProfileRef, ProviderKind, ProviderName,
-    ProviderOrigin,
+    Base, Config, ConfigError, ConfigLayer, LayeredConfig, ProfileRef, ProviderEntry, ProviderKind,
+    ProviderName, ProviderOrigin,
 };
 use crate::escape::{escape_message, shell_quote};
 use crate::expand::{ExpandError, ExpansionContext, ResolveWarning};
@@ -68,7 +68,10 @@ use crate::provider::{
 use crate::provision::{ProvisionError, provision_self};
 use crate::resolve::{PlanWarning, PlanWarningKind};
 use crate::session::{SessionDir, SessionError};
-use crate::spec::{CompileError, CompiledSession, SpecWarning, compile_session, static_rw_roots};
+use crate::spec::{
+    CompileError, CompiledSession, ScriptPathError, SpecWarning, UntrustedRoot, compile_session,
+    has_rewritable_hard_links, resolve_script_path, static_rw_roots,
+};
 use crate::state::{
     ConfigDirs, GLOBAL_CONFIG_FILE, StateDirs, StateError, config_dirs_from_host,
     data_dirs_from_host, resolve_allowing_missing, runtime_dir,
@@ -552,25 +555,36 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
             Some(file.parse_layer()?)
         }
     };
-    let global_file = if project_layer
-        .as_ref()
-        .is_some_and(ConfigLayer::sets_base_none)
-    {
-        None
-    } else {
-        read_global_config(&config_dirs)?
-    };
+    // Read, checked and parsed even when `.stopit.toml` sets `base = "none"`
+    // and the layer goes unused: its target and its script sources are
+    // protected in every session, or a sandbox of this one could plant what
+    // every other workspace runs (§3, The user-global configuration).
+    let global_file = read_global_config(&config_dirs)?;
     let global_layer = match &global_file {
         Some(gf) => Some(gf.parse_layer()?),
         None => None,
     };
+    let global_entries = global_layer
+        .as_ref()
+        .map(|layer| layer.providers.clone())
+        .unwrap_or_default();
     let LayeredConfig {
         config,
         providers: layered_entries,
+        replaced,
     } = ConfigLayer::layer(
         global_layer.map(|layer| (layer, config_dirs.active.path.as_path())),
         project_layer.map(|layer| (layer, workspace.dir.as_path())),
     );
+    if let Some(gf) = &global_file {
+        for name in replaced.iter().filter(|n| is_default_provider_name(n)) {
+            print_warning(&format!(
+                "the unnamed [[provider]] \"{name}\" in {CONFIG_FILE} replaces the unnamed one in \
+                 {:?}; set `name` on one of them to keep both",
+                gf.path
+            ));
+        }
+    }
     let home = host_home(std::env::var_os("HOME"))?;
     let mount = config.workspace.mount.clone();
     let ctx = ExpansionContext::new(
@@ -591,13 +605,25 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     // returning removes it.
     let session = SessionDir::create_from_env()?;
     let providers = layered_session_providers(config.base, &layered_entries)?;
+    // Script paths must not run through links in these (§3.6), nor the way
+    // to the global configuration and its scripts.
+    let rw_grants = static_rw_roots(&static_outputs(&providers), &ctx);
+    let global_guarded = match &global_file {
+        Some(gf) => guard_global_config(
+            gf,
+            &global_entries,
+            &config_dirs.active.path,
+            &workspace.dir,
+            &rw_grants,
+        )?,
+        None => Vec::new(),
+    };
     let pctx = ProviderContext {
         workspace: workspace.dir.clone(),
         workspace_mount: mount.clone(),
         home: home.clone(),
         session_dir: session.root().to_path_buf(),
-        // Script paths must not run through links in these (§3.6).
-        rw_grants: static_rw_roots(&static_outputs(&providers), &ctx),
+        rw_grants,
     };
     let outputs = providers
         .iter()
@@ -618,13 +644,15 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
             path: file.path.clone(),
         });
     }
-    if let Some(gf) = &global_file {
-        protected.push(ProtectedSource {
-            provider: SUPERVISOR_PROVIDER_NAME
-                .parse()
-                .expect("the supervisor's name is a valid provider name"),
-            path: gf.canonical_path.clone(),
-        });
+    for path in global_guarded {
+        if !protected.iter().any(|p| p.path == path) {
+            protected.push(ProtectedSource {
+                provider: SUPERVISOR_PROVIDER_NAME
+                    .parse()
+                    .expect("the supervisor's name is a valid provider name"),
+                path,
+            });
+        }
     }
     // stopit's own state, which no mount may expose (§6.2, Reserved host
     // paths): the parent of every session directory, the data directories,
@@ -1550,6 +1578,75 @@ pub fn check_config_trust(file: Ownership, dir: Ownership, uid: u32) -> Result<(
     Ok(())
 }
 
+/// Whether `name` is the name a `[[provider]]` gets without `name`, its
+/// type.
+fn is_default_provider_name(name: &ProviderName) -> bool {
+    matches!(name.as_str(), "config" | "script" | "vcs")
+}
+
+/// The paths to protect for the global configuration `file`, whose
+/// `[[provider]]` entries are `entries`, declared in `config_dir`: its
+/// canonical path and the canonical source of every protected `script`
+/// entry, used in this session or not.
+///
+/// Each is resolved from its declared path and refused if the way runs
+/// through a symbolic link inside `workspace` or one of `rw_grants`, which
+/// a sandbox of this session could re-point. Protecting the target alone
+/// would leave that link replaceable, and every later session would read
+/// what it then names.
+fn guard_global_config(
+    file: &GlobalConfigFile,
+    entries: &[ProviderEntry],
+    config_dir: &Path,
+    workspace: &Path,
+    rw_grants: &[UntrustedRoot],
+) -> Result<Vec<PathBuf>, RunError> {
+    let untrusted = |reason: String| RunError::UntrustedConfig {
+        path: file.path.clone(),
+        reason,
+    };
+    let resolve =
+        |declared: &Path, what: &str| match resolve_script_path(declared, workspace, rw_grants) {
+            Ok(path) => Ok(path),
+            Err(ScriptPathError::Link { link, root }) => Err(untrusted(format!(
+                "the way to {what} {declared:?} runs through the symbolic link {link:?} inside \
+             {root}, which a sandbox can write, so it could re-point the link; use a path \
+             without links inside it"
+            ))),
+            Err(ScriptPathError::Lookup(e)) => Err(untrusted(format!(
+                "cannot resolve {what} {declared:?}: {e}"
+            ))),
+        };
+    let mut paths = Vec::new();
+    let resolved = resolve(&file.path, "the configuration")?;
+    if resolved != file.canonical_path {
+        return Err(untrusted(format!(
+            "it resolved to {:?} when read, and now to {resolved:?}",
+            file.canonical_path
+        )));
+    }
+    paths.push(resolved);
+    for entry in entries {
+        let ProviderKind::Script {
+            source,
+            protect: true,
+            ..
+        } = &entry.kind
+        else {
+            continue;
+        };
+        let declared = config_dir.join(source.as_path());
+        let script = resolve(
+            &declared,
+            &format!("script provider {:?}", entry.name.as_str()),
+        )?;
+        if !paths.contains(&script) {
+            paths.push(script);
+        }
+    }
+    Ok(paths)
+}
+
 /// Reads `<config_dir>/config.toml` when present and trusted for the current user.
 pub fn read_global_config(config_dirs: &ConfigDirs) -> Result<Option<GlobalConfigFile>, RunError> {
     read_global_config_as(config_dirs, rustix::process::getuid().as_raw())
@@ -1581,6 +1678,11 @@ fn read_global_config_as(
     ) {
         Ok(fd) => fd,
         Err(Errno::NOENT) => return Ok(None),
+        Err(Errno::NOTDIR) => {
+            return Err(untrusted(format!(
+                "{dir:?} or a path on the way to it is not a directory"
+            )));
+        }
         Err(Errno::LOOP) => {
             return Err(untrusted(format!(
                 "the way to it, {dir:?}, runs through a symbolic link, though it was resolved \
@@ -1618,13 +1720,15 @@ fn read_global_config_as(
                 )
                 .map_err(|why| {
                     untrusted(format!(
-                        "the directory {link_parent:?} holding {link:?} failed trust checks, {why}"
+                        "the directory {link_parent:?} holding the link {link:?} on the way to it \
+                         {why}"
                     ))
                 })?;
             }
         }
         let dir_stat = fstat(&dir_fd).map_err(|e| read_error(e.into()))?;
-        check_global_dir_trust(Ownership::of(&dir_stat), uid).map_err(&untrusted)
+        check_global_dir_trust(Ownership::of(&dir_stat), uid)
+            .map_err(|why| untrusted(format!("the directory {dir:?} holding it {why}")))
     };
 
     let (fd, canonical_path) = match openat(
@@ -1645,7 +1749,9 @@ fn read_global_config_as(
             let link_stat = statat(&dir_fd, GLOBAL_CONFIG_FILE, AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(|e| read_error(e.into()))?;
             if link_stat.st_mode & libc::S_IFMT != libc::S_IFLNK {
-                return Err(untrusted("it changed while being opened".into()));
+                return Err(untrusted(
+                    "it stopped being a symbolic link between two opens; run stopit again".into(),
+                ));
             }
             check_global_link_trust(link_stat.st_uid, uid).map_err(&untrusted)?;
             let fd = match openat(
@@ -1696,8 +1802,7 @@ fn read_global_config_as(
             let target_dir_stat = fstat(&target_dir_fd).map_err(|e| read_error(e.into()))?;
             check_global_dir_trust(Ownership::of(&target_dir_stat), uid).map_err(|why| {
                 untrusted(format!(
-                    "the directory {target_dir:?} holding its target {canonical_path:?} failed \
-                     trust checks, {why}"
+                    "the directory {target_dir:?} holding its target {canonical_path:?} {why}"
                 ))
             })?;
             let verify_stat = statat(&target_dir_fd, target_name, AtFlags::SYMLINK_NOFOLLOW)
@@ -1717,10 +1822,19 @@ fn read_global_config_as(
         Err(e) => return Err(read_error(e.into())),
     };
 
+    // Another name for the file inside a writable grant would let a sandbox
+    // rewrite it whatever protects this one.
+    let mut file = File::from(fd);
+    let meta = file.metadata().map_err(&read_error)?;
+    if has_rewritable_hard_links(&canonical_path, &meta) {
+        return Err(untrusted(format!(
+            "{canonical_path:?} has {} hard links, and a sandbox could rewrite it through \
+             another one; give it a single name",
+            meta.nlink()
+        )));
+    }
     let mut bytes = Vec::new();
-    File::from(fd)
-        .read_to_end(&mut bytes)
-        .map_err(&read_error)?;
+    file.read_to_end(&mut bytes).map_err(&read_error)?;
     Ok(Some(GlobalConfigFile {
         path: declared_path,
         canonical_path,
@@ -1748,18 +1862,20 @@ pub fn check_global_file_trust(file: Ownership, uid: u32) -> Result<(), String> 
     Ok(())
 }
 
-/// Checks ownership and mode of a global configuration directory or symlink target's parent.
+/// Checks ownership and mode of a directory on the way to the global
+/// configuration. The reason is a predicate for the caller to put after the
+/// directory's name.
 pub fn check_global_dir_trust(dir: Ownership, uid: u32) -> Result<(), String> {
     if dir.uid != uid && dir.uid != 0 {
         return Err(format!(
-            "its directory is owned by uid {}, neither uid {uid} nor root",
+            "is owned by uid {}, neither uid {uid} nor root",
             dir.uid
         ));
     }
     if dir.mode & 0o022 != 0 && dir.mode & libc::S_ISVTX == 0 {
         return Err(format!(
-            "its directory has mode {:04o}, writable by its group or others and not sticky, so \
-             others could replace it",
+            "has mode {:04o}, writable by its group or others and not sticky, so others could \
+             replace what it holds",
             dir.mode & 0o7777
         ));
     }
@@ -2892,8 +3008,11 @@ mod tests {
         chmod(&dirs.active.path, 0o775);
         assert_eq!(
             untrusted_reason(&dirs),
-            "its directory has mode 0775, writable by its group or others and not sticky, so \
-             others could replace it"
+            format!(
+                "the directory {:?} holding it has mode 0775, writable by its group or others \
+                 and not sticky, so others could replace what it holds",
+                dirs.active.path
+            )
         );
         chmod(&dirs.active.path, 0o755);
         // Not a regular file.
@@ -2985,10 +3104,155 @@ mod tests {
         fs::remove_file(&link).unwrap();
         symlink(&other, root.join("other-link")).unwrap();
         symlink(root.join("other-link/config.toml"), &link).unwrap();
-        assert!(
-            read_global(&dirs).unwrap().is_some(),
-            "resolved through the kernel"
+        // Read here: only the session knows which links a sandbox can write,
+        // and `guard_global_config` checks them.
+        assert!(read_global(&dirs).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_hard_linked_or_misplaced_global_configuration_is_refused() {
+        let (_d, root) = tmp();
+        let dirs = global_dir(&root);
+        let path = dirs.active.path.join(GLOBAL_CONFIG_FILE);
+        fs::write(&path, "").unwrap();
+        chmod(&path, 0o644);
+        fs::hard_link(&path, root.join("other-name.toml")).unwrap();
+        assert_eq!(
+            untrusted_reason(&dirs),
+            format!(
+                "{path:?} has 2 hard links, and a sandbox could rewrite it through another one; \
+                 give it a single name"
+            )
         );
+        // The target of a link too.
+        fs::remove_file(&path).unwrap();
+        symlink(root.join("other-name.toml"), &path).unwrap();
+        fs::hard_link(root.join("other-name.toml"), root.join("third.toml")).unwrap();
+        assert!(untrusted_reason(&dirs).contains("has 2 hard links"));
+        // A configuration directory that is a file.
+        let file_dir = ConfigDirs::canonical(root.join("third.toml"));
+        assert_eq!(
+            untrusted_reason(&file_dir),
+            format!(
+                "{:?} or a path on the way to it is not a directory",
+                root.join("third.toml")
+            )
+        );
+    }
+
+    /// A [`GlobalConfigFile`] read from `dirs`, which must succeed.
+    fn read_ok(dirs: &ConfigDirs) -> GlobalConfigFile {
+        read_global(dirs).unwrap().unwrap()
+    }
+
+    #[test]
+    fn links_on_the_way_to_the_configuration_directory_are_checked() {
+        let (_d, root) = tmp();
+        // `<root>/links/cfg -> <root>/real`, with the configuration inside.
+        let real = global_dir(&root.join("real-parent")).active.path;
+        fs::write(real.join(GLOBAL_CONFIG_FILE), "").unwrap();
+        chmod(&real.join(GLOBAL_CONFIG_FILE), 0o644);
+        let links = root.join("links");
+        fs::create_dir(&links).unwrap();
+        chmod(&links, 0o755);
+        symlink(&real, links.join("cfg")).unwrap();
+        let dirs = crate::state::config_dirs(&root, Some(links.join("cfg").as_os_str())).unwrap();
+        assert_eq!(dirs.active.path, real);
+        assert_eq!(dirs.active.links, [links.join("cfg")]);
+        assert!(read_global(&dirs).unwrap().is_some());
+        // Others could replace the link.
+        chmod(&links, 0o777);
+        assert_eq!(
+            untrusted_reason(&dirs),
+            format!(
+                "the directory {links:?} holding the link {:?} on the way to it has mode 0777, \
+                 writable by its group or others and not sticky, so others could replace what \
+                 it holds",
+                links.join("cfg")
+            )
+        );
+    }
+
+    fn rw_root(path: &Path) -> UntrustedRoot {
+        UntrustedRoot {
+            path: path.to_owned(),
+            kind: crate::spec::UntrustedKind::RwGrant {
+                provider: "dots".parse().unwrap(),
+                profile: None,
+                host: path.to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn the_global_configuration_is_guarded_at_its_target_and_its_scripts() {
+        let (_d, root) = tmp();
+        let ws = root.join("ws");
+        fs::create_dir(&ws).unwrap();
+        let dirs = global_dir(&root);
+        let dots = root.join("dots");
+        fs::create_dir_all(dots.join("v1")).unwrap();
+        chmod(&dots.join("v1"), 0o755);
+        let target = dots.join("v1/stopit.toml");
+        fs::write(&target, "").unwrap();
+        chmod(&target, 0o644);
+        // `config.toml -> dots/current/stopit.toml`, `current -> v1`.
+        symlink("v1", dots.join("current")).unwrap();
+        let link = dirs.active.path.join(GLOBAL_CONFIG_FILE);
+        symlink(dots.join("current/stopit.toml"), &link).unwrap();
+        let script = dots.join("v1/tools.sh");
+        fs::write(&script, "#!/bin/sh\n").unwrap();
+        let entries = ConfigLayer::from_toml_str(&format!(
+            "[[provider]]\ntype = \"script\"\nname = \"a\"\nsource = {:?}\n\
+             [[provider]]\ntype = \"script\"\nname = \"off\"\nsource = \"/nonexistent\"\n\
+             protect = false\n",
+            dots.join("current/tools.sh")
+        ))
+        .unwrap()
+        .providers;
+        let file = read_ok(&dirs);
+        assert_eq!(file.canonical_path, target);
+        // Nothing writable on the way: the target and the script, used or
+        // not, are protected. A script with `protect = false` is not even
+        // resolved.
+        assert_eq!(
+            guard_global_config(&file, &entries, &dirs.active.path, &ws, &[]).unwrap(),
+            [target.clone(), script.clone()]
+        );
+        // With `dots` writable, the `current` link could be re-pointed.
+        let e = guard_global_config(&file, &entries, &dirs.active.path, &ws, &[rw_root(&dots)])
+            .unwrap_err();
+        let RunError::UntrustedConfig { path, reason } = e else {
+            panic!("{e:?}");
+        };
+        assert_eq!(path, link);
+        assert!(
+            reason.starts_with(&format!(
+                "the way to the configuration {link:?} runs through the symbolic link {:?} \
+                 inside {:?}",
+                dots.join("current"),
+                dots
+            )),
+            "{reason}"
+        );
+        // Without the link in the configuration's way, the script's way is
+        // still checked.
+        fs::remove_file(&link).unwrap();
+        symlink(&target, &link).unwrap();
+        let file = read_ok(&dirs);
+        let e = guard_global_config(&file, &entries, &dirs.active.path, &ws, &[rw_root(&dots)])
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("the way to script provider \"a\""),
+            "{e}"
+        );
+        // A target that changed since it was read.
+        let moved = GlobalConfigFile {
+            canonical_path: root.join("elsewhere.toml"),
+            ..file
+        };
+        let e = guard_global_config(&moved, &[], &dirs.active.path, &ws, &[]).unwrap_err();
+        assert!(e.to_string().contains("when read, and now to"), "{e}");
     }
 
     #[test]
@@ -3012,7 +3276,7 @@ mod tests {
         assert_eq!(check_global_dir_trust(dir(uid, 0o755), uid), Ok(()));
         assert_eq!(
             check_global_dir_trust(dir(1001, 0o755), uid),
-            Err("its directory is owned by uid 1001, neither uid 1000 nor root".into())
+            Err("is owned by uid 1001, neither uid 1000 nor root".into())
         );
         assert_eq!(check_global_link_trust(0, uid), Ok(()));
         assert_eq!(check_global_link_trust(uid, uid), Ok(()));

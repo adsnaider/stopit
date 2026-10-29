@@ -1657,8 +1657,8 @@ fn mask_unreadable_rw_dir(
 
 /// Checks every mount's host source against stopit's own state directories
 /// `state` (DESIGN.md §6.2, "Reserved host paths"), returning `mounts` with
-/// a mask added wherever a read-only view shows the session runtime
-/// directory, in plan order. `canonical` maps sandbox paths to the
+/// a mask added wherever a read-only view shows a state directory, in plan
+/// order. `canonical` maps sandbox paths to the
 /// canonical source of the mount there; a mount missing from it (a cover,
 /// a protected source, or a mask whose source cannot be resolved) is taken
 /// at its planned source, which is canonical (or, for that mask, shows
@@ -1685,16 +1685,19 @@ fn mask_unreadable_rw_dir(
 ///   `ephemeral` has none, and `protected` is read-only until protected
 ///   files are served by FUSE, whose writes will each need approval.
 /// * A read-only (`ro` or `protected`) source containing the runtime
-///   directory, or a data directory that exists, gets a mask over it where
-///   the mount shows it, attributed to stopit's own provider name: the
-///   runtime directory holds other sessions' data, and the trust store
-///   lists the user's projects. The mask over the store's directory
-///   (`state.data.store`) is silent, since it always exists and `ro ~`, the
-///   recommended way to show the home directory, contains it; the others
-///   come with a [`SpecWarning::StateDirMasked`] (DESIGN.md §1.5): a
-///   session seldom needs to see the runtime directory, and the default
-///   location while `STOPIT_STATE_DIR` is set is another store, which a
-///   session started without it would use. That is sound: no sandbox can
+///   directory, or a data or configuration directory that exists, gets a
+///   mask over it where the mount shows it, attributed to stopit's own
+///   provider name: the runtime directory holds other sessions' data, the
+///   trust store lists the user's projects, and the global configuration
+///   decides what every session runs. The mask has the kind of what it
+///   covers, so a configuration directory path that names a file gets a
+///   file mask. The masks over the store's directory (`state.data.store`)
+///   and the active configuration directory (`state.config.active`) are
+///   silent, since `ro ~`, the recommended way to show the home directory,
+///   contains them; the others come with a [`SpecWarning::StateDirMasked`]
+///   (DESIGN.md §1.5): a session seldom needs to see the runtime directory,
+///   and the default locations while `STOPIT_STATE_DIR` or
+///   `STOPIT_CONFIG_DIR` is set belong to sessions started without them. That is sound: no sandbox can
 ///   write any directory on the way to it (every `rw` grant containing it
 ///   is refused), so what the mask covers stays where it is. Unless another
 ///   mount lies between the mount's destination (exclusive) and that path
@@ -1859,6 +1862,12 @@ struct SourceToProtect<'a> {
 /// The mounts added need none of the other checks, for the reasons the
 /// covers need none: P is canonical and lies inside S, and X lies below
 /// T_M, reached through M's tree along P.
+///
+/// A P inside one of stopit's state directories, such as a regular global
+/// `config.toml` or a global script in the configuration directory, gets no
+/// mount here. [`check_state_dirs`] runs next and refuses every mount whose
+/// source lies inside a state directory and every `rw` mount containing
+/// one, so no mount left could show P writable.
 fn protect_sources(
     mut mounts: Vec<PlannedMount>,
     rw_sources: &BTreeMap<PathBuf, PathBuf>,

@@ -40,14 +40,16 @@ pub enum ConfigError {
 }
 
 /// Layer that declared a provider, ordered from lowest to highest precedence.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// No `Default`: every construction names its layer, so a forgotten origin
+/// never gets the highest precedence by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ProviderOrigin {
     /// Built-in provider supplied by `base = "default"`.
     Builtin,
     /// Provider declared in `<config_dir>/config.toml`.
     Global,
     /// Provider declared in workspace `.stopit.toml`.
-    #[default]
     Workspace,
 }
 
@@ -97,6 +99,9 @@ pub struct LayeredConfig {
     /// Effective user providers in merge order with their origin and base
     /// directory.
     pub providers: Vec<LayeredProviderEntry>,
+    /// Names of global providers that a workspace provider of the same name
+    /// replaced, in global file order.
+    pub replaced: Vec<ProviderName>,
 }
 
 /// The session-wide top-level settings (DESIGN.md §3.1).
@@ -233,6 +238,7 @@ impl ConfigLayer {
                 return LayeredConfig {
                     config: proj.into_config(),
                     providers,
+                    replaced: Vec::new(),
                 };
             }
             return Self::combine(global, Some((proj, proj_dir)));
@@ -289,9 +295,12 @@ impl ConfigLayer {
 
         let mut layered_providers = Vec::new();
         let mut config_providers = Vec::new();
+        let mut replaced = Vec::new();
         if let Some(dir) = g_dir {
             for entry in g_layer.providers {
-                if !project_names.contains_key(entry.name.as_str()) {
+                if project_names.contains_key(entry.name.as_str()) {
+                    replaced.push(entry.name);
+                } else {
                     config_providers.push(entry.clone());
                     layered_providers.push(LayeredProviderEntry {
                         origin: ProviderOrigin::Global,
@@ -323,6 +332,7 @@ impl ConfigLayer {
                 providers: config_providers,
             },
             providers: layered_providers,
+            replaced,
         }
     }
 }
@@ -1210,6 +1220,21 @@ mod tests {
                 .iter()
                 .map(|e| e.entry.clone())
                 .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            l.replaced.iter().map(|n| n.as_str()).collect::<Vec<_>>(),
+            ["a", "config"]
+        );
+        // Nothing is replaced without a project file, or under its
+        // `base = "none"`.
+        assert!(layered(Some(&global), None).replaced.is_empty());
+        assert!(
+            layered(
+                Some(&global),
+                Some(&format!("base = \"none\"\n{PROVIDER_A}"))
+            )
+            .replaced
+            .is_empty()
         );
         // A duplicate within one file is still an error.
         let msg = ConfigLayer::from_toml_str(&format!("{PROVIDER_A}{PROVIDER_A}"))

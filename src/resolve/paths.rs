@@ -51,7 +51,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use super::merge::{FsRule, FsRuleKind};
-use crate::config::ProviderName;
+use crate::config::{ProviderName, ProviderOrigin};
 use crate::error::is_missing;
 use crate::escape::shell_quote;
 use crate::expand::{
@@ -964,27 +964,46 @@ fn pick<'a>(
     }
     // Sources that differ at the same `(synthesized, literal, depth, mode)`
     // go to the highest `ProviderOrigin`, so a workspace `fs.bind` can
-    // replace a global one at the same destination and mode. Two binds in
-    // the winning layer still conflict.
+    // replace a global one at the same destination and mode. As for
+    // `env.set`, two different sources within any one layer conflict even
+    // when a higher layer also has one, and a built-in rule never loses to
+    // a user rule by layer: it conflicts with a different winner instead.
+    let conflict = |a: &Candidate<'_>, b: &Candidate<'_>| {
+        PathPlanError::Conflict(Box::new(MountConflict {
+            sandbox: a.sandbox.clone(),
+            mode: a.mode,
+            depth: a.rule.depth,
+            first_provider: a.rule.provider.clone(),
+            first: a.source.clone(),
+            second_provider: b.rule.provider.clone(),
+            second: b.source.clone(),
+        }))
+    };
+    for (i, a) in top.iter().enumerate() {
+        if let Some(b) = top[i + 1..]
+            .iter()
+            .find(|b| b.rule.origin == a.rule.origin && !b.source.interchangeable(&a.source))
+        {
+            return Err(conflict(a, b));
+        }
+    }
     let max_origin = top
         .iter()
         .map(|c| c.rule.origin)
         .max()
         .expect("the best rank is attained");
-    let mut top = top.into_iter().filter(|c| c.rule.origin == max_origin);
-    let winner = top.next().expect("max_origin is attained");
-    if let Some(other) = top.find(|c| !c.source.interchangeable(&winner.source)) {
-        return Err(PathPlanError::Conflict(Box::new(MountConflict {
-            sandbox: winner.sandbox,
-            mode: winner.mode,
-            depth: winner.rule.depth,
-            first_provider: winner.rule.provider.clone(),
-            first: winner.source,
-            second_provider: other.rule.provider.clone(),
-            second: other.source,
-        })));
+    let winner_index = top
+        .iter()
+        .position(|c| c.rule.origin == max_origin)
+        .expect("max_origin is attained");
+    if let Some(builtin) = top.iter().find(|c| {
+        c.rule.origin == ProviderOrigin::Builtin
+            && !c.source.interchangeable(&top[winner_index].source)
+    }) {
+        return Err(conflict(builtin, &top[winner_index]));
     }
-    Ok(winner)
+    let mut top = top;
+    Ok(top.swap_remove(winner_index))
 }
 
 #[cfg(test)]
@@ -1654,12 +1673,8 @@ mod tests {
                 [host("/opt/x", f.home().join("b"), EntryKind::File, Ro, "w")]
             );
         }
-        // The global layer beats the built-in one.
-        let mounts = f.clean(&[
-            at(bind("~/a", "/opt/x", BindMode::Ro, "b", 0), Builtin),
-            at(bind("~/c", "/opt/x", BindMode::Ro, "g", 0), Global),
-        ]);
-        assert_eq!(summary(&mounts), [row("/opt/x", Ro, "g")]);
+        // The global layer beats nothing but itself: a built-in rule
+        // conflicts instead (below).
         // The layer only breaks ties: a stricter mode from a lower layer
         // still wins, and so does a profile's own rule over an inherited one.
         let mounts = f.clean(&[
@@ -1672,6 +1687,52 @@ mod tests {
             at(bind("~/b", "/opt/x", BindMode::Ro, "w", 1), Workspace),
         ]);
         assert_eq!(summary(&mounts), [row("/opt/x", Ro, "g")]);
+        // A conflict within a lower layer is an error even though a higher
+        // layer has a bind there, as for `env.set`.
+        let e = f.plan_err(&[
+            at(bind("~/a", "/opt/x", BindMode::Ro, "g1", 0), Global),
+            at(bind("~/b", "/opt/x", BindMode::Ro, "g2", 0), Global),
+            at(bind("~/c", "/opt/x", BindMode::Ro, "w", 0), Workspace),
+        ]);
+        let PathPlanError::Conflict(c) = e else {
+            panic!("expected a conflict, got {e:?}");
+        };
+        assert_eq!(
+            (c.first_provider.as_str(), c.second_provider.as_str()),
+            ("g1", "g2")
+        );
+        // A built-in rule is never replaced by layer: a user rule of the
+        // same rank with another source conflicts with it.
+        let e = f.plan_err(&[
+            at(bind("~/a", "/opt/x", BindMode::Ro, "base", 0), Builtin),
+            at(bind("~/c", "/opt/x", BindMode::Ro, "g", 0), Global),
+        ]);
+        assert!(matches!(e, PathPlanError::Conflict(_)), "{e:?}");
+        f.mkdir("ws/.git");
+        f.mkdir("home/git");
+        let e = f.plan_err(&[
+            at(rule(Protected, "{workspace}/.git", "base", 0), Builtin),
+            at(
+                bind("~/git", "/workspace/.git", BindMode::Protected, "w", 0),
+                Workspace,
+            ),
+        ]);
+        let PathPlanError::Conflict(c) = e else {
+            panic!("expected a conflict, got {e:?}");
+        };
+        assert_eq!(
+            (c.first_provider.as_str(), c.second_provider.as_str()),
+            ("base", "w")
+        );
+        // The same source from a built-in and a user rule is no conflict.
+        let mounts = f.clean(&[
+            at(rule(Protected, "{workspace}/.git", "base", 0), Builtin),
+            at(rule(Protected, "{workspace}/.git", "w", 0), Workspace),
+        ]);
+        assert_eq!(
+            summary(&mounts),
+            [row("/workspace/.git", Protected, "base")]
+        );
         // Two binds within the winning layer still conflict.
         let e = f.plan_err(&[
             at(bind("~/a", "/opt/x", BindMode::Ro, "g", 0), Global),

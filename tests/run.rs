@@ -605,11 +605,25 @@ fn project_settings_override_global_settings() {
 }
 
 #[test]
-fn base_none_in_the_project_does_not_read_the_global_configuration() {
+fn base_none_in_the_project_ignores_the_global_layer_but_still_checks_it() {
     let s = Setup::new();
+    let (probe_dir, _) = probe_at_host_path();
+    s.write_global_config(&probe_config("env.set = { WHICH = \"global\" }"));
+    s.write_raw_config(&format!(
+        "base = \"none\"\n[[provider]]\ntype = \"config\"\n[provider.sandbox]\n\
+         fs.ro = [\"{}\"]\n",
+        probe_dir.display()
+    ));
+    // Nothing of the global layer applies: no `WHICH`, no workspace mount.
+    let results = s.probe(&[], &[Op::Cwd, Op::Env]);
+    assert_eq!(ok(&results[0]), &Data::Cwd("/".into()));
+    let Data::Env(env) = ok(&results[1]) else {
+        panic!("{results:?}")
+    };
+    assert!(!env.contains_key("WHICH"), "{env:?}");
+    // It is still read, checked and parsed, since its target and scripts
+    // are protected in this session too: a broken one stops the run.
     let global = s.write_global_config("this is not toml");
-    // Read under the default base: its error names it.
-    s.write_raw_config("");
     let out = output(s.run_probe_command(&[]), b"[]");
     assert_eq!(code(&out), 125, "{out:?}");
     let err = stderr(&out);
@@ -617,16 +631,126 @@ fn base_none_in_the_project_does_not_read_the_global_configuration() {
         err.starts_with(&format!("stopit: error: {global:?}")),
         "{err}"
     );
-    // Not read at all under `base = "none"`, even when it is untrusted.
-    fs::set_permissions(&global, fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(s.no_session_left());
+}
+
+/// A dotfiles tree at `~/src/dotfiles` holding the global configuration's
+/// target `stopit.toml` (`contents`) and a script `tools.sh` printing an
+/// empty manifest, with `config.toml` linked to the target. Returns the
+/// target and the script.
+fn dotfiles_global_config(s: &Setup, contents: &str) -> (PathBuf, PathBuf) {
+    let dotfiles = s.root.join("home/src/dotfiles");
+    fs::create_dir_all(&dotfiles).unwrap();
+    fs::set_permissions(&dotfiles, fs::Permissions::from_mode(0o755)).unwrap();
+    let target = dotfiles.join("stopit.toml");
+    fs::write(&target, contents).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+    let script = dotfiles.join("tools.sh");
+    fs::write(&script, "#!/bin/sh\nprintf '{\"version\":1}'\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let global = s.write_global_config("");
+    fs::remove_file(&global).unwrap();
+    symlink(&target, &global).unwrap();
+    (target, script)
+}
+
+#[test]
+fn an_unused_global_configuration_stays_protected() {
+    // The workspace grants `rw` on the tree holding the global
+    // configuration and its script, and uses neither: `base = "none"`, then
+    // a provider replacing the global one by name.
+    let s = Setup::new();
+    let global_body = |script: &Path| {
+        format!(
+            "[[provider]]\ntype = \"script\"\nname = \"tools\"\nsource = {script:?}\n{}",
+            probe_config("").replace("name = \"tools\"", "name = \"probe\"")
+        )
+    };
+    let (target, script) = dotfiles_global_config(&s, "");
+    let body = global_body(&script);
+    fs::write(&target, &body).unwrap();
     let (probe_dir, _) = probe_at_host_path();
-    s.write_raw_config(&format!(
-        "base = \"none\"\n[[provider]]\ntype = \"config\"\n[provider.sandbox]\n\
-         fs.ro = [\"{}\"]\n",
-        probe_dir.display()
-    ));
+    let rw_src = "[[provider]]\ntype = \"config\"\nname = \"src\"\n[provider.sandbox]\n\
+                  fs.rw = [\"~/src\"]\n";
+    for project in [
+        format!(
+            "base = \"none\"\n{rw_src}[[provider]]\ntype = \"config\"\nname = \"probe\"\n\
+             [provider.sandbox]\nfs.ro = [\"{}\"]\n",
+            probe_dir.display()
+        ),
+        format!(
+            "{rw_src}[[provider]]\ntype = \"config\"\nname = \"tools\"\n\
+             [provider.sandbox]\nfs.ro = [\"{}\"]\n",
+            probe_dir.display()
+        ),
+    ] {
+        s.write_raw_config(&project);
+        let results = s.probe(
+            &[],
+            &[
+                write("/home/user/src/dotfiles/stopit.toml", "pwned"),
+                write("/home/user/src/dotfiles/tools.sh", "pwned"),
+                link(
+                    "/home/user/src/dotfiles/stopit.toml",
+                    "/home/user/src/dotfiles/second-name",
+                ),
+                write("/home/user/src/dotfiles/other", "fine"),
+            ],
+        );
+        assert_eq!(errno(&results[0]), "EROFS", "{project}: {results:?}");
+        assert_eq!(errno(&results[1]), "EROFS", "{project}: {results:?}");
+        assert_eq!(errno(&results[2]), "EXDEV", "{project}: {results:?}");
+        assert_eq!(ok(&results[3]), &Data::Done, "{project}: {results:?}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), body);
+    }
+}
+
+#[test]
+fn a_global_configuration_reached_through_a_writable_link_is_refused() {
+    // `config.toml -> ~/src/dotfiles/current/stopit.toml`, where `current`
+    // is a link a sandbox with `rw ~/src` could re-point.
+    let s = Setup::new();
+    let (target, _) = dotfiles_global_config(&s, &probe_config(""));
+    let dotfiles = target.parent().unwrap();
+    symlink(".", dotfiles.join("current")).unwrap();
+    let global = s.config_dir().join("config.toml");
+    fs::remove_file(&global).unwrap();
+    symlink(dotfiles.join("current/stopit.toml"), &global).unwrap();
+    // Fine while nothing writable holds the link.
     let results = s.probe(&[], &[Op::Cwd]);
-    assert_eq!(ok(&results[0]), &Data::Cwd("/".into()));
+    assert_eq!(ok(&results[0]), &Data::Cwd("/workspace".into()));
+    s.write_raw_config(
+        "[[provider]]\ntype = \"config\"\nname = \"src\"\n[provider.sandbox]\n\
+         fs.rw = [\"~/src\"]\n",
+    );
+    let out = output(s.run_probe_command(&[]), b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    let err = stderr(&out);
+    assert!(err.contains(&format!("{global:?}")), "{err}");
+    assert!(
+        err.contains(&format!(
+            "runs through the symbolic link {:?}",
+            dotfiles.join("current")
+        )),
+        "{err}"
+    );
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn an_unnamed_provider_replacing_an_unnamed_global_one_warns() {
+    let s = Setup::new();
+    let global = s.write_global_config(&probe_config("").replace("name = \"tools\"\n", ""));
+    s.write_raw_config(&probe_config("").replace("name = \"tools\"\n", ""));
+    let out = output(s.run_probe_command(&[]), b"[]");
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "stopit: warning: the unnamed [[provider]] \"config\" in .stopit.toml replaces the \
+             unnamed one in {global:?}; set `name` on one of them to keep both\n"
+        )
+    );
 }
 
 #[test]
