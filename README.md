@@ -4,15 +4,15 @@ stopit runs a program, such as an LLM coding agent, a shell or a build, in a Lin
 
 It is a single Rust binary built on [bubblewrap](https://github.com/containers/bubblewrap), Landlock and seccomp. Agents with full-screen terminal interfaces (Claude Code, Gemini CLI, Codex, OpenCode) run in it through a terminal proxy that filters what they may send to your terminal. `git` and `jj` run through a broker that keeps the repository's metadata out of the agent's reach.
 
-> **Status: usable, still young.** The sandbox, the configuration and its trust checks, the terminal proxy, `stopit server` with its prompts, the `full` and `proxy` network modes, brokered `git` and `jj` for local work, and resource limits work and are tested against real sandboxes. Fetch and push through the broker, prompts for writes to protected files, `stopit-grant` and saved approvals are not built yet. [DESIGN.md](DESIGN.md) describes the design, and its section 11 lists what is missing.
+> **Status: usable, still young.** These work and are tested against real sandboxes: the sandbox itself, the configuration and its trust checks, the terminal proxy, `stopit server` with its prompts, the `full` and `proxy` network modes, brokered `git` and `jj` for local work, and resource limits. Fetch and push through the broker, prompts for writes to protected files, `stopit-grant` and saved approvals are not built yet. stopit has had no outside security review. [DESIGN.md](DESIGN.md) describes the design, and its section 11 lists the known gaps.
 
 ## What the sandbox gets by default
 
 With an empty `.stopit.toml` (or none), a sandbox has:
 
 - your project, read-write, at `/workspace`, which is also the working directory;
-- secrets in the project masked: `.env`, `.env.*`, `*.pem`, `*.key`, `.npmrc` and `.pypirc` show up empty and unreadable;
-- files that would let it escape on your next run made read-only: `.stopit.toml`, `*.nix`, `flake.lock`, `.envrc`, `.vscode`, `.idea`, `.github/workflows`, agent settings such as `.claude` and `.gemini`, and others (DESIGN.md, Appendix A);
+- secrets in the project masked: `.env`, `.env.*`, `*.pem`, `*.key`, `.npmrc`, `.pypirc`, `.netrc`, SSH keys and others show up empty and unreadable;
+- files that would let it escape on your next run made read-only: `.stopit.toml`, `*.nix`, `flake.lock`, `.envrc`, `.vscode`, `.idea`, `.github/workflows`, the project settings of Claude Code, Gemini CLI and some editors (`.claude`, `.gemini`, `.cursor`, `.mcp.json`, `.zed`), and others (DESIGN.md, Appendix A);
 - the repository's `.git` and `.jj` masked, with `git` and `jj` brokered instead (see [Version control](#version-control));
 - an empty home directory at `/home/user` and an empty `/tmp`, both deleted when the session ends;
 - its own `/proc` and a minimal `/dev`;
@@ -27,7 +27,7 @@ It gets no programs. `/usr`, `/bin` and `/nix/store` are not mounted, so the fir
 - Linux 5.13 or newer with unprivileged user namespaces enabled, and Landlock.
 - bubblewrap 0.12 or newer on `PATH`.
 - `$XDG_RUNTIME_DIR` set to a private directory, as systemd login sessions do.
-- For `network = "full"`: `pasta` from the passt package.
+- For `network = { mode = "full" }`: `pasta` from the passt package.
 - For `[limits]`: a systemd user session, `busctl`, and cgroup v2.
 - Rust 1.88 or newer to build.
 
@@ -56,6 +56,8 @@ imports = [ stopit.homeModules.default ];   # adds stopit to home.packages
    env.path_prepend = ["/usr/local/bin", "/usr/bin", "/bin"]
    ```
 
+   On Fedora, add `"/etc/pki"`, where `/etc/ssl/certs` points.
+
    On NixOS:
 
    ```toml
@@ -63,13 +65,13 @@ imports = [ stopit.homeModules.default ];   # adds stopit to home.packages
    name = "tools"
    type = "config"
    [provider.sandbox]
-   fs.ro = ["/nix/store", "/run/current-system/sw", "/etc/ssl/certs"]
+   fs.ro = ["/nix/store", "/run/current-system/sw", "/usr/bin/env", "/bin/sh", "/etc/ssl/certs"]
    env.path_prepend = ["/run/current-system/sw/bin"]
    ```
 
-   Packages from Home Manager live in `/nix/store` too. Add the `bin` directory of your profile, as an absolute path, to `env.path_prepend`. Granting all of `/nix/store` is fine for trying stopit out. On NixOS the store can hold rendered secrets, so a careful setup grants only the paths a development shell needs (DESIGN.md section 3.6).
+   `/usr/bin/env` and `/bin/sh` are there for scripts that start with `#!/usr/bin/env`. For packages from Home Manager, add your profile (`/etc/profiles/per-user/<you>`, or the target of `~/.nix-profile`) to `fs.ro` and its `bin` to `env.path_prepend`, both as absolute paths. Granting all of `/nix/store` is fine for trying stopit out. On NixOS the store can hold rendered secrets, so a careful setup grants only the paths a development shell needs (DESIGN.md section 3.6).
 
-   This file needs no `stopit allow`: stopit trusts it because only you can write it, and it checks that no sandbox can.
+   This file needs no `stopit allow`. stopit trusts it because only you can write it, and it checks that no sandbox can.
 
 2. Run a command in a project:
 
@@ -101,17 +103,17 @@ stopit server                         # terminal 1, stays in the foreground
 stopit run --profile claude claude    # terminal 2
 ```
 
-`stopit run` and `stopit shell` attach to the project's server when one runs, so every run shares one session: one `/tmp`, one home, the same brokers. Questions for you, such as whether a brokered command may run or whether the agent may write to your clipboard, appear in the server's terminal, never in the agent's, so the agent cannot draw a fake prompt or answer one. Without a server, anything that needs a yes is refused. `--standalone` runs without the server, and `--server ID` picks one by the id it prints.
+`stopit run` and `stopit shell` attach to the project's server when one runs, so every run shares one session, with one `/tmp` and one home. Questions for you, such as whether a brokered command may run or whether the agent may write to your clipboard, appear in the server's terminal, never in the agent's, so the agent cannot draw a fake prompt or answer one. Without a server, anything that needs a yes is refused. `--standalone` runs without the server, and `--server ID` picks one by the id it prints. The server reads the configuration once, when it starts. Restart it after editing `config.toml` or `.stopit.toml`.
 
 ### Profiles for agents
 
-A profile is a complete sandbox description. `main` is used unless you pass `--profile`. Put an agent's profile in `~/.config/stopit/config.toml` next to the tools, so every project has it. Each recipe below grants the agent's own state directory read-write and lets it reach only its provider's API, through stopit's filtering proxy.
+A profile is a complete sandbox description. `main` is used unless you pass `--profile`. Put an agent's profile in `~/.config/stopit/config.toml` next to the tools, so every project has it.
 
-Create each state directory on the host first. stopit skips a rule whose path is missing, with a warning, and the agent's state then lands in the session's home and is gone when the session ends.
+Each recipe below gives the agent a state directory of its own on the host, `~/.stopit-agents/<agent>`, which appears in the sandbox where the agent looks for its state. Do not grant the agent's usual directory (`~/.claude`, `~/.gemini`, `~/.codex`, `~/.config/opencode`) instead if you also run the agent outside stopit. The agent could rewrite its own settings there, such as hooks, MCP servers and plugins, which then run unsandboxed the next time you start it on the host, and it could read every past session you had with it. Create each directory first, since stopit skips a rule whose path is missing, with a warning. Then log in from inside the sandbox if the agent lets you paste a code, or copy just its credentials file into the new directory. Login flows that open a browser and wait on a local port cannot reach a sandbox.
 
-The proxy lets a tool reach only the listed names, on ports 443 and 80, and prints the names it refused when the run ends. If an agent cannot log in or fetch something, add the names it lists, or use `network = { mode = "full" }`, which reaches whatever your machine reaches except services on its loopback. Log in on the host first. Login flows that open a browser and wait on a local port cannot reach a sandbox.
+Each recipe lets the agent reach only its provider, through stopit's filtering proxy. The proxy lets a tool reach the listed names on ports 443 and 80, plus any names `main` already allows, and lists the first ten names it refused when the run ends, in the server's terminal for an attached run. If an agent cannot log in or fetch something, add the names it needs, or use `network = { mode = "full" }`, which reaches whatever your machine reaches except services on its loopback. Anything the agent can read, it can send to the allowed names. The startup summary lists them on its `uploads` line. Agents on Node.js need Node 24 or newer to use the proxy.
 
-The agent's program must be visible in the sandbox too. Installed through Nix or the system's packages, the tools provider covers it. Installed with npm into your home, grant that prefix, as in the Gemini recipe. A launcher that is a link with an absolute path into your home (`~/.local/bin/claude` to `/home/you/.local/share/claude/...`) needs its target granted at that same absolute path.
+The agent's program must be visible in the sandbox too. If you installed it through Nix or the system's packages, the tools provider covers it. If you installed it into your home, grant it there, as the Claude Code and Gemini recipes do.
 
 **Claude Code**
 
@@ -123,12 +125,14 @@ name = "claude"
 type = "config"
 profile = "claude"
 [provider.sandbox]
-fs.rw = ["~/.claude"]
-env.set = { CLAUDE_CONFIG_DIR = "/home/user/.claude" }
-network = { mode = "proxy", allow_domains = ["api.anthropic.com", "statsig.anthropic.com", "console.anthropic.com", "claude.ai"] }
+fs.bind = [{ host = "~/.stopit-agents/claude", sandbox = "/home/user/.claude", mode = "rw" }]
+fs.ro = ["~/.local/bin/claude"]
+env.path_prepend = ["/home/user/.local/bin"]
+env.set = { CLAUDE_CONFIG_DIR = "/home/user/.claude", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1" }
+network = { mode = "proxy", allow_domains = ["api.anthropic.com", "console.anthropic.com", "claude.ai"] }
 ```
 
-`CLAUDE_CONFIG_DIR` keeps Claude Code's settings and login in `~/.claude`, the one directory granted, rather than also in `~/.claude.json`. The project's `.claude` directory stays read-only, so the agent cannot change its own permissions or hooks there.
+`CLAUDE_CONFIG_DIR` keeps Claude Code's settings and login in that one directory rather than also in `~/.claude.json`, and the second variable turns off its telemetry. `~/.local/bin/claude` is where the native installer puts its launcher, a link to the current version, which the rule follows, so the sandbox gets that version's program itself. Drop both lines if Claude Code comes from Nix or the system. The project's `.claude` directory stays read-only, so the agent cannot change the project's settings, and "always allow" answers for the project fail to save.
 
 **Gemini CLI**
 
@@ -140,13 +144,13 @@ name = "gemini"
 type = "config"
 profile = "gemini"
 [provider.sandbox]
-fs.rw = ["~/.gemini"]
+fs.bind = [{ host = "~/.stopit-agents/gemini", sandbox = "/home/user/.gemini", mode = "rw" }]
 fs.ro = ["~/.npm-global"]
 env.path_prepend = ["/home/user/.npm-global/bin"]
-network = { mode = "proxy", allow_domains = ["generativelanguage.googleapis.com", "cloudcode-pa.googleapis.com", "oauth2.googleapis.com", "play.googleapis.com"] }
+network = { mode = "proxy", allow_domains = ["generativelanguage.googleapis.com", "cloudcode-pa.googleapis.com", "oauth2.googleapis.com"] }
 ```
 
-`~/.npm-global` stands for wherever `npm install -g` put it. Gemini CLI reads its key from `GEMINI_API_KEY`, which the default filter drops (`*_KEY`). Prefer the login it keeps in `~/.gemini`, or set the key with `env.set` in the provider, which the filter does not touch, knowing that the configuration file then holds it.
+`~/.npm-global` stands for wherever `npm install -g` put it. Set `"usageStatisticsEnabled": false` in the new directory's `settings.json`. Gemini CLI reads an API key from `GEMINI_API_KEY`, which the default filter drops (`*_KEY`). Prefer its login. If you set the key with `env.set` instead, which the filter does not touch, put it only in `~/.config/stopit/config.toml`, never in a `.stopit.toml` that goes into a repository, and keep that file mode 600. Every program in the profile, including the commands the agent runs, can read it.
 
 **Codex**
 
@@ -158,11 +162,13 @@ name = "codex"
 type = "config"
 profile = "codex"
 [provider.sandbox]
-fs.rw = ["~/.codex"]
+fs.bind = [{ host = "~/.stopit-agents/codex", sandbox = "/home/user/.codex", mode = "rw" }]
 network = { mode = "proxy", allow_domains = ["api.openai.com", "chatgpt.com", "auth.openai.com"] }
 ```
 
-Codex has a sandbox of its own. If it reports that it cannot start it inside stopit, run it with `--sandbox danger-full-access`, and stopit is the boundary.
+Codex has a sandbox of its own. If Codex cannot start it inside stopit, `--sandbox danger-full-access` turns it off. stopit then still limits what Codex's commands can do, but Codex no longer keeps them out of `~/.codex` or off the network, so they can rewrite its configuration and reach the allowed names.
+
+Codex reads project settings from `.codex/` in the project, which the default rules do not protect. In a project that has one, add `fs.protected = ["{workspace}/.codex"]` to its `.stopit.toml`. A rule in `config.toml` would warn in every project without one.
 
 **OpenCode**
 
@@ -174,33 +180,37 @@ name = "opencode"
 type = "config"
 profile = "opencode"
 [provider.sandbox]
-fs.rw = ["~/.config/opencode", "~/.local/share/opencode", "~/.cache/opencode"]
+fs.bind = [
+  { host = "~/.stopit-agents/opencode/config", sandbox = "/home/user/.config/opencode", mode = "rw" },
+  { host = "~/.stopit-agents/opencode/data", sandbox = "/home/user/.local/share/opencode", mode = "rw" },
+]
 network = { mode = "proxy", allow_domains = ["models.dev", "registry.npmjs.org", "api.anthropic.com", "api.openai.com"] }
 ```
 
-List the API of each model provider you use with it.
+List the API of each model provider you use with it. `registry.npmjs.org` is there because OpenCode installs packages at run time, which it then runs, and the proxy lets it upload there too. Its cache stays in the session's home. OpenCode also reads `opencode.json` and `.opencode/` from the project, whose plugins run when you start it on the host, and the default rules do not protect them. In a project that has them, add `fs.protected = ["{workspace}/opencode.json", "{workspace}/.opencode"]` to its `.stopit.toml`.
 
 ### What an agent sees
 
-- **Your terminal, through a proxy.** stopit gives the sandbox a terminal of its own and copies its output to yours, dropping escape sequences that could rewrite your terminal's settings or title, or read it back. Colors, cursor movement, the alternate screen and mouse reporting pass. Writes to your clipboard (OSC 52) are blocked. With `[terminal] clipboard_write = "ask"`, each waits for your answer in the server's terminal (DESIGN.md section 5).
+- **Your terminal, through a proxy.** stopit gives the sandbox a terminal of its own and copies its output to yours, dropping escape sequences that could change your terminal's settings or read them back. Colors, cursor movement, the alternate screen, window titles and mouse reporting pass. Writes to your clipboard (OSC 52) are blocked. With `[terminal] clipboard_write = "ask"`, each waits for your answer in the server's terminal (DESIGN.md section 5.3).
 - **Version control** through the broker (next section).
 - **Nothing of your home** beyond what a profile grants. The sandbox home is empty and shared by the session's runs.
 
 ## Version control
 
-The `vcs` provider, on by default, masks the project's `.git` and `.jj` in the sandbox and puts `git` and `jj` commands on its `PATH` that ask stopit's broker to run the real ones, in a sandbox of their own that can write the repository but not the network.
+The `vcs` provider, on by default, masks the project's `.git` and `.jj` in the sandbox. In their place, `git` and `jj` on the sandbox's `PATH` ask stopit's broker to run the real tools, in a sandbox that can write the repository but has no network.
 
-- Reading and committing run at once: `git status`, `diff`, `log`, `show`, `add`, `commit`; `jj status`, `diff`, `log`, `show`, `new`, `commit`, `describe`.
-- History rewriting asks you in the server's terminal: `git reset`, `rebase`, `checkout`, `switch`, `branch`, `tag`, `clean`, `stash`; `jj squash`, `rebase`, `abandon`, `restore`, `undo`, `bookmark`, `op`. So does anything not listed.
+- Reading and committing run at once: `git status`, `diff`, `log`, `show`, `add`, `commit`; `jj status`, `diff`, `log`, `show`, `new`, `commit`, `describe`, `op log`.
+- Commands that move or discard work ask you in the server's terminal: `git reset`, `rebase`, `checkout`, `switch`, `branch`, `tag`, `clean`, `stash`; `jj squash`, `rebase`, `abandon`, `restore`, `undo`, `bookmark`, `op`. So does anything not listed, and any call with a flag before the subcommand (`git --no-pager log` asks). Approve only commands you understand, since an approved command can write `.git`.
 - Fetch and push are refused. Run them on the host.
 - Options that add configuration, name another repository or run other programs are refused (`git -c`, `-C`, `--git-dir`; `jj --config`, `-R`, `--tool`).
-- git and jj start no editor, pager or signing program, so `git commit` and `jj describe` need `-m`.
+- git and jj start no editor, pager or signing program, so `git commit` and `jj describe` need `-m`, and commits are not signed.
+- The commands work only from inside the project. A `git` run from `/tmp` gets an error.
 
-A refused command exits with 126 and says why on its stderr, as `[stopit: git: ...]`. Commits carry your `user.name` and `user.email` from `~/.gitconfig`.
+A refused command exits with 126 and says why on its stderr, as `[stopit: git: ...]`. Commits carry the `user.name` and `user.email` that `git config --global` gives on the host. jj's own user settings are not read.
 
-The broker supports a plain repository, a colocated jj repository and a git worktree. Others (a jj secondary workspace, a project below a checkout's root) get the mask without the broker, with a warning. Some builds of jj need `/sys/devices/system/cpu` granted read-only to start.
+The broker supports a plain git repository, a jj repository, colocated or not, and a git worktree. Others (a jj secondary workspace, a project below a checkout's root) get the mask without the broker, with a warning. Some builds of jj need `/sys/devices/system/cpu` granted read-only to start.
 
-Use `vcs` with `view = "ro"` for projects whose build reads `.git` itself:
+For projects whose build reads `.git` itself, show it read-only instead. This shows `.git/config` too, including any credentials in remote URLs.
 
 ```toml
 [[provider]]
@@ -210,10 +220,13 @@ view = "ro"
 
 ## More configuration
 
+Each snippet below is a provider of its own. Give each a different `name`, or merge them into one, when you put several in one file.
+
 ### Let a build reach the internet
 
 ```toml
 [[provider]]
+name = "crates"
 type = "config"
 [provider.sandbox]
 network = { mode = "proxy", allow_domains = ["index.crates.io", "static.crates.io"] }
@@ -227,6 +240,7 @@ Tools find the proxy through `HTTPS_PROXY` and the other proxy variables, which 
 
 ```toml
 [[provider]]
+name = "cargo-cache"
 type = "config"
 [provider.sandbox]
 fs.rw = ["~/.cargo/registry"]
@@ -239,6 +253,7 @@ env.set = { CARGO_HOME = "/home/user/.cargo" }
 
 ```toml
 [[provider]]
+name = "rules"
 type = "config"
 [provider.sandbox]
 fs.masked = ["{workspace}/config/credentials.yml"]
@@ -254,20 +269,28 @@ The most specific rule wins: an exact path beats a glob, and between rules for t
 
 ### Brokered commands of your own
 
-A shim runs a command in another profile, after the rules you give it, and asks when they say `ask`:
+A shim runs a command in a fresh sandbox of another profile. Its rules pick the profile and decide whether to allow, ask or deny. Here `cargo publish` asks, and runs in a profile that can reach crates.io:
 
 ```toml
 [profiles.publish]
 
 [[provider]]
+name = "cargo-shim"
 type = "config"
 [provider.sandbox]
 shims.cargo = { binary = "cargo", deny_flags = ["--config"], default = { decision = "allow", profile = "main" }, rules = [
   { subcommand = ["publish"], decision = "ask", profile = "publish" },
 ] }
+
+[[provider]]
+name = "publish"
+type = "config"
+profile = "publish"
+[provider.sandbox]
+network = { mode = "proxy", allow_domains = ["crates.io", "index.crates.io", "static.crates.io"] }
 ```
 
-DESIGN.md section 7.1 describes the rules.
+The publish profile still has no registry token, since the default filter drops `CARGO_REGISTRY_TOKEN`. DESIGN.md section 7.1 describes the rules.
 
 ### Limit processes, memory and CPU
 
@@ -278,7 +301,7 @@ memory = "8G"
 cpu    = "400%"   # of one CPU
 ```
 
-The limits hold for the session as a whole: a run, or a server and all its runs. stopit asks your systemd for a scope of its own and refuses to start unless the limits are in place there.
+The limits cover the whole session, which is one run, or a server with all its runs. stopit asks your systemd for a scope of its own and refuses to start unless the limits are in place there.
 
 ### Generate grants with a script
 
@@ -319,6 +342,9 @@ Before the sandbox starts, `stopit run` and `stopit shell` print to stderr what 
 - `protected` files are read-only. There is no approval prompt for writes yet.
 - Answers to prompts last for the session at most. Nothing is saved to `.stopit.toml`.
 - `stopit-grant`, to ask for one more grant for one command, is not built.
+- The proxy reaches ports 443 and 80 only, so SSH needs `full` mode.
+- A prompt holds up the run's output until you answer it.
+- `tty` and `ttyname` fail inside the sandbox.
 - Script providers are not hashed by `stopit allow`. A script you change after allowing still runs.
 - A sandbox can create a `.git` in a subdirectory, or in the project when it has none, which `git` on the host then trusts. Look before running `git` there.
 

@@ -1,17 +1,17 @@
 # `stopit`: system architecture and security design
 
-**Status:** Draft  
-**Target Platform:** Linux (unprivileged user namespaces, Landlock ABI ≥ 4, seccomp user-notify, FUSE)  
-**Sandbox Backend:** bubblewrap ≥ 0.11  
-**Implementation Language:** Rust
+**Status.** Draft, partly implemented (§12).  
+**Target platform.** Linux 5.13 or newer, with unprivileged user namespaces and Landlock (any ABI, with more protection on newer ones, §6.3). The planned protected-file flow (§4) adds seccomp user-notify and FUSE.  
+**Sandbox backend.** bubblewrap 0.12 or newer.  
+**Implementation language.** Rust 1.88 or newer.
 
 ---
 
-## 1. Scope, Threat Model & Invariants
+## 1. Scope, threat model and invariants
 
 `stopit` is a general-purpose sandbox for running programs with **minimum-required privilege**. Interactive LLM agents are the primary motivating use case, but `stopit` has **no harness-specific features**: agents, their shells, and any other program are all described with the same configuration primitives (see §7.6 for a worked example).
 
-### 1.1 Threat Classes
+### 1.1 Threat classes
 
 1. **The Actively Hostile Program (e.g. a prompt-injected agent):**
    * Attempts sandbox escape, data exfiltration, or planting delayed-execution backdoors that run when the human next interacts with the workspace on the host (`.git/hooks`, `.envrc`, `flake.nix` + `use flake`, editor configs).
@@ -20,13 +20,13 @@
 3. **Silent Secret Harvesting:**
    * Reads sensitive host files (`~/.ssh`, `~/.aws`, `~/.config/gh`, `.env`, harness credential directories, `/run/user/$UID/bus`, Nix tokens) which may then be sent to third parties (e.g. model providers as context).
 
-### 1.2 Non-Goals
+### 1.2 Non-goals
 
 * **Code the user explicitly runs later.** If the sandboxed program edits `build.rs`, a `Makefile`, or a test, and the user later runs it on the host, that code runs. `stopit` protects against code that runs *without an explicit user action* (I3), not against code the user chooses to execute.
 * **Kernel exploits.** Attack surface is reduced (seccomp, Landlock, namespaces) but not eliminated.
 * **Secrets embedded inside the tool environment** granted by a provider (§3.6).
 
-### 1.3 Core Security Invariants
+### 1.3 Core security invariants
 
 These are the guarantees of `base = "default"`. Under `base = "none"` the same mechanisms exist but every grant must be added explicitly (§3.2).
 
@@ -36,7 +36,7 @@ These are the guarantees of `base = "default"`. Under `base = "none"` the same m
 * **I4. Trusted terminal ownership.** The sandbox never holds the host terminal. The supervisor owns it, filters sandbox output through an escape-sequence allowlist (§5.3), and renders approval prompts the sandbox cannot forge.
 * **I5. Explicit, additive policy.** `base = "none"` grants nothing. Every grant comes from a **provider** (§3.6), and everything `base = "default"` grants can be written out manually as providers (Appendix A).
 
-### 1.4 Attacker Capabilities in Scope
+### 1.4 Attacker capabilities in scope
 
 This fixes what a reviewer may assume the attacker can do, so that a failure within these capabilities is a bug and one outside them is an accepted limit.
 
@@ -54,7 +54,7 @@ This fixes what a reviewer may assume the attacker can do, so that a failure wit
 * **Hard links the host created** to content outside the sandbox's view, or to masked or protected content (§3.4, Hard links; §11, Masks apply to sandbox paths, not host content).
 * **A malicious configuration author or provider script.** The configuration defines the policy, and providers run on the host with the user's privileges (§3.6), so they are trusted; stopit validates the configuration to catch mistakes, not to contain its author (§11, Only mount destinations are reserved).
 
-### 1.5 Errors vs. Warnings
+### 1.5 Errors and warnings
 
 The project's **layout** (files, links, modes and permissions on disk, including anything a sandbox left behind, §1.4) can contradict the **configuration**: a rule names a path that is missing, a glob matches a planted link, masked content is visible at another sandbox path. stopit then resolves to the **safe outcome**, the one that never grants more access than the configuration intended (a restriction stays on; a grant may be dropped), and emits a **warning** naming the rule and the layout, so the maintainer can fix the layout. It does not special-case such layouts. It does not refuse to start either, so that what a sandbox left behind cannot stop the next session from starting. The exceptions are the layouts below with no safe outcome yet, and those listed in §11. Examples (§3.4, §6.2): a missing path, or a final link whose target is missing, skips its rule; a directory a restrictive rule cannot inspect (one a sandbox made `chmod 000` or `chmod a-x`, say) is masked as a whole, with a louder warning when that hides a whole grant, such as the workspace mount; a link matched by a glob inside an untrusted root is skipped; an `rw` rule or bind through a planted link is dropped; content under a mask visible at another sandbox path (or protected content writable there) is masked (or protected) at that path too.
 
@@ -66,7 +66,7 @@ Some current behaviour does not follow this principle yet; see §11, Behaviour n
 
 ---
 
-## 2. System Architecture
+## 2. System architecture
 
 `stopit` is a **single Rust binary** with several personas selected via `argv[0]` / subcommands:
 
@@ -82,7 +82,7 @@ Some current behaviour does not follow this principle yet; see §11, Behaviour n
 3. **Capability Shim (`/run/stopit/bin/<tool>`):**
    * Symlinks to a small static trampoline placed at the front of `PATH`. On execution, the trampoline runs the provisioned stopit as `__shim`, which sends a request plus `stdin`/`stdout`/`stderr` FDs to the broker (§7.1).
 
-### 2.1 Session Runtime Directory
+### 2.1 Session runtime directory
 
 All per-session state lives under `$XDG_RUNTIME_DIR/stopit/<session-id>/` on the host (never `/run/stopit`, which is root-owned):
 
@@ -141,7 +141,7 @@ flowchart TB
 
 ---
 
-## 3. Configuration Model
+## 3. Configuration model
 
 Configuration lives in `.stopit.toml` at the workspace root, layered over the user-global `config.toml` described below. It is read **only** when the supervisor starts or is explicitly asked to reload. It is the user's responsibility to verify it before use; it does not take effect on `cd`.
 
@@ -184,7 +184,7 @@ stopit:   env set  API_URL
 
 What is listed: host content mounted `rw`, `protected` (`prot`) or `ro` outside the workspace, or inside it with a mode wider than the workspace mount's (`rw` over `protected` over `ro`: an `rw` `{workspace}/out` under an `ro` workspace is listed, a `ro` part of an `rw` workspace is not; with the workspace not mounted, every mount of its content is), one line per mount with its provider, `rw` first, then `prot`, then `ro` (`host -> sandbox` when the sandbox path differs; the sandbox `HOME` is written `~` like the host's, so a `~` rule shows as one path); `sockets  not masked in rw grants` when `fs.mask_sockets` is off and any host content is mounted `rw` (§3.4; sockets that delegate to host daemons get their own flag once such grants exist, below); the network if its mode is not `none` or `loopback` (`full`, or `proxy to` the domains); shared namespaces (`share`), re-enabled syscalls (`syscalls`), brokered commands (`broker`, with their provider), script providers with `protect = false` (`script`), and environment `pass` patterns and `set` names the default base does not already have (`env pass`, `env set`: names only, never values). Left out, as they widen nothing: the workspace's own mount and anything inside it no wider than that mount, masked and ephemeral mounts, and the supervisor's own rules (the protected configuration file). A provider with more than 10 mounts of one mode (a Nix closure can have thousands) gets one line with their count instead (`ro       4312 mounts  (provider "tools")`), and a name list is cut after 10 names with `and N more`. Paths under the host `HOME` are written with `~`, and every value is escaped like the rest of what stopit prints (§5). `--quiet` (`-q`) on `run` and `shell` leaves the summary out; warnings and errors are still printed. Like every stopit option it must come before the command: after it, `-q` is the command's own.
 
-### 3.1 Structure: Top-Level Settings vs. Providers
+### 3.1 Structure of top-level settings and providers
 
 The configuration has a single way of granting resources: **providers**. Only session-wide settings, which are not grants, live at the top level.
 
@@ -274,7 +274,7 @@ Profiles come from two places:
 
 `inherit = "<profile>"` (default `"main"`) means the profile starts from the parent's fully merged grants, then adds its own. `inherit = "none"` starts from the empty sandbox. `stopit-grant` (§7.5) creates a temporary profile: the caller's profile plus the requested delta.
 
-### 3.4 Path Modes
+### 3.4 Path modes
 
 | Mode | What the sandbox sees | Mechanism |
 | :--- | :--- | :--- |
@@ -309,7 +309,7 @@ Additional checks:
 * **Unix sockets.** Network namespaces isolate abstract sockets, but a socket *file* created by a host process inside an RW directory is reachable through the bind mount (e.g. `.devenv/state/postgres/.s.PGSQL.5432`). With `fs.mask_sockets = true` (default base), sockets found in RW grants at startup are masked (an empty file with mode 0000, so connecting fails with `EACCES`).
 * **Hard links.** A protected file with `nlink > 1` is writable through its other name. The sandbox cannot create such links (`link` across mounts fails with `EXDEV`), but pre-existing ones trigger a startup warning.
 
-### 3.5 Merging & Precedence
+### 3.5 Merging and precedence
 
 All providers' manifests are merged per profile, in order: base providers first, then the global `config.toml`'s providers in file order, then `.stopit.toml`'s providers in file order; a profile with `inherit` starts from its parent's merged result.
 
@@ -408,7 +408,7 @@ view = "masked"
 * **Reference rule:** within a manifest, a plain profile reference (`inherit = "local"`, shim `profile = "ro"`) resolves first to that manifest's own contributed profile, then to a user-declared profile. `main` and other providers' profiles are referenced by their full names. A full name (e.g. `vcs.local`) always resolves globally, including to the manifest's own profiles; plain names are preferred inside a manifest because the provider `name` can change.
 * **Validation:** every manifest table accepts only maps (array forms are rejected) and unknown keys are rejected. A JSON manifest from a script **must** include `"version"`; an inline `[provider.sandbox]` may omit it (defaults to 1). Bind `mode` is one of `ro`, `rw`, `protected` only (`masked` and `ephemeral` have no host content to bind). Bind `host`/`sandbox` paths contain no globs (glob characters are `*`, `?`, `[`, `]`), and a bind's `sandbox` side additionally allows no `{workspace}` placeholder. Path rules are also validated syntactically at load time (§3.4).
 * **Script providers** receive on stdin a JSON object containing their `[provider.config]` and a context (`workspace` host path, `workspace_mount`, `home`, `session_dir`, provider `name`, target `profile`), and print a manifest on stdout. A non-zero exit or invalid manifest aborts startup.
-* **Scripts run on the host with the user's privileges.** With `protect = true` (default) the script is `protected`, and so is its directory if it sources other files (not implemented yet, since only the script itself is protected, §11), so the sandbox cannot rewrite code that runs on the host next session. `protect = false` is allowed but flagged in the startup summary.
+* **Scripts run on the host with the user's privileges.** With `protect = true` (default) the script is `protected`, so the sandbox cannot rewrite code that runs on the host next session. The plan is to protect its directory too if it sources other files, but only the script itself is protected so far (§11). `protect = false` is allowed but flagged in the startup summary.
 * **How a source is protected.** The script is resolved once to its canonical path, which is both the file run and the file protected (protecting a link would leave its target writable). That protection is the supervisor's rule, not a grant, so it is not a path rule competing in precedence (§3.5), where an exact `rw` rule of the same path, or a profile's own rule, would beat it, and no provider's output can lift it. Instead, once a profile's mounts are planned and checked (§6.2, after the restricted-content covers), the source P is protected wherever the profile lets the sandbox write it, in **every** profile of the session: for every `rw` mount M whose canonical source S is P or an ancestor of it, M shows P at X, M's sandbox path joined with P's path below S; unless another mount lies between M's path and X (mounted on top: a mask there hides P, a read-only or protected mount shows it read-only, an `rw` one is compared in turn), X gets a `protected` mount of P, attributed to the script provider, replacing M if X is M's own path. So the source is protected at its aligned path when it lies in the workspace, and at every other path an `rw` grant shows it (a `~` grant, a bind); a profile where it is not visible, masked or read-only gets nothing. Like the covers of Restricted content exposure (§6.2), these mounts need no other checks: P is canonical and lies inside S, and X lies below M's path, reached through M's tree along P. A directory P is protected as a directory, and an `rw` mount whose source lies strictly inside it is not the narrower grant it would be under a protected rule: it is mounted `protected` too, with a warning naming both providers. A source that cannot be inspected when the session is compiled is an error naming the provider, and so is a regular file with more than one hard link that the user owns or can write (`faccessat`, so ACLs count; a Nix store file deduplicated by `auto-optimise-store`, owned by root and read-only, cannot be rewritten through any name and is accepted): the sandbox could rewrite it through another name inside an `rw` tree, which no mount at the protected name prevents, so there is no safe outcome (§1.5); give the script a single link. A script provider checks this right after resolving its path, before the script runs (it may already have been rewritten that way), and the session compiler checks every protected source again. Hard links to files inside a protected directory are not detected (§11). The supervisor protects the loaded `.stopit.toml` the same way (§3). These protected mounts are checked and mounted by path like every other, so they inherit its gap (§11, Path resolution is path-based; Literal restrictive rules rely on pinned parents): another session of the same workspace could swap a parent directory between the compile and the mount.
 * **Script paths through writable links are refused.** Before a script runs, its path as declared (`source` joined to the configuration's directory) is resolved one component at a time like a host source (§6.2, Untrusted links), and that one lookup gives the canonical path that is run and protected; if it runs through a symlink inside the workspace or inside a directory that a `config` provider grants `rw` (in any profile: an `fs.rw` path, a glob's literal prefix, or the host side of an `rw` bind), the final component included, the provider is refused with an error naming it, the link and that directory. This holds even when the lookup fails after following the link, as a planted link may be why it fails. The sandbox can plant or replace such a link (only the link's target is protected), and the next session would run whatever it leads to. There is no safe outcome (running it is host code execution; skipping the provider changes the grants), so this is an error (§1.5): point `source` at a path without links inside them. These are the untrusted roots known before any script runs: `config` providers' rules are static, while the `rw` grants of script providers are known only once they have run (§11). Renaming a parent directory of a protected source away is covered by pinned parents, still pending (§11, Literal restrictive rules rely on pinned parents).
 * Manifests are cached, keyed by a hash of the provider's protected inputs and config.
@@ -438,15 +438,15 @@ Built-in providers can implement `handlers` in Rust (the `vcs` provider parses `
 
 **Host daemons.** A provider may grant access to a host daemon's socket (e.g. a future `buck2` provider talking to the buck2 daemon). Such daemons run *outside* the sandbox (buck2 executes build rules on the host), so granting the socket is equivalent to granting host code execution (the same reason the Nix daemon is never exposed). This is allowed as a deliberate choice; socket grants are flagged as **delegates to host** in the startup summary.
 
-**Nix guidance (outside `stopit` core).** Define a `devShells.agent` (or similar) with every tool the agent needs in your flake and expose it through a `script` provider (later the `nix` provider). The closure-only manifest means only the store paths that environment needs are visible, not all of `/nix/store`, which on NixOS can contain secrets (e.g. `access-tokens` rendered into `nix.conf`). The `nix` provider refuses closures that pull in paths named `*-etc`, `*-home-manager-files`, or `*nix.conf*`. The sandbox has **no access to the Nix daemon**; changing the tool environment requires the user to edit the (protected) flake and restart or reload the session.
+**Nix guidance (outside `stopit` core).** Define a `devShells.agent` (or similar) in your flake with every tool the agent needs and expose it through a `script` provider (later the `nix` provider). The closure-only manifest means only the store paths that environment needs are visible, not all of `/nix/store`, which on NixOS can contain secrets (e.g. `access-tokens` rendered into `nix.conf`). The `nix` provider refuses closures that pull in paths named `*-etc`, `*-home-manager-files`, or `*nix.conf*`. The sandbox has **no access to the Nix daemon**; changing the tool environment requires the user to edit the (protected) flake and restart or reload the session.
 
 ---
 
-## 4. Protected Files & the Approval Flow
+## 4. Protected files and the approval flow
 
 Any attempt to modify a protected file triggers an approval prompt showing the diff. The **kernel mounts remain the security boundary**; the FUSE service and the seccomp hook are there to implement the approval UX on top of them.
 
-### 4.1 Two Writer Styles, Two Hooks
+### 4.1 Two writer styles, two hooks
 
 | Writer style | Syscalls | When is the full content known? | Typical users |
 | :--- | :--- | :--- | :--- |
@@ -486,11 +486,11 @@ The same four decisions are used for brokered-tool approvals (§7.4), where "per
 
 ---
 
-## 5. Terminal: PTY Proxy, Output Filtering & Approval Overlay
+## 5. Terminal proxy, output filtering and approvals
 
 `stopit run [--workspace DIR] [--profile NAME] [-q|--quiet] [--server ID | --standalone] [--] <cmd> [args…]` runs `<cmd>` in the sandbox, in the session of the `stopit server` serving the workspace if there is one (§5.5); everything from `<cmd>` on is the command's, flags included. `stopit shell` is shorthand for `stopit run $SHELL`, with `SHELL` from the host environment (it is an error if unset; the sandbox must grant that shell). The supervisor exits with the command's status, or `128 + N` if it was killed by signal `N`, as shells report it. When it fails itself before the command starts (configuration, providers, the session directory, a missing bwrap or a failure to spawn it), it prints `stopit: error: …` and exits with 125. The supervisor passes `--json-status-fd` to bwrap so a bwrap setup failure before the sandboxed command runs exits with 125 instead of passing bwrap's own exit code 1 through as the command's status. Warnings are printed as `stopit: warning: …`, each distinct message once (an inherited rule is planned, and warns, again in every profile inheriting it), except missing paths of the default base's own rules (`.envrc`, `flake.lock`, …, which most workspaces lack). After them, unless `--quiet` is given (before the command, like every stopit option), comes the startup summary of what the profile grants (§3). Every line stopit prints is escaped: control and format characters are shown as `\u{1b}` (§6.3), since configuration, scripts and the filesystem put text in them; bwrap's own messages are not stopit's and are not escaped. The supervisor catches `SIGINT`, `SIGQUIT`, `SIGTERM` and `SIGHUP` from the start (a signal ignored when it started stays ignored). One that arrives before bwrap is spawned kills any running script provider's process group, removes the session directory, and exits with `128 + N`; one that arrives while bwrap runs is forwarded to bwrap, whose death ends the sandbox (`--die-with-parent`), and the supervisor then removes the session directory and exits with bwrap's status (`128 + N` when the signal killed it). Caught signals return to their default action on `exec`, so bwrap and script providers inherit nothing from this. Whenever a terminal is involved, the supervisor also ignores `SIGTSTP`, `SIGTTIN` and `SIGTTOU` (`__init` resets them for the command), refuses to start in the background of its terminal, and restores the terminal's settings (`tcsetattr`) after the command. Interactive programs put the terminal into raw mode and draw TUIs, so the supervisor relays a PTY of the sandbox's own to the host terminal.
 
-### 5.1 PTY Proxy
+### 5.1 PTY proxy
 
 * When any of the supervisor's stdin, stdout and stderr is a terminal, it opens a PTY and gives the sandbox the slave in place of each one that is. The slave is opened from the master with `TIOCGPTPEER`, never by path, and starts with the host terminal's settings and window size. Standard descriptors that are pipes or files stay as they are, so `stopit run cmd > out.txt` still writes the file directly.
 * `__init` starts a new session and makes the slave its controlling terminal (§6.3 step 2), so bwrap gets no `--new-session` then. bwrap itself leaves the host terminal's session through `setsid` before it runs, so no process of the sandbox's tree has the host terminal as its controlling terminal. `/dev/tty` inside is the slave, and the sandbox cannot reach the host's foreground process group, line discipline, or settings. With no terminal on stdio but a controlling terminal the sandbox could open as `/dev/tty`, bwrap's `--new-session` detaches it instead, and no PTY is opened.
@@ -500,7 +500,7 @@ The same four decisions are used for brokered-tool approvals (§7.4), where "per
 * `SIGWINCH` makes the supervisor copy the host terminal's window size to the master, and the kernel signals the sandbox's foreground process group.
 * When the sandbox ends, the supervisor passes on its last output and then changes back what the sandbox left changed. That covers the alternate screen, mouse reporting in every encoding, focus events, bracketed paste, synchronized output, theme change and in-band resize reports, cursor keys and keypad modes, reverse video, origin mode, autowrap, a hidden cursor, insert mode, line drawing, a scroll region, xterm key modifiers, kitty keyboard flags on each screen, and character attributes. A TUI killed in the alternate screen thus leaves a usable terminal. A host terminal that takes no output for two seconds is given up on.
 
-### 5.2 State Machine
+### 5.2 State machine
 
 The overlay below is not built. Without a screen model the supervisor cannot repaint the sandbox's screen after drawing on it, so approval prompts appear on the terminal of `stopit server` instead (§5.4, §5.5).
 
@@ -529,7 +529,7 @@ stateDiagram-v2
     Intercepting --> Passthrough: return decision
 ```
 
-### 5.3 Output Filtering (Escape-Sequence Allowlist)
+### 5.3 Output filtering (escape-sequence allowlist)
 
 Raw sandbox output reaching the host terminal is an escape channel: OSC 52 can set the clipboard (malicious paste), some terminals support file transfer over escape sequences, and query/response tricks have caused RCE in some emulators. All OSC, DCS, APC, PM, and SOS sequences are **blocked by default**; the following are allowed:
 
@@ -553,19 +553,19 @@ The filter assumes a UTF-8 host terminal. On a terminal that reads bytes as Lati
 
 TIOCSTI from inside the sandbox only reaches the sandbox's own PTY and is harmless to the host; it is also blocked by seccomp (§6.3).
 
-### 5.4 Approval Prompt Safeguards
+### 5.4 Approval prompt safeguards
 
 Approval prompts appear on the terminal of `stopit server`, which no sandbox can write to. A run attached to the server sends each request over a connection of its own to the control socket, naming the run number the server gave it, and the server asks about one request at a time. OSC 52 clipboard writes under `clipboard_write = "ask"` and brokered commands whose rule says `ask` (§7.1) use it today, and `stopit-grant` will (§7.5). A brokered command's prompt comes from the broker, which sends it to the server for the run. A standalone run has no one to ask, so it denies every request and says how many it denied after the command. An attached run says so too.
 
-* **Ground truth:** prompts display resolved facts, not sandbox claims. The server looks up the run by its number and shows the run number, its profile and its command. A clipboard write shows its byte count, its newline count and its selections, and its content with every byte visible: newlines, tabs, control characters and invalid UTF-8 are escaped (`\n`, `\xff`). Content over 200 characters shows its first 160 and its last 40. The filter passes only strict base64, so what the prompt shows is what the host terminal decodes, and content that does not decode is denied without a prompt. Planned prompts show the exact binary path, arguments, working directory and capability delta; for pushes, the resolved remote URL plus the commits and bookmarks being pushed.
+* **Ground truth:** prompts display resolved facts, not sandbox claims. The server looks up the run by its number and shows the run number, its profile and its command. A clipboard write shows its byte count, its newline count and its selections, and its content with every byte visible: newlines, tabs, control characters and invalid UTF-8 are escaped (`\n`, `\xff`). Content over 200 characters shows its first 160 and its last 40. The filter passes only strict base64, so what the prompt shows is what the host terminal decodes, and content that does not decode is denied without a prompt. A brokered command's prompt shows the binary with its arguments, the target profile, the working directory, the shim and the rule (§7.1). Planned prompts add the capability delta for `stopit-grant`, and for pushes the resolved remote URL and the commits and bookmarks being pushed.
 * **No typeahead:** the prompt rings the bell, discards pending input on the server's terminal, waits 300 ms, and discards it again before reading one key, so keystrokes meant for something else cannot land on `y`. The server reads keys from its own non-blocking descriptor of the terminal, so a key another reader takes cannot wedge the prompt.
 * **Foreground only:** the server asks only while its terminal has it in the foreground, as the supervisor refuses to run in the background (§6.2). A server moved to the background with `&` would otherwise be stopped by the kernel on its first prompt. In the background, on a terminal that is not its controlling terminal, or without a terminal on stdin, the server denies every request, and logs why once per run. Server log lines wait while a prompt is up, so they never cut into it.
 * **Answers:** `y` allows once, `s` allows for the rest of the session within the request's scope, and any other key, Ctrl-C and Escape included, denies. So does `approval.timeout` passing, the client going away, the server stopping, or a signal the client catches while it waits. That signal then reaches the sandbox as usual. A request whose client left while it waited for an earlier prompt is denied without a prompt.
 * **Rate limiting:** after the user denies a request, requests in the same scope are denied without a prompt for five seconds, so a sandbox cannot bury the user in prompts. A timeout or a cancel does not start this quiet period.
 * **Client-side memory:** the server's answer says whether it covers the session or starts a quiet period, and the client remembers that for its run. Later writes it covers cost no connection to the server.
 * **Unforgeable by construction:** the sandbox draws only on its own PTY, and the prompt is in another window, so the prompt needs no secret marker.
-* **Precise session rules:** "Allow for this session" matches exactly the displayed scope, here clipboard writes from that profile. Planned broker rules use this remote *and* this bookmark, not the whole subcommand. Session answers live in the server's memory and end with it. Writing them to `.stopit.toml` is planned with the broker, whose rules are what one would persist.
-* **Deny feedback:** a denied clipboard write is dropped. Brokered commands will return exit code `126` with `[stopit: denied by user]` on stderr.
+* **Precise session rules:** "Allow for this session" matches exactly the displayed scope, which is clipboard writes from that profile, or a brokered command's shim and rule. Planned remote rules narrow that to this remote *and* this bookmark. Session answers live in the server's memory and end with it. Writing them to `.stopit.toml` is not built.
+* **Deny feedback:** a denied clipboard write is dropped. A denied brokered command exits with `126` and `[stopit: <shim>: denied by user]` on its stderr.
 
 ### 5.5 `stopit server`
 
@@ -581,9 +581,9 @@ The server's own terminal never reaches a sandbox. bwrap starts in a session of 
 
 ---
 
-## 6. Sandbox Construction
+## 6. Sandbox construction
 
-### 6.1 `SandboxEngine` Trait
+### 6.1 `SandboxEngine` trait
 
 The supervisor turns a profile's merged manifest into a backend-independent `SandboxSpec` (mounts and modes, namespaces, env, FDs, seccomp/Landlock policy, command) and hands it to an engine:
 
@@ -643,7 +643,7 @@ Because the roots are collected from all profiles, every profile's mounts are pl
 
 **Mount locking.** bubblewrap drops all capabilities before executing `__init`, except when `network = "none"` with `net` unshared, where bubblewrap retains `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, and `CAP_SETPCAP` for `__init` to unshare a fresh network namespace and drop all capabilities in §6.3 step 3 before `execve`. The target therefore starts without `CAP_SYS_ADMIN` and cannot `umount` or `mount -o remount,rw` anything. `--disable-userns` plus seccomp prevent creating a new user namespace to regain capabilities; even if one were created, the kernel marks all inherited mounts `MNT_LOCKED` and locks their `ro`, `nosuid`, and `nodev` flags, so they could not be detached or remounted read-write individually.
 
-### 6.3 Init Helper (`stopit __init`)
+### 6.3 Init helper (`stopit __init`)
 
 `stopit __init` runs as the first program inside the sandbox while bwrap stays PID 1 and reaps zombies. It executes these steps in order:
 
@@ -669,9 +669,9 @@ When `__init` fails, it prints `stopit __init: ...` to stderr and exits 127 when
 
 ---
 
-## 7. Brokered Tools
+## 7. Brokered tools
 
-### 7.1 Shims & Broker Protocol
+### 7.1 Shims and the broker protocol
 
 * `/run/stopit/bin` (RO, front of `PATH`) holds one symbolic link per shim the profile has (`jj`, `git`, `stopit-grant`, user-defined shims), each to the trampoline at `/run/stopit/shim`. Each profile has a directory of its own in the session directory's `shims/`, made in a temporary directory and renamed into place, so a sandbox sees only its own shims and never part of them. A sandbox without shims gets an empty directory. The trampoline is a static program of a few kilobytes without `std`, built from `shim/trampoline.rs` with the rest of stopit, for x86_64 and aarch64. It needs no loader or library, so it runs in any sandbox. It takes the shim's name from the path it was run as (`AT_EXECFN`), not `argv[0]`, so callers that set `argv[0]` differently (`exec -a`, some spawn APIs) still reach the right shim. The name is not a security boundary. A caller can make a link of any name, or talk to the socket itself. It turns `<name> <args...>` into the command that runs the provisioned stopit (§2.1) followed by `__shim <name> -- <args...>`, which stopit writes into its copy of the trampoline when it provisions a session. The copy as built holds a marker there instead, and refuses to run until the buffer starts with the absolute path of a program.
 * `stopit __shim` sends its stdin, stdout, stderr and an `O_PATH` descriptor of its working directory over `SCM_RIGHTS` to `/run/stopit/broker.sock`, then a request with the shim's name, its arguments and the working directory as the sandbox sees it. It passes on `SIGINT`, `SIGQUIT`, `SIGTERM` and `SIGHUP`, and exits with the status the broker sends back, or with 125 and a message when it cannot reach the broker or the broker cannot run the command.
@@ -703,13 +703,13 @@ rules      = [
 * Shim names `stopit` and `stopit-grant` are reserved.
 * Each entry in a rule's `subcommand` list is one or more tokens separated by single spaces (`[a-z0-9][a-z0-9_-]*`); the last token may be `*` (e.g. `bookmark *`). A lone `*` is rejected (use `default`), and flags are not subcommands.
 
-### 7.2 Global-Flag Parsing
+### 7.2 Global-flag parsing
 
 So far there are no handlers. The `vcs` shims are declarative like every other shim (§7.1). The words before the first flag pick a rule, and the refused flags below apply anywhere in `argv`, in every spelling §7.1 lists. A global flag before the subcommand sends the call to the default, which asks. The rest of this section is the plan.
 
 Policy is matched after parsing each tool's global options with the tool's own grammar, so that flags anywhere in `argv` are seen. The `vcs` provider's handlers implement this for `jj` (`-R/--repository`, `--at-op`, `--ignore-working-copy`, `--config`, `--config-file`, `--config-toml`) and `git` (`-C`, `-c`, `--git-dir`, `--work-tree`, `--exec-path`, `--config-env`, `--upload-pack`, `--receive-pack`). Config-injection flags are denied outright. Declarative shims (from `config`/`script` providers) match on the first non-flag arguments and `deny_flags`.
 
-### 7.3 The `vcs` Provider
+### 7.3 The `vcs` provider
 
 ```toml
 [[provider]]
@@ -730,7 +730,7 @@ signing = false         # SSH commit signing in vcs.local (§7.3.4)
 * **No editor, pager or signing program.** The caller holds the terminal, so a pager or editor that can run commands would give it a shell in `vcs.local`, whose writes to `.git` and `.jj` host tools trust later. A signing program reads configuration of its own. git gets `GIT_EDITOR=false`, `GIT_SEQUENCE_EDITOR=false`, `GIT_PAGER=cat` and `--no-pager`, and jj `JJ_EDITOR=false` and `--no-pager`. So `git commit` without `-m`, or `jj describe` without `-m`, fails. git also gets `gpg.program`, `gpg.ssh.program` and `gpg.x509.program` set to `false` and `commit.gpgSign`, `tag.gpgSign` and `log.showSignature` off, and both tools get a `GNUPGHOME` where nothing is. So `git commit -S` fails. The `jj` shim refuses `--tool`, `-i` and `--interactive`, which run a diff or merge tool.
 * **Remote commands** are refused whatever `fetch` and `push` say, and both profiles have no network, so a call the rules miss cannot reach a remote over the network either. A remote at a local path the profile can see stays reachable. `fetch = "allow"`, `push = "allow"` and `signing = true` are accepted and warned about, since they have no effect yet. Fetch and push run on the host.
 
-#### 7.3.1 Layout Resolution
+#### 7.3.1 Layout resolution
 
 The code so far reads the layout itself and runs no tool (Implemented so far, above). The plan follows. The provider cannot assume `{workspace}/.git` and `{workspace}/.jj` are self-contained directories. At session start it resolves the actual on-disk layout by asking the tools' own discovery logic (`git rev-parse --git-dir --git-common-dir --show-toplevel`, jj's workspace loading via `jj-lib`) on the host, never by trusting path strings written inside the workspace without validation:
 
@@ -762,7 +762,7 @@ Pointer files (`.git` gitfiles, `.jj/repo`) live in the agent-writable workspace
 
 * **Shims** `jj` and `git` (per `tools`) with the default policy (§7.4) and the runtime handlers (flag parsing, remote resolution, push URL/commit resolution for prompts).
 
-#### 7.3.3 Remote Access (`fetch` / `push`)
+#### 7.3.3 Remote access (`fetch` and `push`)
 
 `fetch` and `push` each take `"deny" | "ask" | "allow"` (default `"ask"` for both). They decide which remote-touching commands are routed to `vcs.remote`, and with which decision:
 
@@ -791,7 +791,7 @@ The `ssh` client binary must be present in the tool environment granted by the u
 
 HTTPS remotes (proxy environment plus a credential helper) are future work.
 
-#### 7.3.4 Commit Signing (`signing`)
+#### 7.3.4 Commit signing (`signing`)
 
 With `signing = true`, `vcs.local` (and `vcs.remote`) get a filtered SSH agent socket offering **only the signing key**, and no network. The supervisor reads the signing configuration from the user's host config (git: `gpg.format = ssh`, `user.signingKey`, `commit.gpgSign`; jj: `signing.backend = "ssh"`, `signing.key`, `signing.behavior`) and carries it into the safe git/jj configs. `ssh-keygen` must be present in the tool environment.
 
@@ -803,7 +803,7 @@ With `signing = true`, `vcs.local` (and `vcs.remote`) get a filtered SSH agent s
   * `JJ_CONFIG=/run/stopit/jjconfig-safe.toml` (`ui.pager=":builtin"`, external diff/merge tools and `fix.tools` disabled).
 * Brokered commands see the **host** version of protected files (only approved content exists there).
 
-### 7.4 Default `vcs` Shim Policy
+### 7.4 Default `vcs` shim policy
 
 | Tool | Subcommand | Decision | Profile | Notes |
 | :--- | :--- | :--- | :--- | :--- |
@@ -819,7 +819,7 @@ With `signing = true`, `vcs.local` (and `vcs.remote`) get a filtered SSH agent s
 | any | Config-injection flags (§7.2). For git also `--exec` (another name for `--upload-pack` and `--receive-pack`) and `--output` (writes to any path the profile can write), and for jj `--tool`, `-i` and `--interactive` | Deny | | |
 | any | Anything unlisted, and anything with a flag before the subcommand | Ask | `vcs.local` | |
 
-### 7.5 `stopit-grant` (Ad-Hoc Capability Requests)
+### 7.5 `stopit-grant` (ad-hoc capability requests)
 
 ```
 stopit-grant +net:<domain> +rw:<path> +secret:<NAME> +ssh-agent:<key> -- <cmd…>
@@ -829,7 +829,7 @@ Always **Ask**. Runs `<cmd>` in a temporary profile derived from the caller's pl
 * `+secret:<NAME>` injects a named secret (from the user's global config or a host secret store) as an environment variable for that command only, e.g. `CARGO_REGISTRY_TOKEN` for `cargo publish`.
 * `+ssh-agent:<key>` exposes a filtered SSH agent offering only the named key, with per-use confirmation.
 
-### 7.6 Worked Example: Running an Agent Harness
+### 7.6 Worked example of an agent harness
 
 There is no harness-specific feature; profiles, providers and shims cover it. To give a harness its credentials and model API access while running every shell it spawns in the stricter `main` profile:
 
@@ -924,7 +924,7 @@ path_prepend = ["/nix/store/…/bin"]
 
 ---
 
-## 10. Resource Limits (Optional, Top-Level)
+## 10. Resource limits (optional, top-level)
 
 ```toml
 [limits]
@@ -942,7 +942,7 @@ Session-wide, so not a provider setting. Off unless configured. Mitigates forkbo
 
 ---
 
-## 11. Known Limitations & Future Work
+## 11. Known limitations and future work
 
 * **Nested repository creation.** The sandbox can create `subdir/.git` (or `.jj`) with hostile config (e.g. `core.fsmonitor`) that a shell prompt running `git status` on `cd` would execute on the host. Not mitigated in v1. Future fix: full-workspace FUSE (below) can intercept `mkdir .git` anywhere.
 * **Ignored `close()` errors** make denied in-place writes look successful to some programs (§4.3).
@@ -1012,7 +1012,7 @@ Session-wide, so not a provider setting. Off unless configured. Mitigates forkbo
 
 ---
 
-## 12. Phased Implementation Plan & Verification
+## 12. Phased implementation plan and verification
 
 Where the phases stand:
 
@@ -1022,35 +1022,35 @@ Where the phases stand:
 * Phase 4 is not built. Protected files are read-only.
 * Phase 5 has the proxy (SNI matching, an uploads list in the startup summary) and `[limits]` (§10). The `nix` provider is not built.
 
-### Phase 1: Scaffold, Configuration, Providers, `BwrapEngine`
+### Phase 1. Scaffold, configuration, providers, `BwrapEngine`
 * Cargo package (a library plus the `stopit` binary) + `flake.nix` dev environment (Rust toolchain, bubblewrap, jujutsu, git).
 * Config parser: top-level settings, bases, profiles (`inherit`), `[[provider]]` with `config` and `script` types, manifest v1, merging and precedence (§3.5).
 * Path modes `masked`/`ro`/`rw`/`ephemeral`; env; network `none`/`loopback`.
 * `SandboxSpec` → `BwrapEngine`; `stopit __init` (controlling terminal, FD hygiene, Landlock, seccomp).
 * Startup summary of widening grants.
 
-### Phase 2: PTY Proxy, Output Filter & Approval Overlay
+### Phase 2. PTY proxy, output filter and approval overlay
 * PTY allocation, escape-sequence allowlist, window-size forwarding.
 * Overlay with arming delay, input flush, supervisor marker, four-way decisions, approval timeout setting.
 * "Ask" decisions are only enabled once this phase lands.
 
-### Phase 3: Broker, Shims & the `vcs` Provider
+### Phase 3. Broker, shims and the `vcs` provider
 * Per-sandbox broker sockets, `SCM_RIGHTS`, cwd verification, signal/exit relay, declarative shim rules, `BrokerHandler`.
 * `vcs` provider: layout resolution (git worktrees, jj secondary workspaces, subdirectory workspaces), masking, `vcs.ro`/`vcs.local`/`vcs.remote`, `jj`/`git` handlers.
 * Remote access: `fetch`/`push` settings, remote resolution, `stopit __connect` tunnel, filtered SSH agent, synthesized `ssh_config`/`known_hosts`; `signing`.
 * `stopit-grant` with `+net`, `+rw`, `+secret`, `+ssh-agent`.
 
-### Phase 4: Protected Files
+### Phase 4. Protected files
 * Narrow FUSE shadow filesystem, prompt in `flush`, in-place host writes, conflict detection.
 * Seccomp rename user-notify handling.
 * Persist-to-config (`approvals` provider via `toml_edit`); agent instruction snippet generation; `stopit log`.
 
-### Phase 5: Network Proxy, Resource Limits, More Providers
+### Phase 5. Network proxy, resource limits, more providers
 * Proxy mode with SNI/CONNECT matching and exfiltration tagging.
 * `[limits]` via transient cgroup scopes.
 * `nix` provider.
 
-### Escape & Behavior Test Suite (`tests/escape_suite.rs`)
+### Escape and behavior test suite (`tests/escape_suite.rs`)
 1. `umount` / `mount -o remount,rw` on masked and RO paths → `EPERM`.
 2. `mv`/`rm -rf` on masked `/workspace/.git` → `EBUSY`/`EROFS`.
 3. `unshare -U -m` → fails; `clone3` → `ENOSYS`; `io_uring_setup` → `EPERM`; `socket(AF_VSOCK, …)` → fails.
@@ -1070,7 +1070,7 @@ Where the phases stand:
 
 ---
 
-## Appendix A: `base = "default"` Written Out Explicitly
+## Appendix A. `base = "default"` written out
 
 ```toml
 base = "none"
@@ -1178,7 +1178,7 @@ The declarative form above reproduces the `vcs` provider's *grants*; its runtime
 
 ---
 
-## Appendix B: Changes from Draft v1
+## Appendix B. Changes from draft v1
 
 * Added bases (`none`/`default`), the explicit additive policy model (I5), path modes including `protected` and `ephemeral`, profiles, and Appendix A.
 * **Provider-centric configuration:** every grant (filesystem, system mounts, env, network, shims, hardening opt-outs, contributed profiles) comes from a `[[provider]]` (`config`, `script`, `vcs`, later `nix`). Only `base`, `[workspace]`, `[limits]`, `[approval]`, `[terminal]` and `[profiles.*]` remain top-level. Explicit merge/precedence rules.
