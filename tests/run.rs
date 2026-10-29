@@ -3288,21 +3288,34 @@ fn a_standalone_run_blocks_clipboard_asks_and_says_so() {
 
 // --- network = "full" through pasta ---
 
-/// The host's `pasta`, or `None` (the test is skipped) if `PATH` has none.
+/// The host's `pasta`, or `None` if `PATH` has none, and the test is
+/// skipped. With `STOPIT_REQUIRE_PASTA=1` the test fails instead.
 fn host_pasta() -> Option<PathBuf> {
     let found = std::env::var_os("PATH").and_then(|p| stopit::net::find_pasta_in(&p));
     if found.is_none() {
+        assert!(
+            std::env::var_os("STOPIT_REQUIRE_PASTA").is_none_or(|v| v != "1"),
+            "no pasta in PATH, and STOPIT_REQUIRE_PASTA=1"
+        );
         eprintln!("skipping: no pasta in PATH");
     }
     found
+}
+
+/// Whether the sandbox of [`shell_config`], which sees `/usr/bin` and
+/// `/bin` in its `PATH`, has `name`.
+fn sandbox_has(name: &str) -> bool {
+    ["/usr/bin", "/bin"]
+        .iter()
+        .any(|dir| Path::new(dir).join(name).exists())
 }
 
 /// [`shell_config`] with `network = "full"`, if the host has a shell,
 /// bash and pasta.
 fn full_network_config() -> Option<String> {
     let config = shell_config()?;
-    if !Path::new("/bin/bash").exists() || !Path::new("/usr/bin/timeout").exists() {
-        eprintln!("skipping: no /bin/bash or /usr/bin/timeout on the host");
+    if !sandbox_has("bash") || !sandbox_has("timeout") {
+        eprintln!("skipping: no bash or timeout in /usr/bin or /bin on the host");
         return None;
     }
     host_pasta()?;
@@ -3349,6 +3362,41 @@ fn full_network_reaches_out_but_not_the_host_loopback() {
     if let Some(gw) = gateway {
         script += &try_connect("gateway", &gw.to_string(), v4_port);
     }
+    // UDP to the host's loopback goes nowhere either.
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    udp.set_nonblocking(true).unwrap();
+    script += &format!(
+        "echo hi > /dev/udp/127.0.0.1/{} 2>/dev/null; ",
+        udp.local_addr().unwrap().port()
+    );
+    // Nor does a host abstract socket, the namespace's own.
+    let abstract_name = format!("stopit-test-{}", std::process::id());
+    let abstract_listener = std::os::unix::net::UnixListener::bind_addr(
+        &<std::os::unix::net::SocketAddr as std::os::linux::net::SocketAddrExt>::from_abstract_name(
+            abstract_name.as_bytes(),
+        ).unwrap(),
+    )
+    .unwrap();
+    abstract_listener.set_nonblocking(true).unwrap();
+    if sandbox_has("python3") {
+        script += &format!(
+            "python3 -c 'import socket; s = socket.socket(socket.AF_UNIX)\n\
+             try:\n s.connect(\"\\0{abstract_name}\"); print(\"abstract reached\")\n\
+             except OSError: print(\"abstract refused\")'; "
+        );
+    }
+    // The sandbox cannot change its network, and its user namespace maps
+    // one id.
+    let ip = ["/usr/bin/ip", "/bin/ip"]
+        .into_iter()
+        .find(|p| Path::new(p).exists());
+    if let Some(ip) = ip {
+        script += &format!(
+            "if {ip} link set lo down 2>/dev/null; then echo lo changed; \
+             else echo lo kept; fi; "
+        );
+    }
+    script += "wc -l < /proc/self/uid_map; ";
     script += "cat /etc/resolv.conf; tail -n +3 /proc/net/dev | cut -d: -f1";
     let out = output(
         s.stopit(&["run", "--quiet", "/bin/bash", "-c", &script]),
@@ -3366,6 +3414,15 @@ fn full_network_reaches_out_but_not_the_host_loopback() {
     // Nothing reached the listeners either.
     v4.set_nonblocking(true).unwrap();
     assert!(v4.accept().is_err());
+    assert!(udp.recv(&mut [0u8; 16]).is_err());
+    assert!(abstract_listener.accept().is_err());
+    if sandbox_has("python3") {
+        assert!(shown.contains("abstract refused"), "{shown}");
+    }
+    if ip.is_some() {
+        assert!(shown.contains("lo kept"), "{shown}");
+    }
+    assert!(shown.contains("\n1\nnameserver"), "{shown}");
     // The sandbox's resolver is pasta's forwarder, and it has an interface
     // besides `lo`.
     assert!(shown.contains("nameserver 169.254.1.1\n"), "{shown}");
@@ -3378,6 +3435,42 @@ fn full_network_reaches_out_but_not_the_host_loopback() {
     assert!(interfaces.contains(&"lo"), "{shown}");
     assert!(interfaces.len() >= 2, "{shown}");
     assert!(s.no_session_left());
+}
+
+#[test]
+fn full_network_is_in_the_summary() {
+    let Some(config) = full_network_config() else {
+        return;
+    };
+    let s = Setup::with_config(&config);
+    let out = output(s.stopit(&["run", "/bin/sh", "-c", "true"]), b"");
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert!(
+        stderr(&out).contains("stopit:   network  full\n"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_shared_network_namespace_keeps_the_hosts_resolver() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Ok(host) = fs::read_to_string("/etc/resolv.conf") else {
+        return;
+    };
+    // No pasta needed: the sandbox is in the host's network namespace.
+    let s = Setup::with_config(&format!(
+        "{config}network.mode = \"full\"\nsandbox.share = [\"net\"]\n\
+         [[provider]]\ntype = \"config\"\nname = \"dns\"\n[provider.sandbox]\n\
+         fs.ro = [\"/etc/resolv.conf\"]\n"
+    ));
+    let out = output(
+        s.stopit(&["run", "--quiet", "/bin/sh", "-c", "cat /etc/resolv.conf"]),
+        b"",
+    );
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), host);
 }
 
 #[test]

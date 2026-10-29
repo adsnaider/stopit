@@ -309,8 +309,8 @@ pub enum TerminalSession {
 }
 
 /// Whether stopit makes the sandbox's network namespace itself, for pasta
-/// to join ([`crate::net`]): with `network = "full"`, unless the profile
-/// shares the host's.
+/// to join ([`crate::net`]). It does with `network = "full"`, unless the
+/// profile shares the host's.
 pub fn own_network_namespace(spec: &SandboxSpec) -> bool {
     spec.network == NetworkSpec::Full && !spec.namespaces.is_shared(ShareableNamespace::Net)
 }
@@ -526,8 +526,8 @@ impl BwrapCommand {
         &self.command
     }
 
-    /// Whether the sandbox needs pasta for its network: bwrap then waits
-    /// on `--block-fd` until [`crate::net::start_pasta`] lets it go on.
+    /// Whether the sandbox needs pasta for its network. bwrap then waits on
+    /// `--block-fd` until [`crate::net::start_pasta`] lets it go on.
     pub fn needs_pasta(&self) -> bool {
         self.own_netns
     }
@@ -586,7 +586,10 @@ impl BwrapCommand {
     ///
     /// When the sandbox [needs pasta](Self::needs_pasta), bwrap also gets
     /// `--block-fd`, and the write end of that pipe is returned, for
-    /// [`crate::net::start_pasta`].
+    /// [`crate::net::start_pasta`]. bwrap goes on once a byte arrives, and
+    /// also once every copy of the write end is closed. So if pasta fails,
+    /// kill bwrap before dropping it. bwrap then has no network but an `lo`
+    /// that is down, never the host's.
     pub fn into_command_with_status(self) -> Result<(Command, File, Option<OwnedFd>), BwrapError> {
         let block_overhead = if self.own_netns {
             BLOCK_ARGV_OVERHEAD
@@ -644,15 +647,21 @@ impl BwrapCommand {
             command.arg("--block-fd").arg(bfd.as_raw_fd().to_string());
         }
         // The id maps for the user namespace of `own_netns`, built before
-        // the fork so the child never allocates.
+        // the fork so the child never allocates. The kernel checks the
+        // writer's effective ids.
         let netns_maps = self.own_netns.then(|| {
-            let uid = rustix::process::getuid().as_raw();
-            let gid = rustix::process::getgid().as_raw();
+            let uid = rustix::process::geteuid().as_raw();
+            let gid = rustix::process::getegid().as_raw();
             (
                 CString::new(format!("{uid} {uid} 1")).expect("no NUL in numbers"),
                 CString::new(format!("{gid} {gid} 1")).expect("no NUL in numbers"),
             )
         });
+        // Whether this process is not dumpable, as `stopit server` makes
+        // itself. Its `/proc/self` files then belong to root, and the child
+        // cannot write its maps without being dumpable for that moment.
+        // SAFETY: a plain prctl query.
+        let undumpable = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) } == 0;
         command
             .arg("--args")
             .arg(self.args_fd.as_raw_fd().to_string())
@@ -685,7 +694,7 @@ impl BwrapCommand {
         // `N` with `dup2`, and clears close-on-exec on each `O_PATH` bind
         // descriptor and any status or block pipe descriptor. Last, for
         // `own_netns`, it enters a new user and network namespace, mapping
-        // only the caller's ids, with `prctl`, `unshare`, `open` and
+        // only the caller's ids, with `unshare`, `prctl`, `open` and
         // `write`.
         unsafe {
             command.pre_exec(move || {
@@ -709,21 +718,24 @@ impl BwrapCommand {
                     fcntl_setfd(fd, FdFlags::empty())?;
                 }
                 if let Some((uid_map, gid_map)) = &netns_maps {
-                    // A non-dumpable process (`stopit server`) has its
-                    // `/proc/self` files owned by root, so it could not write
-                    // its maps. `exec` makes bwrap dumpable a moment later
-                    // anyway.
-                    if libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) != 0 {
+                    if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) != 0 {
                         return Err(io::Error::last_os_error());
                     }
-                    if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) != 0 {
+                    // Dumpable only for the three writes, so no process of
+                    // the user can read the server's memory, which this
+                    // child still holds a copy of, any longer than that.
+                    if undumpable && libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) != 0 {
                         return Err(io::Error::last_os_error());
                     }
                     // A process without CAP_SETGID in the parent namespace
                     // may map its gid only once `setgroups` is denied.
-                    write_proc(c"/proc/self/setgroups", b"deny")?;
-                    write_proc(c"/proc/self/uid_map", uid_map.as_bytes())?;
-                    write_proc(c"/proc/self/gid_map", gid_map.as_bytes())?;
+                    let written = write_proc(c"/proc/self/setgroups", b"deny")
+                        .and_then(|()| write_proc(c"/proc/self/uid_map", uid_map.as_bytes()))
+                        .and_then(|()| write_proc(c"/proc/self/gid_map", gid_map.as_bytes()));
+                    if undumpable && libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    written?;
                 }
                 Ok(())
             });
@@ -733,11 +745,11 @@ impl BwrapCommand {
 }
 
 /// Writes `data` to the `/proc` file `path` in one `write`, as files such
-/// as `uid_map` need. Async-signal-safe: it allocates nothing.
+/// as `uid_map` need. It allocates nothing, so it is async-signal-safe.
 fn write_proc(path: &std::ffi::CStr, data: &[u8]) -> io::Result<()> {
     let fd = rustix::fs::open(path, OFlags::WRONLY | OFlags::CLOEXEC, Mode::empty())?;
     if rustix::io::write(&fd, data)? != data.len() {
-        return Err(io::Error::other("short write to a /proc file"));
+        return Err(io::Error::from_raw_os_error(libc::EIO));
     }
     Ok(())
 }

@@ -1372,13 +1372,9 @@ fn wait_foreground(
     if let Some(t) = &mut terminal {
         t.enter_raw().map_err(RunError::Pty)?;
     }
-    let mut child = command.spawn().map_err(|e| {
-        if e.kind() == io::ErrorKind::NotFound {
-            RunError::BwrapMissing
-        } else {
-            RunError::Spawn(e)
-        }
-    })?;
+    let mut child = command
+        .spawn()
+        .map_err(|e| spawn_error(e, pasta.is_some()))?;
     // Close our copies of the status pipe's write end, so `status_reader`
     // sees EOF when bwrap finishes or execs `__init`, and of the slaves
     // given to the sandbox.
@@ -1444,6 +1440,27 @@ fn wait_foreground(
     }
     let json_status = read_nonblocking_status(status_reader);
     Ok(bwrap_exit_code(status, &json_status))
+}
+
+/// The error for bwrap failing to start with `e`. The bwrap process's own
+/// setup before `exec` fails the same way, so with `own_netns` (a sandbox
+/// needing pasta), a permission error while bwrap is there means the
+/// network namespace could not be made.
+pub(crate) fn spawn_error(e: io::Error, own_netns: bool) -> RunError {
+    let bwrap_found = || {
+        std::env::var_os("PATH")
+            .and_then(|path| crate::net::find_program_in(crate::bwrap::BWRAP, &path))
+            .is_some()
+    };
+    match e.raw_os_error() {
+        Some(libc::ENOENT) if !bwrap_found() => RunError::BwrapMissing,
+        Some(libc::EPERM | libc::EACCES | libc::ENOSPC | libc::EUSERS)
+            if own_netns && bwrap_found() =>
+        {
+            RunError::Network(crate::net::NetError::Namespace(e))
+        }
+        _ => RunError::Spawn(e),
+    }
 }
 
 /// "N clipboard writes blocked", for `denied` writes.

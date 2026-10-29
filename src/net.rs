@@ -3,9 +3,10 @@
 //! The sandbox gets a network namespace of its own, which pasta (from
 //! passt) connects to the host's network. pasta forwards the sandbox's
 //! TCP and UDP traffic through sockets on the host, so the sandbox reaches
-//! whatever the host reaches, except the host's loopback: `--no-map-gw`
-//! keeps the gateway address from standing for it. No port of the host or
-//! of the sandbox is forwarded to the other side.
+//! whatever the host reaches. The exception is the host's loopback, since
+//! `--no-map-gw` keeps the gateway address from standing for it. Only the
+//! DNS forwarder reaches the host's resolver there. pasta forwards no
+//! port of the host or of the sandbox to the other side.
 //!
 //! bwrap cannot create a network namespace pasta may join, because
 //! `--disable-userns` puts the sandbox in a user namespace nested below the
@@ -15,17 +16,20 @@
 //! ([`BwrapCommand`](crate::bwrap::BwrapCommand)). bwrap then waits on
 //! `--block-fd` while [`start_pasta`] runs pasta against bwrap's pid. pasta
 //! joins both namespaces, configures the sandbox's interface with the
-//! host's addresses and routes, and goes to the background, where it stays
-//! until bwrap's namespaces are gone. Only then may bwrap go on.
+//! host's addresses and routes, and goes to the background. It checks
+//! every second whether bwrap still runs, and exits within a second or so
+//! of bwrap. Only once pasta is in the background may bwrap go on.
 //!
-//! DNS goes to [`DNS_FORWARD`], which pasta passes to the host's resolver
-//! from the host's side, so a resolver on the host's loopback works too.
-//! The sandbox's `/etc/resolv.conf` names it ([`crate::etc`]).
+//! DNS goes to [`DNS_FORWARD`], which pasta passes to the host's first
+//! nameserver from the host's side, so a resolver on the host's loopback
+//! works too. The sandbox's `/etc/resolv.conf` names it ([`crate::etc`]).
+//! The forwarder has an IPv4 address only.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Seek};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -55,6 +59,13 @@ pub enum NetError {
     )]
     PastaMissing,
 
+    /// The bwrap process cannot make its user and network namespaces.
+    #[error(
+        "cannot make the sandbox's network namespace: {0}; network = \"full\" needs \
+         unprivileged user namespaces, which some systems restrict (Ubuntu's AppArmor, for one)"
+    )]
+    Namespace(#[source] io::Error),
+
     /// pasta could not be run or waited for.
     #[error("cannot run pasta {path:?}: {source}")]
     Spawn {
@@ -70,13 +81,21 @@ pub enum NetError {
     Failed(String),
 }
 
-/// The pasta in `path`, a `PATH`-like list of directories: the first
-/// executable regular file named [`PASTA`].
+/// The first executable regular file named [`PASTA`] in the directories of
+/// `path`, a `PATH`-like list. Only absolute entries count, since a
+/// relative one names a directory below the current one, often a
+/// workspace a sandbox can write.
 pub fn find_pasta_in(path: &OsStr) -> Option<PathBuf> {
+    find_program_in(PASTA, path)
+}
+
+/// The first executable regular file named `name` in the absolute
+/// directories of `path`, a `PATH`-like list.
+pub fn find_program_in(name: &str, path: &OsStr) -> Option<PathBuf> {
     path.as_bytes()
         .split(|&b| b == b':')
-        .filter(|dir| !dir.is_empty())
-        .map(|dir| Path::new(OsStr::from_bytes(dir)).join(PASTA))
+        .filter(|dir| dir.starts_with(b"/"))
+        .map(|dir| Path::new(OsStr::from_bytes(dir)).join(name))
         .find(|candidate| is_executable(candidate))
 }
 
@@ -87,10 +106,10 @@ pub fn find_pasta() -> Result<PathBuf, NetError> {
         .ok_or(NetError::PastaMissing)
 }
 
+/// Whether `path` is a regular file this process may execute.
 fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.metadata()
-        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    path.metadata().is_ok_and(|m| m.is_file())
+        && rustix::fs::access(path, rustix::fs::Access::EXEC_OK).is_ok()
 }
 
 /// pasta's arguments for the namespaces of process `pid`.
@@ -123,8 +142,8 @@ pub fn pasta_args(pid: u32) -> Vec<OsString> {
 /// Runs `pasta` for the namespaces of bwrap process `pid`, then lets bwrap
 /// go on by writing to `block`, its `--block-fd`. pasta goes to the
 /// background once the network is up, so its exit with status 0 is the
-/// sign. Fails if pasta does not, within [`PASTA_TIMEOUT`]; bwrap is then
-/// left blocked, for the caller to kill.
+/// sign. Fails unless pasta exits with 0 within [`PASTA_TIMEOUT`]. bwrap is
+/// then left blocked, for the caller to kill.
 pub fn start_pasta(pasta: &Path, pid: u32, block: &OwnedFd) -> Result<(), NetError> {
     start_pasta_within(pasta, pid, block, PASTA_TIMEOUT)
 }
@@ -143,13 +162,31 @@ fn start_pasta_within(
     // background keeps what it inherited open, and a pipe would never end.
     let output = rustix::fs::memfd_create("stopit-pasta", rustix::fs::MemfdFlags::CLOEXEC)
         .map_err(|e| spawn_error(e.into()))?;
-    let mut child = Command::new(pasta)
+    let mut command = Command::new(pasta);
+    command
         .args(pasta_args(pid))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(output.try_clone().map_err(spawn_error)?))
-        .spawn()
-        .map_err(spawn_error)?;
+        // Out of the terminal's process group, so a Ctrl-C meant for the
+        // sandbox does not end pasta while it sets the network up.
+        .process_group(0);
+    // SAFETY: `close_range` is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            // Nothing of stopit's above stdio, as for bwrap.
+            if libc::close_range(
+                3,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC as libc::c_int,
+            ) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(spawn_error)?;
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait().map_err(spawn_error)? {
@@ -220,8 +257,10 @@ mod tests {
         let path = [&dir_entry, &not_exec, &good, &later]
             .map(|d| d.to_str().unwrap().to_owned())
             .join(":");
-        // Empty entries do not mean the current directory.
-        let path = format!("::{path}:");
+        // Empty and relative entries do not mean the current directory.
+        let relative = good.strip_prefix(root.path()).unwrap().to_owned();
+        let path = format!("::{}:{path}:", relative.display());
+        assert_eq!(find_pasta_in(relative.as_os_str()), None, "{relative:?}");
         assert_eq!(find_pasta_in(OsStr::new(&path)), Some(good.join(PASTA)));
         assert_eq!(find_pasta_in(OsStr::new("")), None);
         assert_eq!(find_pasta_in(OsStr::new(dir_entry.to_str().unwrap())), None);

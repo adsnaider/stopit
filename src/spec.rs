@@ -1120,6 +1120,13 @@ pub enum ReservedReason {
     /// The path is inside a reserved directory.
     #[error("is inside the reserved path {0:?}")]
     InsideReserved(PathBuf),
+    /// The path is or contains `/etc/resolv.conf`, which stopit writes
+    /// itself with `network = "full"`.
+    #[error(
+        "is or contains \"/etc/resolv.conf\", which stopit writes itself with network = \"full\", \
+         naming pasta's DNS forwarder; drop the rule"
+    )]
+    CoversResolvConf,
     /// The sandbox home is the workspace mount.
     #[error("is the same as the workspace mount")]
     SameAsWorkspace,
@@ -1163,13 +1170,20 @@ fn reserved_dirs() -> impl Iterator<Item = &'static str> {
 ///
 /// Every synthesized `/etc` file is checked whether or not the profile
 /// enables it (`system.etc`), so a mount's validity does not depend on it.
+/// `/etc/resolv.conf` is the exception: it is reserved only when
+/// `resolv_reserved`, with `network = "full"` in a network namespace of
+/// stopit's own, since a profile sharing the host's namespace needs the
+/// host's file.
 ///
 /// This runs after mount planning, because glob rules only have concrete
 /// destinations then. It applies to every mode, `masked` and `protected`
 /// included: allowing some modes would buy little, since these paths are
 /// stopit's own and no rule has a reason to touch them, and one rule for all
 /// modes is simpler to state and to check.
-fn check_mount_destinations(mounts: &[PlannedMount]) -> Result<(), SpecError> {
+fn check_mount_destinations(
+    mounts: &[PlannedMount],
+    resolv_reserved: bool,
+) -> Result<(), SpecError> {
     // Each reserved path, and whether nothing may be inside it (true for the
     // system directories, false for the synthesized files).
     let reserved: Vec<(PathBuf, bool)> = SYSTEM_DIRS
@@ -1178,13 +1192,17 @@ fn check_mount_destinations(mounts: &[PlannedMount]) -> Result<(), SpecError> {
         .chain(
             EtcFile::ALL
                 .iter()
+                .filter(|&&f| resolv_reserved || f != EtcFile::ResolvConf)
                 .map(|f| (Path::new(ETC_DIR).join(f.as_str()), false)),
         )
         .collect();
+    let resolv_conf = Path::new(ETC_DIR).join(EtcFile::ResolvConf.as_str());
     for m in mounts {
         let dest = m.sandbox.as_path();
         let collision = reserved.iter().find_map(|(r, is_dir)| {
-            if r.starts_with(dest) {
+            if *r == resolv_conf && r.starts_with(dest) {
+                Some(ReservedReason::CoversResolvConf)
+            } else if r.starts_with(dest) {
                 Some(ReservedReason::CoversReserved(r.clone()))
             } else if *is_dir && dest.starts_with(r) {
                 Some(ReservedReason::InsideReserved(r.clone()))
@@ -1603,7 +1621,7 @@ fn mask_rw_sockets(
         mounts.retain(|m| !replace_rw.contains(&m.sandbox));
     }
     let added: Vec<PlannedMount> = added.into_values().collect();
-    debug_assert!(check_mount_destinations(&added).is_ok());
+    debug_assert!(check_mount_destinations(&added, true).is_ok());
     mounts.extend(added);
     sort_plan(&mut mounts);
     mounts
@@ -1813,7 +1831,7 @@ fn check_state_dirs(
         return Ok(mounts);
     }
     let masks: Vec<PlannedMount> = masks.into_values().collect();
-    debug_assert!(check_mount_destinations(&masks).is_ok());
+    debug_assert!(check_mount_destinations(&masks, true).is_ok());
     mounts.extend(masks);
     sort_plan(&mut mounts);
     Ok(mounts)
@@ -1942,7 +1960,7 @@ fn protect_sources(
         return mounts;
     }
     let added: Vec<PlannedMount> = added.into_values().collect();
-    debug_assert!(check_mount_destinations(&added).is_ok());
+    debug_assert!(check_mount_destinations(&added, true).is_ok());
     // Only the `rw` mount exposing P can lie at an added path: its own.
     mounts.retain(|m| added.iter().all(|a| a.sandbox != m.sandbox));
     mounts.extend(added);
@@ -2088,7 +2106,7 @@ fn cover_restricted_exposure(
         warnings.push(SpecWarning::RestrictedContentExposed(Box::new(x)));
     }
     let covers: Vec<PlannedMount> = covers.into_values().collect();
-    debug_assert!(check_mount_destinations(&covers).is_ok());
+    debug_assert!(check_mount_destinations(&covers, true).is_ok());
     // Only an exposing mount can lie at a covered path: its own.
     mounts.retain(|m| covers.iter().all(|c| c.sandbox != m.sandbox));
     mounts.extend(covers);
@@ -2956,8 +2974,17 @@ fn plan_profile(
     let home = grants.system.home.clone().unwrap_or_default();
     check_reserved_paths(ctx.workspace_sandbox(), Path::new(home.as_str()))?;
     let plan = plan_mounts(&grants.fs, &ctx.with_sandbox_home(&home))?;
-    check_mount_destinations(&plan.mounts)?;
+    check_mount_destinations(&plan.mounts, synthesizes_resolv_conf(grants))?;
     Ok(PlannedProfile { home, plan })
+}
+
+/// Whether a profile with `grants` gets the synthesized
+/// `/etc/resolv.conf`: with `network = "full"` in a network namespace of
+/// stopit's own, as [`crate::bwrap::own_network_namespace`] decides from
+/// the compiled spec.
+fn synthesizes_resolv_conf(grants: &EffectiveGrants) -> bool {
+    grants.network.mode == NetworkMode::Full
+        && !grants.sandbox.share.contains(&ShareableNamespace::Net)
 }
 
 /// The second stage of compiling a profile: checks the planned mounts'
@@ -3003,9 +3030,8 @@ fn finish_profile(
     let inherited_domains = parent.map(|p| &p.network.allow_domains);
     let network = network_spec(&grants.network, inherited_domains, &mut warnings);
     let mut etc = grants.system.etc.clone();
-    // pasta's DNS forwarder is the sandbox's resolver, in a network
-    // namespace of stopit's own (`crate::bwrap::own_network_namespace`).
-    if network == NetworkSpec::Full && !grants.sandbox.share.contains(&ShareableNamespace::Net) {
+    // pasta's DNS forwarder is the sandbox's resolver.
+    if synthesizes_resolv_conf(grants) {
         etc.insert(EtcFile::ResolvConf);
     }
     let spec = SandboxSpec {
@@ -3907,6 +3933,28 @@ mod tests {
         // The host's namespace has the host's resolver, which a provider
         // grants as it likes.
         assert!(etc("network.mode = \"full\"\nsandbox.share = [\"net\"]").is_empty());
+        let grant = "fs.ro = [\"/etc/resolv.conf\"]";
+        assert!(
+            etc(&format!(
+                "network.mode = \"full\"\nsandbox.share = [\"net\"]\n{grant}"
+            ))
+            .is_empty()
+        );
+        for mode in ["none", "loopback", "proxy"] {
+            etc(&format!("network.mode = {mode:?}\n{grant}"));
+        }
+        // Its own namespace has pasta's, and a rule for the host's is a
+        // mistake, which the error explains.
+        let e = f
+            .compile_err(&format!(
+                "base = \"none\"\n{}",
+                prov("a", "main", &format!("network.mode = \"full\"\n{grant}"))
+            ))
+            .to_string();
+        assert!(
+            e.contains("which stopit writes itself with network = \"full\""),
+            "{e}"
+        );
         for mode in ["none", "loopback", "proxy"] {
             assert!(
                 etc(&format!("network.mode = {mode:?}")).is_empty(),
@@ -4378,8 +4426,6 @@ mod tests {
                 "/etc/nsswitch.conf",
                 CoversReserved(p("/etc/nsswitch.conf")),
             ),
-            // Reserved in every network mode, though only `full` has it.
-            ("/etc/resolv.conf", CoversReserved(p("/etc/resolv.conf"))),
         ];
         for (dest, reason) in rejected {
             let e = compile_with_rule(&f, &bind_at(dest)).unwrap_err();

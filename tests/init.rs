@@ -1022,8 +1022,8 @@ fn landlock_and_netns_block_host_abstract_unix_socket() {
     );
 
     // Network mode `full` has a network namespace of its own, which pasta
-    // connects (here, without pasta, it has no network at all). The host's
-    // abstract sockets are not in it.
+    // connects. Without pasta, as here, it has no network at all. The
+    // host's abstract sockets are not in it.
     init.spec = init
         .f
         .compile(&init_config(&[], "network = { mode = \"full\" }"));

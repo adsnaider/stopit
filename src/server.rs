@@ -474,13 +474,9 @@ fn run_for_client(
         if runs.stopping {
             return Err(RunError::ServerStopping);
         }
-        let child = child_command.spawn().map_err(|e| {
-            if e.kind() == io::ErrorKind::NotFound {
-                RunError::BwrapMissing
-            } else {
-                RunError::Spawn(e)
-            }
-        })?;
+        let child = child_command
+            .spawn()
+            .map_err(|e| crate::supervisor::spawn_error(e, pasta.is_some()))?;
         let pidfd = match pidfd_open(Pid::from_child(&child), PidfdFlags::empty()) {
             Ok(pidfd) => pidfd,
             Err(e) => {
@@ -512,6 +508,10 @@ fn run_for_client(
         // Killed before `block` closes, which would let bwrap go on.
         let _ = pidfd_send_signal(&pidfd, Signal::KILL);
         let _ = child.wait();
+        // A stopping server killed bwrap, which is what pasta found.
+        if lock(runs).stopping {
+            return Err(RunError::ServerStopping);
+        }
         return Err(e.into());
     }
     drop(block);

@@ -30,8 +30,8 @@
 //!   (§8) and DNS lookups fail fast.
 //! * `resolv.conf` names pasta's DNS forwarder ([`crate::net::DNS_FORWARD`]),
 //!   which passes queries to the host's resolver, so a host resolver on
-//!   loopback works too. It names no search domains: the host's would tell
-//!   the sandbox where it runs.
+//!   loopback works too. It names no search domains, since the host's
+//!   would tell the sandbox where it runs.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
