@@ -216,7 +216,7 @@ impl Approver {
         }
         // Printed without the lock, so a stalled stderr holds up no
         // prompt.
-        eprintln!("{line}");
+        print_line(line);
     }
 
     /// Logs once per run of `asker` that the server cannot ask, and why.
@@ -408,9 +408,17 @@ impl Drop for Prompting<'_> {
             std::mem::take(&mut state.held)
         };
         for line in held {
-            eprintln!("{line}");
+            print_line(&line);
         }
     }
+}
+
+/// Prints `line` to stderr, ignoring errors: `eprintln!` would panic on a
+/// hung-up terminal, and abort the server if that happened while a panic
+/// unwinds through [`Prompting`].
+fn print_line(line: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(io::stderr(), "{line}");
 }
 
 /// Whether `fd` is readable now.

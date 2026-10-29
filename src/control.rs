@@ -215,7 +215,7 @@ pub fn read_request(sock: &UnixStream) -> io::Result<Option<ClientMessage>> {
                 io::ErrorKind::InvalidData,
                 format!(
                     "the stopit server speaks protocol {PROTOCOL_VERSION} and this stopit \
-                     speaks {version}: they come from different builds, so run both from the \
+                     speaks {version}; they come from different builds, so run both from the \
                      same build"
                 ),
             ));
