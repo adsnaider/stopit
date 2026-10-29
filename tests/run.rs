@@ -1790,25 +1790,34 @@ fn without_a_new_session_the_sandbox_shares_the_terminal() {
     assert_ne!(tty_nr(contents(&results[0])), 0, "{results:?}");
 }
 
+/// The `tty_nr` that `/proc/<pid>/stat` shows for the terminal `tty`.
+fn tty_nr_of(tty: &File) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let rdev = tty.metadata().unwrap().rdev();
+    let (major, minor) = (libc::major(rdev) as u64, libc::minor(rdev) as u64);
+    (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)
+}
+
 #[test]
-fn the_sandbox_has_no_controlling_terminal() {
-    let Some((_master, slave)) = open_pty() else {
+fn the_sandbox_never_has_the_host_terminal() {
+    let Some((master, slave)) = open_pty() else {
         return;
     };
+    let host = tty_nr_of(&slave);
     let s = Setup::with_config("");
     let ops = [read("/proc/self/stat")];
     let input = serde_json::to_vec(&ops).unwrap();
 
     // Every stdio redirected, but the terminal still reachable as
-    // `/dev/tty`: detached.
+    // `/dev/tty`: detached, with no controlling terminal at all.
     let mut command = s.run_probe_command(&[]);
     with_controlling_terminal(&mut command, &slave);
     let out = output(command, &input);
     let results = probe_results("stopit run, a terminal but no tty stdio", &out, &ops);
     assert_eq!(tty_nr(contents(&results[0])), 0, "{results:?}");
 
-    // The terminal as stderr: detached. (What goes there stays in the
-    // terminal, which nothing reads; it is short.)
+    // The terminal as stderr: a PTY of its own, whose slave is the
+    // sandbox's controlling terminal.
     let input_file = s.root.join("ops.json");
     fs::write(&input_file, &input).unwrap();
     let mut command = s.run_probe_command(&[]);
@@ -1819,8 +1828,10 @@ fn the_sandbox_has_no_controlling_terminal() {
     with_controlling_terminal(&mut command, &slave);
     let out = spawn_with_stdio(&mut command, None, BWRAP_DEADLINE);
     let results = probe_results("stopit run, the terminal as stderr", &out, &ops);
-    assert_eq!(tty_nr(contents(&results[0])), 0, "{results:?}");
+    let nr = tty_nr(contents(&results[0]));
+    assert!(nr != 0 && nr != host, "{nr} {host} {results:?}");
     assert!(s.no_session_left());
+    drop(master);
 }
 
 /// `command` made to start in a new session with no controlling terminal.
@@ -1835,37 +1846,43 @@ fn without_controlling_terminal(command: &mut Command) {
 }
 
 #[test]
-fn a_terminal_as_stdin_alone_detaches_the_sandbox() {
-    // No controlling terminal: only stdin reaches the terminal.
+fn a_terminal_as_stdin_alone_gets_a_pty_of_its_own() {
+    // No controlling terminal: only stdin reaches the terminal. stopit
+    // reads the keys and passes them to the sandbox's PTY, whose line
+    // discipline turns Ctrl-D into the end of the probe's input.
     let Some((master, slave)) = open_pty() else {
         return;
     };
+    let host = tty_nr_of(&slave);
     let s = Setup::with_config("");
-    let ops = [read("/proc/self/stat"), read("/proc/self/fdinfo/0")];
+    let ops = [read("/proc/self/stat"), Op::Argv];
     let mut command = s.run_probe_command(&[]);
     command
         .stdin(slave.try_clone().unwrap())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     without_controlling_terminal(&mut command);
-    // The operations, then end of file (Ctrl-D at the start of a line).
+    let child = command.spawn().unwrap();
+    wait_for_probe(child.id() as i32);
     let mut input = serde_json::to_vec(&ops).unwrap();
     input.extend_from_slice(b"\n\x04");
     (&master).write_all(&input).unwrap();
-    let out = spawn_with_stdio(&mut command, None, BWRAP_DEADLINE);
+    let out = finish(child);
     let results = probe_results("stopit run, the terminal as stdin", &out, &ops);
-    assert_eq!(tty_nr(contents(&results[0])), 0, "{results:?}");
+    let nr = tty_nr(contents(&results[0]));
+    assert!(nr != 0 && nr != host, "{nr} {host} {results:?}");
     assert!(stderr(&out).is_empty(), "{out:?}");
     assert!(s.no_session_left());
 }
 
 #[test]
-fn a_terminal_as_stdout_alone_detaches_the_sandbox() {
+fn a_terminal_as_stdout_alone_gets_a_pty_of_its_own() {
     // No controlling terminal: only stdout reaches the terminal. The
     // results are read back from the terminal's master.
     let Some((master, slave)) = open_pty() else {
         return;
     };
+    let host = tty_nr_of(&slave);
     let s = Setup::with_config("");
     let ops = [read("/proc/self/stat")];
     let input_file = s.root.join("ops.json");
@@ -1888,8 +1905,231 @@ fn a_terminal_as_stdout_alone_detaches_the_sandbox() {
         ..out
     };
     let results = probe_results("stopit run, the terminal as stdout", &out, &ops);
-    assert_eq!(tty_nr(contents(&results[0])), 0, "{results:?}");
+    let nr = tty_nr(contents(&results[0]));
+    assert!(nr != 0 && nr != host, "{nr} {host} {results:?}");
     assert!(s.no_session_left());
+}
+
+/// stopit run on the terminal `slave` (stdin, stdout, stderr and controlling
+/// terminal), with everything written to the terminal collected from
+/// `master` by a thread.
+struct OnTerminal {
+    child: Option<Child>,
+    master: File,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl OnTerminal {
+    fn spawn(mut command: Command, master: File, slave: File) -> Self {
+        command
+            .stdin(slave.try_clone().unwrap())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave.try_clone().unwrap());
+        with_controlling_terminal(&mut command, &slave);
+        let child = command.spawn().unwrap();
+        drop(command);
+        drop(slave);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut reader = master.try_clone().unwrap();
+        let sink = seen.clone();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                sink.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        });
+        OnTerminal {
+            child: Some(child),
+            master,
+            seen,
+        }
+    }
+
+    fn pid(&self) -> i32 {
+        self.child.as_ref().unwrap().id() as i32
+    }
+
+    /// Waits for stopit to end, as [`finish`] does.
+    fn finish(&mut self) -> Output {
+        finish(self.child.take().unwrap())
+    }
+
+    fn type_keys(&self, keys: &[u8]) {
+        (&self.master).write_all(keys).unwrap();
+    }
+
+    fn seen(&self) -> Vec<u8> {
+        self.seen.lock().unwrap().clone()
+    }
+
+    /// Waits until the terminal has shown `needle` since byte `from`, and
+    /// returns where it ends.
+    #[track_caller]
+    fn wait_for(&self, needle: &[u8], from: usize) -> usize {
+        let deadline = Instant::now() + BWRAP_DEADLINE;
+        loop {
+            let seen = self.seen();
+            if let Some(at) = seen[from.min(seen.len())..]
+                .windows(needle.len())
+                .position(|w| w == needle)
+            {
+                return from + at + needle.len();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{:?} not shown; the terminal shows {:?}",
+                String::from_utf8_lossy(needle),
+                String::from_utf8_lossy(&seen)
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// A configuration granting the host's `/bin/sh` and coreutils, or `None`
+/// (the test is skipped) if the host has no `/bin/sh` there.
+fn shell_config() -> Option<String> {
+    if !Path::new("/bin/sh").exists() || !Path::new("/usr/bin/stty").exists() {
+        eprintln!("skipping: no /bin/sh or /usr/bin/stty on the host");
+        return None;
+    }
+    let dirs: Vec<String> = ["/usr", "/bin", "/lib", "/lib64"]
+        .into_iter()
+        .filter(|d| Path::new(d).exists())
+        .map(|d| format!("{d:?}"))
+        .collect();
+    Some(format!(
+        "[[provider]]\ntype = \"config\"\nname = \"sh\"\n[provider.sandbox]\n\
+         fs.ro = [{}]\nenv.path_prepend = [\"/usr/bin\", \"/bin\"]\n\
+         env.set = {{ PS1 = \"sandbox$ \" }}\n",
+        dirs.join(", ")
+    ))
+}
+
+#[test]
+fn job_control_works_inside_the_sandbox() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((master, slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::with_config(&config);
+    let command = s.stopit(&["run", "--quiet", "/bin/sh", "-i"]);
+    let mut t = OnTerminal::spawn(command, master, slave);
+    let at = t.wait_for(b"sandbox$ ", 0);
+    // Ctrl-Z stops the foreground job, not stopit, nor the shell.
+    t.type_keys(b"sleep 30\r");
+    thread::sleep(Duration::from_millis(500));
+    t.type_keys(b"\x1a");
+    let at = t.wait_for(b"sandbox$ ", at);
+    let pid = t.pid();
+    let sleep = descendants(pid)
+        .into_iter()
+        .find(|&p| fs::read(format!("/proc/{p}/comm")).is_ok_and(|c| c == b"sleep\n"))
+        .expect("sleep runs");
+    assert_eq!(state(sleep).as_deref(), Some("T"));
+    assert_ne!(state(pid).as_deref(), Some("T"));
+    // `fg` resumes it, and Ctrl-C ends it, again without touching stopit.
+    t.type_keys(b"fg\r");
+    thread::sleep(Duration::from_millis(500));
+    assert_ne!(state(sleep).as_deref(), Some("T"));
+    t.type_keys(b"\x03");
+    let at = t.wait_for(b"sandbox$ ", at);
+    wait_gone(sleep);
+    t.type_keys(b"exit 7\r");
+    let out = t.finish();
+    assert_eq!(
+        code(&out),
+        7,
+        "{:?}",
+        String::from_utf8_lossy(&t.seen.lock().unwrap())
+    );
+    assert!(t.seen().len() >= at);
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn window_size_changes_reach_the_sandbox() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((master, slave)) = open_pty() else {
+        return;
+    };
+    let size = |rows, cols| rustix::termios::Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    rustix::termios::tcsetwinsize(&slave, size(24, 80)).unwrap();
+    let s = Setup::with_config(&config);
+    let command = s.stopit(&["run", "--quiet", "/bin/sh", "-i"]);
+    let mut t = OnTerminal::spawn(command, master, slave);
+    let at = t.wait_for(b"sandbox$ ", 0);
+    t.type_keys(b"stty size\r");
+    let at = t.wait_for(b"24 80", at);
+    // The terminal emulator resizes: the kernel signals stopit, which is in
+    // the terminal's foreground, and stopit resizes the sandbox's PTY.
+    rustix::termios::tcsetwinsize(&t.master, size(50, 132)).unwrap();
+    thread::sleep(Duration::from_millis(200));
+    t.type_keys(b"stty size\r");
+    t.wait_for(b"50 132", at);
+    t.type_keys(b"exit\r");
+    let out = t.finish();
+    assert_eq!(code(&out), 0, "{out:?}");
+}
+
+#[test]
+fn escape_sequences_from_the_sandbox_are_filtered() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((master, slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::with_config(&config);
+    // The kitty keyboard protocol and the alternate screen pass; a
+    // clipboard read, a title report, kitty graphics from a file, OSC 1337
+    // and tmux passthrough do not. The modes left on are turned off.
+    let script = "printf 'A\\033[>1uB\\033[?1049hC\\033]52;c;?\\007D\\033[21tE\
+                  \\033_Gt=f;L2V0Yw==\\033\\\\F\\033]1337;File=x\\007G\\033Ptmux;x\\033\\\\H'";
+    let command = s.stopit(&["run", "--quiet", "/bin/sh", "-c", script]);
+    let mut t = OnTerminal::spawn(command, master, slave);
+    let out = t.finish();
+    assert_eq!(code(&out), 0, "{out:?}");
+    let at = t.wait_for(b"\x1b[?1049l", 0);
+    let seen = t.seen();
+    assert_eq!(
+        String::from_utf8_lossy(&seen[..at]),
+        "A\x1b[>1uB\x1b[?1049hCDEFGH\x1b[<1u\x1b[?1049l"
+    );
+}
+
+#[test]
+fn the_host_terminal_settings_survive_the_sandbox() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((master, slave)) = open_pty() else {
+        return;
+    };
+    let before = rustix::termios::tcgetattr(&slave).unwrap();
+    let s = Setup::with_config(&config);
+    // The sandbox turns off echo on its terminal and exits.
+    let command = s.stopit(&["run", "--quiet", "/bin/sh", "-c", "stty -echo raw; exit 3"]);
+    let probe_slave = slave.try_clone().unwrap();
+    let mut t = OnTerminal::spawn(command, master, slave);
+    let out = t.finish();
+    assert_eq!(code(&out), 3, "{out:?}");
+    let after = rustix::termios::tcgetattr(&probe_slave).unwrap();
+    assert_eq!(after.local_modes, before.local_modes);
+    assert_eq!(after.input_modes, before.input_modes);
+    assert_eq!(after.output_modes, before.output_modes);
 }
 
 // --- Job control and signals ---
@@ -2091,8 +2331,8 @@ fn a_background_start_on_the_terminal_is_refused() {
     assert_eq!(
         stderr(&out),
         "stopit: error: stopit is not in the foreground of its terminal (started in the \
-         background?); until stopit runs the sandbox on a terminal of its own, it only starts \
-         in the foreground\n"
+         background?); it relays the terminal to the sandbox, so it only starts in the \
+         foreground\n"
     );
     assert!(s.no_session_left());
 }

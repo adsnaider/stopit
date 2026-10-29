@@ -12,8 +12,8 @@
 //!    including `ENOSYS`, aborts `__init` because Landlock requires a newer
 //!    kernel than `close_range`.
 //! 3. When `spec.pty_slave` is set, call `setsid` and `ioctl(TIOCSCTTY)` on
-//!    standard input so the PTY slave becomes the sandbox's controlling
-//!    terminal.
+//!    the first standard descriptor that is a terminal, the supervisor's PTY
+//!    slave, so it becomes the sandbox's controlling terminal.
 //! 4. When `spec.lo_down` is set, clear `IFF_UP` on `lo` inside the new
 //!    network namespace.
 //! 5. Clear ambient, bounding, inheritable, permitted, and effective
@@ -207,7 +207,8 @@ pub fn env_value<'a>(entries: &'a [CString], key: &[u8]) -> Option<&'a [u8]> {
 pub struct InitSpec {
     /// Take `lo` down inside the sandbox's private network namespace.
     pub lo_down: bool,
-    /// Become session leader and claim fd 0 as the controlling PTY slave.
+    /// Become session leader and claim the first standard descriptor that
+    /// is a terminal, the supervisor's PTY slave, as controlling terminal.
     pub pty_slave: bool,
     /// Landlock ruleset configuration.
     pub landlock: LandlockSpec,
@@ -523,12 +524,18 @@ fn close_fds_from(first: u32) -> io::Result<()> {
 }
 
 fn setup_pty_slave() -> io::Result<()> {
+    // The supervisor replaces every standard descriptor that is a terminal
+    // with the slave, and passes none of the host's terminals.
+    // SAFETY: `isatty` takes a descriptor number only.
+    let Some(fd) = (0..=2).find(|&fd| unsafe { libc::isatty(fd) } == 1) else {
+        return Err(io::Error::other("no standard descriptor is a terminal"));
+    };
     // SAFETY: `setsid` and `ioctl(TIOCSCTTY)` take no pointers.
     unsafe {
         if libc::setsid() < 0 {
             return Err(io::Error::last_os_error());
         }
-        if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0 as libc::c_int) != 0 {
+        if libc::ioctl(fd, libc::TIOCSCTTY as _, 0 as libc::c_int) != 0 {
             return Err(io::Error::last_os_error());
         }
     }

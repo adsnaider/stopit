@@ -280,15 +280,14 @@ pub enum BwrapError {
     NoCommand,
 }
 
-/// Whether the sandbox stays in the caller's session or gets a new one.
+/// How the sandbox relates to the caller's session and terminal.
 ///
-/// Until the supervisor runs sandboxes on a PTY of its own (DESIGN.md §5.1),
-/// their stdio is the host's, and so may be the controlling terminal they
-/// inherit. Seccomp blocks `TIOCSTI` and `TIOCLINUX` (§6.3 step 4), and
-/// bwrap's `--new-session` also detaches the sandbox from the caller's
-/// controlling terminal so `/dev/tty` and foreground process-group operations
-/// cannot reach the host session. The kernel's job control then no longer
-/// covers the sandbox, so the supervisor disables it until the PTY lands.
+/// When any of the supervisor's stdio is a terminal, the sandbox runs on a
+/// PTY of the supervisor's (DESIGN.md §5.1, [`Pty`](Self::Pty)): `__init`
+/// starts a session of its own with the slave as controlling terminal, so
+/// the host terminal is never the sandbox's. When none is, but the
+/// supervisor has a controlling terminal the sandbox could open as
+/// `/dev/tty`, bwrap's `--new-session` detaches it ([`Detach`](Self::Detach)).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TerminalSession {
     /// Stay in the caller's session (no `--new-session`).
@@ -297,6 +296,12 @@ pub enum TerminalSession {
     /// A new session, detached from the caller's controlling terminal
     /// (`--new-session`).
     Detach,
+    /// A new session that `__init` starts, whose controlling terminal is the
+    /// supervisor's PTY slave on the sandbox's stdio (`InitSpec::pty_slave`).
+    /// bwrap gets no `--new-session`, since `__init` must not already lead a
+    /// session. Only [`BwrapCommand::for_init`] gives it a meaning; for other
+    /// commands it is [`Keep`](Self::Keep).
+    Pty,
 }
 
 /// The working directory a sandbox starts in: the workspace mount if the
@@ -363,7 +368,8 @@ impl BwrapCommand {
         }
         let encoded = init::encode_env(env.iter().map(|(k, v)| (k, v))).map_err(BwrapError::Env)?;
         let env_fd = sealed_memfd("stopit-init-env", &encoded).map_err(BwrapError::DataFd)?;
-        let init_spec = init::InitSpec::from_sandbox_spec(spec);
+        let mut init_spec = init::InitSpec::from_sandbox_spec(spec);
+        init_spec.pty_slave = terminal == TerminalSession::Pty;
         let encoded_spec = init::encode_spec(&init_spec).map_err(BwrapError::Spec)?;
         let spec_fd =
             sealed_memfd("stopit-init-spec", &encoded_spec).map_err(BwrapError::DataFd)?;
@@ -949,10 +955,7 @@ fn plan_with_caps(
             "CAP_SETPCAP",
         ])?;
     }
-    // TODO(§5.1, Phase 2): once the sandbox's stdio is a PTY of the
-    // supervisor's, `__init` sets up the controlling terminal (§6.3 step 1)
-    // and `--new-session` is never used. Until then it keeps the sandbox off
-    // the host's terminal (see `TerminalSession`).
+    // On a PTY, `__init` starts the session (see `TerminalSession`).
     if terminal == TerminalSession::Detach {
         plan.push(["--new-session"])?;
     }

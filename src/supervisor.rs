@@ -19,7 +19,9 @@
 //!    base ([`summary_lines`]), after the warnings;
 //! 5. provisions itself into the session directory (§2.1), computes the
 //!    target's environment from its own (§9), and runs bwrap with `__init`
-//!    and the command, on the supervisor's own stdio ([`wait_foreground`]);
+//!    and the command on the supervisor's stdio, or on a PTY of its own
+//!    relayed to the host terminal when any of that is a terminal
+//!    ([`wait_foreground`], [`crate::pty`]);
 //! 6. waits for it, restores the terminal's state, removes the session
 //!    directory, and exits with the command's status ([`exit_code`]).
 //!
@@ -34,19 +36,19 @@
 //! filesystem (often sandbox-writable) put text in them. bwrap's own
 //! messages are not stopit's, and are not escaped.
 //!
-//! Not done yet: the PTY proxy in §5, the broker, and the network proxy.
+//! Not done yet: approval prompts (§5.2), the broker, and the network proxy.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{ExitCode, ExitStatus};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::process::{ExitCode, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use rustix::io::Errno;
 use rustix::process::Pid;
@@ -55,17 +57,19 @@ use thiserror::Error;
 
 use crate::bwrap::{BwrapCommand, BwrapError, TerminalSession, working_dir};
 use crate::config::{
-    Base, Config, ConfigError, ConfigLayer, LayeredConfig, ProfileRef, ProviderEntry, ProviderKind,
-    ProviderName, ProviderOrigin,
+    Base, ClipboardWrite, Config, ConfigError, ConfigLayer, LayeredConfig, ProfileRef,
+    ProviderEntry, ProviderKind, ProviderName, ProviderOrigin,
 };
 use crate::escape::{escape_message, shell_quote};
 use crate::expand::{ExpandError, ExpansionContext, ResolveWarning};
+use crate::filter::{ClipboardPolicy, OutputFilter};
 use crate::manifest::{Grants, Manifest, SandboxHome};
 use crate::provider::{
     BASE_PROVIDER_NAME, ProtectedSource, ProviderContext, ProviderError, SUPERVISOR_PROVIDER_NAME,
     layered_session_providers, protected_sources, static_outputs,
 };
 use crate::provision::{ProvisionError, provision_self};
+use crate::pty::{Pty, PtyRelay, RawMode};
 use crate::resolve::{PlanWarning, PlanWarningKind};
 use crate::session::{SessionDir, SessionError};
 use crate::spec::{
@@ -287,10 +291,14 @@ pub enum RunError {
     /// stdio is the controlling terminal, and stopit is not in its
     /// foreground process group.
     #[error(
-        "stopit is not in the foreground of its terminal (started in the background?); until \
-         stopit runs the sandbox on a terminal of its own, it only starts in the foreground"
+        "stopit is not in the foreground of its terminal (started in the background?); it \
+         relays the terminal to the sandbox, so it only starts in the foreground"
     )]
     Background,
+
+    /// The sandbox's PTY cannot be set up.
+    #[error("cannot set up the sandbox's terminal: {0}")]
+    Pty(#[source] io::Error),
 
     /// Whether stopit is in the foreground of its terminal cannot be told.
     #[error("cannot check that stopit is in the foreground of its terminal: {0}")]
@@ -711,6 +719,11 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     let sandbox_cwd = working_dir(&profile.spec, mount.as_path());
     let stdio = stdio_terminals();
     let terminal = terminal_session(stdio);
+    let clipboard = match config.terminal.clipboard_write {
+        ClipboardWrite::Allow => ClipboardPolicy::Allow,
+        // TODO(§5.4): `ask` needs a prompt; until then it blocks.
+        ClipboardWrite::Block | ClipboardWrite::Ask => ClipboardPolicy::Block,
+    };
     let command = BwrapCommand::for_init(
         &profile.spec,
         &session,
@@ -721,11 +734,16 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
         terminal,
     )?;
     ignore_job_control();
-    if terminal == TerminalSession::Detach {
+    if terminal != TerminalSession::Keep {
         check_foreground(stdio)?;
     }
     let saved = TerminalState::save(stdio);
-    let status = wait_foreground(command);
+    let pty = if terminal == TerminalSession::Pty {
+        Some(SandboxTerminal::open(stdio, clipboard).map_err(RunError::Pty)?)
+    } else {
+        None
+    };
+    let status = wait_foreground(command, pty);
     saved.restore();
     // The sandbox is gone, or going: bwrap returns once its namespace's
     // init exits, and if bwrap itself was killed, `--die-with-parent` kills
@@ -742,6 +760,32 @@ const CAUGHT: [libc::c_int; 4] = [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, li
 
 /// The last caught signal not yet handled, or 0.
 static RECEIVED: AtomicI32 = AtomicI32::new(0);
+
+/// Whether the host terminal's window size changed since the relay last
+/// copied it ([`record_winch`]).
+static WINCH: AtomicBool = AtomicBool::new(false);
+
+/// Signal handler for `SIGWINCH` while the sandbox runs on a PTY.
+extern "C" fn record_winch(_: libc::c_int) {
+    WINCH.store(true, Ordering::SeqCst);
+}
+
+/// Catches `SIGWINCH` with [`record_winch`]. Like [`CAUGHT`], it is blocked
+/// except while waiting in `ppoll`, and goes back to its default on `exec`.
+fn catch_winch() -> io::Result<()> {
+    // SAFETY: `sigaction` on a zeroed, then filled, local struct; the
+    // handler only stores to an atomic.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = record_winch as extern "C" fn(libc::c_int) as usize;
+        action.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut action.sa_mask);
+        if libc::sigaction(libc::SIGWINCH, &action, std::ptr::null_mut()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
 
 /// Non-blocking self-pipe waking threads blocked in `poll` when a caught
 /// signal arrives.
@@ -864,13 +908,12 @@ fn catch_signals() -> io::Result<()> {
 /// life, and for bwrap, which inherits them ignored (`__init` resets them
 /// for the command).
 ///
-/// Until the PTY proxy exists, a sandbox detached from the terminal
-/// ([`TerminalSession::Detach`]) still has it as its stdio, but the kernel's
-/// job-control checks only apply to a process's controlling terminal: were
-/// the supervisor stopped (Ctrl-Z) or put in the background, the sandbox
-/// would go on reading and writing the terminal behind the shell's back. So
-/// the supervisor cannot be stopped by the terminal, and refuses to start in
-/// the background ([`check_foreground`]).
+/// The supervisor holds the host terminal in raw mode and relays it to the
+/// sandbox's PTY ([`SandboxTerminal`]). Stopped, or put in the background,
+/// it would leave the terminal raw under the shell while the sandbox waits.
+/// Keys such as Ctrl-Z go to the sandbox's own line discipline anyway, so
+/// the supervisor cannot be stopped by the terminal, and refuses to start
+/// in the background ([`check_foreground`]).
 fn ignore_job_control() {
     for signal in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
         // SAFETY: `signal` with `SIG_IGN` installs no handler code; it only
@@ -946,8 +989,57 @@ impl TerminalState {
     }
 }
 
-/// Spawns `command` (bwrap) on the supervisor's stdio and waits for it,
-/// returning the exit status to exit with ([`exit_code`]).
+/// The PTY a sandbox runs on when the supervisor's stdio includes a
+/// terminal (DESIGN.md §5.1), with what the relay needs to reach the host
+/// terminal.
+struct SandboxTerminal {
+    /// The PTY's master, until the relay takes it.
+    master: Option<OwnedFd>,
+    /// The PTY's slave, until the sandbox has its copies.
+    slave: Option<OwnedFd>,
+    /// Which of stdin, stdout and stderr the slave replaces.
+    stdio: [bool; 3],
+    /// The host terminal's raw mode while the relay reads keys.
+    raw: Option<RawMode>,
+    relay_input: Option<BorrowedFd<'static>>,
+    relay_output: BorrowedFd<'static>,
+    clipboard: ClipboardPolicy,
+}
+
+impl SandboxTerminal {
+    /// Opens the PTY for the supervisor's stdio, of which those `stdio`
+    /// says are terminals (at least one). The slave starts with the host
+    /// terminal's settings and window size. Keys are read from stdin when
+    /// it is a terminal, which is then put into raw mode; the sandbox's
+    /// output goes to the first of stdout, stderr and stdin that is one.
+    fn open(stdio: [bool; 3], clipboard: ClipboardPolicy) -> io::Result<SandboxTerminal> {
+        let fds: Vec<BorrowedFd<'static>> = stdio_fds([true; 3]).collect();
+        let input = stdio[0].then_some(fds[0]);
+        let output = [1, 2, 0]
+            .into_iter()
+            .find(|&i| stdio[i])
+            .map(|i| fds[i])
+            .expect("at least one stdio is a terminal");
+        let settings_from = input.unwrap_or(output);
+        let termios = rustix::termios::tcgetattr(settings_from).ok();
+        let pty = Pty::open(termios.as_ref(), Some(output))?;
+        Ok(SandboxTerminal {
+            master: Some(pty.master),
+            slave: Some(pty.slave),
+            stdio,
+            raw: None,
+            relay_input: input,
+            relay_output: output,
+            clipboard,
+        })
+    }
+}
+
+/// Spawns `command` (bwrap) on the supervisor's stdio, or on the slave of
+/// `terminal` where that replaces it, and waits for it, returning the exit
+/// status to exit with ([`exit_code`]). With a terminal, the supervisor
+/// relays between the PTY master and the host terminal meanwhile
+/// ([`PtyRelay`]), and copies window size changes.
 ///
 /// The caught signals ([`CAUGHT`]) are blocked from just before the spawn
 /// (bwrap starts with the mask the supervisor had before) and only
@@ -956,16 +1048,31 @@ impl TerminalState {
 /// with `128 + N` instead. One that arrives while bwrap runs is forwarded
 /// to it, so that the sandbox ends and the supervisor goes on to clean up;
 /// the supervisor then exits with bwrap's status, `128 + N` if the signal
-/// killed it. That includes `SIGINT` and `SIGQUIT`: a terminal's Ctrl-C
-/// reaches bwrap through the process group anyway, but not the sandboxed
-/// program, which is in a session of its own (§6.2 step 1), and a signal
-/// sent to the supervisor alone should end the sandbox just the same.
-fn wait_foreground(command: BwrapCommand) -> Result<u8, RunError> {
+/// killed it. A signal sent to the supervisor alone thus ends the sandbox,
+/// which is in a session of its own whenever a terminal is involved.
+fn wait_foreground(
+    command: BwrapCommand,
+    mut terminal: Option<SandboxTerminal>,
+) -> Result<u8, RunError> {
+    if terminal.is_some() {
+        catch_winch().map_err(RunError::Signals)?;
+    }
     let mask = BlockedSignals::block().map_err(RunError::Signals)?;
     if let Some(signal) = take_signal() {
         return Ok(signal_exit_code(signal));
     }
     let (mut command, status_reader) = command.into_command_with_status()?;
+    if let Some(t) = &terminal {
+        let slave = |i: usize| -> Result<Stdio, RunError> {
+            match &t.slave {
+                Some(slave) if t.stdio[i] => {
+                    Ok(Stdio::from(slave.try_clone().map_err(RunError::Pty)?))
+                }
+                _ => Ok(Stdio::inherit()),
+            }
+        };
+        command.stdin(slave(0)?).stdout(slave(1)?).stderr(slave(2)?);
+    }
     let old = mask.old;
     // SAFETY: `pthread_sigmask` is async-signal-safe, and `old` a copy.
     unsafe {
@@ -976,6 +1083,13 @@ fn wait_foreground(command: BwrapCommand) -> Result<u8, RunError> {
             }
         });
     }
+    // Raw before the spawn, so no key typed while the sandbox starts is
+    // taken by the host terminal's line discipline.
+    if let Some(t) = &mut terminal
+        && let Some(input) = t.relay_input
+    {
+        t.raw = Some(RawMode::enter(input).map_err(RunError::Pty)?);
+    }
     let mut child = command.spawn().map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
             RunError::BwrapMissing
@@ -983,12 +1097,25 @@ fn wait_foreground(command: BwrapCommand) -> Result<u8, RunError> {
             RunError::Spawn(e)
         }
     })?;
-    // Close our copy of the status pipe's write end so `status_reader` sees EOF
-    // when bwrap finishes or execs `__init`.
+    // Close our copies of the status pipe's write end, so `status_reader`
+    // sees EOF when bwrap finishes or execs `__init`, and of the slave, so
+    // the master reports the end once the sandbox has none open.
     drop(command);
+    let mut relay = terminal.as_mut().and_then(|t| {
+        t.slave = None;
+        Some(PtyRelay::new(
+            t.master.take()?,
+            t.relay_input,
+            t.relay_output,
+            OutputFilter::new(t.clipboard),
+        ))
+    });
+    if let Some(r) = &relay {
+        r.resize();
+    }
     let pid = Pid::from_child(&child);
-    // Waiting through a pidfd lets `ppoll` wait for the child and the
-    // signals at once. Without one (impossible on the kernels stopit
+    // Waiting through a pidfd lets `ppoll` wait for the child, the signals
+    // and the PTY at once. Without one (impossible on the kernels stopit
     // supports), signals are only forwarded once bwrap is done.
     if let Ok(pidfd) = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) {
         loop {
@@ -997,14 +1124,50 @@ fn wait_foreground(command: BwrapCommand) -> Result<u8, RunError> {
                 // its pid is still its own.
                 unsafe { libc::kill(pid.as_raw_nonzero().get(), signal) };
             }
-            match mask.wait_readable(pidfd.as_fd()) {
-                Ok(()) => break,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            if WINCH.swap(false, Ordering::SeqCst)
+                && let Some(r) = &relay
+            {
+                r.resize();
+            }
+            let interest = relay.as_ref().map(PtyRelay::poll_fds);
+            let mut fds = vec![libc::pollfd {
+                fd: pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            let mut slots = [None, None];
+            if let Some(interest) = interest {
+                for (slot, wanted) in slots.iter_mut().zip([interest.master, interest.input]) {
+                    if let Some((fd, events)) = wanted {
+                        *slot = Some(fds.len());
+                        fds.push(libc::pollfd {
+                            fd,
+                            events,
+                            revents: 0,
+                        });
+                    }
+                }
+            }
+            match mask.wait(&mut fds) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
+            }
+            if let Some(r) = &mut relay {
+                let revents = |slot: Option<usize>| slot.map_or(0, |i| fds[i].revents);
+                r.handle(revents(slots[0]), revents(slots[1]));
+            }
+            if fds[0].revents != 0 {
+                break;
             }
         }
     }
     let status = child.wait().map_err(RunError::Spawn)?;
+    if let Some(r) = relay {
+        r.finish();
+    }
+    // Restores the host terminal's settings, after the last output.
+    drop(terminal);
     let json_status = read_nonblocking_status(status_reader);
     Ok(bwrap_exit_code(status, &json_status))
 }
@@ -1069,7 +1232,7 @@ impl BlockedSignals {
         unsafe {
             let mut set: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(&mut set);
-            for signal in CAUGHT {
+            for signal in CAUGHT.into_iter().chain([libc::SIGWINCH]) {
                 libc::sigaddset(&mut set, signal);
             }
             let mut old: libc::sigset_t = std::mem::zeroed();
@@ -1080,21 +1243,23 @@ impl BlockedSignals {
         }
     }
 
-    /// Waits until `fd` is readable, with [`CAUGHT`] unblocked meanwhile:
-    /// `Interrupted` if one of them (or another signal) arrived.
-    fn wait_readable(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
-        let mut pollfd = libc::pollfd {
-            fd: fd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: plain libc calls on a local signal set and pollfd.
+    /// Waits until one of `fds` is ready, with [`CAUGHT`] and `SIGWINCH`
+    /// unblocked meanwhile: `Interrupted` if one of them (or another
+    /// signal) arrived.
+    fn wait(&self, fds: &mut [libc::pollfd]) -> io::Result<()> {
+        // SAFETY: plain libc calls on a local signal set and valid pollfds.
         unsafe {
             let mut waiting = self.old;
-            for signal in CAUGHT {
+            for signal in CAUGHT.into_iter().chain([libc::SIGWINCH]) {
                 libc::sigdelset(&mut waiting, signal);
             }
-            if libc::ppoll(&mut pollfd, 1, std::ptr::null(), &waiting) < 0 {
+            if libc::ppoll(
+                fds.as_mut_ptr(),
+                fds.len() as libc::nfds_t,
+                std::ptr::null(),
+                &waiting,
+            ) < 0
+            {
                 return Err(io::Error::last_os_error());
             }
         }
@@ -1147,10 +1312,13 @@ fn stdio_terminals() -> [bool; 3] {
     ]
 }
 
-/// [`needs_new_session`] for this process, whose stdio is a terminal as
-/// `stdio` says.
+/// How the sandbox relates to this process's terminal, whose stdio is a
+/// terminal as `stdio` says: on a PTY of its own if any is
+/// ([`TerminalSession::Pty`]), else detached if [`needs_new_session`].
 fn terminal_session(stdio: [bool; 3]) -> TerminalSession {
-    if needs_new_session(stdio, has_controlling_terminal()) {
+    if stdio.contains(&true) {
+        TerminalSession::Pty
+    } else if needs_new_session(stdio, has_controlling_terminal()) {
         TerminalSession::Detach
     } else {
         TerminalSession::Keep
