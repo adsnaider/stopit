@@ -2103,7 +2103,7 @@ mod tests {
             [
                 "user:x:1000:100::/home/agent:/bin/sh\n\
                  nobody:x:65534:65534::/nonexistent:/bin/false\n",
-                "user:x:100:\nnogroup:x:65534:\n",
+                "user:x:100:\nnogroup:x:65534:\nnobody:x:65534:\n",
                 etc::hosts(Some(etc::SANDBOX_HOSTNAME)).as_str(),
                 etc::NSSWITCH_CONF,
                 "nameserver 169.254.1.1\n",

@@ -4206,7 +4206,11 @@ fn jj_runs_through_the_broker_while_main_sees_no_metadata() {
         eprintln!("skipping: no jj or git in /usr/bin or /bin");
         return;
     }
-    let s = Setup::with_config(&config);
+    // Some builds of jj read the CPU count from `/sys`.
+    let s = Setup::with_config(&format!(
+        "{config}[[provider]]\ntype = \"config\"\nname = \"cpus\"\n[provider.sandbox]\n\
+         fs.ro = [\"/sys/devices/system/cpu\"]\n"
+    ));
     // Some builds of jj need more of the host than a sandbox has (`/sys`
     // for the CPU count, a group named `nobody`), so jj must run in one
     // first. Outside a repository, `jj root` exits with 1.

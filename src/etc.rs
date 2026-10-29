@@ -15,8 +15,9 @@
 //!   not the sandbox has one.
 //! * Inside the user namespace only that uid and gid are mapped; every other
 //!   id, host root included, shows as the overflow id [`OVERFLOW_ID`]. So
-//!   the files also name it (`nobody`, `nogroup`), which `ls -l` and `id`
-//!   show for files owned by other host users and for supplementary groups.
+//!   the files also name it (`nobody`, and `nogroup` and `nobody` for the
+//!   group), which `ls -l` and `id` show for files owned by other host
+//!   users and for supplementary groups.
 //!   There is no `root` entry: host root is unmapped and shows as `nobody`,
 //!   so uid 0 does not exist in the sandbox unless stopit runs as root.
 //! * `hosts` maps `localhost`, and [`SANDBOX_HOSTNAME`] too when stopit sets
@@ -163,12 +164,14 @@ pub fn passwd(ids: SandboxIds, home: &SandboxHome) -> String {
     out
 }
 
-/// `/etc/group`: the sandbox user's primary group, then `nogroup` unless
-/// that group has its gid.
+/// `/etc/group`: the sandbox user's primary group, then, unless that group
+/// has its gid, the overflow gid as `nogroup`, Debian's name, and again as
+/// `nobody`, Fedora's, which some programs look up by name.
 pub fn group(ids: SandboxIds) -> String {
     let mut out = format!("{SANDBOX_USER}:x:{}:\n", ids.gid);
     if ids.gid != OVERFLOW_ID {
         writeln!(out, "{OVERFLOW_GROUP}:x:{OVERFLOW_ID}:").expect("writing to a String");
+        writeln!(out, "{OVERFLOW_USER}:x:{OVERFLOW_ID}:").expect("writing to a String");
     }
     out
 }
@@ -202,7 +205,10 @@ mod tests {
 
     #[test]
     fn group_golden() {
-        assert_eq!(group(IDS), "user:x:100:\nnogroup:x:65534:\n");
+        assert_eq!(
+            group(IDS),
+            "user:x:100:\nnogroup:x:65534:\nnobody:x:65534:\n"
+        );
     }
 
     #[test]
