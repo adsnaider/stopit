@@ -161,6 +161,18 @@ impl NetworkSpec {
     }
 }
 
+impl SandboxSpec {
+    /// The domains of the network proxy this sandbox gets, if it gets one.
+    /// It does in proxy mode with a network namespace of its own, and then
+    /// also the bridge and the proxy variables.
+    pub fn proxy_domains(&self) -> Option<&BTreeSet<Domain>> {
+        if self.namespaces.is_shared(ShareableNamespace::Net) {
+            return None;
+        }
+        self.network.allow_domains()
+    }
+}
+
 /// A non-fatal problem found compiling a profile.
 #[derive(Debug, Error)]
 pub enum SpecWarning {

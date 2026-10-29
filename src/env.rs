@@ -61,7 +61,7 @@ impl EffectiveEnv {
     }
 
     /// [`apply`](Self::apply), with `defaults` added after the identity
-    /// variables and before `set`: they override passed host variables, and
+    /// variables and before `set`. They override passed host variables, and
     /// `set` overrides them.
     pub fn apply_with(
         &self,
@@ -108,18 +108,14 @@ impl EffectiveEnv {
 impl SandboxSpec {
     /// The environment the target gets in this sandbox, built from the
     /// `host` environment (typically [`std::env::vars_os`]). See
-    /// [`EffectiveEnv::apply`]. In proxy mode, with a network namespace of
-    /// its own, the proxy variables point at the bridge
-    /// ([`crate::proxy::proxy_env`]), whatever the host's say.
+    /// [`EffectiveEnv::apply`]. With a network proxy
+    /// ([`SandboxSpec::proxy_domains`]), the proxy variables point at the
+    /// bridge ([`crate::proxy::proxy_env`]), whatever the host's say.
     pub fn target_env(
         &self,
         host: impl IntoIterator<Item = (OsString, OsString)>,
     ) -> Vec<(OsString, OsString)> {
-        let proxied = matches!(self.network, crate::spec::NetworkSpec::Proxy { .. })
-            && !self
-                .namespaces
-                .is_shared(crate::manifest::ShareableNamespace::Net);
-        let defaults = if proxied {
+        let defaults = if self.proxy_domains().is_some() {
             crate::proxy::proxy_env()
         } else {
             Vec::new()

@@ -1010,16 +1010,9 @@ impl LoadedSession {
         profile: &CompiledProfile,
         label: &str,
     ) -> Result<Option<crate::proxy::Proxy>, RunError> {
-        let crate::spec::NetworkSpec::Proxy { allow_domains } = &profile.spec.network else {
+        let Some(allow_domains) = profile.spec.proxy_domains() else {
             return Ok(None);
         };
-        if profile
-            .spec
-            .namespaces
-            .is_shared(crate::manifest::ShareableNamespace::Net)
-        {
-            return Ok(None);
-        }
         let path = self.session.root().join(format!("proxy-{label}.sock"));
         crate::server::check_socket_path(&path)?;
         crate::proxy::Proxy::start(path.clone(), allow_domains.clone())
@@ -3376,6 +3369,30 @@ mod tests {
             assert!(matches!(e, RunError::ShellUnset), "{e}");
             assert!(e.to_string().contains("SHELL is not set"), "{e}");
         }
+    }
+
+    #[test]
+    fn a_blocked_caught_signal_shows_as_pending() {
+        // In a thread of its own, which alone gets the signal.
+        std::thread::spawn(|| {
+            // SAFETY: plain libc calls on local signal sets; the signal is
+            // blocked and directed at this thread, and taken back before
+            // the thread ends.
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGHUP);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+                assert_eq!(blocked_pending_signal(), None);
+                libc::pthread_kill(libc::pthread_self(), libc::SIGHUP);
+                assert_eq!(blocked_pending_signal(), Some(libc::SIGHUP));
+                let mut info: libc::siginfo_t = std::mem::zeroed();
+                assert_eq!(libc::sigwaitinfo(&set, &mut info), libc::SIGHUP);
+                assert_eq!(blocked_pending_signal(), None);
+            }
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

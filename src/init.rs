@@ -227,7 +227,7 @@ impl InitSpec {
             pty_slave: false,
             landlock: LandlockSpec::from_sandbox_spec(spec),
             allow_syscalls: spec.allow_syscalls.clone(),
-            proxy_bridge: matches!(spec.network, NetworkSpec::Proxy { .. }) && own_net,
+            proxy_bridge: spec.proxy_domains().is_some(),
         }
     }
 }
@@ -701,24 +701,15 @@ fn start_proxy_bridge() -> io::Result<()> {
             // SAFETY: as above, in the single-threaded child.
             match unsafe { libc::fork() } {
                 0 => {
-                    for signal in [
-                        libc::SIGINT,
-                        libc::SIGQUIT,
-                        libc::SIGHUP,
-                        libc::SIGTSTP,
-                        libc::SIGTTIN,
-                        libc::SIGTTOU,
-                        libc::SIGPIPE,
-                    ] {
-                        // SAFETY: setting a signal to be ignored.
-                        unsafe { libc::signal(signal, libc::SIG_IGN) };
+                    // A session of its own, so neither the terminal nor a
+                    // `kill 0` of the target's reaches it.
+                    // SAFETY: plain libc calls in the single-threaded
+                    // grandchild.
+                    unsafe {
+                        libc::setsid();
+                        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
                     }
-                    // The bridge has nothing to say, and must not keep the
-                    // terminal open.
-                    for fd in 0..3 {
-                        // SAFETY: closing stdio, which nothing else uses.
-                        unsafe { libc::close(fd) };
-                    }
+                    detach_stdio();
                     crate::proxy::run_bridge(
                         listeners,
                         std::path::Path::new(crate::proxy::SANDBOX_PROXY_SOCKET),
@@ -727,6 +718,8 @@ fn start_proxy_bridge() -> io::Result<()> {
                 }
                 // SAFETY: `_exit` skips the parent's atexit handlers and
                 // buffers, which belong to `__init`.
+                -1 => unsafe { libc::_exit(1) },
+                // SAFETY: as above.
                 _ => unsafe { libc::_exit(0) },
             }
         }
@@ -734,11 +727,42 @@ fn start_proxy_bridge() -> io::Result<()> {
             drop(listeners);
             drop(target);
             let mut status = 0;
-            // SAFETY: waits for the child just forked.
-            if unsafe { libc::waitpid(child, &mut status, 0) } < 0 {
-                return Err(io::Error::last_os_error());
+            loop {
+                // SAFETY: waits for the child just forked.
+                if unsafe { libc::waitpid(child, &mut status, 0) } >= 0 {
+                    break;
+                }
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
             }
-            Ok(())
+            if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::other("the bridge process could not start"))
+            }
+        }
+    }
+}
+
+/// Points stdin, stdout and stderr at `/dev/null`, or closes them if the
+/// sandbox has none. The bridge has nothing to say, must not keep the
+/// terminal open, and must not have its sockets take descriptors 0 to 2,
+/// where a panic message would land in a connection.
+fn detach_stdio() {
+    // SAFETY: plain libc calls on descriptors this process owns.
+    unsafe {
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
+        for fd in 0..3 {
+            if null >= 0 {
+                libc::dup2(null, fd);
+            } else {
+                libc::close(fd);
+            }
+        }
+        if null > 2 {
+            libc::close(null);
         }
     }
 }

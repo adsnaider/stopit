@@ -266,10 +266,7 @@ fn network_line(network: &NetworkSpec, lines: &mut Vec<String>) {
                 .filter(|d| crate::proxy::accepts_uploads(d))
                 .collect();
             if !uploads.is_empty() {
-                lines.push(grant(
-                    "uploads",
-                    &format!("{}  (these accept uploads)", name_list(uploads)),
-                ));
+                lines.push(grant("uploads", &name_list(uploads)));
             }
         }
     }
@@ -576,7 +573,7 @@ mod tests {
             }),
             [
                 "  network  proxy to api.anthropic.com, github.com, static.crates.io",
-                "  uploads  api.anthropic.com, github.com  (these accept uploads)"
+                "  uploads  api.anthropic.com, github.com"
             ]
         );
     }
