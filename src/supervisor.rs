@@ -579,8 +579,8 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     if let Some(gf) = &global_file {
         for name in replaced.iter().filter(|n| is_default_provider_name(n)) {
             print_warning(&format!(
-                "the unnamed [[provider]] \"{name}\" in {CONFIG_FILE} replaces the unnamed one in \
-                 {:?}; set `name` on one of them to keep both",
+                "the [[provider]] named \"{name}\" in {CONFIG_FILE} replaces the one of that name \
+                 in {:?}; give one of them another `name` to keep both",
                 gf.path
             ));
         }
@@ -1611,7 +1611,7 @@ fn guard_global_config(
             Err(ScriptPathError::Link { link, root }) => Err(untrusted(format!(
                 "the way to {what} {declared:?} runs through the symbolic link {link:?} inside \
              {root}, which a sandbox can write, so it could re-point the link; use a path \
-             without links inside it"
+             with no symbolic link inside that directory"
             ))),
             Err(ScriptPathError::Lookup(e)) => Err(untrusted(format!(
                 "cannot resolve {what} {declared:?}: {e}"

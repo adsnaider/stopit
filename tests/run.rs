@@ -747,8 +747,8 @@ fn an_unnamed_provider_replacing_an_unnamed_global_one_warns() {
     assert_eq!(
         stderr(&out),
         format!(
-            "stopit: warning: the unnamed [[provider]] \"config\" in .stopit.toml replaces the \
-             unnamed one in {global:?}; set `name` on one of them to keep both\n"
+            "stopit: warning: the [[provider]] named \"config\" in .stopit.toml replaces the one \
+             of that name in {global:?}; give one of them another `name` to keep both\n"
         )
     );
 }

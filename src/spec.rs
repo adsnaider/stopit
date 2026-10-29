@@ -1697,14 +1697,16 @@ fn mask_unreadable_rw_dir(
 ///   contains them; the others come with a [`SpecWarning::StateDirMasked`]
 ///   (DESIGN.md §1.5): a session seldom needs to see the runtime directory,
 ///   and the default locations while `STOPIT_STATE_DIR` or
-///   `STOPIT_CONFIG_DIR` is set belong to sessions started without them. That is sound: no sandbox can
-///   write any directory on the way to it (every `rw` grant containing it
-///   is refused), so what the mask covers stays where it is. Unless another
+///   `STOPIT_CONFIG_DIR` is set belong to sessions started without them.
+///   That is sound: no sandbox can write any directory on the way to it
+///   (every `rw` grant containing it is refused), so what the mask covers
+///   stays where it is. Unless another
 ///   mount lies between the mount's destination (exclusive) and that path
-///   (inclusive), mounted on top: it is checked in turn. A data directory
-///   that does not exist (the default location while `STOPIT_STATE_DIR` is
-///   used) shows nothing, and a mask would need a mount point the read-only
-///   view cannot get. A `masked` source shows nothing either.
+///   (inclusive), mounted on top: it is checked in turn. A data or
+///   configuration directory that does not exist (a default location while
+///   an override is used) shows nothing, and a mask would need a mount
+///   point the read-only view cannot get. A `masked` source shows nothing
+///   either.
 fn check_state_dirs(
     mut mounts: Vec<PlannedMount>,
     canonical: &BTreeMap<PathBuf, PathBuf>,
