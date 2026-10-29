@@ -951,8 +951,28 @@ fn pick<'a>(
         return Ok(winner);
     }
     // Ephemeral ties (`~` and `/home/user`) never conflict: the first wins.
-    let mut top = candidates.into_iter().filter(|c| c.rank() == best);
-    let winner = top.next().expect("the best rank is attained");
+    let top: Vec<Candidate<'a>> = candidates
+        .into_iter()
+        .filter(|c| c.rank() == best)
+        .collect();
+    if best.3 == PathMode::Ephemeral {
+        return Ok(top.into_iter().next().expect("the best rank is attained"));
+    }
+    let first_source = &top.first().expect("the best rank is attained").source;
+    if top.iter().all(|c| c.source.interchangeable(first_source)) {
+        return Ok(top.into_iter().next().expect("the best rank is attained"));
+    }
+    // Sources that differ at the same `(synthesized, literal, depth, mode)`
+    // go to the highest `ProviderOrigin`, so a workspace `fs.bind` can
+    // replace a global one at the same destination and mode. Two binds in
+    // the winning layer still conflict.
+    let max_origin = top
+        .iter()
+        .map(|c| c.rule.origin)
+        .max()
+        .expect("the best rank is attained");
+    let mut top = top.into_iter().filter(|c| c.rule.origin == max_origin);
+    let winner = top.next().expect("max_origin is attained");
     if let Some(other) = top.find(|c| !c.source.interchangeable(&winner.source)) {
         return Err(PathPlanError::Conflict(Box::new(MountConflict {
             sandbox: winner.sandbox,
@@ -1070,6 +1090,7 @@ mod tests {
                 pattern: pattern.parse().unwrap(),
             },
             provider: pn(provider),
+            origin: crate::config::ProviderOrigin::Workspace,
             depth,
         }
     }
@@ -1082,6 +1103,7 @@ mod tests {
                 mode,
             }),
             provider: pn(provider),
+            origin: crate::config::ProviderOrigin::Workspace,
             depth,
         }
     }
@@ -1601,6 +1623,68 @@ mod tests {
             bind("~/b", "/opt/x", BindMode::Protected, "q", 0),
         ]);
         assert_eq!(summary(&mounts), [row("/opt/x", Protected, "q")]);
+    }
+
+    #[test]
+    fn a_higher_layer_bind_replaces_a_lower_one_at_the_same_rank() {
+        use crate::config::ProviderOrigin::{Builtin, Global, Workspace};
+
+        let at = |mut r: FsRule, origin| {
+            r.origin = origin;
+            r
+        };
+        let f = Fixture::new();
+        f.file("home/a");
+        f.file("home/b");
+        f.file("home/c");
+        // Whatever the order, the workspace layer's bind wins.
+        for rules in [
+            [
+                at(bind("~/a", "/opt/x", BindMode::Ro, "g", 0), Global),
+                at(bind("~/b", "/opt/x", BindMode::Ro, "w", 0), Workspace),
+            ],
+            [
+                at(bind("~/b", "/opt/x", BindMode::Ro, "w", 0), Workspace),
+                at(bind("~/a", "/opt/x", BindMode::Ro, "g", 0), Global),
+            ],
+        ] {
+            let mounts = f.clean(&rules);
+            assert_eq!(
+                mounts,
+                [host("/opt/x", f.home().join("b"), EntryKind::File, Ro, "w")]
+            );
+        }
+        // The global layer beats the built-in one.
+        let mounts = f.clean(&[
+            at(bind("~/a", "/opt/x", BindMode::Ro, "b", 0), Builtin),
+            at(bind("~/c", "/opt/x", BindMode::Ro, "g", 0), Global),
+        ]);
+        assert_eq!(summary(&mounts), [row("/opt/x", Ro, "g")]);
+        // The layer only breaks ties: a stricter mode from a lower layer
+        // still wins, and so does a profile's own rule over an inherited one.
+        let mounts = f.clean(&[
+            at(bind("~/a", "/opt/x", BindMode::Protected, "g", 0), Global),
+            at(bind("~/b", "/opt/x", BindMode::Ro, "w", 0), Workspace),
+        ]);
+        assert_eq!(summary(&mounts), [row("/opt/x", Protected, "g")]);
+        let mounts = f.clean(&[
+            at(bind("~/a", "/opt/x", BindMode::Ro, "g", 0), Global),
+            at(bind("~/b", "/opt/x", BindMode::Ro, "w", 1), Workspace),
+        ]);
+        assert_eq!(summary(&mounts), [row("/opt/x", Ro, "g")]);
+        // Two binds within the winning layer still conflict.
+        let e = f.plan_err(&[
+            at(bind("~/a", "/opt/x", BindMode::Ro, "g", 0), Global),
+            at(bind("~/b", "/opt/x", BindMode::Ro, "w1", 0), Workspace),
+            at(bind("~/c", "/opt/x", BindMode::Ro, "w2", 0), Workspace),
+        ]);
+        let PathPlanError::Conflict(c) = e else {
+            panic!("expected a conflict, got {e:?}");
+        };
+        assert_eq!(
+            (c.first_provider.as_str(), c.second_provider.as_str()),
+            ("w1", "w2")
+        );
     }
 
     #[test]
@@ -2509,6 +2593,7 @@ mod tests {
                 pattern: PathPattern::new_unchecked(s),
             },
             provider: pn("p"),
+            origin: crate::config::ProviderOrigin::Workspace,
             depth: 0,
         };
         let e = f.plan_err(&[unchecked(Ephemeral, "{workspace}/*.tmp")]);

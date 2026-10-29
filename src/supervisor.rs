@@ -34,11 +34,7 @@
 //! filesystem (often sandbox-writable) put text in them. bwrap's own
 //! messages are not stopit's, and are not escaped.
 //!
-//! Not done yet: the PTY proxy (§5; until then the sandbox runs on the
-//! host's terminal, see [`TerminalSession`]), the user-global configuration
-//! layered under `.stopit.toml` (§3), the refusal of a default base with no
-//! user provider granting tools (§3.2), the broker, protected files and the
-//! network proxy.
+//! Not done yet: the PTY proxy in §5, the broker, and the network proxy.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -58,20 +54,24 @@ use rustix::termios::Termios;
 use thiserror::Error;
 
 use crate::bwrap::{BwrapCommand, BwrapError, TerminalSession, working_dir};
-use crate::config::{Base, Config, ConfigError, ProfileRef, ProviderKind, ProviderName};
+use crate::config::{
+    Base, Config, ConfigError, ConfigLayer, LayeredConfig, ProfileRef, ProviderKind, ProviderName,
+    ProviderOrigin,
+};
 use crate::escape::{escape_message, shell_quote};
 use crate::expand::{ExpandError, ExpansionContext, ResolveWarning};
-use crate::manifest::SandboxHome;
+use crate::manifest::{Grants, Manifest, SandboxHome};
 use crate::provider::{
     BASE_PROVIDER_NAME, ProtectedSource, ProviderContext, ProviderError, SUPERVISOR_PROVIDER_NAME,
-    protected_sources, session_providers, static_outputs,
+    layered_session_providers, protected_sources, static_outputs,
 };
 use crate::provision::{ProvisionError, provision_self};
 use crate::resolve::{PlanWarning, PlanWarningKind};
 use crate::session::{SessionDir, SessionError};
 use crate::spec::{CompileError, CompiledSession, SpecWarning, compile_session, static_rw_roots};
 use crate::state::{
-    StateDirs, StateError, data_dirs_from_host, resolve_allowing_missing, runtime_dir,
+    ConfigDirs, GLOBAL_CONFIG_FILE, StateDirs, StateError, config_dirs_from_host,
+    data_dirs_from_host, resolve_allowing_missing, runtime_dir,
 };
 use crate::summary::{SummaryContext, summary_lines};
 use crate::trust::{Allowed, Decision, TrustError, TrustStore};
@@ -292,6 +292,13 @@ pub enum RunError {
     /// Whether stopit is in the foreground of its terminal cannot be told.
     #[error("cannot check that stopit is in the foreground of its terminal: {0}")]
     Foreground(#[source] io::Error),
+
+    /// Effective `base = "default"` has no user provider granting tools.
+    #[error("{}", no_tools_configured_message(global_config))]
+    NoToolsConfigured {
+        /// Active user-global configuration file path.
+        global_config: PathBuf,
+    },
 }
 
 /// What [`run`] runs.
@@ -522,6 +529,7 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     // `STOPIT_STATE_DIR` if set. The store is created now if missing, so
     // that read-only views of it mask it.
     let data_dirs = data_dirs_from_host()?;
+    let config_dirs = config_dirs_from_host()?;
     let store = TrustStore::open(&data_dirs.store.path)?;
     // Before anything runs or is created: only a configuration the user
     // allowed, in the exact bytes read, which are the bytes parsed; and not
@@ -529,7 +537,7 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     let allowed = store.read()?;
     drop(store);
     let explicit = invocation.workspace.is_some().then_some(&workspace.dir);
-    let config = match &file {
+    let project_layer = match &file {
         None => {
             let links = discovery_links(
                 &cwd,
@@ -537,14 +545,32 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
                 std::env::var_os("PWD"),
             );
             check_missing(&allowed, &workspace.dir, explicit.is_some(), &links)?;
-            Config::default()
+            None
         }
         Some(file) => {
             check_allowed(&allowed, file, explicit.map(PathBuf::as_path))?;
-            file.parse()?
+            Some(file.parse_layer()?)
         }
     };
-    // TODO(§3): layer `.stopit.toml` over the user-global configuration.
+    let global_file = if project_layer
+        .as_ref()
+        .is_some_and(ConfigLayer::sets_base_none)
+    {
+        None
+    } else {
+        read_global_config(&config_dirs)?
+    };
+    let global_layer = match &global_file {
+        Some(gf) => Some(gf.parse_layer()?),
+        None => None,
+    };
+    let LayeredConfig {
+        config,
+        providers: layered_entries,
+    } = ConfigLayer::layer(
+        global_layer.map(|layer| (layer, config_dirs.active.path.as_path())),
+        project_layer.map(|layer| (layer, workspace.dir.as_path())),
+    );
     let home = host_home(std::env::var_os("HOME"))?;
     let mount = config.workspace.mount.clone();
     let ctx = ExpansionContext::new(
@@ -564,9 +590,7 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     // Before the providers, which are told where it is. From here on,
     // returning removes it.
     let session = SessionDir::create_from_env()?;
-    // Relative script sources are resolved against the configuration
-    // file's directory: the workspace, by construction.
-    let providers = session_providers(&config, &workspace.dir)?;
+    let providers = layered_session_providers(config.base, &layered_entries)?;
     let pctx = ProviderContext {
         workspace: workspace.dir.clone(),
         workspace_mount: mount.clone(),
@@ -579,7 +603,10 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
         .iter()
         .map(|p| Ok((p.name().clone(), p.manifest(&pctx)?)))
         .collect::<Result<Vec<_>, ProviderError>>()?;
-    // The script providers' sources, and the configuration file itself,
+    let has_user_tools = outputs.iter().any(|(_, out)| {
+        out.origin != ProviderOrigin::Builtin && manifest_grants_tools(&out.manifest)
+    });
+    // The script providers' sources, and the configuration files themselves,
     // protected in every profile whatever the base and rules (§3, §3.6),
     // the latter attributed to the name reserved for stopit's own rules.
     let mut protected = protected_sources(&providers)?;
@@ -591,23 +618,37 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
             path: file.path.clone(),
         });
     }
+    if let Some(gf) = &global_file {
+        protected.push(ProtectedSource {
+            provider: SUPERVISOR_PROVIDER_NAME
+                .parse()
+                .expect("the supervisor's name is a valid provider name"),
+            path: gf.canonical_path.clone(),
+        });
+    }
     // stopit's own state, which no mount may expose (§6.2, Reserved host
-    // paths): the parent of every session directory, and the data
-    // directories. `XDG_RUNTIME_DIR` is set and absolute, or there would be
-    // no session.
+    // paths): the parent of every session directory, the data directories,
+    // and the configuration directories. `XDG_RUNTIME_DIR` is set and
+    // absolute, or there would be no session.
     let runtime = runtime_dir(Path::new(
         &std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_default(),
     ))?;
     debug_assert_eq!(Some(runtime.path.as_path()), session.root().parent());
+    let global_config_path = config_dirs.active.path.join(GLOBAL_CONFIG_FILE);
     let state = StateDirs {
         runtime,
         data: data_dirs,
+        config: config_dirs,
     };
     let compiled = compile_session(&config, outputs, &protected, &state, &ctx)?;
+    if config.base == Base::Default && !has_user_tools {
+        return Err(RunError::NoToolsConfigured {
+            global_config: global_config_path,
+        });
+    }
     for line in warning_lines(&compiled, config.base) {
         print_warning(&line);
     }
-    // TODO(§3.2): refuse a default base with no user provider granting tools.
     let profile_name = profile.as_str().to_owned();
     let Some(profile) = compiled.get(&profile) else {
         return Err(RunError::UnknownProfile {
@@ -1152,18 +1193,72 @@ pub struct ConfigFile {
 }
 
 impl ConfigFile {
-    /// The configuration it holds (an empty file is the default
-    /// configuration: `base = "default"` and nothing else).
+    /// Parses the file as a [`Config`].
     pub fn parse(&self) -> Result<Config, RunError> {
-        let text = std::str::from_utf8(&self.bytes).map_err(|e| RunError::ReadConfig {
-            path: self.path.clone(),
-            source: io::Error::new(io::ErrorKind::InvalidData, e),
-        })?;
-        Config::from_toml_str(text).map_err(|source| RunError::Config {
-            path: self.path.clone(),
-            source,
-        })
+        Ok(self.parse_layer()?.into_config())
     }
+
+    /// Parses the file as a [`ConfigLayer`] keeping explicit field presence.
+    pub fn parse_layer(&self) -> Result<ConfigLayer, RunError> {
+        parse_layer(&self.path, &self.bytes)
+    }
+}
+
+/// User-global configuration file content and canonical target path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalConfigFile {
+    /// Declared path `<config_dir>/config.toml` used in error messages.
+    pub path: PathBuf,
+    /// Canonical path of the underlying file, protected against writable grants.
+    pub canonical_path: PathBuf,
+    /// Raw file bytes.
+    pub bytes: Vec<u8>,
+}
+
+impl GlobalConfigFile {
+    /// Parses the file as a [`ConfigLayer`] keeping explicit field presence.
+    pub fn parse_layer(&self) -> Result<ConfigLayer, RunError> {
+        parse_layer(&self.path, &self.bytes)
+    }
+}
+
+/// Parses `bytes`, read from `path`, as a [`ConfigLayer`].
+fn parse_layer(path: &Path, bytes: &[u8]) -> Result<ConfigLayer, RunError> {
+    let text = std::str::from_utf8(bytes).map_err(|e| RunError::ReadConfig {
+        path: path.to_owned(),
+        source: io::Error::new(io::ErrorKind::InvalidData, e),
+    })?;
+    ConfigLayer::from_toml_str(text).map_err(|source| RunError::Config {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+/// Whether `manifest` grants tools in its top-level grants or any contributed profile.
+pub fn manifest_grants_tools(manifest: &Manifest) -> bool {
+    grants_tools(&manifest.grants) || manifest.profiles.values().any(|p| grants_tools(&p.grants))
+}
+
+fn grants_tools(grants: &Grants) -> bool {
+    !grants.fs.ro.is_empty()
+        || !grants.fs.rw.is_empty()
+        || !grants.fs.bind.is_empty()
+        || !grants.env.path_prepend.is_empty()
+}
+
+fn no_tools_configured_message(global_config: &Path) -> String {
+    format!(
+        "base = \"default\" mounts no tools, and no provider in {global_config:?} or {CONFIG_FILE} \
+         grants any; configure a tool provider in {global_config:?} for every workspace or in \
+         {CONFIG_FILE} for this workspace, for example:\n\
+         \n\
+         [[provider]]\n\
+         type = \"config\"\n\
+         name = \"tools\"\n\
+         [provider.sandbox]\n\
+         fs.ro = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
+         env.path_prepend = [\"/usr/bin\", \"/bin\"]"
+    )
 }
 
 /// Refuses `file` unless `allowed` (the trust store) allows its path with
@@ -1450,6 +1545,232 @@ pub fn check_config_trust(file: Ownership, dir: Ownership, uid: u32) -> Result<(
             "its directory is writable by its group or others and not sticky (mode {:04o}), so \
              they could replace it",
             dir.mode & 0o7777
+        ));
+    }
+    Ok(())
+}
+
+/// Reads `<config_dir>/config.toml` when present and trusted for the current user.
+pub fn read_global_config(config_dirs: &ConfigDirs) -> Result<Option<GlobalConfigFile>, RunError> {
+    read_global_config_as(config_dirs, rustix::process::getuid().as_raw())
+}
+
+fn read_global_config_as(
+    config_dirs: &ConfigDirs,
+    uid: u32,
+) -> Result<Option<GlobalConfigFile>, RunError> {
+    use rustix::fs::{AtFlags, CWD, Mode, OFlags, ResolveFlags, fstat, openat, openat2, statat};
+
+    let dir = &config_dirs.active.path;
+    let declared_path = dir.join(GLOBAL_CONFIG_FILE);
+    let read_error = |source: io::Error| RunError::ReadConfig {
+        path: declared_path.clone(),
+        source,
+    };
+    let untrusted = |reason: String| RunError::UntrustedConfig {
+        path: declared_path.clone(),
+        reason,
+    };
+
+    let dir_fd = match openat2(
+        CWD,
+        dir,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS,
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(Errno::LOOP) => {
+            return Err(untrusted(format!(
+                "the way to it, {dir:?}, runs through a symbolic link, though it was resolved \
+                 without one; a symbolic link was put there since"
+            )));
+        }
+        Err(e @ (Errno::NOSYS | Errno::PERM)) => {
+            return Err(read_error(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "openat2 failed with {e}; stopit needs Linux 5.6 or later without a seccomp \
+                     profile that blocks openat2"
+                ),
+            )));
+        }
+        Err(e) => return Err(read_error(e.into())),
+    };
+
+    let check_way_and_dir = || -> Result<(), RunError> {
+        for link in &config_dirs.active.links {
+            let link_meta = fs::symlink_metadata(link).map_err(&read_error)?;
+            check_global_link_trust(link_meta.uid(), uid).map_err(|why| {
+                untrusted(format!(
+                    "{link:?} on the way to it failed trust checks, {why}"
+                ))
+            })?;
+            if let Some(link_parent) = link.parent() {
+                let parent_meta = fs::metadata(link_parent).map_err(&read_error)?;
+                check_global_dir_trust(
+                    Ownership {
+                        uid: parent_meta.uid(),
+                        mode: parent_meta.mode(),
+                    },
+                    uid,
+                )
+                .map_err(|why| {
+                    untrusted(format!(
+                        "the directory {link_parent:?} holding {link:?} failed trust checks, {why}"
+                    ))
+                })?;
+            }
+        }
+        let dir_stat = fstat(&dir_fd).map_err(|e| read_error(e.into()))?;
+        check_global_dir_trust(Ownership::of(&dir_stat), uid).map_err(&untrusted)
+    };
+
+    let (fd, canonical_path) = match openat(
+        &dir_fd,
+        GLOBAL_CONFIG_FILE,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NOCTTY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Err(Errno::NOENT) => return Ok(None),
+        Ok(fd) => {
+            check_way_and_dir()?;
+            let file_stat = fstat(&fd).map_err(|e| read_error(e.into()))?;
+            check_global_file_trust(Ownership::of(&file_stat), uid).map_err(&untrusted)?;
+            (fd, declared_path.clone())
+        }
+        Err(Errno::LOOP) => {
+            check_way_and_dir()?;
+            let link_stat = statat(&dir_fd, GLOBAL_CONFIG_FILE, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|e| read_error(e.into()))?;
+            if link_stat.st_mode & libc::S_IFMT != libc::S_IFLNK {
+                return Err(untrusted("it changed while being opened".into()));
+            }
+            check_global_link_trust(link_stat.st_uid, uid).map_err(&untrusted)?;
+            let fd = match openat(
+                &dir_fd,
+                GLOBAL_CONFIG_FILE,
+                OFlags::RDONLY | OFlags::NOCTTY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(Errno::NOENT) => {
+                    return Err(untrusted("it is a dangling symbolic link".into()));
+                }
+                Err(e) => return Err(read_error(e.into())),
+            };
+            let target_stat = fstat(&fd).map_err(|e| read_error(e.into()))?;
+            check_global_file_trust(Ownership::of(&target_stat), uid)
+                .map_err(|why| untrusted(format!("its target failed trust checks, {why}")))?;
+            let canonical_path =
+                fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).map_err(&read_error)?;
+            let (Some(target_dir), Some(target_name)) =
+                (canonical_path.parent(), canonical_path.file_name())
+            else {
+                return Err(untrusted(format!(
+                    "its target {canonical_path:?} has no parent directory"
+                )));
+            };
+            let target_dir_fd = match openat2(
+                CWD,
+                target_dir,
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::NO_SYMLINKS,
+            ) {
+                Ok(tfd) => tfd,
+                Err(Errno::LOOP) => {
+                    return Err(untrusted(format!(
+                        "the directory {target_dir:?} holding its target {canonical_path:?} runs \
+                         through a symbolic link"
+                    )));
+                }
+                Err(e) => {
+                    return Err(untrusted(format!(
+                        "cannot inspect the directory {target_dir:?} holding its target \
+                         {canonical_path:?}: {e}"
+                    )));
+                }
+            };
+            let target_dir_stat = fstat(&target_dir_fd).map_err(|e| read_error(e.into()))?;
+            check_global_dir_trust(Ownership::of(&target_dir_stat), uid).map_err(|why| {
+                untrusted(format!(
+                    "the directory {target_dir:?} holding its target {canonical_path:?} failed \
+                     trust checks, {why}"
+                ))
+            })?;
+            let verify_stat = statat(&target_dir_fd, target_name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|e| {
+                    untrusted(format!(
+                        "its target {canonical_path:?} could not be verified: {e}"
+                    ))
+                })?;
+            if (verify_stat.st_dev, verify_stat.st_ino) != (target_stat.st_dev, target_stat.st_ino)
+            {
+                return Err(untrusted(format!(
+                    "its target {canonical_path:?} was replaced or deleted while being opened"
+                )));
+            }
+            (fd, canonical_path)
+        }
+        Err(e) => return Err(read_error(e.into())),
+    };
+
+    let mut bytes = Vec::new();
+    File::from(fd)
+        .read_to_end(&mut bytes)
+        .map_err(&read_error)?;
+    Ok(Some(GlobalConfigFile {
+        path: declared_path,
+        canonical_path,
+        bytes,
+    }))
+}
+
+/// Checks ownership and mode of a global configuration file or symlink target.
+pub fn check_global_file_trust(file: Ownership, uid: u32) -> Result<(), String> {
+    if file.mode & libc::S_IFMT != libc::S_IFREG {
+        return Err("it is not a regular file".into());
+    }
+    if file.uid != uid && file.uid != 0 {
+        return Err(format!(
+            "it is owned by uid {}, neither uid {uid} nor root",
+            file.uid
+        ));
+    }
+    if file.mode & 0o022 != 0 {
+        return Err(format!(
+            "it has mode {:04o} and is writable by its group or others; run `chmod go-w` on it",
+            file.mode & 0o7777
+        ));
+    }
+    Ok(())
+}
+
+/// Checks ownership and mode of a global configuration directory or symlink target's parent.
+pub fn check_global_dir_trust(dir: Ownership, uid: u32) -> Result<(), String> {
+    if dir.uid != uid && dir.uid != 0 {
+        return Err(format!(
+            "its directory is owned by uid {}, neither uid {uid} nor root",
+            dir.uid
+        ));
+    }
+    if dir.mode & 0o022 != 0 && dir.mode & libc::S_ISVTX == 0 {
+        return Err(format!(
+            "its directory has mode {:04o}, writable by its group or others and not sticky, so \
+             others could replace it",
+            dir.mode & 0o7777
+        ));
+    }
+    Ok(())
+}
+
+/// Checks ownership of a symlink naming the global configuration file.
+pub fn check_global_link_trust(link_uid: u32, uid: u32) -> Result<(), String> {
+    if link_uid != uid && link_uid != 0 {
+        return Err(format!(
+            "the symbolic link is owned by uid {link_uid}, neither uid {uid} nor root"
         ));
     }
     Ok(())
@@ -2483,5 +2804,245 @@ mod tests {
         let after = unsafe { *libc::__errno_location() };
         drain_signal_pipe();
         assert_eq!(after, libc::ENOENT);
+    }
+
+    // --- The user-global configuration ---
+
+    fn chmod(path: &Path, mode: u32) {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// A trusted configuration directory `cfg` (`0755`) below `root`.
+    fn global_dir(root: &Path) -> ConfigDirs {
+        let dir = root.join("cfg");
+        fs::create_dir_all(&dir).unwrap();
+        chmod(&dir, 0o755);
+        ConfigDirs::canonical(dir)
+    }
+
+    fn read_global(dirs: &ConfigDirs) -> Result<Option<GlobalConfigFile>, RunError> {
+        read_global_config_as(dirs, rustix::process::getuid().as_raw())
+    }
+
+    #[track_caller]
+    fn untrusted_reason(dirs: &ConfigDirs) -> String {
+        match read_global(dirs) {
+            Err(RunError::UntrustedConfig { path, reason }) => {
+                assert_eq!(path, dirs.active.path.join(GLOBAL_CONFIG_FILE));
+                reason
+            }
+            other => panic!("expected an untrusted configuration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_global_configuration_is_absent() {
+        let (_d, root) = tmp();
+        // Neither the directory nor the file.
+        let dirs = ConfigDirs::canonical(root.join("nope/stopit"));
+        assert_eq!(read_global(&dirs).unwrap(), None);
+        // The directory without the file.
+        let dirs = global_dir(&root);
+        assert_eq!(read_global(&dirs).unwrap(), None);
+    }
+
+    #[test]
+    fn an_owned_global_configuration_is_read() {
+        let (_d, root) = tmp();
+        let dirs = global_dir(&root);
+        let path = dirs.active.path.join(GLOBAL_CONFIG_FILE);
+        fs::write(&path, "base = \"none\"\n").unwrap();
+        for mode in [0o644, 0o600, 0o400] {
+            chmod(&path, mode);
+            let file = read_global(&dirs).unwrap().unwrap();
+            assert_eq!(
+                file,
+                GlobalConfigFile {
+                    path: path.clone(),
+                    canonical_path: path.clone(),
+                    bytes: b"base = \"none\"\n".to_vec(),
+                }
+            );
+            assert!(file.parse_layer().unwrap().sets_base_none());
+        }
+        // A sticky world-writable directory is fine, as for `/nix/store`.
+        chmod(&dirs.active.path, 0o1777);
+        assert!(read_global(&dirs).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_writable_or_odd_global_configuration_is_refused() {
+        let (_d, root) = tmp();
+        let dirs = global_dir(&root);
+        let path = dirs.active.path.join(GLOBAL_CONFIG_FILE);
+        fs::write(&path, "").unwrap();
+        for mode in [0o664, 0o646, 0o666] {
+            chmod(&path, mode);
+            let reason = untrusted_reason(&dirs);
+            assert_eq!(
+                reason,
+                format!(
+                    "it has mode {mode:04o} and is writable by its group or others; run `chmod \
+                     go-w` on it"
+                )
+            );
+        }
+        chmod(&path, 0o644);
+        // A group-writable directory lets others swap the file.
+        chmod(&dirs.active.path, 0o775);
+        assert_eq!(
+            untrusted_reason(&dirs),
+            "its directory has mode 0775, writable by its group or others and not sticky, so \
+             others could replace it"
+        );
+        chmod(&dirs.active.path, 0o755);
+        // Not a regular file.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert_eq!(untrusted_reason(&dirs), "it is not a regular file");
+        fs::remove_dir(&path).unwrap();
+        // Bytes that are not UTF-8 or not TOML fail when parsed.
+        fs::write(&path, b"\xff").unwrap();
+        let file = read_global(&dirs).unwrap().unwrap();
+        assert!(matches!(
+            file.parse_layer(),
+            Err(RunError::ReadConfig { .. })
+        ));
+        fs::write(&path, "base = 1").unwrap();
+        let file = read_global(&dirs).unwrap().unwrap();
+        assert!(matches!(file.parse_layer(), Err(RunError::Config { .. })));
+    }
+
+    #[test]
+    fn a_symlinked_global_configuration_is_read_through_its_target() {
+        let (_d, root) = tmp();
+        let dirs = global_dir(&root);
+        let link = dirs.active.path.join(GLOBAL_CONFIG_FILE);
+        // A Home Manager style store: a sticky shared directory holding a
+        // read-only file.
+        let store = root.join("store");
+        fs::create_dir(&store).unwrap();
+        chmod(&store, 0o1775);
+        let target = store.join("abc-config.toml");
+        fs::write(&target, "[limits]\npids = 7\n").unwrap();
+        chmod(&target, 0o444);
+        symlink(&target, &link).unwrap();
+        let file = read_global(&dirs).unwrap().unwrap();
+        assert_eq!(file.path, link);
+        assert_eq!(file.canonical_path, target);
+        assert_eq!(
+            file.parse_layer().unwrap().limits.pids,
+            std::num::NonZeroU32::new(7)
+        );
+        // A relative link into a dotfiles directory.
+        let dotfiles = root.join("dotfiles");
+        fs::create_dir(&dotfiles).unwrap();
+        chmod(&dotfiles, 0o755);
+        fs::write(dotfiles.join("stopit.toml"), "").unwrap();
+        chmod(&dotfiles.join("stopit.toml"), 0o644);
+        fs::remove_file(&link).unwrap();
+        symlink("../dotfiles/stopit.toml", &link).unwrap();
+        let file = read_global(&dirs).unwrap().unwrap();
+        assert_eq!(file.canonical_path, dotfiles.join("stopit.toml"));
+    }
+
+    #[test]
+    fn a_symlinked_global_configuration_with_a_bad_target_is_refused() {
+        let (_d, root) = tmp();
+        let dirs = global_dir(&root);
+        let link = dirs.active.path.join(GLOBAL_CONFIG_FILE);
+        let other = root.join("other");
+        fs::create_dir(&other).unwrap();
+        chmod(&other, 0o755);
+        let target = other.join("config.toml");
+        symlink(&target, &link).unwrap();
+        // Dangling: refused rather than treated as absent.
+        assert_eq!(untrusted_reason(&dirs), "it is a dangling symbolic link");
+        // A writable target.
+        fs::write(&target, "").unwrap();
+        chmod(&target, 0o666);
+        assert!(
+            untrusted_reason(&dirs).starts_with("its target failed trust checks, it has mode 0666"),
+        );
+        // A target in a directory others can write without the sticky bit.
+        chmod(&target, 0o644);
+        chmod(&other, 0o777);
+        let reason = untrusted_reason(&dirs);
+        assert!(
+            reason.starts_with(&format!("the directory {other:?} holding its target")),
+            "{reason}"
+        );
+        assert!(reason.contains("not sticky"), "{reason}");
+        chmod(&other, 0o755);
+        // A link to a directory.
+        fs::remove_file(&link).unwrap();
+        symlink(&other, &link).unwrap();
+        assert_eq!(
+            untrusted_reason(&dirs),
+            "its target failed trust checks, it is not a regular file"
+        );
+        // A link whose target directory path runs through another link.
+        fs::remove_file(&link).unwrap();
+        symlink(&other, root.join("other-link")).unwrap();
+        symlink(root.join("other-link/config.toml"), &link).unwrap();
+        assert!(
+            read_global(&dirs).unwrap().is_some(),
+            "resolved through the kernel"
+        );
+    }
+
+    #[test]
+    fn global_trust_checks_accept_only_the_user_or_root() {
+        let uid = 1000;
+        let file = |uid, mode| Ownership {
+            uid,
+            mode: libc::S_IFREG | mode,
+        };
+        let dir = |uid, mode| Ownership {
+            uid,
+            mode: libc::S_IFDIR | mode,
+        };
+        assert_eq!(check_global_file_trust(file(uid, 0o644), uid), Ok(()));
+        assert_eq!(check_global_file_trust(file(0, 0o444), uid), Ok(()));
+        assert_eq!(
+            check_global_file_trust(file(1001, 0o644), uid),
+            Err("it is owned by uid 1001, neither uid 1000 nor root".into())
+        );
+        assert_eq!(check_global_dir_trust(dir(0, 0o1775), uid), Ok(()));
+        assert_eq!(check_global_dir_trust(dir(uid, 0o755), uid), Ok(()));
+        assert_eq!(
+            check_global_dir_trust(dir(1001, 0o755), uid),
+            Err("its directory is owned by uid 1001, neither uid 1000 nor root".into())
+        );
+        assert_eq!(check_global_link_trust(0, uid), Ok(()));
+        assert_eq!(check_global_link_trust(uid, uid), Ok(()));
+        assert_eq!(
+            check_global_link_trust(1001, uid),
+            Err("the symbolic link is owned by uid 1001, neither uid 1000 nor root".into())
+        );
+    }
+
+    #[test]
+    fn tool_grants_are_paths_or_a_search_path() {
+        let grants = |src: &str| -> bool {
+            manifest_grants_tools(&toml::from_str::<Manifest>(src).unwrap())
+        };
+        assert!(!grants(""));
+        assert!(!grants(
+            "fs.masked = [\"/x\"]\nenv.set = { EDITOR = \"vi\" }"
+        ));
+        assert!(!grants("fs.protected = [\"/x\"]\nnetwork.mode = \"full\""));
+        // The host's `PATH` never reaches the sandbox, so passing it grants
+        // nothing.
+        assert!(!grants("env.pass = [\"PATH\", \"*\"]"));
+        for src in [
+            "fs.ro = [\"/usr\"]",
+            "fs.rw = [\"~/data\"]",
+            "fs.bind = [{ host = \"/opt/a\", sandbox = \"/opt/b\", mode = \"ro\" }]",
+            "env.path_prepend = [\"/bin\"]",
+            "[profiles.p]\nfs.ro = [\"/usr\"]",
+        ] {
+            assert!(grants(src), "{src}");
+        }
     }
 }

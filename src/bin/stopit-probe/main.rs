@@ -450,8 +450,8 @@ fn syscall_probe(call: SyscallProbe) -> io::Result<()> {
             }
         }
         SyscallProbe::Keyctl => {
-            // SAFETY: invalid command `0` (`KEYCTL_GET_KEYRING_ID` with 0) has
-            // no persistent side effects; seccomp blocks `SYS_keyctl` first.
+            // SAFETY: invalid command `-1` fails with `EOPNOTSUPP` without side
+            // effects when allowed, and seccomp blocks `SYS_keyctl` first.
             check(unsafe { libc::syscall(libc::SYS_keyctl, -1i32, 0usize, 0usize, 0usize, 0usize) })
         }
         SyscallProbe::AddKey => {

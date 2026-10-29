@@ -13,6 +13,7 @@ use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
 /// meaning of a value must never depend on field order, so schema structs
 /// are deserialized through this wrapper, which rejects everything but a
 /// map (a JSON object or a TOML table).
+#[derive(Default)]
 pub(crate) struct MapOnly<T>(pub T);
 
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for MapOnly<T> {

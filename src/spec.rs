@@ -1444,7 +1444,7 @@ fn check_host_sources(
         .map(|(k, (p, _))| (k.clone(), p.clone()))
         .collect();
     let mounts = cover_restricted_exposure(kept, &sources, ws_host, warnings);
-    let mounts = protect_sources(mounts, &rw_sources, protected, warnings);
+    let mounts = protect_sources(mounts, &rw_sources, protected, state, warnings);
     let workspace = (ws_host, ctx.workspace_sandbox());
     let mounts = check_state_dirs(mounts, &canonical, workspace, state, warnings)?;
     let mounts = if mask_sockets {
@@ -1750,16 +1750,17 @@ fn check_state_dirs(
                 let Ok(rel) = rel else {
                     continue;
                 };
-                match (m.mode, dir) {
-                    (PathMode::Ro | PathMode::Protected, StateDir::Runtime) => {}
-                    (PathMode::Ro | PathMode::Protected, StateDir::Data) => {
+                let mask_kind = match (m.mode, dir) {
+                    (PathMode::Ro | PathMode::Protected, StateDir::Runtime) => EntryKind::Dir,
+                    (PathMode::Ro | PathMode::Protected, StateDir::Data | StateDir::Config) => {
                         // Resolved, so not a link if it exists.
-                        if !fs::symlink_metadata(reserved).is_ok_and(|meta| meta.is_dir()) {
+                        let Ok(meta) = fs::symlink_metadata(reserved) else {
                             continue;
-                        }
+                        };
+                        EntryKind::from_file_type(meta.file_type())
                     }
                     (PathMode::Masked | PathMode::Ephemeral | PathMode::Rw, _) => continue,
-                }
+                };
                 let x = m.sandbox.join(rel);
                 let overmounted = x
                     .ancestors()
@@ -1768,10 +1769,11 @@ fn check_state_dirs(
                 if overmounted || masks.contains_key(&x) {
                     continue;
                 }
-                // The store's own directory is masked quietly: `ro ~` is
-                // the recommended way to show the home directory, and it
-                // always contains it.
-                let quiet = dir == StateDir::Data && state_path.path == state.data.store.path;
+                // The active data and configuration directories are masked
+                // quietly under `ro ~` so showing the home directory does not
+                // warn on every run.
+                let quiet = (dir == StateDir::Data && state_path.path == state.data.store.path)
+                    || (dir == StateDir::Config && state_path.path == state.config.active.path);
                 if !quiet {
                     warnings.push(SpecWarning::StateDirMasked(Box::new(StateDirMasked {
                         provider: m.provider.clone(),
@@ -1790,7 +1792,7 @@ fn check_state_dirs(
                         sandbox: x,
                         source: MountSource::Host {
                             path: reserved.to_owned(),
-                            kind: EntryKind::Dir,
+                            kind: mask_kind,
                         },
                         mode: PathMode::Masked,
                         provider: SUPERVISOR_PROVIDER_NAME
@@ -1861,6 +1863,7 @@ fn protect_sources(
     mut mounts: Vec<PlannedMount>,
     rw_sources: &BTreeMap<PathBuf, PathBuf>,
     protected: &[SourceToProtect<'_>],
+    state: &StateDirs,
     warnings: &mut Vec<SpecWarning>,
 ) -> Vec<PlannedMount> {
     let mut added: BTreeMap<PathBuf, PlannedMount> = BTreeMap::new();
@@ -1870,6 +1873,9 @@ fn protect_sources(
     {
         let at: BTreeSet<&Path> = mounts.iter().map(|m| m.sandbox.as_path()).collect();
         for p in protected {
+            if state.iter().any(|(_, sp)| p.path.starts_with(&sp.path)) {
+                continue;
+            }
             for (i, m) in mounts.iter().enumerate() {
                 if m.mode != PathMode::Rw {
                     continue;
@@ -3238,7 +3244,7 @@ mod tests {
     use crate::policy::PathMode::{self, Ephemeral, Masked, Protected, Ro, Rw};
     use crate::provider::{ProviderContext, session_providers};
     use crate::resolve::{EphemeralKey, MountSource, PlanWarningKind};
-    use crate::state::{DataDirs, StatePath};
+    use crate::state::{ConfigDirs, DataDirs, StatePath};
 
     /// The source of an ephemeral mount whose rule was written as `pattern`.
     fn eph_source(pattern: &str) -> MountSource {
@@ -3287,6 +3293,7 @@ mod tests {
             let state = StateDirs {
                 runtime: StatePath::canonical(root.join("run/stopit")),
                 data: DataDirs::canonical(root.join("home/.local/share/stopit")),
+                config: ConfigDirs::canonical(root.join("home/.config/stopit")),
             };
             Fixture {
                 _dir: dir,
@@ -6987,7 +6994,8 @@ mod tests {
 
     #[test]
     fn masked_content_shown_elsewhere_is_masked_there_too() {
-        let f = Fixture::new();
+        let mut f = Fixture::new();
+        f.state.config = ConfigDirs::canonical(f.root.join("config/stopit"));
         f.file("home/.config/tool/token");
         f.file("home/.config/other");
         let cfg = f.root.join("home/.config");
@@ -8384,8 +8392,9 @@ mod tests {
     #[test]
     fn a_provider_source_is_protected_wherever_an_rw_grant_shows_it() {
         let mut f = Fixture::new();
-        // `~` is bound `rw`: keep the data directory out of it.
+        // `~` is bound `rw`: keep the data and config directories out of it.
         f.state.data = DataDirs::canonical(f.root.join("data/stopit"));
+        f.state.config = ConfigDirs::canonical(f.root.join("config/stopit"));
         f.file("home/bin/env.sh");
         f.mkdir("home/other");
         let src = format!(
@@ -8458,6 +8467,7 @@ mod tests {
         // must not be shown read-only on top of that cover.
         let mut f = Fixture::new();
         f.state.data = DataDirs::canonical(f.root.join("data/stopit"));
+        f.state.config = ConfigDirs::canonical(f.root.join("config/stopit"));
         f.file("home/cfg/env.sh");
         let src = format!(
             "base = \"none\"\n{}",
@@ -9280,6 +9290,118 @@ mod tests {
             );
         }
         f.compile(&none_with("fs.rw = [\"~/sub\"]"));
+    }
+
+    #[test]
+    fn config_directories_are_reserved_masked_and_safe_through_symlinks() {
+        let mut f = Fixture::new();
+        f.mkdir("home/.config/stopit/sub");
+        let cfg_dir = f.state.config.active.path.clone();
+
+        for (body, mode, host, contains) in [
+            (
+                "fs.rw = [\"~/.config\"]",
+                Rw,
+                f.root.join("home/.config"),
+                true,
+            ),
+            ("fs.ro = [\"~/.config/stopit\"]", Ro, cfg_dir.clone(), false),
+            (
+                "fs.masked = [\"~/.config/stopit/sub\"]",
+                Masked,
+                cfg_dir.join("sub"),
+                false,
+            ),
+        ] {
+            let r = reserved_host(f.compile_err(&none_with(body)));
+            assert_eq!(
+                (r.mode, &r.resolved, r.dir, r.contains),
+                (mode, &host, StateDir::Config, contains),
+                "{body}"
+            );
+            assert!(r.to_string().contains("configuration directory"), "{r}");
+        }
+
+        let s = f.compile(&none_with("fs.ro = [\"~\"]"));
+        let main = get(&s, "main");
+        assert!(main.warnings.is_empty(), "{:?}", main.warnings);
+        assert_eq!(
+            mounts(&main.spec),
+            [
+                row("/home/user", Ro, "u"),
+                row("/home/user/.config/stopit", Masked, "stopit"),
+            ]
+        );
+
+        f.mkdir("var/cfg");
+        let override_dir = f.root.join("var/cfg");
+        let home = f.root.join("home");
+        f.state.config = crate::state::config_dirs(&home, Some(override_dir.as_os_str())).unwrap();
+        let s = f.compile(&none_with(&format!(
+            "fs.ro = [\"~\", {:?}]",
+            f.root.join("var")
+        )));
+        let main = get(&s, "main");
+        let [SpecWarning::StateDirMasked(w)] = main.warnings.as_slice() else {
+            panic!("{:?}", main.warnings);
+        };
+        assert_eq!(w.dir, StateDir::Config);
+        assert_eq!(w.reserved, home.join(".config/stopit"));
+        assert_eq!(w.masked_at, PathBuf::from("/home/user/.config/stopit"));
+
+        let mut f_link = Fixture::new();
+        f_link.mkdir("home/.config");
+        f_link.mkdir("store/xyz-stopit");
+        f_link.file("store/xyz-stopit/config.toml");
+        symlink(
+            f_link.root.join("store/xyz-stopit"),
+            f_link.root.join("home/.config/stopit"),
+        )
+        .unwrap();
+        f_link.state.config = crate::state::config_dirs(&f_link.root.join("home"), None).unwrap();
+        assert_eq!(
+            f_link.state.config.active.path,
+            f_link.root.join("store/xyz-stopit")
+        );
+        let r = reserved_host(f_link.compile_err(&none_with("fs.rw = [\"~/.config\"]")));
+        assert_eq!(
+            (r.dir, r.contains, r.via),
+            (
+                StateDir::Config,
+                true,
+                Some(f_link.root.join("home/.config/stopit"))
+            )
+        );
+        let store = f_link.root.join("store");
+        let s = f_link.compile(&none_with(&format!("fs.ro = [\"~\", {store:?}]")));
+        let main = get(&s, "main");
+        assert!(main.warnings.is_empty(), "{:?}", main.warnings);
+        assert_eq!(
+            mounts(&main.spec),
+            [
+                row("/home/user", Ro, "u"),
+                row(store.to_str().unwrap(), Ro, "u"),
+                row(store.join("xyz-stopit").to_str().unwrap(), Masked, "stopit"),
+            ]
+        );
+
+        let mut f_file = Fixture::new();
+        f_file.mkdir("home/.config");
+        f_file.file("store/xyz-file");
+        symlink(
+            f_file.root.join("store/xyz-file"),
+            f_file.root.join("home/.config/stopit"),
+        )
+        .unwrap();
+        f_file.state.config = crate::state::config_dirs(&f_file.root.join("home"), None).unwrap();
+        let store = f_file.root.join("store");
+        let s = f_file.compile(&none_with(&format!("fs.ro = [\"~\", {store:?}]")));
+        let main = get(&s, "main");
+        assert!(main.warnings.is_empty(), "{:?}", main.warnings);
+        assert_eq!(
+            main.spec.mounts[2].source,
+            host(&store.join("xyz-file"), EntryKind::File)
+        );
     }
 
     #[test]

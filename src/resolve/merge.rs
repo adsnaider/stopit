@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 use super::graph::{Contribution, ProfileGraph};
-use crate::config::{ProfileRef, ProviderName};
+use crate::config::{ProfileRef, ProviderName, ProviderOrigin};
 use crate::manifest::{
     Bind, DevMode, Domain, EnvName, EnvPattern, EnvValue, EtcFile, FsGrants, OptInSyscall,
     PathPattern, SandboxHome, SearchPathEntry, ShareableNamespace, ShimName, ShimSpec,
@@ -48,6 +48,8 @@ pub struct FsRule {
     pub kind: FsRuleKind,
     /// The provider that granted it.
     pub provider: ProviderName,
+    /// Layer that declared the provider.
+    pub origin: ProviderOrigin,
     /// How far up the inheritance chain the rule was granted: 0 for the
     /// profile's own contributions, 1 for its parent's own, 2 for its
     /// grandparent's, and so on. Used for "a profile's own rules beat
@@ -341,23 +343,27 @@ fn merge_etc(inherited: &BTreeSet<EtcFile>, own: &[Contribution]) -> BTreeSet<Et
     union(inherited, own.iter().map(|c| &c.grants.system.etc))
 }
 
-/// `system.home` (§3.5): conflicting values within a profile are an error
-/// (identical values are fine); a profile's own value overrides the
-/// inherited one. Default none.
+/// `system.home` (§3.5): higher [`ProviderOrigin`] overrides lower within a
+/// profile, while conflicting values within the same origin are an error and
+/// identical values pass; a profile's own value overrides the inherited one.
 fn merge_home(
     profile: &ProfileRef,
     inherited: Option<&SandboxHome>,
     own: &[Contribution],
 ) -> Result<Option<SandboxHome>, MergeError> {
-    let mut found: Option<(&SandboxHome, &ProviderName)> = None;
+    let mut found: Option<(&SandboxHome, &ProviderName, ProviderOrigin)> = None;
     for c in own {
         let Some(home) = &c.grants.system.home else {
             continue;
         };
         match found {
-            None => found = Some((home, &c.provider)),
-            Some((first, _)) if first == home => {}
-            Some((first, first_provider)) => {
+            None => found = Some((home, &c.provider, c.origin)),
+            Some((_, _, first_origin)) if c.origin > first_origin => {
+                found = Some((home, &c.provider, c.origin));
+            }
+            Some((_, _, first_origin)) if c.origin < first_origin => {}
+            Some((first, _, _)) if first == home => {}
+            Some((first, first_provider, _)) => {
                 return Err(MergeError::HomeConflict {
                     profile: profile.clone(),
                     first_provider: first_provider.clone(),
@@ -368,7 +374,7 @@ fn merge_home(
             }
         }
     }
-    Ok(found.map(|(home, _)| home).or(inherited).cloned())
+    Ok(found.map(|(home, _, _)| home).or(inherited).cloned())
 }
 
 /// `env.pass` / `env.deny` (§3.5): union with the inherited patterns,
@@ -395,23 +401,28 @@ fn dedup_extend<'a, T: Clone + PartialEq + 'a>(
     }
 }
 
-/// `env.set` (§3.5, §9): conflicting values for one variable within a
-/// profile are an error unless identical; a profile's own value overrides
-/// the inherited one, variable by variable.
+/// `env.set` (§3.5, §9): higher [`ProviderOrigin`] overrides lower per
+/// variable within a profile, while conflicting values within the same origin
+/// are an error unless identical; a profile's own value overrides the
+/// inherited one, variable by variable.
 fn merge_env_set(
     profile: &ProfileRef,
     inherited: &BTreeMap<EnvName, EnvValue>,
     own: &[Contribution],
 ) -> Result<BTreeMap<EnvName, EnvValue>, MergeError> {
-    let mut found: BTreeMap<&EnvName, (&EnvValue, &ProviderName)> = BTreeMap::new();
+    let mut found: BTreeMap<&EnvName, (&EnvValue, &ProviderName, ProviderOrigin)> = BTreeMap::new();
     for c in own {
         for (name, value) in &c.grants.env.set {
             match found.get(name) {
                 None => {
-                    found.insert(name, (value, &c.provider));
+                    found.insert(name, (value, &c.provider, c.origin));
                 }
-                Some((first, _)) if *first == value => {}
-                Some((first, first_provider)) => {
+                Some((_, _, first_origin)) if c.origin > *first_origin => {
+                    found.insert(name, (value, &c.provider, c.origin));
+                }
+                Some((_, _, first_origin)) if c.origin < *first_origin => {}
+                Some((first, _, _)) if *first == value => {}
+                Some((first, first_provider, _)) => {
                     return Err(MergeError::EnvSetConflict(Box::new(EnvSetConflict {
                         profile: profile.clone(),
                         name: name.clone(),
@@ -428,7 +439,7 @@ fn merge_env_set(
     out.extend(
         found
             .into_iter()
-            .map(|(name, (value, _))| (name.clone(), value.clone())),
+            .map(|(name, (value, _, _))| (name.clone(), value.clone())),
     );
     Ok(out)
 }
@@ -472,25 +483,35 @@ fn union<'a, T: Clone + Ord + 'a>(
     out
 }
 
-/// `shims` (§3.5): the same shim name from two contributions within a
-/// profile is an error naming both providers (even if the specs are
-/// identical); a profile's own shim replaces an inherited one of the same
-/// name.
+/// `shims` (§3.5): higher [`ProviderOrigin`] replaces lower for the same shim
+/// name within a profile, while the same shim name from two contributions in
+/// the same origin is an error naming both providers; a profile's own shim
+/// replaces an inherited one of the same name.
 fn merge_shims(
     profile: &ProfileRef,
     inherited: &BTreeMap<ShimName, (ShimSpec, ProviderName)>,
     own: &[Contribution],
 ) -> Result<BTreeMap<ShimName, (ShimSpec, ProviderName)>, MergeError> {
-    let mut found: BTreeMap<&ShimName, (&ShimSpec, &ProviderName)> = BTreeMap::new();
+    let mut found: BTreeMap<&ShimName, (&ShimSpec, &ProviderName, ProviderOrigin)> =
+        BTreeMap::new();
     for c in own {
         for (shim, spec) in &c.grants.shims {
-            if let Some((_, first_provider)) = found.insert(shim, (spec, &c.provider)) {
-                return Err(MergeError::DuplicateShim {
-                    profile: profile.clone(),
-                    shim: shim.clone(),
-                    first_provider: first_provider.clone(),
-                    second_provider: c.provider.clone(),
-                });
+            match found.get(shim) {
+                None => {
+                    found.insert(shim, (spec, &c.provider, c.origin));
+                }
+                Some((_, _, first_origin)) if c.origin > *first_origin => {
+                    found.insert(shim, (spec, &c.provider, c.origin));
+                }
+                Some((_, _, first_origin)) if c.origin < *first_origin => {}
+                Some((_, first_provider, _)) => {
+                    return Err(MergeError::DuplicateShim {
+                        profile: profile.clone(),
+                        shim: shim.clone(),
+                        first_provider: (*first_provider).clone(),
+                        second_provider: c.provider.clone(),
+                    });
+                }
             }
         }
     }
@@ -498,7 +519,7 @@ fn merge_shims(
     out.extend(
         found
             .into_iter()
-            .map(|(shim, (spec, provider))| (shim.clone(), (spec.clone(), provider.clone()))),
+            .map(|(shim, (spec, provider, _))| (shim.clone(), (spec.clone(), provider.clone()))),
     );
     Ok(out)
 }
@@ -526,6 +547,7 @@ fn merge_fs_rules(inherited: &[FsRule], own: &[Contribution]) -> Vec<FsRule> {
         out.extend(fs_rules(&c.grants.fs).map(|kind| FsRule {
             kind,
             provider: c.provider.clone(),
+            origin: c.origin,
             depth: 0,
         }));
     }
@@ -1132,6 +1154,7 @@ mod tests {
                     pattern: "/opt".parse().unwrap(),
                 },
                 provider: pn("b"),
+                origin: ProviderOrigin::Workspace,
                 depth: 0,
             }],
             env: EffectiveEnv {
@@ -1358,6 +1381,141 @@ mod tests {
             prov("a", "main", &shim("jj", "jj")),
             prov("b", "main", &shim("jj", "jj")),
         ));
+        assert_eq!(
+            e.to_string(),
+            r#"profile "main": shim "jj" is granted by both provider "a" and provider "b""#
+        );
+    }
+
+    // --- Layering a workspace `.stopit.toml` over the user-global config ---
+
+    /// The merge of `global` layered under `project` with
+    /// [`ConfigLayer::layer`](crate::config::ConfigLayer::layer).
+    fn layered(global: &str, project: &str) -> Result<MergedProfiles, MergeError> {
+        use crate::config::ConfigLayer;
+        use crate::provider::from_layered_entry;
+
+        let layered = ConfigLayer::layer(
+            Some((
+                ConfigLayer::from_toml_str(global).unwrap(),
+                Path::new("/cfg"),
+            )),
+            Some((
+                ConfigLayer::from_toml_str(project).unwrap(),
+                Path::new("/w"),
+            )),
+        );
+        let ctx = ProviderContext {
+            workspace: PathBuf::from("/w"),
+            workspace_mount: "/workspace".parse().unwrap(),
+            home: PathBuf::from("/home/u"),
+            session_dir: PathBuf::from("/run/s"),
+            rw_grants: Vec::new(),
+        };
+        let outputs = layered
+            .providers
+            .iter()
+            .map(|e| {
+                let p = from_layered_entry(e).unwrap();
+                (p.name().clone(), p.manifest(&ctx).unwrap())
+            })
+            .collect();
+        merge_profiles(&build_profile_graph(&layered.config, outputs).unwrap())
+    }
+
+    #[test]
+    fn the_workspace_layer_overrides_single_valued_global_keys() {
+        let global = format!(
+            "{}{}",
+            prov(
+                "g1",
+                "main",
+                &format!(
+                    "system.home = \"/home/global\"\nenv.set = {{ EDITOR = \"vi\", LANG = \"C\" }}\n{}",
+                    shim("jj", "jj-global")
+                )
+            ),
+            prov("g2", "main", "env.path_prepend = [\"/g/bin\"]"),
+        );
+        let project = format!(
+            "{}{}",
+            prov(
+                "p1",
+                "main",
+                &format!(
+                    "system.home = \"/home/project\"\nenv.set = {{ LANG = \"C.UTF-8\" }}\n{}",
+                    shim("jj", "jj-project")
+                )
+            ),
+            prov("p2", "main", "env.path_prepend = [\"/p/bin\", \"/g/bin\"]"),
+        );
+        let m = layered(&global, &project).unwrap();
+        assert_eq!(home(&m, "main"), Some("/home/project"));
+        // `EDITOR` only in the global layer survives; `LANG` is the project's.
+        assert_eq!(
+            set(&m, "main"),
+            [
+                ("EDITOR".to_owned(), "vi".to_owned()),
+                ("LANG".to_owned(), "C.UTF-8".to_owned()),
+            ]
+        );
+        assert_eq!(shims(&m, "main"), triples(&[("jj", "jj-project", "p1")]));
+        // Workspace entries come first in `PATH`, and duplicates collapse.
+        assert_eq!(
+            strs(&eff(&m, "main").env.path_prepend),
+            ["/p/bin", "/g/bin"]
+        );
+
+        // The order of the global and project providers within the profile
+        // does not matter: a lower layer never overrides a higher one.
+        let m = layered(
+            &prov("g", "main", "system.home = \"/home/global\""),
+            &format!(
+                "[profiles.child]\n{}",
+                prov("p", "main", "system.home = \"/home/project\"")
+            ),
+        )
+        .unwrap();
+        assert_eq!(home(&m, "main"), Some("/home/project"));
+        assert_eq!(home(&m, "child"), Some("/home/project"));
+    }
+
+    #[test]
+    fn conflicts_within_one_layer_are_still_errors() {
+        // Two global providers conflicting, with no project value.
+        let e = layered(
+            &format!(
+                "{}{}",
+                prov("a", "main", "system.home = \"/home/a\""),
+                prov("b", "main", "system.home = \"/home/b\"")
+            ),
+            "",
+        )
+        .unwrap_err();
+        assert!(matches!(e, MergeError::HomeConflict { .. }), "{e}");
+        // Two project providers conflicting over a global value.
+        let e = layered(
+            &prov("g", "main", "env.set = { X = \"0\" }"),
+            &format!(
+                "{}{}",
+                prov("a", "main", "env.set = { X = \"1\" }"),
+                prov("b", "main", "env.set = { X = \"2\" }")
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            r#"profile "main": conflicting env.set values for "X": "1" (provider "a") and "2" (provider "b")"#
+        );
+        let e = layered(
+            &prov("g", "main", &shim("jj", "jj")),
+            &format!(
+                "{}{}",
+                prov("a", "main", &shim("jj", "jj")),
+                prov("b", "main", &shim("jj", "jj"))
+            ),
+        )
+        .unwrap_err();
         assert_eq!(
             e.to_string(),
             r#"profile "main": shim "jj" is granted by both provider "a" and provider "b""#

@@ -23,7 +23,7 @@ use std::fmt;
 
 use thiserror::Error;
 
-use crate::config::{Config, Inherit, ProfileName, ProfileRef, ProviderName};
+use crate::config::{Config, Inherit, ProfileName, ProfileRef, ProviderName, ProviderOrigin};
 use crate::manifest::{Grants, ShimName};
 use crate::provider::ProviderOutput;
 
@@ -32,6 +32,8 @@ use crate::provider::ProviderOutput;
 pub struct Contribution {
     /// The provider the grants come from.
     pub provider: ProviderName,
+    /// Layer that declared the provider.
+    pub origin: ProviderOrigin,
     /// The grants. Every shim profile reference is a resolved full name.
     pub grants: Grants,
 }
@@ -343,7 +345,11 @@ pub fn build_profile_graph(
 
     // Provider outputs, in merge order.
     for (provider, output) in outputs {
-        let ProviderOutput { profile, manifest } = output;
+        let ProviderOutput {
+            profile,
+            manifest,
+            origin,
+        } = output;
         if !known.contains(&profile) {
             return Err(ProfileError::UnknownTarget {
                 suggestions: suggestions(&profile, &known),
@@ -363,6 +369,7 @@ pub fn build_profile_graph(
         let node = profiles.get_mut(&profile).expect("checked above");
         node.contributions.push(Contribution {
             provider: provider.clone(),
+            origin,
             grants,
         });
 
@@ -384,6 +391,7 @@ pub fn build_profile_graph(
             node.parent = parent;
             node.contributions.push(Contribution {
                 provider: provider.clone(),
+                origin,
                 grants,
             });
         }
@@ -458,6 +466,7 @@ mod tests {
             ProviderOutput {
                 profile: pr(profile),
                 manifest: manifest(src),
+                origin: ProviderOrigin::Workspace,
             },
         )
     }

@@ -39,6 +39,66 @@ pub enum ConfigError {
     Toml(#[from] toml::de::Error),
 }
 
+/// Layer that declared a provider, ordered from lowest to highest precedence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ProviderOrigin {
+    /// Built-in provider supplied by `base = "default"`.
+    Builtin,
+    /// Provider declared in `<config_dir>/config.toml`.
+    Global,
+    /// Provider declared in workspace `.stopit.toml`.
+    #[default]
+    Workspace,
+}
+
+/// One parsed configuration document before layering defaults.
+///
+/// Tracks which top-level fields were explicitly written so a project
+/// `.stopit.toml` overrides only the fields it sets while falling back to the
+/// user-global `config.toml` and then built-in defaults.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(try_from = "MapOnly<RawConfig>")]
+pub struct ConfigLayer {
+    /// Explicit `base`, if written.
+    pub base: Option<Base>,
+    /// Explicit `workspace.mount`, if written.
+    pub workspace_mount: Option<WorkspaceMount>,
+    /// Explicit `[limits]` values.
+    pub limits: Limits,
+    /// Explicit `approval.timeout`, if written.
+    pub approval_timeout: Option<ApprovalTimeout>,
+    /// Explicit `terminal.clipboard_write`, if written.
+    pub terminal_clipboard_write: Option<ClipboardWrite>,
+    /// User-declared profiles in this file.
+    pub profiles: BTreeMap<ProfileName, ProfileDecl>,
+    /// `[[provider]]` entries in file order, unique by effective name within
+    /// this file.
+    pub providers: Vec<ProviderEntry>,
+}
+
+/// A `[[provider]]` entry paired with the layer and base directory that
+/// declared it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayeredProviderEntry {
+    /// Which configuration layer declared this entry.
+    pub origin: ProviderOrigin,
+    /// Directory of the declaring configuration file, used to resolve relative
+    /// `script` provider `source` paths and set their working directory.
+    pub base_dir: PathBuf,
+    /// Parsed provider entry.
+    pub entry: ProviderEntry,
+}
+
+/// Result of layering optional global and workspace configuration documents.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayeredConfig {
+    /// Effective session configuration with defaults filled in.
+    pub config: Config,
+    /// Effective user providers in merge order with their origin and base
+    /// directory.
+    pub providers: Vec<LayeredProviderEntry>,
+}
+
 /// The session-wide top-level settings (DESIGN.md §3.1).
 ///
 /// Every field has the default given in the design, so an empty document is
@@ -66,20 +126,20 @@ pub struct Config {
     pub providers: Vec<ProviderEntry>,
 }
 
-/// Deserialization shape of [`Config`]; see [`MapOnly`].
+/// Deserialization shape of [`ConfigLayer`] and [`Config`]; see [`MapOnly`].
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct RawConfig {
-    base: Base,
-    workspace: WorkspaceSettings,
+    base: Option<Base>,
+    workspace: MapOnly<RawWorkspaceSettings>,
     limits: Limits,
-    approval: Approval,
-    terminal: Terminal,
+    approval: MapOnly<RawApproval>,
+    terminal: MapOnly<RawTerminal>,
     profiles: BTreeMap<ProfileName, ProfileDecl>,
     provider: Vec<ProviderEntry>,
 }
 
-impl TryFrom<MapOnly<RawConfig>> for Config {
+impl TryFrom<MapOnly<RawConfig>> for ConfigLayer {
     type Error = ValueError;
 
     fn try_from(MapOnly(raw): MapOnly<RawConfig>) -> Result<Self, ValueError> {
@@ -96,15 +156,174 @@ impl TryFrom<MapOnly<RawConfig>> for Config {
                 )));
             }
         }
-        Ok(Config {
+        Ok(ConfigLayer {
             base: raw.base,
-            workspace: raw.workspace,
+            workspace_mount: raw.workspace.0.mount,
             limits: raw.limits,
-            approval: raw.approval,
-            terminal: raw.terminal,
+            approval_timeout: raw.approval.0.timeout,
+            terminal_clipboard_write: raw.terminal.0.clipboard_write,
             profiles: raw.profiles,
             providers: raw.provider,
         })
+    }
+}
+
+impl TryFrom<MapOnly<RawConfig>> for Config {
+    type Error = ValueError;
+
+    fn try_from(raw: MapOnly<RawConfig>) -> Result<Self, ValueError> {
+        Ok(ConfigLayer::try_from(raw)?.into_config())
+    }
+}
+
+impl ConfigLayer {
+    /// Parses a single configuration layer from TOML text.
+    pub fn from_toml_str(s: &str) -> Result<ConfigLayer, ConfigError> {
+        Ok(toml::from_str(s)?)
+    }
+
+    /// Returns true when this document explicitly sets `base = "none"`.
+    pub fn sets_base_none(&self) -> bool {
+        self.base == Some(Base::None)
+    }
+
+    /// Resolves this layer alone against built-in defaults.
+    pub fn into_config(self) -> Config {
+        Config {
+            base: self.base.unwrap_or_default(),
+            workspace: WorkspaceSettings {
+                mount: self.workspace_mount.unwrap_or_default(),
+            },
+            limits: self.limits,
+            approval: Approval {
+                timeout: self.approval_timeout.unwrap_or_default(),
+            },
+            terminal: Terminal {
+                clipboard_write: self.terminal_clipboard_write.unwrap_or_default(),
+            },
+            profiles: self.profiles,
+            providers: self.providers,
+        }
+    }
+
+    /// Layers optional global configuration under optional project
+    /// configuration.
+    ///
+    /// When `project` explicitly sets `base = "none"`, `global` is ignored
+    /// completely. Otherwise `project` fields override `global` fields where
+    /// explicitly set, `[profiles.<name>]` declarations in `project` override
+    /// matching names in `global`, and `[[provider]]` entries in `project`
+    /// replace matching `ProviderName` entries from `global`.
+    pub fn layer(
+        global: Option<(ConfigLayer, &Path)>,
+        project: Option<(ConfigLayer, &Path)>,
+    ) -> LayeredConfig {
+        if let Some((proj, proj_dir)) = project {
+            if proj.sets_base_none() {
+                let providers = proj
+                    .providers
+                    .iter()
+                    .cloned()
+                    .map(|entry| LayeredProviderEntry {
+                        origin: ProviderOrigin::Workspace,
+                        base_dir: proj_dir.to_path_buf(),
+                        entry,
+                    })
+                    .collect();
+                return LayeredConfig {
+                    config: proj.into_config(),
+                    providers,
+                };
+            }
+            return Self::combine(global, Some((proj, proj_dir)));
+        }
+        Self::combine(global, None)
+    }
+
+    fn combine(
+        global: Option<(ConfigLayer, &Path)>,
+        project: Option<(ConfigLayer, &Path)>,
+    ) -> LayeredConfig {
+        let (g_layer, g_dir) = match global {
+            Some((layer, dir)) => (layer, Some(dir)),
+            None => (ConfigLayer::default(), None),
+        };
+        let (p_layer, p_dir) = match project {
+            Some((layer, dir)) => (layer, Some(dir)),
+            None => (ConfigLayer::default(), None),
+        };
+
+        let base = p_layer.base.or(g_layer.base).unwrap_or_default();
+        let workspace = WorkspaceSettings {
+            mount: p_layer
+                .workspace_mount
+                .or(g_layer.workspace_mount)
+                .unwrap_or_default(),
+        };
+        let limits = Limits {
+            pids: p_layer.limits.pids.or(g_layer.limits.pids),
+            memory: p_layer.limits.memory.or(g_layer.limits.memory),
+            cpu: p_layer.limits.cpu.or(g_layer.limits.cpu),
+        };
+        let approval = Approval {
+            timeout: p_layer
+                .approval_timeout
+                .or(g_layer.approval_timeout)
+                .unwrap_or_default(),
+        };
+        let terminal = Terminal {
+            clipboard_write: p_layer
+                .terminal_clipboard_write
+                .or(g_layer.terminal_clipboard_write)
+                .unwrap_or_default(),
+        };
+
+        let mut profiles = g_layer.profiles;
+        profiles.extend(p_layer.profiles);
+
+        let project_names: HashMap<&str, ()> = p_layer
+            .providers
+            .iter()
+            .map(|e| (e.name.as_str(), ()))
+            .collect();
+
+        let mut layered_providers = Vec::new();
+        let mut config_providers = Vec::new();
+        if let Some(dir) = g_dir {
+            for entry in g_layer.providers {
+                if !project_names.contains_key(entry.name.as_str()) {
+                    config_providers.push(entry.clone());
+                    layered_providers.push(LayeredProviderEntry {
+                        origin: ProviderOrigin::Global,
+                        base_dir: dir.to_path_buf(),
+                        entry,
+                    });
+                }
+            }
+        }
+        if let Some(dir) = p_dir {
+            for entry in p_layer.providers {
+                config_providers.push(entry.clone());
+                layered_providers.push(LayeredProviderEntry {
+                    origin: ProviderOrigin::Workspace,
+                    base_dir: dir.to_path_buf(),
+                    entry,
+                });
+            }
+        }
+
+        LayeredConfig {
+            config: Config {
+                base,
+                workspace,
+                limits,
+                approval,
+                terminal,
+                profiles,
+                providers: config_providers,
+            },
+            providers: layered_providers,
+        }
     }
 }
 
@@ -138,12 +357,14 @@ pub struct WorkspaceSettings {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct RawWorkspaceSettings {
-    mount: WorkspaceMount,
+    mount: Option<WorkspaceMount>,
 }
 
 impl From<MapOnly<RawWorkspaceSettings>> for WorkspaceSettings {
     fn from(MapOnly(raw): MapOnly<RawWorkspaceSettings>) -> Self {
-        WorkspaceSettings { mount: raw.mount }
+        WorkspaceSettings {
+            mount: raw.mount.unwrap_or_default(),
+        }
     }
 }
 
@@ -341,13 +562,13 @@ pub struct Approval {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct RawApproval {
-    timeout: ApprovalTimeout,
+    timeout: Option<ApprovalTimeout>,
 }
 
 impl From<MapOnly<RawApproval>> for Approval {
     fn from(MapOnly(raw): MapOnly<RawApproval>) -> Self {
         Approval {
-            timeout: raw.timeout,
+            timeout: raw.timeout.unwrap_or_default(),
         }
     }
 }
@@ -416,13 +637,13 @@ pub struct Terminal {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct RawTerminal {
-    clipboard_write: ClipboardWrite,
+    clipboard_write: Option<ClipboardWrite>,
 }
 
 impl From<MapOnly<RawTerminal>> for Terminal {
     fn from(MapOnly(raw): MapOnly<RawTerminal>) -> Self {
         Terminal {
-            clipboard_write: raw.clipboard_write,
+            clipboard_write: raw.clipboard_write.unwrap_or_default(),
         }
     }
 }
@@ -824,5 +1045,176 @@ mod tests {
         assert!(msg.contains("line 1"), "{msg}");
         let msg = err("[workspace]\nmount = \"/a//b\"\n");
         assert!(msg.contains("line 2"), "{msg}");
+    }
+
+    // --- Layering the workspace configuration over the user-global one ---
+
+    fn layer(src: &str) -> ConfigLayer {
+        ConfigLayer::from_toml_str(src).unwrap()
+    }
+
+    fn layered(global: Option<&str>, project: Option<&str>) -> LayeredConfig {
+        ConfigLayer::layer(
+            global.map(|g| (layer(g), Path::new("/cfg"))),
+            project.map(|p| (layer(p), Path::new("/w"))),
+        )
+    }
+
+    const PROVIDER_A: &str = "[[provider]]\ntype = \"config\"\nname = \"a\"\n";
+
+    /// Each provider as `(name, origin, base_dir)`.
+    fn origins(l: &LayeredConfig) -> Vec<(String, ProviderOrigin, PathBuf)> {
+        l.providers
+            .iter()
+            .map(|e| (e.entry.name.to_string(), e.origin, e.base_dir.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn a_layer_records_only_what_was_written() {
+        assert_eq!(layer(""), ConfigLayer::default());
+        assert_eq!(
+            layer("[workspace]\n[limits]\n[approval]\n[terminal]\n"),
+            ConfigLayer::default()
+        );
+        let l = layer("[approval]\ntimeout = \"off\"\n[terminal]\nclipboard_write = \"block\"\n");
+        // Written defaults count as written, so they override a lower layer.
+        assert_eq!(l.approval_timeout, Some(ApprovalTimeout::Off));
+        assert_eq!(l.terminal_clipboard_write, Some(ClipboardWrite::Block));
+        assert_eq!(l.base, None);
+        assert!(layer("base = \"none\"").sets_base_none());
+        assert!(!layer("base = \"default\"").sets_base_none());
+        assert!(!layer("").sets_base_none());
+        assert_eq!(layer("").into_config(), expected_defaults());
+    }
+
+    #[test]
+    fn project_fields_override_global_fields_field_by_field() {
+        let global = "[workspace]\nmount = \"/global\"\n\
+                      [limits]\npids = 10\nmemory = \"1G\"\n\
+                      [approval]\ntimeout = \"30s\"\n\
+                      [terminal]\nclipboard_write = \"allow\"\n";
+        // Unset in the project: everything comes from the global layer.
+        let l = layered(Some(global), Some(""));
+        let want = Config::from_toml_str(global).unwrap();
+        assert_eq!(l.config, want);
+        // Set in the project, including to the built-in defaults.
+        let project = "[workspace]\nmount = \"/workspace\"\n\
+                       [limits]\npids = 20\n\
+                       [terminal]\nclipboard_write = \"block\"\n";
+        let l = layered(Some(global), Some(project));
+        assert_eq!(l.config.workspace.mount, "/workspace".parse().unwrap());
+        assert_eq!(l.config.limits.pids, std::num::NonZeroU32::new(20));
+        assert_eq!(l.config.limits.memory, want.limits.memory);
+        assert_eq!(l.config.limits.cpu, None);
+        assert_eq!(l.config.approval.timeout, want.approval.timeout);
+        assert_eq!(l.config.terminal.clipboard_write, ClipboardWrite::Block);
+        // Neither layer sets a field: the built-in default.
+        assert_eq!(layered(Some(""), Some("")).config, expected_defaults());
+        assert_eq!(layered(None, None).config, expected_defaults());
+        // Without a project file, the global layer alone.
+        assert_eq!(layered(Some(global), None).config, want);
+    }
+
+    #[test]
+    fn base_none_in_the_project_ignores_the_global_layer() {
+        let global = format!(
+            "[limits]\npids = 10\n[profiles.g]\n{PROVIDER_A}[provider.sandbox]\nfs.ro = [\"/usr\"]\n"
+        );
+        let l = layered(Some(&global), Some("base = \"none\""));
+        assert_eq!(l.config.base, Base::None);
+        assert_eq!(l.config.limits.pids, None);
+        assert!(l.config.profiles.is_empty());
+        assert!(l.providers.is_empty() && l.config.providers.is_empty());
+        // `base` itself layers like any other field otherwise.
+        assert_eq!(
+            layered(Some("base = \"none\""), Some("")).config.base,
+            Base::None
+        );
+        assert_eq!(
+            layered(Some("base = \"none\""), Some("base = \"default\""))
+                .config
+                .base,
+            Base::Default
+        );
+        // A global `base = "none"` does not drop the global layer's own
+        // providers.
+        let l = layered(Some(&format!("base = \"none\"\n{PROVIDER_A}")), None);
+        assert_eq!(
+            origins(&l),
+            [(
+                "a".to_owned(),
+                ProviderOrigin::Global,
+                PathBuf::from("/cfg")
+            )]
+        );
+    }
+
+    #[test]
+    fn project_profiles_and_providers_replace_global_ones_by_name() {
+        let global = format!(
+            "[profiles.shared]\ninherit = \"none\"\n[profiles.g]\n\
+             {PROVIDER_A}\
+             [[provider]]\ntype = \"config\"\nname = \"g-only\"\n\
+             [[provider]]\ntype = \"config\"\n"
+        );
+        let project = format!(
+            "[profiles.shared]\n[profiles.p]\n\
+             [[provider]]\ntype = \"config\"\n\
+             [[provider]]\ntype = \"config\"\nname = \"p-only\"\n\
+             {PROVIDER_A}"
+        );
+        let l = layered(Some(&global), Some(&project));
+        assert_eq!(
+            l.config
+                .profiles
+                .keys()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>(),
+            ["g", "p", "shared"]
+        );
+        assert_eq!(
+            l.config.profiles[&"shared".parse::<ProfileName>().unwrap()].inherit,
+            Inherit::default()
+        );
+        // The implicit `config` name collides like an explicit one, and the
+        // surviving global providers stay first, in file order.
+        assert_eq!(
+            origins(&l),
+            [
+                (
+                    "g-only".to_owned(),
+                    ProviderOrigin::Global,
+                    PathBuf::from("/cfg")
+                ),
+                (
+                    "config".to_owned(),
+                    ProviderOrigin::Workspace,
+                    PathBuf::from("/w")
+                ),
+                (
+                    "p-only".to_owned(),
+                    ProviderOrigin::Workspace,
+                    PathBuf::from("/w")
+                ),
+                (
+                    "a".to_owned(),
+                    ProviderOrigin::Workspace,
+                    PathBuf::from("/w")
+                ),
+            ]
+        );
+        assert_eq!(
+            l.config.providers,
+            l.providers
+                .iter()
+                .map(|e| e.entry.clone())
+                .collect::<Vec<_>>()
+        );
+        // A duplicate within one file is still an error.
+        let msg = ConfigLayer::from_toml_str(&format!("{PROVIDER_A}{PROVIDER_A}"))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("duplicate provider name \"a\""), "{msg}");
     }
 }

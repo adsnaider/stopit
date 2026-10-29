@@ -39,6 +39,14 @@ pub const STATE_DIR_NAME: &str = "stopit";
 /// (see [`data_dirs`]).
 pub const STATE_DIR_ENV: &str = "STOPIT_STATE_DIR";
 
+/// Environment variable that overrides where stopit's user-global
+/// configuration directory is located.
+pub const CONFIG_DIR_ENV: &str = "STOPIT_CONFIG_DIR";
+
+/// File name of stopit's user-global configuration inside the active
+/// configuration directory.
+pub const GLOBAL_CONFIG_FILE: &str = "config.toml";
+
 /// The most symlinks [`resolve_allowing_missing`] follows, as the kernel
 /// does (`ELOOP` past it).
 const MAX_LINKS: usize = 40;
@@ -91,6 +99,16 @@ pub enum StateError {
         path: PathBuf,
     },
 
+    /// `STOPIT_CONFIG_DIR` is set to a path that is not absolute.
+    #[error(
+        "{CONFIG_DIR_ENV} {path:?} is not an absolute path; set it to the absolute path of stopit's \
+         configuration directory, or unset it"
+    )]
+    ConfigOverrideRelative {
+        /// The value of `STOPIT_CONFIG_DIR`.
+        path: PathBuf,
+    },
+
     /// A state directory's path cannot be resolved.
     #[error("cannot resolve stopit's state directory {path:?}: {source}")]
     Resolve {
@@ -108,6 +126,8 @@ pub enum StateDir {
     Runtime,
     /// A data directory ([`DataDirs`]): stopit's persistent state.
     Data,
+    /// User-global configuration directory in [`ConfigDirs`].
+    Config,
 }
 
 impl StateDir {
@@ -119,6 +139,9 @@ impl StateDir {
                  included)"
             }
             StateDir::Data => "stopit's persistent state, such as which configurations you allowed",
+            StateDir::Config => {
+                "stopit's user-global configuration, which decides what every session runs"
+            }
         }
     }
 }
@@ -128,6 +151,7 @@ impl fmt::Display for StateDir {
         f.write_str(match self {
             StateDir::Runtime => "session runtime directory",
             StateDir::Data => "data directory",
+            StateDir::Config => "configuration directory",
         })
     }
 }
@@ -185,6 +209,33 @@ impl DataDirs {
     }
 }
 
+/// stopit's user-global configuration directories from [`config_dirs`].
+/// Both the active directory and any distinct default location are reserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigDirs {
+    /// Active configuration directory from `STOPIT_CONFIG_DIR` when set, or
+    /// `<home>/.config/stopit` otherwise.
+    pub active: StatePath,
+    /// Default `<home>/.config/stopit` location when `STOPIT_CONFIG_DIR`
+    /// points elsewhere.
+    pub default: Option<StatePath>,
+}
+
+impl ConfigDirs {
+    /// Configuration directory at `path` with no link on the way to it.
+    pub fn canonical(path: PathBuf) -> Self {
+        ConfigDirs {
+            active: StatePath::canonical(path),
+            default: None,
+        }
+    }
+
+    /// Active directory first, followed by the default location when distinct.
+    pub fn iter(&self) -> impl Iterator<Item = &StatePath> {
+        std::iter::once(&self.active).chain(&self.default)
+    }
+}
+
 /// stopit's host state directories for a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateDirs {
@@ -193,6 +244,9 @@ pub struct StateDirs {
     pub runtime: StatePath,
     /// The data directories ([`data_dirs`]), which need not exist yet.
     pub data: DataDirs,
+    /// User-global configuration directories from [`config_dirs`], which need
+    /// not exist.
+    pub config: ConfigDirs,
 }
 
 impl StateDirs {
@@ -200,6 +254,7 @@ impl StateDirs {
     pub fn iter(&self) -> impl Iterator<Item = (StateDir, &StatePath)> {
         std::iter::once((StateDir::Runtime, &self.runtime))
             .chain(self.data.iter().map(|d| (StateDir::Data, d)))
+            .chain(self.config.iter().map(|c| (StateDir::Config, c)))
     }
 }
 
@@ -254,6 +309,38 @@ pub fn data_dirs(home: &Path, state_dir: Option<&OsStr>) -> Result<DataDirs, Sta
     let store = resolve(state_dir.to_owned())?;
     let default = (store.path != default.path).then_some(default);
     Ok(DataDirs { store, default })
+}
+
+/// Resolves stopit's user-global configuration directories for the current
+/// user from [`passwd_home`] and `STOPIT_CONFIG_DIR`.
+pub fn config_dirs_from_host() -> Result<ConfigDirs, StateError> {
+    let home = passwd_home(rustix::process::getuid().as_raw())?;
+    config_dirs(&home, std::env::var_os(CONFIG_DIR_ENV).as_deref())
+}
+
+/// Resolves stopit's user-global configuration directories from the password
+/// database home directory `home` and an optional `STOPIT_CONFIG_DIR` value.
+///
+/// Neither `HOME` nor `XDG_CONFIG_HOME` affects the default location
+/// `<home>/.config/stopit`. When `config_dir` is set, it must be an absolute
+/// path, and both `active` and `default` stay reserved when they differ.
+pub fn config_dirs(home: &Path, config_dir: Option<&OsStr>) -> Result<ConfigDirs, StateError> {
+    let default = resolve(home.join(".config").join(STATE_DIR_NAME))?;
+    let Some(config_dir) = config_dir else {
+        return Ok(ConfigDirs {
+            active: default,
+            default: None,
+        });
+    };
+    let config_dir = Path::new(config_dir);
+    if !config_dir.is_absolute() {
+        return Err(StateError::ConfigOverrideRelative {
+            path: config_dir.to_owned(),
+        });
+    }
+    let active = resolve(config_dir.to_owned())?;
+    let default = (active.path != default.path).then_some(default);
+    Ok(ConfigDirs { active, default })
 }
 
 /// [`resolve_allowing_missing`] for a state directory.
@@ -428,6 +515,7 @@ mod tests {
         let state = StateDirs {
             runtime: StatePath::canonical(root.join("run/stopit")),
             data: dirs,
+            config: ConfigDirs::canonical(root.join("home/.config/stopit")),
         };
         assert_eq!(
             state
@@ -438,6 +526,7 @@ mod tests {
                 (StateDir::Runtime, root.join("run/stopit")),
                 (StateDir::Data, root.join("state")),
                 (StateDir::Data, root.join("home/.local/share/stopit")),
+                (StateDir::Config, root.join("home/.config/stopit")),
             ]
         );
         // An override naming the default location (here through a link)
@@ -460,6 +549,53 @@ mod tests {
                 format!(
                     "STOPIT_STATE_DIR {value:?} is not an absolute path; set it to the absolute \
                      path of stopit's data directory, or unset it"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn config_dirs_default_and_override_behave_like_data_dirs() {
+        let (_d, root) = tmp();
+        let default = StatePath::canonical(root.join("home/.config/stopit"));
+        assert_eq!(
+            config_dirs(&root.join("home"), None).unwrap(),
+            ConfigDirs {
+                active: default.clone(),
+                default: None,
+            }
+        );
+
+        let dirs = config_dirs(&root.join("home"), os(&root.join("cfg"))).unwrap();
+        assert_eq!(
+            dirs,
+            ConfigDirs {
+                active: StatePath::canonical(root.join("cfg")),
+                default: Some(default.clone()),
+            }
+        );
+        assert_eq!(
+            dirs.iter().collect::<Vec<_>>(),
+            [&StatePath::canonical(root.join("cfg")), &default]
+        );
+
+        fs::create_dir_all(root.join("home/.config")).unwrap();
+        symlink("home/.config", root.join("cfg-link")).unwrap();
+        let same = config_dirs(&root.join("home"), os(&root.join("cfg-link/stopit"))).unwrap();
+        assert_eq!(same.active.path, root.join("home/.config/stopit"));
+        assert_eq!(same.default, None);
+
+        for value in ["rel/config", ""] {
+            let e = config_dirs(&root, Some(OsStr::new(value))).unwrap_err();
+            assert!(
+                matches!(e, StateError::ConfigOverrideRelative { .. }),
+                "{e}"
+            );
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "STOPIT_CONFIG_DIR {value:?} is not an absolute path; set it to the absolute \
+                     path of stopit's configuration directory, or unset it"
                 )
             );
         }

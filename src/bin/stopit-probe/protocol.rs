@@ -184,9 +184,9 @@ pub enum SyscallProbe {
     Bpf,
     /// `perf_event_open(NULL, 0, -1, -1, 0)`.
     PerfEventOpen,
-    /// `userfaultfd(0)`.
+    /// `userfaultfd(O_CLOEXEC)`.
     Userfaultfd,
-    /// `keyctl(0, 0, 0, 0, 0)`.
+    /// `keyctl(-1, 0, 0, 0, 0)`.
     Keyctl,
     /// `add_key(NULL, NULL, NULL, 0, 0)`.
     AddKey,

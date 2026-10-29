@@ -107,8 +107,31 @@ impl Setup {
         self.root.join("state/stopit")
     }
 
+    /// stopit's user-global configuration directory, set with
+    /// `STOPIT_CONFIG_DIR`, so that no test reads the host user's real
+    /// `~/.config/stopit/config.toml`.
+    fn config_dir(&self) -> PathBuf {
+        self.root.join("config/stopit")
+    }
+
+    /// Writes `contents` as `<config_dir>/config.toml` with trusted ownership
+    /// and permissions (`0755` directory, `0644` file).
+    fn write_global_config(&self, contents: &str) -> PathBuf {
+        let dir = self.config_dir();
+        fs::create_dir_all(&dir).unwrap();
+        if let Some(parent) = dir.parent() {
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.join(stopit::state::GLOBAL_CONFIG_FILE);
+        fs::write(&path, contents).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        path
+    }
+
     /// `stopit <args…>` from the workspace, with only `XDG_RUNTIME_DIR`,
-    /// `STOPIT_STATE_DIR` ([`state_dir`](Self::state_dir)), `HOME` and
+    /// `STOPIT_STATE_DIR` ([`state_dir`](Self::state_dir)),
+    /// `STOPIT_CONFIG_DIR` ([`config_dir`](Self::config_dir)), `HOME` and
     /// `PATH` (to find bwrap) in its environment.
     fn stopit<S: AsRef<std::ffi::OsStr>>(&self, args: &[S]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_stopit"));
@@ -118,6 +141,7 @@ impl Setup {
             .env_clear()
             .env("XDG_RUNTIME_DIR", self.runtime())
             .env("STOPIT_STATE_DIR", self.state_dir())
+            .env("STOPIT_CONFIG_DIR", self.config_dir())
             .env("HOME", self.root.join("home"))
             .env("PATH", std::env::var_os("PATH").unwrap_or_default());
         command
@@ -313,14 +337,16 @@ fn quiet_suppresses_the_summary_but_not_warnings() {
 #[test]
 fn the_default_configuration_prints_only_the_header() {
     let s = Setup::new();
+    s.write_global_config(GLOBAL_SEARCH_PATH);
     s.write_raw_config("");
     let out = output(s.stopit(&["run", "true"]), b"");
     assert_eq!(code(&out), 127, "{out:?}");
-    // Then the missing command's own message: the base grants no tools.
+    // Then the missing command's own message: the global search path names
+    // a directory nothing mounts.
     assert_eq!(
         stderr(&out),
         format!(
-            "{}stopit __init: true: not found (the environment has no PATH)\n",
+            "{}stopit __init: true: not found in PATH\n",
             summary_header(&s)
         )
     );
@@ -453,6 +479,7 @@ fn no_configuration_runs_the_default_base_in_the_cwd() {
     // Without a `.stopit.toml` the default base applies, with nothing to
     // allow.
     let s = Setup::new();
+    s.write_global_config(GLOBAL_SEARCH_PATH);
     let out = output(s.run_probe_command(&[]), b"[]");
     assert_default_base_ran(&out);
     assert!(s.no_session_left());
@@ -469,10 +496,265 @@ fn no_configuration_runs_the_default_base_in_the_cwd() {
 fn an_empty_configuration_runs_the_default_base() {
     // The default base grants nothing for the probe, so it is not found.
     let s = Setup::new();
+    s.write_global_config(GLOBAL_SEARCH_PATH);
     s.write_raw_config("");
     let out = output(s.run_probe_command(&[]), b"[]");
     assert_default_base_ran(&out);
     assert!(s.no_session_left());
+}
+
+// --- The user-global configuration ---
+
+/// A user-global configuration whose only tool grant is a search path
+/// naming a directory nothing mounts, so the default base runs and finds
+/// nothing.
+const GLOBAL_SEARCH_PATH: &str = "[[provider]]\ntype = \"config\"\nname = \"search\"\n\
+                                  [provider.sandbox]\nenv.path_prepend = [\"/nowhere/bin\"]\n";
+
+/// The refusal of a default base without tools, for a global configuration
+/// at `global`.
+fn no_tools_refusal(global: &Path) -> String {
+    format!(
+        "stopit: error: base = \"default\" mounts no tools, and no provider in {global:?} or \
+         .stopit.toml grants any; configure a tool provider in {global:?} for every workspace or \
+         in .stopit.toml for this workspace, for example:\n\
+         \n\
+         [[provider]]\n\
+         type = \"config\"\n\
+         name = \"tools\"\n\
+         [provider.sandbox]\n\
+         fs.ro = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
+         env.path_prepend = [\"/usr/bin\", \"/bin\"]\n"
+    )
+}
+
+#[test]
+fn a_default_base_without_tools_is_refused() {
+    let s = Setup::new();
+    let global = s.config_dir().join("config.toml");
+    let refused = no_tools_refusal(&global);
+    let check = |what: &str| {
+        let out = output(s.run_probe_command(&[]), b"[]");
+        assert_eq!(code(&out), 125, "{what}: {out:?}");
+        assert_eq!(stderr(&out), refused, "{what}");
+        assert!(out.stdout.is_empty(), "{what}: {out:?}");
+        assert!(s.no_session_left(), "{what}");
+    };
+    // No configuration at all, then an empty workspace configuration.
+    check("no configuration");
+    s.write_raw_config("");
+    check("an empty .stopit.toml");
+    // Restrictions and settings are not tools.
+    s.write_raw_config(
+        "[[provider]]\ntype = \"config\"\n[provider.sandbox]\n\
+         fs.masked = [\"{workspace}/secret\"]\nenv.set = { EDITOR = \"vi\" }\n",
+    );
+    check("a provider granting no tools");
+    s.write_global_config("[approval]\ntimeout = \"30s\"\n");
+    check("a global configuration granting no tools");
+    // `base = "none"` asks for an empty sandbox, so nothing is refused.
+    s.write_raw_config("base = \"none\"\n");
+    let out = output(s.stopit(&["run", "--quiet", "/nothing"]), b"");
+    assert_eq!(code(&out), 127, "{out:?}");
+}
+
+#[test]
+fn the_global_configuration_grants_tools_to_every_workspace() {
+    let s = Setup::new();
+    s.write_global_config(&probe_config("env.set = { WHICH = \"global\" }"));
+    let which = |s: &Setup| {
+        let results = s.probe(&[], &[Op::Env]);
+        let Data::Env(env) = ok(&results[0]) else {
+            panic!("{results:?}")
+        };
+        env.get("WHICH").cloned()
+    };
+    // Without a workspace configuration, and with an empty one.
+    assert_eq!(which(&s).as_deref(), Some("global"));
+    s.write_raw_config("");
+    assert_eq!(which(&s).as_deref(), Some("global"));
+    // A workspace provider overrides a global `env.set` variable.
+    s.write_raw_config(
+        "[[provider]]\ntype = \"config\"\nname = \"mine\"\n[provider.sandbox]\n\
+         env.set = { WHICH = \"project\" }\n",
+    );
+    assert_eq!(which(&s).as_deref(), Some("project"));
+    // A workspace provider with the global provider's name replaces it.
+    s.write_raw_config(&probe_config(""));
+    assert_eq!(which(&s), None);
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn project_settings_override_global_settings() {
+    let s = Setup::new();
+    s.write_global_config(&format!(
+        "[workspace]\nmount = \"/global-ws\"\n{}",
+        probe_config("")
+    ));
+    let cwd = |s: &Setup| {
+        let results = s.probe(&[], &[Op::Cwd]);
+        ok(&results[0]).clone()
+    };
+    assert_eq!(cwd(&s), Data::Cwd("/global-ws".into()));
+    s.write_raw_config("[workspace]\nmount = \"/project-ws\"\n");
+    assert_eq!(cwd(&s), Data::Cwd("/project-ws".into()));
+    // Writing the built-in default still overrides the global value.
+    s.write_raw_config("[workspace]\nmount = \"/workspace\"\n");
+    assert_eq!(cwd(&s), Data::Cwd("/workspace".into()));
+}
+
+#[test]
+fn base_none_in_the_project_does_not_read_the_global_configuration() {
+    let s = Setup::new();
+    let global = s.write_global_config("this is not toml");
+    // Read under the default base: its error names it.
+    s.write_raw_config("");
+    let out = output(s.run_probe_command(&[]), b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    let err = stderr(&out);
+    assert!(
+        err.starts_with(&format!("stopit: error: {global:?}")),
+        "{err}"
+    );
+    // Not read at all under `base = "none"`, even when it is untrusted.
+    fs::set_permissions(&global, fs::Permissions::from_mode(0o666)).unwrap();
+    let (probe_dir, _) = probe_at_host_path();
+    s.write_raw_config(&format!(
+        "base = \"none\"\n[[provider]]\ntype = \"config\"\n[provider.sandbox]\n\
+         fs.ro = [\"{}\"]\n",
+        probe_dir.display()
+    ));
+    let results = s.probe(&[], &[Op::Cwd]);
+    assert_eq!(ok(&results[0]), &Data::Cwd("/".into()));
+}
+
+#[test]
+fn an_untrusted_global_configuration_is_refused() {
+    let s = Setup::new();
+    let global = s.write_global_config(&probe_config(""));
+    fs::set_permissions(&global, fs::Permissions::from_mode(0o664)).unwrap();
+    let out = output(s.run_probe_command(&[]), b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    let err = stderr(&out);
+    assert!(err.contains(&format!("{global:?}")), "{err}");
+    assert!(
+        err.contains("it has mode 0664 and is writable by its group or others"),
+        "{err}"
+    );
+    assert!(!s.runtime().join("stopit").exists());
+    // A dangling symbolic link is refused, not skipped.
+    fs::remove_file(&global).unwrap();
+    symlink(s.root.join("missing.toml"), &global).unwrap();
+    let out = output(s.run_probe_command(&[]), b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert!(
+        stderr(&out).contains("it is a dangling symbolic link"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_symlinked_global_configuration_is_protected_at_its_target() {
+    // The global configuration lives in a dotfiles directory inside a tree
+    // that the workspace grants `rw`.
+    let s = Setup::new();
+    let dotfiles = s.root.join("home/src/dotfiles");
+    fs::create_dir_all(&dotfiles).unwrap();
+    fs::set_permissions(&dotfiles, fs::Permissions::from_mode(0o755)).unwrap();
+    let target = dotfiles.join("stopit.toml");
+    let contents = probe_config("");
+    fs::write(&target, &contents).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+    let global = s.write_global_config("");
+    fs::remove_file(&global).unwrap();
+    symlink(&target, &global).unwrap();
+    s.write_raw_config(
+        "[[provider]]\ntype = \"config\"\nname = \"src\"\n[provider.sandbox]\n\
+         fs.rw = [\"~/src\"]\n",
+    );
+    let results = s.probe(
+        &[],
+        &[
+            write("/home/user/src/dotfiles/stopit.toml", "pwned"),
+            remove("/home/user/src/dotfiles/stopit.toml"),
+            rename(
+                "/home/user/src/dotfiles/stopit.toml",
+                "/home/user/src/dotfiles/old.toml",
+            ),
+            rename("/home/user/src/dotfiles", "/home/user/src/moved"),
+            write("/home/user/src/dotfiles/other", "fine"),
+        ],
+    );
+    assert_eq!(errno(&results[0]), "EROFS", "{results:?}");
+    assert_eq!(errno(&results[1]), "EBUSY", "{results:?}");
+    assert_eq!(errno(&results[2]), "EBUSY", "{results:?}");
+    assert_eq!(errno(&results[3]), "EBUSY", "{results:?}");
+    assert_eq!(ok(&results[4]), &Data::Done, "{results:?}");
+    assert_eq!(fs::read_to_string(&target).unwrap(), contents);
+}
+
+#[test]
+fn a_relative_global_script_provider_runs_from_the_configuration_directory() {
+    let s = Setup::new();
+    let dir = s.config_dir();
+    let (probe_dir, _) = probe_at_host_path();
+    s.write_global_config(
+        "[[provider]]\ntype = \"script\"\nname = \"tools\"\nsource = \"providers/tools.sh\"\n",
+    );
+    fs::create_dir(dir.join("providers")).unwrap();
+    let script = dir.join("providers/tools.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\npwd > '{}'\nprintf '{{\"version\":1,\"fs\":{{\"ro\":[\"{}\"]}}}}'\n",
+            s.root.join("cwd.txt").display(),
+            probe_dir.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let results = s.probe(&[], &[Op::Cwd]);
+    assert_eq!(ok(&results[0]), &Data::Cwd("/workspace".into()));
+    assert_eq!(
+        fs::read_to_string(s.root.join("cwd.txt"))
+            .unwrap()
+            .trim_end(),
+        dir.to_str().unwrap()
+    );
+}
+
+#[test]
+fn the_configuration_directory_is_reserved() {
+    // The test sets `STOPIT_CONFIG_DIR`; the default location comes from the
+    // password database, not `HOME`, so the spec tests cover it.
+    let s = Setup::new();
+    s.write_global_config(&probe_config(""));
+    let parent = s.config_dir().parent().unwrap().to_owned();
+    for rw in [parent.clone(), s.config_dir()] {
+        s.write_raw_config(&format!(
+            "[[provider]]\ntype = \"config\"\nname = \"cfg\"\n[provider.sandbox]\n\
+             fs.rw = [\"{}\"]\n",
+            rw.display()
+        ));
+        let out = output(s.run_probe_command(&[]), b"[]");
+        assert_eq!(code(&out), 125, "{rw:?}: {out:?}");
+        assert!(
+            stderr(&out).contains("configuration directory"),
+            "{rw:?}: {out:?}"
+        );
+        assert!(s.no_session_left());
+    }
+    // Shown read-only with its parent, it is masked quietly.
+    s.write_raw_config(&format!(
+        "[[provider]]\ntype = \"config\"\nname = \"cfg\"\n[provider.sandbox]\n\
+         fs.ro = [\"{}\"]\n",
+        parent.display()
+    ));
+    let inside = s.config_dir().join("config.toml");
+    let results = s.probe(&[], &[read(&inside), list(s.config_dir())]);
+    assert_eq!(errno(&results[0]), "ENOENT", "{results:?}");
+    assert_eq!(ok(&results[1]), &Data::List(vec![]), "{results:?}");
 }
 
 // --- Trust on first use ---
@@ -700,6 +982,7 @@ fn a_deleted_allowed_configuration_is_not_replaced_by_the_defaults() {
     // The user's configuration may grant less than the default one: once
     // allowed, its absence is refused until the user says otherwise.
     let s = Setup::with_config("");
+    s.write_global_config(GLOBAL_SEARCH_PATH);
     let config = s.config_path();
     fs::create_dir(s.ws().join("sub")).unwrap();
     fs::remove_file(&config).unwrap();
@@ -754,6 +1037,7 @@ fn a_link_swapped_in_for_an_allowed_workspace_does_not_run_the_defaults() {
     // workspace away and puts a link to a directory without configuration
     // in its place: discovery resolves the link, and finds none.
     let s = Setup::with_config("");
+    s.write_global_config(GLOBAL_SEARCH_PATH);
     let config = s.config_path();
     let ws = s.ws();
     let elsewhere = s.root.join("elsewhere");

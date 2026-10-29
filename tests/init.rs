@@ -582,6 +582,86 @@ fn bad_init_arguments_fail_before_running_anything() {
     );
 }
 
+#[test]
+fn invalid_spec_json_and_missing_landlock_path_exit_125_without_running_target() {
+    use std::io::{Seek, SeekFrom, Write};
+    use stopit::init::{InitSpec, encode_spec};
+    use stopit::landlock::{ACCESS_FS_READ_DIR, LandlockPathRule};
+
+    let init = Init::new();
+    let spec = init.f.compile(&init_config(
+        &[],
+        "fs.rw = [\"{workspace}\"]\nnetwork = { mode = \"loopback\" }",
+    ));
+    let marker = init.f.workspace().join("target-ran");
+    let ops = [write("/workspace/target-ran", "ran")];
+    let stdin = serde_json::to_vec(&ops).unwrap();
+
+    let run_with_spec_bytes = |spec_bytes: &[u8]| -> Output {
+        let env_mem = memfd_create("stopit-test-env", MemfdFlags::CLOEXEC).unwrap();
+        let mut spec_mem =
+            std::fs::File::from(memfd_create("stopit-test-spec", MemfdFlags::CLOEXEC).unwrap());
+        spec_mem.write_all(spec_bytes).unwrap();
+        spec_mem.seek(SeekFrom::Start(0)).unwrap();
+
+        let env_fd = rustix::io::fcntl_dupfd_cloexec(&env_mem, 64).unwrap();
+        let spec_fd = rustix::io::fcntl_dupfd_cloexec(&spec_mem, 65).unwrap();
+        let mut argv: Vec<OsString> = vec![
+            "__init".into(),
+            "--env-fd".into(),
+            env_fd.as_raw_fd().to_string().into(),
+            "--spec-fd".into(),
+            spec_fd.as_raw_fd().to_string().into(),
+            "--".into(),
+        ];
+        argv.extend(init.probe.iter().cloned());
+        let cmd = BwrapCommand::new(
+            &spec,
+            &init.session.session,
+            &init.session.provisioned,
+            Path::new("/workspace"),
+            &argv,
+            stopit::bwrap::TerminalSession::Keep,
+        )
+        .unwrap();
+        let cmd = leaking_fd(
+            leaking_fd(cmd.into_command(), env_fd.as_raw_fd()),
+            spec_fd.as_raw_fd(),
+        );
+        run_bwrap(cmd, Some(&stdin))
+    };
+
+    let out = run_with_spec_bytes(b"{not valid json");
+    assert_eq!(code(&out), i32::from(EXIT_INIT_FAILED), "{out:?}");
+    assert!(
+        stderr(&out).contains("invalid init specification JSON"),
+        "{out:?}"
+    );
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert!(!marker.exists(), "target ran despite invalid spec JSON");
+
+    let mut missing_rule_spec = InitSpec::from_sandbox_spec(&spec);
+    missing_rule_spec.landlock.rules.push(LandlockPathRule {
+        path: PathBuf::from("/missing-sandbox-landlock-path"),
+        access: ACCESS_FS_READ_DIR,
+    });
+    let out = run_with_spec_bytes(&encode_spec(&missing_rule_spec).unwrap());
+    assert_eq!(code(&out), i32::from(EXIT_INIT_FAILED), "{out:?}");
+    assert!(
+        stderr(&out).starts_with("stopit __init: cannot apply Landlock policy:"),
+        "{out:?}"
+    );
+    assert!(
+        stderr(&out).contains("/missing-sandbox-landlock-path"),
+        "{out:?}"
+    );
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert!(
+        !marker.exists(),
+        "target ran despite missing Landlock rule path"
+    );
+}
+
 // --- Network loopback teardown and capability zeroing ---
 
 /// Asserts that all five capability masks in `/proc/self/status` are zero.

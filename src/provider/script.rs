@@ -33,7 +33,7 @@ use rustix::process::{Pid, PidfdFlags, Signal, kill_process_group, pidfd_open};
 use serde_json::{Map, Number, Value};
 
 use super::{Provider, ProviderContext, ProviderError, ProviderOutput};
-use crate::config::{ProfileRef, ProviderName, ScriptSource};
+use crate::config::{ProfileRef, ProviderName, ProviderOrigin, ScriptSource};
 use crate::escape::escape_message;
 use crate::manifest::Manifest;
 use crate::spec::{ScriptPathError, has_rewritable_hard_links, resolve_script_path};
@@ -79,11 +79,12 @@ pub struct ScriptProvider {
     base_dir: PathBuf,
     protect: bool,
     config: toml::Table,
+    origin: ProviderOrigin,
 }
 
 impl ScriptProvider {
-    /// Creates a provider for `source`, declared in a configuration file in
-    /// `base_dir`.
+    /// Creates a workspace-origin provider for `source`, declared in a
+    /// configuration file in `base_dir`.
     ///
     /// A relative `source` is resolved against `base_dir`; an absolute one is
     /// used as is. `base_dir` is also the script's current directory; it
@@ -97,6 +98,25 @@ impl ScriptProvider {
         protect: bool,
         config: toml::Table,
     ) -> Self {
+        Self::with_origin(
+            name,
+            source,
+            base_dir,
+            protect,
+            config,
+            ProviderOrigin::Workspace,
+        )
+    }
+
+    /// Creates a provider for `source` in `base_dir` tagged with `origin`.
+    pub fn with_origin(
+        name: ProviderName,
+        source: &ScriptSource,
+        base_dir: &Path,
+        protect: bool,
+        config: toml::Table,
+        origin: ProviderOrigin,
+    ) -> Self {
         ScriptProvider {
             name,
             source: base_dir.join(source.as_path()),
@@ -104,6 +124,7 @@ impl ScriptProvider {
             base_dir: base_dir.to_owned(),
             protect,
             config,
+            origin,
         }
     }
 
@@ -427,6 +448,7 @@ impl Provider for ScriptProvider {
         Ok(ProviderOutput {
             profile: ProfileRef::main(),
             manifest,
+            origin: self.origin,
         })
     }
 }

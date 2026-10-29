@@ -27,7 +27,7 @@ use stopit::provider::{ProviderContext, protected_sources, session_providers, st
 use stopit::provision::{Provisioned, provision};
 use stopit::session::SessionDir;
 use stopit::spec::{SandboxSpec, compile_session, static_rw_roots};
-use stopit::state::{DataDirs, StateDirs, StatePath};
+use stopit::state::{ConfigDirs, DataDirs, StateDirs, StatePath};
 use tempfile::TempDir;
 
 #[allow(unused_imports)]
@@ -494,6 +494,7 @@ impl SpecFixture {
         let state = StateDirs {
             runtime: StatePath::canonical(self.root.join("runtime/stopit")),
             data: DataDirs::canonical(self.home().join(".local/share/stopit")),
+            config: ConfigDirs::canonical(self.home().join(".config/stopit")),
         };
         let session = compile_session(&config, outputs, &protected, &state, &ctx)
             .unwrap_or_else(|e| panic!("the configuration does not compile: {e}"));

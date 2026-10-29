@@ -2,8 +2,8 @@
 
 use std::path::Path;
 
-use super::{ConfigProvider, Provider, ProviderError, from_entry};
-use crate::config::{Base, Config, ProfileRef, ProviderName};
+use super::{ConfigProvider, Provider, ProviderError, from_layered_entry};
+use crate::config::{Base, Config, LayeredProviderEntry, ProfileRef, ProviderName, ProviderOrigin};
 use crate::manifest::Manifest;
 
 /// The name of the built-in `config` provider of `base = "default"`. User
@@ -26,54 +26,67 @@ pub fn default_base_manifest() -> Result<Manifest, ProviderError> {
     toml::from_str(DEFAULT_MANIFEST_TOML).map_err(|e| ProviderError::BuiltinBase(e.to_string()))
 }
 
-/// The ordered providers of a session: the base's built-in providers first,
-/// then the user's `[[provider]]` entries in file order (§3.5).
-///
-/// `base_dir` is the directory of the configuration file, as for
-/// [`from_entry`].
-///
-/// TODO: a single `base_dir` is used because only one configuration file is
-/// loaded today. When user-global layering lands, each entry must carry the
-/// directory of the file that declared it (DESIGN.md §3.6).
+/// The ordered providers of a single-layer session: the base's built-in
+/// providers first, then `config.providers` in file order resolved against
+/// `base_dir`.
 pub fn session_providers(
     config: &Config,
     base_dir: &Path,
 ) -> Result<Vec<Box<dyn Provider>>, ProviderError> {
-    if let Some(entry) = config
+    let entries: Vec<LayeredProviderEntry> = config
         .providers
         .iter()
-        .find(|e| e.name.as_str() == SUPERVISOR_PROVIDER_NAME)
+        .cloned()
+        .map(|entry| LayeredProviderEntry {
+            origin: ProviderOrigin::Workspace,
+            base_dir: base_dir.to_path_buf(),
+            entry,
+        })
+        .collect();
+    layered_session_providers(config.base, &entries)
+}
+
+/// Builds the ordered providers of a layered session with built-in base
+/// providers first, followed by `entries` in merge order using each entry's
+/// own declaring directory and [`ProviderOrigin`].
+pub fn layered_session_providers(
+    base: Base,
+    entries: &[LayeredProviderEntry],
+) -> Result<Vec<Box<dyn Provider>>, ProviderError> {
+    if let Some(entry) = entries
+        .iter()
+        .find(|e| e.entry.name.as_str() == SUPERVISOR_PROVIDER_NAME)
     {
         return Err(ProviderError::ReservedForSupervisor {
-            name: entry.name.clone(),
+            name: entry.entry.name.clone(),
         });
     }
     let mut providers: Vec<Box<dyn Provider>> = Vec::new();
-    match config.base {
+    match base {
         Base::None => {}
         Base::Default => {
-            if let Some(entry) = config
-                .providers
+            if let Some(entry) = entries
                 .iter()
-                .find(|e| e.name.as_str() == BASE_PROVIDER_NAME)
+                .find(|e| e.entry.name.as_str() == BASE_PROVIDER_NAME)
             {
                 return Err(ProviderError::ReservedName {
-                    name: entry.name.clone(),
+                    name: entry.entry.name.clone(),
                 });
             }
             // The `vcs` provider joins the default base in Phase 3.
             let name = BASE_PROVIDER_NAME
                 .parse::<ProviderName>()
                 .map_err(|e| ProviderError::BuiltinBase(e.to_string()))?;
-            providers.push(Box::new(ConfigProvider::new(
+            providers.push(Box::new(ConfigProvider::with_origin(
                 name,
                 ProfileRef::main(),
                 default_base_manifest()?,
+                ProviderOrigin::Builtin,
             )));
         }
     }
-    for entry in &config.providers {
-        providers.push(from_entry(entry, base_dir)?);
+    for entry in entries {
+        providers.push(from_layered_entry(entry)?);
     }
     Ok(providers)
 }

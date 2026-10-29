@@ -14,12 +14,16 @@ use std::string::FromUtf8Error;
 
 use thiserror::Error;
 
-use crate::config::{ProfileRef, ProviderEntry, ProviderKind, ProviderName, WorkspaceMount};
+use crate::config::{
+    LayeredProviderEntry, ProfileRef, ProviderEntry, ProviderKind, ProviderName, ProviderOrigin,
+    WorkspaceMount,
+};
 use crate::manifest::{Manifest, ManifestError};
 use crate::spec::UntrustedRoot;
 
 pub use base::{
-    BASE_PROVIDER_NAME, SUPERVISOR_PROVIDER_NAME, default_base_manifest, session_providers,
+    BASE_PROVIDER_NAME, SUPERVISOR_PROVIDER_NAME, default_base_manifest, layered_session_providers,
+    session_providers,
 };
 pub use config::ConfigProvider;
 pub use script::{STDERR_LIMIT, STDOUT_LIMIT, ScriptProvider};
@@ -52,6 +56,8 @@ pub struct ProviderOutput {
     /// The manifest. Contributed profiles stay in `manifest.profiles`,
     /// unprefixed; the provider-name prefix is added during resolution.
     pub manifest: Manifest,
+    /// Layer that declared this provider.
+    pub origin: ProviderOrigin,
 }
 
 /// Error produced while running a provider.
@@ -392,28 +398,46 @@ pub fn from_entry(
     entry: &ProviderEntry,
     base_dir: &Path,
 ) -> Result<Box<dyn Provider>, ProviderError> {
+    from_entry_with_origin(entry, base_dir, ProviderOrigin::Workspace)
+}
+
+/// Builds the provider for a configuration entry tagged with `origin`.
+pub fn from_entry_with_origin(
+    entry: &ProviderEntry,
+    base_dir: &Path,
+    origin: ProviderOrigin,
+) -> Result<Box<dyn Provider>, ProviderError> {
     match &entry.kind {
-        ProviderKind::Config { profile, sandbox } => Ok(Box::new(ConfigProvider::new(
+        ProviderKind::Config { profile, sandbox } => Ok(Box::new(ConfigProvider::with_origin(
             entry.name.clone(),
             profile.clone(),
             (**sandbox).clone(),
+            origin,
         ))),
         ProviderKind::Script {
             source,
             protect,
             config,
-        } => Ok(Box::new(ScriptProvider::new(
+        } => Ok(Box::new(ScriptProvider::with_origin(
             entry.name.clone(),
             source,
             base_dir,
             *protect,
             config.clone(),
+            origin,
         ))),
         kind @ ProviderKind::Vcs { .. } => Err(ProviderError::Unsupported {
             name: entry.name.clone(),
             kind: kind.type_name(),
         }),
     }
+}
+
+/// Builds the provider for a [`LayeredProviderEntry`].
+pub fn from_layered_entry(
+    entry: &LayeredProviderEntry,
+) -> Result<Box<dyn Provider>, ProviderError> {
+    from_entry_with_origin(&entry.entry, &entry.base_dir, entry.origin)
 }
 
 #[cfg(test)]
