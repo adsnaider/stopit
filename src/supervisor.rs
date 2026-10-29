@@ -787,8 +787,19 @@ pub(crate) struct LoadedSession {
     provisioned: Provisioned,
     /// The shim trampoline in the session directory.
     trampoline: PathBuf,
+    /// What `stopit-grant` requests asked to mount `rw`, which every later
+    /// compile treats as untrusted roots (§7.5).
+    granted: std::sync::Mutex<GrantedRw>,
     /// Dropped last.
     pub(crate) session: SessionDir,
+}
+
+/// The canonical host paths that `stopit-grant` requests of a session asked
+/// to mount `rw`, allowed or not, and how many times the set grew.
+#[derive(Default)]
+struct GrantedRw {
+    paths: std::collections::BTreeSet<PathBuf>,
+    generation: u64,
 }
 
 impl LoadedSession {
@@ -960,8 +971,29 @@ impl LoadedSession {
             ctx,
             provisioned,
             trampoline,
+            granted: Default::default(),
             session,
         })
+    }
+
+    fn granted(&self) -> std::sync::MutexGuard<'_, GrantedRw> {
+        self.granted.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Compiles with `outputs`, and `granted` as more untrusted roots.
+    fn compile_granted(
+        &self,
+        outputs: Vec<(ProviderName, ProviderOutput)>,
+        granted: &std::collections::BTreeSet<PathBuf>,
+    ) -> Result<CompiledSession, RunError> {
+        Ok(crate::spec::compile_session_granted(
+            &self.config,
+            outputs,
+            &self.protected,
+            &self.state,
+            &self.ctx,
+            granted,
+        )?)
     }
 
     /// Compiles every profile again from the providers' outputs of
@@ -970,13 +1002,8 @@ impl LoadedSession {
     /// and missing paths are decided when the sandbox starts, as for a
     /// standalone run. Script providers are not run again.
     pub(crate) fn recompile(&self) -> Result<(CompiledSession, Vec<String>), RunError> {
-        let compiled = compile_session(
-            &self.config,
-            self.outputs.clone(),
-            &self.protected,
-            &self.state,
-            &self.ctx,
-        )?;
+        let granted = self.granted().paths.clone();
+        let compiled = self.compile_granted(self.outputs.clone(), &granted)?;
         let warnings = warning_lines(&compiled, self.config.base);
         Ok((compiled, warnings))
     }
@@ -985,19 +1012,48 @@ impl LoadedSession {
     /// does, with `extra` after the providers' outputs: the temporary
     /// profile of a `stopit-grant` request (§7.5), which every check of
     /// the compiler then applies to. Warnings are dropped.
+    ///
+    /// First adds `rw`, the request's canonical `rw` paths, to the paths
+    /// every later compile of the session treats as untrusted roots,
+    /// whatever the user answers. Returns the compiled session and the
+    /// generation of those paths it saw, for
+    /// [`current_grant`](Self::current_grant).
     pub(crate) fn compile_with(
         &self,
         extra: (ProviderName, ProviderOutput),
-    ) -> Result<CompiledSession, RunError> {
+        rw: &[PathBuf],
+    ) -> Result<(CompiledSession, u64), RunError> {
+        let (granted, generation) = {
+            let mut state = self.granted();
+            let before = state.paths.len();
+            state.paths.extend(rw.iter().cloned());
+            if state.paths.len() != before {
+                state.generation += 1;
+            }
+            (state.paths.clone(), state.generation)
+        };
         let mut outputs = self.outputs.clone();
         outputs.push(extra);
-        Ok(compile_session(
-            &self.config,
-            outputs,
-            &self.protected,
-            &self.state,
-            &self.ctx,
-        )?)
+        Ok((self.compile_granted(outputs, &granted)?, generation))
+    }
+
+    /// `compiled`, from [`compile_with`](Self::compile_with) at
+    /// `generation`, if no other request has added `rw` paths since.
+    /// Otherwise compiles `extra` again with them, so a command another
+    /// grant let write there since cannot have moved what this one mounts.
+    pub(crate) fn current_grant(
+        &self,
+        extra: (ProviderName, ProviderOutput),
+        generation: u64,
+        compiled: CompiledSession,
+    ) -> Result<CompiledSession, RunError> {
+        let state = self.granted();
+        if state.generation == generation {
+            return Ok(compiled);
+        }
+        let mut outputs = self.outputs.clone();
+        outputs.push(extra);
+        self.compile_granted(outputs, &state.paths)
     }
 
     /// The host user's home directory, which `~` in rules names.

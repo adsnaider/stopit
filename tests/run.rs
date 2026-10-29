@@ -4257,22 +4257,38 @@ fn grants_the_host_refuses_say_why_only_on_the_server_terminal() {
     };
     let s = Setup::new();
     let root = s.root.clone();
-    for dir in ["cfg", "x/hidden", "data"] {
+    for dir in [
+        "cfg",
+        "x/hidden",
+        "data",
+        "rw/keep",
+        "cargo/registry",
+        "ws/sub",
+    ] {
         fs::create_dir_all(root.join(dir)).unwrap();
     }
     fs::write(root.join("cfg/f"), "").unwrap();
+    fs::write(root.join("tok"), "").unwrap();
     let _socket = std::os::unix::net::UnixListener::bind(root.join("s.sock")).unwrap();
-    // `main` masks x/hidden, and the profile `publish` mounts cfg/f by
-    // path.
+    // `main` masks x/hidden, keeps rw/keep read-only inside a writable rw,
+    // and has the workspace where it lies on the host. The profile
+    // `publish` mounts cfg/f by path, and binds tok to a place it reaches
+    // through cargo.
     s.write_config(&format!(
         "{config}[approval]\ntimeout = \"20s\"\n\
          [[provider]]\ntype = \"config\"\nname = \"mask\"\n[provider.sandbox]\n\
-         fs.ro = [\"{x}\"]\nfs.masked = [\"{x}/hidden\"]\n\
+         fs.ro = [\"{x}\", \"{rw}/keep\"]\nfs.masked = [\"{x}/hidden\"]\nfs.rw = [\"{rw}\"]\n\
          [profiles.publish]\n\
          [[provider]]\ntype = \"config\"\nname = \"pub\"\nprofile = \"publish\"\n\
-         [provider.sandbox]\nfs.ro = [\"{cfg}/f\"]\n",
+         [provider.sandbox]\nfs.ro = [\"{cfg}/f\", \"{cargo}\"]\n\
+         fs.bind = [{{ host = \"{tok}\", sandbox = \"{cargo}/registry/tok\", mode = \"ro\" }}]\n\
+         [workspace]\nmount = \"{ws}\"\n",
         x = root.join("x").display(),
+        rw = root.join("rw").display(),
         cfg = root.join("cfg").display(),
+        cargo = root.join("cargo").display(),
+        tok = root.join("tok").display(),
+        ws = s.ws().display(),
     ));
     let server = Server::start_on_terminal(&s, &server_master, server_slave);
     let cases = [
@@ -4280,11 +4296,23 @@ fn grants_the_host_refuses_say_why_only_on_the_server_terminal() {
         (format!("+ro:{}/s.sock", root.display()), "is a socket"),
         (
             format!("+rw:{}/cfg", root.display()),
-            "and profile \"publish\" mounts",
+            "and profile \"publish\" reaches",
         ),
         (
             format!("+ro:{}/x/hidden", root.display()),
             "would replace the masked rule of provider \"mask\"",
+        ),
+        (
+            format!("+rw:{}/rw/keep", root.display()),
+            "would replace the ro rule of provider \"mask\"",
+        ),
+        (
+            format!("+ro:{}/sub", s.ws().display()),
+            "is inside the workspace mount",
+        ),
+        (
+            format!("+rw:{}/cargo/registry", root.display()),
+            "registry/tok below it by path, for its mount at",
         ),
         (
             format!("+rw:{}", s.state_dir().display()),
@@ -4329,6 +4357,198 @@ fn grants_the_host_refuses_say_why_only_on_the_server_terminal() {
     answer(&server, &server_master, b"y", "allowed once");
     let out = child.join().unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "rc=0\n", "{out:?}");
+}
+
+#[test]
+fn a_later_grant_follows_no_link_where_an_earlier_one_could_write() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((server_master, server_slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::with_config(&format!("{config}[approval]\ntimeout = \"20s\"\n"));
+    let writable = s.root.join("writable");
+    fs::create_dir(&writable).unwrap();
+    let target = s.root.join("target");
+    fs::create_dir(&target).unwrap();
+    let server = Server::start_on_terminal(&s, &server_master, server_slave);
+    // The first grant's command plants a link. A command like it could
+    // swap the link between a later prompt and the mount.
+    let line = format!(
+        "stopit-grant +rw:{w} -- ln -s {t} {w}/link; echo \"rc=$?\"",
+        w = writable.display(),
+        t = target.display()
+    );
+    let child = command_output_async(s.stopit(&["run", "--quiet", "/bin/sh", "-c", &line]));
+    server.wait_for_log("[n] deny: ");
+    answer(&server, &server_master, b"y", "allowed once");
+    let out = child.join().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "rc=0\n", "{out:?}");
+    assert!(
+        fs::symlink_metadata(writable.join("link"))
+            .unwrap()
+            .is_symlink()
+    );
+    // A grant through the link is refused, though its target is harmless.
+    let prompts = server.log().matches("[n] deny: ").count();
+    let line = format!(
+        "stopit-grant +ro:{}/link -- true; echo \"rc=$?\"",
+        writable.display()
+    );
+    let out = output(s.stopit(&["run", "--quiet", "/bin/sh", "-c", &line]), b"");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "rc=126\n", "{out:?}");
+    assert!(
+        stderr(&out).contains("refused; the stopit server's terminal says why"),
+        "{out:?}"
+    );
+    let logged = server.wait_for_log("stopit-grant refused without asking");
+    assert!(
+        logged.contains("asked for rw with stopit-grant in this session"),
+        "{logged}"
+    );
+    assert_eq!(server.log().matches("[n] deny: ").count(), prompts);
+    // The same link made where no grant could write is followed, and the
+    // prompt shows its target.
+    let elsewhere = s.root.join("elsewhere");
+    symlink(&target, &elsewhere).unwrap();
+    let line = format!("stopit-grant +ro:{} -- true", elsewhere.display());
+    let child = command_output_async(s.stopit(&["run", "--quiet", "/bin/sh", "-c", &line]));
+    server.wait_for_log(&format!("read-only {}", target.display()));
+    answer(&server, &server_master, b"n", "denied");
+    child.join().unwrap();
+}
+
+#[test]
+fn a_grant_allowed_after_another_asked_for_rw_is_checked_again() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((server_master, server_slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::with_config(&format!("{config}[approval]\ntimeout = \"20s\"\n"));
+    let dir = s.root.join("dir");
+    fs::create_dir(&dir).unwrap();
+    let target = s.root.join("target");
+    fs::create_dir(&target).unwrap();
+    symlink(&target, dir.join("link")).unwrap();
+    let server = Server::start_on_terminal(&s, &server_master, server_slave);
+    let run = |line: String| {
+        command_output_async(s.stopit(&[
+            "run",
+            "--quiet",
+            "/bin/sh",
+            "-c",
+            &format!("{line}; echo \"rc=$?\""),
+        ]))
+    };
+    // The first request goes through a link no grant could write yet.
+    let first = run(format!("stopit-grant +ro:{}/link -- true", dir.display()));
+    server.wait_for_log(&format!("read-only {}", target.display()));
+    // While it waits, a second asks to write where the link is. Its
+    // prompt waits for the first one's answer.
+    let rw = format!("+rw:{}", dir.display());
+    let second = run(format!("stopit-grant {rw} -- true"));
+    // The server holds its log while a prompt is up, so the second
+    // request shows as its shim's process. Its broker compiles it soon
+    // after.
+    wait_until(|| {
+        fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .any(|p| {
+                fs::read(p.path().join("cmdline")).is_ok_and(|c| {
+                    c.split(|&b| b == 0).any(|a| a == rw.as_bytes())
+                        && c.split(|&b| b == 0).any(|a| a == b"__shim")
+                })
+            })
+            .then_some(())
+    });
+    thread::sleep(Duration::from_secs(1));
+    // The first is allowed, then compiled again with the second's path as
+    // a place a sandbox may write, where its link is no longer followed.
+    answer(&server, &server_master, b"y", "allowed once");
+    let out = first.join().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "rc=126\n", "{out:?}");
+    assert!(
+        stderr(&out).contains("refused; the stopit server's terminal says why"),
+        "{out:?}"
+    );
+    // The second one's prompt is up by now, and the log line of the
+    // refusal waits for its answer.
+    server.wait_for_log(&format!("read-write {}", dir.display()));
+    answer(&server, &server_master, b"n", "denied");
+    let out = second.join().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "rc=126\n", "{out:?}");
+    assert!(
+        stderr(&out).contains("stopit-grant: denied by user"),
+        "{out:?}"
+    );
+    let logged = server.wait_for_log("stopit-grant refused after the prompt");
+    assert!(logged.contains("run 1 "), "{logged}");
+}
+
+#[test]
+fn the_server_refuses_client_requests_about_anything_but_the_clipboard() {
+    use stopit::approval::ApprovalRequest;
+    use stopit::control::{ClientMessage, ServerMessage};
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((server_master, server_slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::with_config(&format!("{config}[approval]\ntimeout = \"20s\"\n"));
+    let server = Server::start_on_terminal(&s, &server_master, server_slave);
+    // A live run for the requests to name.
+    let child = command_output_async(s.stopit(&["run", "--quiet", "/bin/sh", "-c", "sleep 3"]));
+    server.wait_for_log("run 1 started");
+    let socket = s
+        .runtime()
+        .join("stopit")
+        .join(&server.id)
+        .join("control/socket");
+    let requests = [
+        ApprovalRequest::Command {
+            shim: "git".into(),
+            rule: "default".into(),
+            profile: "main".into(),
+            command: "git push".into(),
+            cwd: "/workspace".into(),
+        },
+        ApprovalRequest::Grant {
+            grants: vec!["the full network".into()],
+            key: "net:full".into(),
+            scope: "curl".into(),
+            profile: "stopit.grant".into(),
+            command: "curl x".into(),
+            cwd: "/workspace".into(),
+        },
+    ];
+    for request in requests {
+        let conn = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        stopit::control::send_approval_hello(&conn).unwrap();
+        stopit::control::write_frame(&conn, &ClientMessage::Approve { run: 1, request }).unwrap();
+        let decision: Option<ServerMessage> = stopit::control::read_frame(&conn).unwrap();
+        assert_eq!(
+            decision,
+            Some(ServerMessage::Decision {
+                allow: false,
+                session: false,
+                quiet: false,
+            })
+        );
+    }
+    let refused = "refused a client's approval request that was not a clipboard write";
+    let deadline = Instant::now() + BWRAP_DEADLINE;
+    while server.log().matches(refused).count() < 2 {
+        assert!(Instant::now() < deadline, "{}", server.log());
+        thread::sleep(Duration::from_millis(20));
+    }
+    let log = server.log();
+    assert!(!log.contains("[n] deny: "), "{log}");
+    child.join().unwrap();
 }
 
 #[test]

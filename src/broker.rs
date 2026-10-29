@@ -621,14 +621,15 @@ struct GrantCall<'a> {
 
 /// Serves a `stopit-grant` call (§7.5).
 ///
-/// What the sandbox can check on its own, its arguments and its own
-/// profile, is refused with the reason on its stderr. Without a server to
-/// ask, every other call is refused before the host is looked at. Then refusals that depend on the
-/// host, such as a missing path or what the compiler rejects, give the
-/// sandbox only a generic line, so it cannot learn host paths or probe
-/// for them unseen, and the server's log gets the reason. The temporary
-/// profile is compiled with the session's providers, so every check of a
-/// rule applies, and is then checked against the session as it is.
+/// The broker refuses what the sandbox can check on its own, its
+/// arguments and its own profile, with the reason on its stderr. Without a
+/// server to ask, it refuses every other call before it looks at the host.
+/// With one, a refusal that depends on the host, such as a missing path or
+/// what the compiler rejects, gives the sandbox only a generic line, so it
+/// cannot learn host paths or probe for them unseen, and the server's log
+/// gets the reason. The broker compiles the temporary profile with the
+/// session's providers, so every check of a rule applies, then checks it
+/// against the session as it is.
 fn run_grant(
     call: GrantCall<'_>,
     args: Vec<Vec<u8>>,
@@ -701,16 +702,20 @@ fn run_grant(
         say("denied by user a moment ago; wait before asking again");
         return Ok(EXIT_DENIED);
     }
-    let refuse = |why: &str| {
-        approver.log(&format!(
-            "stopit: run {} ({}): stopit-grant refused without asking: {}",
+    let refuse_when = |when: &str, why: &str| {
+        approver.log_refusal(
             ctx.run,
-            crate::escape::escape_message(&format!("profile {:?}", shared.caller.as_str())),
-            crate::escape::escape_message(why)
-        ));
+            &format!(
+                "stopit: run {} ({}): stopit-grant refused {when}: {}",
+                ctx.run,
+                crate::escape::escape_message(&format!("profile {:?}", shared.caller.as_str())),
+                crate::escape::escape_message(why)
+            ),
+        );
         say("refused; the stopit server's terminal says why");
         Ok(EXIT_DENIED)
     };
+    let refuse = |why: &str| refuse_when("without asking", why);
     let home = ctx.loaded.host_home();
     let mut paths = Vec::new();
     for (path, rw) in request.paths() {
@@ -736,20 +741,30 @@ fn run_grant(
         Ok(built) => built,
         Err(why) => return refuse(&why),
     };
-    let provider = crate::provider::SUPERVISOR_PROVIDER_NAME
+    let provider: crate::config::ProviderName = crate::provider::SUPERVISOR_PROVIDER_NAME
         .parse()
         .expect("the supervisor's name is a valid provider name");
-    let compiled = match ctx.loaded.compile_with((provider, output)) {
+    let extra = (provider, output);
+    let rw: Vec<PathBuf> = paths
+        .iter()
+        .filter(|(_, rw)| *rw)
+        .map(|(p, _)| p.clone())
+        .collect();
+    let workspace_mount = ctx.loaded.workspace_mount();
+    let check = |compiled: &CompiledSession| {
+        let granted = compiled
+            .get(&target)
+            .ok_or("the temporary profile did not compile")?;
+        check_grant(&ctx.compiled, caller, granted, &paths, workspace_mount)
+    };
+    let (compiled, generation) = match ctx.loaded.compile_with(extra.clone(), &rw) {
         Ok(compiled) => compiled,
         Err(e) => return refuse(&e.to_string()),
     };
-    let Some(granted) = compiled.get(&target) else {
-        return refuse("the temporary profile did not compile");
-    };
-    if let Err(why) = check_grant(&ctx.compiled, caller, granted, &paths) {
+    if let Err(why) = check(&compiled) {
         return refuse(&why);
     }
-    let network = mode.map(|_| &granted.spec.network);
+    let network = mode.map(|_| &compiled.get(&target).expect("checked above").spec.network);
     let ask = ApprovalRequest::Grant {
         grants: GrantRequest::describe(home, network, &paths),
         key: GrantRequest::key(network, &paths),
@@ -762,6 +777,17 @@ fn run_grant(
         say("denied by user");
         return Ok(EXIT_DENIED);
     }
+    // Another request may have asked for rw paths since the compile, and
+    // its command may write there by now. Compiled again with them, the
+    // grant's mounts cannot follow a link planted there.
+    let refuse = |why: &str| refuse_when("after the prompt", why);
+    let compiled = match ctx.loaded.current_grant(extra, generation, compiled) {
+        Ok(compiled) => compiled,
+        Err(e) => return refuse(&e.to_string()),
+    };
+    if let Err(why) = check(&compiled) {
+        return refuse(&why);
+    }
     let granted = Arc::new(RunContext {
         compiled: Arc::new(compiled),
         ..(**ctx).clone()
@@ -771,22 +797,38 @@ fn run_grant(
         .into_iter()
         .map(OsString::from_vec)
         .collect();
-    start_and_wait(
+    let started = start_and_wait(
         conn, shared, number, &granted, &target, &command, stdio, cwd_fd, rel,
-    )
+    );
+    // The error may name host paths, which the sandbox is not told.
+    started.map_err(|e| {
+        approver.log_refusal(
+            ctx.run,
+            &format!(
+                "stopit: run {}: the command stopit-grant allowed did not start: {}",
+                ctx.run,
+                crate::escape::escape_message(&e)
+            ),
+        );
+        "the command did not start; the stopit server's terminal says why".to_owned()
+    })
 }
 
 /// Checks the compiled temporary profile `granted` against the session as
 /// compiled for the run, `session`, and the caller's profile `caller`,
 /// for what the compiler cannot see from one profile. `paths` are the
 /// grant's canonical host paths, with whether each is read-write.
+/// `workspace_mount` is where the workspace appears in the sandbox.
 ///
-/// * A read-write path must not hold the host source of a mount that some
-///   profile makes by path, outside its untrusted roots (§3.4, §6.2). The
-///   granted command could swap a link in there, which later sandboxes,
-///   compiled without this grant, would follow.
-/// * A grant must not land on or inside a path the caller masks or
-///   protects, where a profile's own rule would lift the caller's.
+/// * A read-write path must not have a host path below it that some profile
+///   reaches by path, outside its untrusted roots (§3.4, §6.2). That is a mount's
+///   own source, or where its destination lies in the host tree of the
+///   mount above it. The granted command could swap a link in there, which
+///   later sandboxes would follow.
+/// * A grant must not land on or inside the workspace mount, which is the
+///   sandbox's to write already, or a path the caller masks or protects,
+///   or a read-only path inside a writable one. A profile's own rule beats
+///   an inherited one, so the grant would lift the caller's rule.
 /// * The grant must add no compile warning to the caller's, since a
 ///   warning means a rule did not take as the prompt would show it.
 fn check_grant(
@@ -794,48 +836,78 @@ fn check_grant(
     caller: &crate::spec::CompiledProfile,
     granted: &crate::spec::CompiledProfile,
     paths: &[(PathBuf, bool)],
+    workspace_mount: &Path,
 ) -> Result<(), String> {
     use crate::policy::PathMode;
-    use crate::resolve::MountSource;
-    for (granted_path, _) in paths.iter().filter(|(_, rw)| *rw) {
+    let rw: Vec<&Path> = paths
+        .iter()
+        .filter(|(_, rw)| *rw)
+        .map(|(p, _)| p.as_path())
+        .collect();
+    if !rw.is_empty() {
         for (name, profile) in session.iter() {
-            let spec = &profile.spec;
-            for m in &spec.mounts {
-                let MountSource::Host { path, .. } = &m.source else {
-                    continue;
-                };
-                let sources = [Some(path), spec.canonical_sources.get(&m.sandbox)];
-                for source in sources.into_iter().flatten() {
-                    let trusted_by_fd = spec.untrusted_roots.iter().any(|r| source.starts_with(r));
-                    if source.starts_with(granted_path) && !trusted_by_fd {
-                        return Err(format!(
-                            "{} would be writable, and profile {:?} mounts {} below it by path",
-                            granted_path.display(),
-                            name.as_str(),
-                            source.display()
-                        ));
-                    }
-                }
+            if let Some((writable, sandbox, host)) = reached_by_path(&profile.spec, &rw) {
+                return Err(format!(
+                    "{} would be writable, and profile {:?} reaches {} below it by path, \
+                     for its mount at {}",
+                    writable.display(),
+                    name.as_str(),
+                    host.display(),
+                    sandbox.display()
+                ));
             }
         }
     }
     let stopit = crate::provider::SUPERVISOR_PROVIDER_NAME;
+    // stopit's own rules, the masks over sockets and its state and the
+    // protected configuration files, are left out: the compiler applies
+    // them to every profile, the temporary one included.
+    let restriction = |c: &crate::resolve::PlannedMount| -> Option<String> {
+        if c.provider.as_str() == stopit {
+            return None;
+        }
+        let inside_rw = || {
+            caller.spec.mounts.iter().any(|r| {
+                r.mode == PathMode::Rw
+                    && c.sandbox != r.sandbox
+                    && c.sandbox.starts_with(&r.sandbox)
+            })
+        };
+        match c.mode {
+            PathMode::Masked | PathMode::Protected => {}
+            PathMode::Ro if inside_rw() => {}
+            _ => return None,
+        }
+        Some(format!(
+            "the {} rule of provider {:?} at {}",
+            c.mode.as_str(),
+            c.provider.as_str(),
+            c.sandbox.display()
+        ))
+    };
     for m in &granted.spec.mounts {
-        let from_grant = m.provider.as_str() == stopit
-            && matches!(m.mode, PathMode::Ro | PathMode::Rw | PathMode::Protected);
+        let from_grant =
+            m.provider.as_str() == stopit && matches!(m.mode, PathMode::Ro | PathMode::Rw);
         if !from_grant {
             continue;
         }
-        if let Some(restricted) = caller.spec.mounts.iter().find(|c| {
-            matches!(c.mode, PathMode::Masked | PathMode::Protected)
-                && c.provider.as_str() != stopit
-                && m.sandbox.starts_with(&c.sandbox)
-        }) {
+        if m.sandbox.starts_with(workspace_mount) {
             return Err(format!(
-                "it would replace the {} rule of provider {:?} at {}",
-                restricted.mode.as_str(),
-                restricted.provider.as_str(),
-                restricted.sandbox.display()
+                "{} is inside the workspace mount {}",
+                m.sandbox.display(),
+                workspace_mount.display()
+            ));
+        }
+        let lifted = caller
+            .spec
+            .mounts
+            .iter()
+            .filter(|c| m.sandbox.starts_with(&c.sandbox))
+            .find_map(restriction);
+        if let Some(rule) = lifted {
+            return Err(format!(
+                "a grant at {} would replace {rule}",
+                m.sandbox.display()
             ));
         }
     }
@@ -849,6 +921,62 @@ fn check_grant(
         return Err(format!("a rule would not take as asked: {new}"));
     }
     Ok(())
+}
+
+/// The first host path below one of `rw` that `spec` reaches by path, with
+/// that `rw` path and the sandbox path of the mount, if any. A mount
+/// reaches its own host source, and the host path its destination lies on
+/// in the tree of the nearest mount above it. A host source inside one of
+/// the spec's untrusted roots is mounted by descriptor, with no link
+/// followed, so it does not count.
+fn reached_by_path<'a>(
+    spec: &crate::spec::SandboxSpec,
+    rw: &[&'a Path],
+) -> Option<(&'a Path, PathBuf, PathBuf)> {
+    use crate::resolve::MountSource;
+    let by_sandbox: std::collections::BTreeMap<&Path, &crate::resolve::PlannedMount> = spec
+        .mounts
+        .iter()
+        .map(|m| (m.sandbox.as_path(), m))
+        .collect();
+    // The host paths `m` reaches through the host tree of `base`, a mount
+    // at or above it, by path.
+    let reached = |m: &crate::resolve::PlannedMount, base: &crate::resolve::PlannedMount| {
+        let MountSource::Host { path, .. } = &base.source else {
+            return Vec::new();
+        };
+        let below = m
+            .sandbox
+            .strip_prefix(&base.sandbox)
+            .expect("the base is at or above the mount");
+        [Some(path), spec.canonical_sources.get(&base.sandbox)]
+            .into_iter()
+            .flatten()
+            .filter(|source| !spec.untrusted_roots.iter().any(|r| source.starts_with(r)))
+            .map(|source| match below.as_os_str().is_empty() {
+                true => source.clone(),
+                false => source.join(below),
+            })
+            .collect()
+    };
+    for m in &spec.mounts {
+        let above = m
+            .sandbox
+            .ancestors()
+            .skip(1)
+            .find_map(|a| by_sandbox.get(a).copied());
+        let hosts = reached(m, m)
+            .into_iter()
+            .chain(above.map(|a| reached(m, a)).unwrap_or_default());
+        for host in hosts {
+            // The root of a writable path stays where it is: moving it
+            // takes its parent, which the grant does not make writable.
+            if let Some(writable) = rw.iter().find(|w| host.starts_with(w) && host != **w) {
+                return Some((writable, m.sandbox.clone(), host));
+            }
+        }
+    }
+    None
 }
 
 /// One of a run's [`MAX_LIVE`] shim commands, given back on drop.

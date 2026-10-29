@@ -1001,6 +1001,10 @@ pub enum UntrustedKind {
         /// The mount's host source, as planned (before resolving links).
         host: PathBuf,
     },
+    /// A path a `stopit-grant` request of this session asked to mount
+    /// `rw` (DESIGN.md §7.5), whether or not the user allowed it. Such a
+    /// command may still run and plant links.
+    Granted,
 }
 
 impl fmt::Display for UntrustedRoot {
@@ -1019,6 +1023,11 @@ impl fmt::Display for UntrustedRoot {
                 }
                 Ok(())
             }
+            UntrustedKind::Granted => write!(
+                f,
+                "{:?}, asked for rw with stopit-grant in this session",
+                self.path
+            ),
         }
     }
 }
@@ -1088,6 +1097,19 @@ impl UntrustedRoots {
                     host: host.clone(),
                 },
             });
+        }
+    }
+
+    /// Adds `paths`, canonical host paths that `stopit-grant` requests asked
+    /// to mount `rw`, unless a root is already there.
+    fn add_granted(&mut self, paths: &BTreeSet<PathBuf>) {
+        for path in paths {
+            if !self.roots.iter().any(|r| &r.path == path) {
+                self.roots.push(UntrustedRoot {
+                    path: path.clone(),
+                    kind: UntrustedKind::Granted,
+                });
+            }
         }
     }
 
@@ -3250,6 +3272,21 @@ pub fn compile_session(
     state: &StateDirs,
     ctx: &ExpansionContext,
 ) -> Result<CompiledSession, CompileError> {
+    compile_session_granted(config, outputs, protected, state, ctx, &BTreeSet::new())
+}
+
+/// [`compile_session`] with `granted`, the canonical host paths that
+/// `stopit-grant` requests of the session asked to mount `rw`, as more
+/// untrusted roots (DESIGN.md §7.5). A sandbox may have planted links there
+/// that no profile's own rules show.
+pub fn compile_session_granted(
+    config: &Config,
+    outputs: Vec<(ProviderName, ProviderOutput)>,
+    protected: &[ProtectedSource],
+    state: &StateDirs,
+    ctx: &ExpansionContext,
+    granted: &BTreeSet<PathBuf>,
+) -> Result<CompiledSession, CompileError> {
     let graph = build_profile_graph(config, outputs)?;
     let merged = merge_profiles(&graph)?;
     let protected = protected
@@ -3292,6 +3329,7 @@ pub fn compile_session(
         roots.add_rw_mounts(Some(profile), &p.plan.mounts);
         planned.push(p);
     }
+    roots.add_granted(granted);
     let mut profiles = BTreeMap::new();
     for ((profile, grants), p) in merged.iter().zip(planned) {
         let parent = graph

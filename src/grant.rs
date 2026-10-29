@@ -225,8 +225,8 @@ impl GrantRequest {
     /// The provider output adding a profile that inherits `caller` with the
     /// grants, and that profile's full name. `mode` is its network mode
     /// from [`network_mode`](Self::network_mode). The profile has no
-    /// `stopit-grant` of its own, so a granted command cannot ask again
-    /// from on top of its grants.
+    /// `stopit-grant` of its own, so a granted command cannot ask for more
+    /// on top of its grants.
     pub fn output(
         &self,
         caller: &ProfileRef,

@@ -382,10 +382,13 @@ fn approve_for_client(conn: &UnixStream, approver: &Approver, runs: &SharedRuns)
     let verdict = match asker {
         Some(asker) if clipboard_write => approver.decide(&asker, &request, conn.as_fd()),
         Some(_) => {
-            approver.log(&format!(
-                "stopit: run {run}: refused a client's approval request that was not a \
-                 clipboard write"
-            ));
+            approver.log_refusal(
+                run,
+                &format!(
+                    "stopit: run {run}: refused a client's approval request that was not a \
+                     clipboard write"
+                ),
+            );
             Verdict::Denied
         }
         None => Verdict::Denied,

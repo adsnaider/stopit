@@ -27,6 +27,14 @@ const ARMING_DELAY: Duration = Duration::from_millis(300);
 /// denied one in it, so a sandbox cannot bury the user in prompts.
 pub const QUIET_AFTER_DENY: Duration = Duration::from_secs(5);
 
+/// The most log lines held back while a prompt is up. Later ones are
+/// counted, and the count is printed with the held lines.
+const MAX_HELD: usize = 100;
+
+/// The most refusals logged for one run, so a sandbox that loops on
+/// refused requests cannot flood the server's terminal.
+pub const MAX_REFUSALS_LOGGED: u32 = 20;
+
 /// The most characters of escaped clipboard content a prompt shows from
 /// its start. Longer content shows `...` and then [`PREVIEW_TAIL`].
 const PREVIEW_HEAD: usize = 160;
@@ -226,8 +234,12 @@ struct State {
     quiet: HashMap<String, Instant>,
     /// Whether a prompt is on the terminal.
     prompting: bool,
-    /// Log lines held back while a prompt is up.
+    /// Log lines held back while a prompt is up, at most [`MAX_HELD`].
     held: Vec<String>,
+    /// Log lines dropped while a prompt was up, once `held` was full.
+    dropped: usize,
+    /// How many refusals each run had logged ([`Approver::log_refusal`]).
+    refusals: HashMap<u64, u32>,
     /// Runs already told about in the log that the server cannot ask
     /// for them, so the log says it once per run.
     told_unasked: HashSet<u64>,
@@ -300,7 +312,11 @@ impl Approver {
         {
             let mut state = self.state();
             if state.prompting {
-                state.held.push(line.to_owned());
+                if state.held.len() < MAX_HELD {
+                    state.held.push(line.to_owned());
+                } else {
+                    state.dropped += 1;
+                }
                 return;
             }
         }
@@ -331,6 +347,27 @@ impl Approver {
             .get(quiet)
             .is_some_and(|until| Instant::now() < *until)
             .then_some(Verdict::Denied)
+    }
+
+    /// Logs `line`, a request run `run` made that was refused without
+    /// asking, as [`log`](Self::log) does, for the first
+    /// [`MAX_REFUSALS_LOGGED`] of the run. The next one logs that the run's
+    /// later refusals go unlogged, and later ones log nothing.
+    pub fn log_refusal(&self, run: u64, line: &str) {
+        let count = {
+            let mut state = self.state();
+            let count = state.refusals.entry(run).or_insert(0);
+            *count = count.saturating_add(1);
+            *count
+        };
+        if count <= MAX_REFUSALS_LOGGED {
+            self.log(line);
+        } else if count == MAX_REFUSALS_LOGGED + 1 {
+            self.log(&format!(
+                "stopit: run {run} has had {MAX_REFUSALS_LOGGED} requests refused without \
+                 asking; its later ones are not logged"
+            ));
+        }
     }
 
     /// Whether a denial from `asker`'s profile still quiets `request`, so
@@ -504,13 +541,21 @@ struct Prompting<'a>(&'a Approver);
 
 impl Drop for Prompting<'_> {
     fn drop(&mut self) {
-        let held = {
+        let (held, dropped) = {
             let mut state = self.0.state();
             state.prompting = false;
-            std::mem::take(&mut state.held)
+            (
+                std::mem::take(&mut state.held),
+                std::mem::take(&mut state.dropped),
+            )
         };
         for line in held {
             print_line(&line);
+        }
+        if dropped > 0 {
+            print_line(&format!(
+                "stopit: {dropped} more log lines came while asking and were dropped"
+            ));
         }
     }
 }
@@ -1053,6 +1098,45 @@ mod tests {
         let state = approver.state();
         assert!(!state.prompting);
         assert!(state.held.is_empty());
+    }
+
+    #[test]
+    fn held_lines_are_capped_and_counted() {
+        let approver = Approver::with_terminal(None, ApprovalTimeout::Off, QUIET_AFTER_DENY);
+        approver.state().prompting = true;
+        for i in 0..MAX_HELD + 5 {
+            approver.log(&format!("line {i}"));
+        }
+        {
+            let state = approver.state();
+            assert_eq!(state.held.len(), MAX_HELD);
+            assert_eq!(state.held[MAX_HELD - 1], format!("line {}", MAX_HELD - 1));
+            assert_eq!(state.dropped, 5);
+        }
+        drop(Prompting(&approver));
+        let state = approver.state();
+        assert!(state.held.is_empty());
+        assert_eq!(state.dropped, 0);
+    }
+
+    #[test]
+    fn refusals_are_logged_up_to_a_limit_per_run() {
+        let approver = Approver::with_terminal(None, ApprovalTimeout::Off, QUIET_AFTER_DENY);
+        approver.state().prompting = true;
+        for _ in 0..MAX_REFUSALS_LOGGED + 10 {
+            approver.log_refusal(7, "refused");
+        }
+        approver.log_refusal(8, "other run");
+        let state = approver.state();
+        let n = MAX_REFUSALS_LOGGED as usize;
+        assert_eq!(state.held.len(), n + 2);
+        assert!(state.held[..n].iter().all(|l| l == "refused"));
+        assert!(
+            state.held[n].contains("run 7 has had 20 requests refused"),
+            "{:?}",
+            state.held[n]
+        );
+        assert_eq!(state.held[n + 1], "other run");
     }
 
     #[test]
