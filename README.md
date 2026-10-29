@@ -97,7 +97,7 @@ network = { mode = "full" }
 fs.ro = ["/etc/ssl/certs"]
 ```
 
-`full` gives the sandbox a network of its own, connected to yours by `pasta` from the passt package, which must be installed. The sandbox reaches what your machine reaches, except services on your machine's loopback. Only DNS queries reach your machine's resolver there. The planned `proxy` mode, which allows only listed domains, is not built yet.
+`full` gives the sandbox a network of its own, connected to yours by `pasta` from the passt package, which must be installed. The sandbox reaches what your machine reaches, except services on your machine's loopback. Only DNS queries, on ports 53 and 853, reach your machine's resolver there. The planned `proxy` mode, which allows only listed domains, is not built yet.
 
 ### Keep a build cache between sessions
 

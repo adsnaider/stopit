@@ -62,7 +62,7 @@ pub enum NetError {
     /// The bwrap process cannot make its user and network namespaces.
     #[error(
         "cannot make the sandbox's network namespace: {0}; network = \"full\" needs \
-         unprivileged user namespaces, which some systems restrict (Ubuntu's AppArmor, for one)"
+         unprivileged user namespaces, which some systems restrict, Ubuntu's AppArmor among them"
     )]
     Namespace(#[source] io::Error),
 

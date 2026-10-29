@@ -1124,7 +1124,8 @@ pub enum ReservedReason {
     /// itself with `network = "full"`.
     #[error(
         "is or contains \"/etc/resolv.conf\", which stopit writes itself with network = \"full\", \
-         naming pasta's DNS forwarder; drop the rule"
+         naming pasta's DNS forwarder; drop the rule, or grant it only in profiles \
+         with another network mode"
     )]
     CoversResolvConf,
     /// The sandbox home is the workspace mount.
@@ -1170,7 +1171,7 @@ fn reserved_dirs() -> impl Iterator<Item = &'static str> {
 ///
 /// Every synthesized `/etc` file is checked whether or not the profile
 /// enables it (`system.etc`), so a mount's validity does not depend on it.
-/// `/etc/resolv.conf` is the exception: it is reserved only when
+/// `/etc/resolv.conf` is the exception. It is reserved only when
 /// `resolv_reserved`, with `network = "full"` in a network namespace of
 /// stopit's own, since a profile sharing the host's namespace needs the
 /// host's file.
@@ -2979,9 +2980,9 @@ fn plan_profile(
 }
 
 /// Whether a profile with `grants` gets the synthesized
-/// `/etc/resolv.conf`: with `network = "full"` in a network namespace of
-/// stopit's own, as [`crate::bwrap::own_network_namespace`] decides from
-/// the compiled spec.
+/// `/etc/resolv.conf`. It does with `network = "full"` in a network
+/// namespace of stopit's own, as [`crate::bwrap::own_network_namespace`]
+/// decides from the compiled spec.
 fn synthesizes_resolv_conf(grants: &EffectiveGrants) -> bool {
     grants.network.mode == NetworkMode::Full
         && !grants.sandbox.share.contains(&ShareableNamespace::Net)

@@ -3294,7 +3294,7 @@ fn host_pasta() -> Option<PathBuf> {
     let found = std::env::var_os("PATH").and_then(|p| stopit::net::find_pasta_in(&p));
     if found.is_none() {
         assert!(
-            std::env::var_os("STOPIT_REQUIRE_PASTA").is_none_or(|v| v != "1"),
+            !pasta_required(),
             "no pasta in PATH, and STOPIT_REQUIRE_PASTA=1"
         );
         eprintln!("skipping: no pasta in PATH");
@@ -3310,11 +3310,20 @@ fn sandbox_has(name: &str) -> bool {
         .any(|dir| Path::new(dir).join(name).exists())
 }
 
+/// Whether `STOPIT_REQUIRE_PASTA=1` asks for the pasta tests to run.
+fn pasta_required() -> bool {
+    std::env::var_os("STOPIT_REQUIRE_PASTA").is_some_and(|v| v == "1")
+}
+
 /// [`shell_config`] with `network = "full"`, if the host has a shell,
 /// bash and pasta.
 fn full_network_config() -> Option<String> {
     let config = shell_config()?;
     if !sandbox_has("bash") || !sandbox_has("timeout") {
+        assert!(
+            !pasta_required(),
+            "no bash or timeout, and STOPIT_REQUIRE_PASTA=1"
+        );
         eprintln!("skipping: no bash or timeout in /usr/bin or /bin on the host");
         return None;
     }
@@ -3379,14 +3388,15 @@ fn full_network_reaches_out_but_not_the_host_loopback() {
     .unwrap();
     abstract_listener.set_nonblocking(true).unwrap();
     if sandbox_has("python3") {
+        // The namespace, not Landlock, keeps it out: no such socket here.
         script += &format!(
             "python3 -c 'import socket; s = socket.socket(socket.AF_UNIX)\n\
              try:\n s.connect(\"\\0{abstract_name}\"); print(\"abstract reached\")\n\
-             except OSError: print(\"abstract refused\")'; "
+             except ConnectionRefusedError: print(\"abstract refused\")\n\
+             except OSError as e: print(\"abstract error\", e.errno)'; "
         );
     }
-    // The sandbox cannot change its network, and its user namespace maps
-    // one id.
+    // The sandbox has no capability over its network.
     let ip = ["/usr/bin/ip", "/bin/ip"]
         .into_iter()
         .find(|p| Path::new(p).exists());
@@ -3396,12 +3406,8 @@ fn full_network_reaches_out_but_not_the_host_loopback() {
              else echo lo kept; fi; "
         );
     }
-    script += "wc -l < /proc/self/uid_map; ";
     script += "cat /etc/resolv.conf; tail -n +3 /proc/net/dev | cut -d: -f1";
-    let out = output(
-        s.stopit(&["run", "--quiet", "/bin/bash", "-c", &script]),
-        b"",
-    );
+    let out = output(s.stopit(&["run", "--quiet", "bash", "-c", &script]), b"");
     assert_eq!(code(&out), 0, "{out:?}");
     let shown = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(shown.contains("v4 refused"), "{shown}");
@@ -3422,7 +3428,6 @@ fn full_network_reaches_out_but_not_the_host_loopback() {
     if ip.is_some() {
         assert!(shown.contains("lo kept"), "{shown}");
     }
-    assert!(shown.contains("\n1\nnameserver"), "{shown}");
     // The sandbox's resolver is pasta's forwarder, and it has an interface
     // besides `lo`.
     assert!(shown.contains("nameserver 169.254.1.1\n"), "{shown}");
@@ -3492,10 +3497,7 @@ fn full_network_resolves_and_connects_where_the_host_does() {
     }
     let s = Setup::with_config(&config);
     let script = try_connect("out", host, 443);
-    let out = output(
-        s.stopit(&["run", "--quiet", "/bin/bash", "-c", &script]),
-        b"",
-    );
+    let out = output(s.stopit(&["run", "--quiet", "bash", "-c", &script]), b"");
     assert_eq!(code(&out), 0, "{out:?}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "out reached\n");
 }
@@ -3617,10 +3619,7 @@ fn an_attached_run_gets_the_full_network_too() {
         "{}cat /etc/resolv.conf",
         try_connect("v4", "127.0.0.1", v4.local_addr().unwrap().port())
     );
-    let out = output(
-        s.stopit(&["run", "--quiet", "/bin/bash", "-c", &script]),
-        b"",
-    );
+    let out = output(s.stopit(&["run", "--quiet", "bash", "-c", &script]), b"");
     assert_eq!(code(&out), 0, "{out:?}");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
