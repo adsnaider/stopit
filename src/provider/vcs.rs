@@ -60,6 +60,9 @@ const SAFE_GIT_CONFIG: [(&str, &str); 11] = [
 /// shared home.
 const VCS_HOME: &str = "/home/vcs";
 
+/// Where jj keeps repository configuration outside the repository.
+const JJ_REPO_CONFIG: &str = "~/.config/jj/repos";
+
 /// The `vcs` provider.
 #[derive(Debug, Clone)]
 pub struct VcsProvider {
@@ -510,6 +513,7 @@ impl VcsProvider {
             Value::Table(table([
                 ("ro", list(storage.clone())),
                 ("ephemeral", home()),
+                ("masked", list(vec![JJ_REPO_CONFIG.to_owned()])),
             ])),
         );
         ro.insert(
@@ -521,9 +525,11 @@ impl VcsProvider {
         if !locked.is_empty() {
             local_fs.insert("ro".into(), list(locked));
         }
-        if !hooks.is_empty() {
-            local_fs.insert("masked".into(), list(hooks));
-        }
+        // jj reads repository configuration from the user's
+        // `~/.config/jj/repos`, which a grant of `main` covering `~/.config`
+        // would let `main` write.
+        hooks.push(JJ_REPO_CONFIG.to_owned());
+        local_fs.insert("masked".into(), list(hooks));
         let mut local = toml::Table::new();
         local.insert("network".into(), offline());
         local.insert("system".into(), system());
@@ -885,7 +891,7 @@ mod tests {
         assert_eq!(patterns(&local.grants.fs.ro), ["{workspace}/.git/config"]);
         assert_eq!(
             patterns(&local.grants.fs.masked),
-            ["{workspace}/.git/hooks"]
+            ["{workspace}/.git/hooks", JJ_REPO_CONFIG]
         );
         let ro = profile(&m, "ro");
         assert_eq!(patterns(&ro.grants.fs.ro), ["{workspace}/.git"]);

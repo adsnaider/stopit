@@ -4165,20 +4165,30 @@ fn the_vcs_profiles_have_a_home_main_cannot_write() {
         eprintln!("skipping: no git in /usr/bin or /bin");
         return;
     }
-    // A shim of the test's own into vcs.local, to look around there.
+    // A shim of the test's own into vcs.local, to look around there, and a
+    // grant of `~/.config` in main.
     let s = Setup::with_config(&format!(
         "{config}[[provider]]\ntype = \"config\"\nname = \"look\"\n[provider.sandbox]\n\
+         fs.rw = [\"~/.config\"]\n\
          shims.in-vcs = {{ binary = \"sh\", default = {{ decision = \"allow\", profile = \"vcs.local\" }} }}\n"
     ));
+    let host_config = s.root.join("home/.config");
+    fs::create_dir_all(host_config.join("jj/repos/abc")).unwrap();
+    fs::write(host_config.join("jj/repos/abc/config.toml"), "x = 1\n").unwrap();
+    fs::create_dir_all(host_config.join("tool")).unwrap();
+    fs::write(host_config.join("tool/x"), "tool\n").unwrap();
     host_git(&s.ws(), &["init", "-q", "-b", "main"]);
     let script = "echo \"main $HOME\"; echo planted > ~/.gitconfig; \
-                  in-vcs -c 'echo \"vcs $HOME $(ls -A \"$HOME\" | wc -l)\"; \
-                  grep -c \"^user:.*:/home/vcs:\" /etc/passwd'";
+                  in-vcs -c 'echo \"vcs $HOME $(ls -A \"$HOME\" | tr \"\\n\" \" \")\"; \
+                  grep -c \"^user:.*:/home/vcs:\" /etc/passwd; cat ~/.config/tool/x; \
+                  cat ~/.config/jj/repos/abc/config.toml 2>/dev/null || echo hidden'";
     let out = output(s.stopit(&["run", "--quiet", "/bin/sh", "-c", script]), b"");
     assert_eq!(code(&out), 0, "{out:?}");
+    // main's home stays out, its grants under `~` come along, and jj's
+    // repository configuration stays masked.
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "main /home/user\nvcs /home/vcs 0\n1\n"
+        "main /home/user\nvcs /home/vcs .config \n1\ntool\nhidden\n"
     );
 }
 
