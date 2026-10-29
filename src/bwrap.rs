@@ -299,8 +299,9 @@ pub enum TerminalSession {
     /// A new session that `__init` starts, whose controlling terminal is the
     /// supervisor's PTY slave on the sandbox's stdio (`InitSpec::pty_slave`).
     /// bwrap gets no `--new-session`, since `__init` must not already lead a
-    /// session. Only [`BwrapCommand::for_init`] gives it a meaning; for other
-    /// commands it is [`Keep`](Self::Keep).
+    /// session. Only [`BwrapCommand::for_init`] runs `__init`; for other
+    /// commands it is [`Detach`](Self::Detach), so the host terminal stays
+    /// out of reach either way.
     Pty,
 }
 
@@ -404,6 +405,10 @@ impl BwrapCommand {
         argv_after_prefix: &[OsString],
         terminal: TerminalSession,
     ) -> Result<BwrapCommand, BwrapError> {
+        let terminal = match terminal {
+            TerminalSession::Pty => TerminalSession::Detach,
+            other => other,
+        };
         Self::build(
             spec,
             session,
@@ -2705,6 +2710,51 @@ mod tests {
         )
         .unwrap();
         assert!(!cmd_shared_net.args().contains(&OsString::from("--cap-add")));
+    }
+
+    #[test]
+    fn a_pty_session_is_started_by_init_and_detaches_other_commands() {
+        let f = Fixture::new();
+        let target = [OsString::from("/bin/true")];
+        let new_session = OsString::from("--new-session");
+        let pty_slave = |cmd: &BwrapCommand| {
+            init::decode_spec(&read_fd(cmd.spec_fd().unwrap()))
+                .unwrap()
+                .pty_slave
+        };
+        for (terminal, with_new_session, slave) in [
+            (TerminalSession::Keep, false, false),
+            (TerminalSession::Detach, true, false),
+            (TerminalSession::Pty, false, true),
+        ] {
+            let cmd = BwrapCommand::for_init(
+                &SandboxSpec::default(),
+                &f.session,
+                &f.provisioned,
+                Path::new("/"),
+                &[],
+                &target,
+                terminal,
+            )
+            .unwrap();
+            assert_eq!(
+                cmd.args().contains(&new_session),
+                with_new_session,
+                "{terminal:?}"
+            );
+            assert_eq!(pty_slave(&cmd), slave, "{terminal:?}");
+        }
+        // Without `__init` to start the session, a PTY session detaches.
+        let cmd = BwrapCommand::new(
+            &SandboxSpec::default(),
+            &f.session,
+            &f.provisioned,
+            Path::new("/"),
+            &target,
+            TerminalSession::Pty,
+        )
+        .unwrap();
+        assert!(cmd.args().contains(&new_session));
     }
 
     #[test]

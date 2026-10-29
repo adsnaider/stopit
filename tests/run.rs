@@ -1989,6 +1989,19 @@ impl OnTerminal {
     }
 }
 
+/// Polls `f` until it returns something, within the usual deadline.
+#[track_caller]
+fn wait_until<T>(mut f: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + BWRAP_DEADLINE;
+    loop {
+        if let Some(t) = f() {
+            return t;
+        }
+        assert!(Instant::now() < deadline, "not within {BWRAP_DEADLINE:?}");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// A configuration granting the host's `/bin/sh` and coreutils, or `None`
 /// (the test is skipped) if the host has no `/bin/sh` there.
 fn shell_config() -> Option<String> {
@@ -2023,20 +2036,19 @@ fn job_control_works_inside_the_sandbox() {
     let at = t.wait_for(b"sandbox$ ", 0);
     // Ctrl-Z stops the foreground job, not stopit, nor the shell.
     t.type_keys(b"sleep 30\r");
-    thread::sleep(Duration::from_millis(500));
+    let pid = t.pid();
+    let sleep = wait_until(|| {
+        descendants(pid)
+            .into_iter()
+            .find(|&p| fs::read(format!("/proc/{p}/comm")).is_ok_and(|c| c == b"sleep\n"))
+    });
     t.type_keys(b"\x1a");
     let at = t.wait_for(b"sandbox$ ", at);
-    let pid = t.pid();
-    let sleep = descendants(pid)
-        .into_iter()
-        .find(|&p| fs::read(format!("/proc/{p}/comm")).is_ok_and(|c| c == b"sleep\n"))
-        .expect("sleep runs");
-    assert_eq!(state(sleep).as_deref(), Some("T"));
+    wait_until(|| (state(sleep).as_deref() == Some("T")).then_some(()));
     assert_ne!(state(pid).as_deref(), Some("T"));
     // `fg` resumes it, and Ctrl-C ends it, again without touching stopit.
     t.type_keys(b"fg\r");
-    thread::sleep(Duration::from_millis(500));
-    assert_ne!(state(sleep).as_deref(), Some("T"));
+    wait_until(|| (state(sleep).as_deref() != Some("T")).then_some(()));
     t.type_keys(b"\x03");
     let at = t.wait_for(b"sandbox$ ", at);
     wait_gone(sleep);
@@ -2076,9 +2088,17 @@ fn window_size_changes_reach_the_sandbox() {
     // The terminal emulator resizes: the kernel signals stopit, which is in
     // the terminal's foreground, and stopit resizes the sandbox's PTY.
     rustix::termios::tcsetwinsize(&t.master, size(50, 132)).unwrap();
-    thread::sleep(Duration::from_millis(200));
-    t.type_keys(b"stty size\r");
-    t.wait_for(b"50 132", at);
+    // The signal may arrive after the next command runs: asked again until
+    // the new size shows.
+    let mut from = at;
+    wait_until(|| {
+        t.type_keys(b"stty size\r");
+        from = t.wait_for(b"sandbox$ ", from);
+        let seen = t.seen();
+        String::from_utf8_lossy(&seen[at..])
+            .contains("50 132")
+            .then_some(())
+    });
     t.type_keys(b"exit\r");
     let out = t.finish();
     assert_eq!(code(&out), 0, "{out:?}");
@@ -2102,12 +2122,86 @@ fn escape_sequences_from_the_sandbox_are_filtered() {
     let mut t = OnTerminal::spawn(command, master, slave);
     let out = t.finish();
     assert_eq!(code(&out), 0, "{out:?}");
-    let at = t.wait_for(b"\x1b[?1049l", 0);
+    let at = t.wait_for(b"\x1b[<1u", 0);
     let seen = t.seen();
     assert_eq!(
         String::from_utf8_lossy(&seen[..at]),
-        "A\x1b[>1uB\x1b[?1049hCDEFGH\x1b[<1u\x1b[?1049l"
+        "A\x1b[>1uB\x1b[?1049hCDEFGH\x1b[?1049l\x1b[<1u"
     );
+}
+
+#[test]
+fn the_last_output_is_passed_on_in_full() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((master, slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::with_config(&config);
+    let command = s.stopit(&[
+        "run",
+        "--quiet",
+        "/bin/sh",
+        "-c",
+        "head -c 1048576 /dev/zero | tr '\\0' x",
+    ]);
+    let mut t = OnTerminal::spawn(command, master, slave);
+    let out = t.finish();
+    assert_eq!(code(&out), 0, "{out:?}");
+    let count = || t.seen().iter().filter(|&&b| b == b'x').count();
+    wait_until(|| (count() == 1 << 20).then_some(()));
+}
+
+#[test]
+fn a_sandbox_that_reopens_its_terminal_still_reaches_it() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((master, slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::with_config(&config);
+    // Every copy of the slave closed for a while, then `/dev/tty` opened,
+    // as pinentry does after `exec </dev/null >/dev/null 2>&1`.
+    let script = "exec </dev/null >/dev/null 2>&1; sleep 0.3; \
+                  echo again >/dev/tty; read line </dev/tty; echo \"got $line\" >/dev/tty";
+    let command = s.stopit(&["run", "--quiet", "/bin/sh", "-c", script]);
+    let mut t = OnTerminal::spawn(command, master, slave);
+    let at = t.wait_for(b"again", 0);
+    t.type_keys(b"key\r");
+    t.wait_for(b"got key", at);
+    let out = t.finish();
+    assert_eq!(code(&out), 0, "{out:?}");
+}
+
+#[test]
+fn the_host_terminal_is_restored_when_stopit_is_killed() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((master, slave)) = open_pty() else {
+        return;
+    };
+    let before = rustix::termios::tcgetattr(&slave).unwrap();
+    let probe_slave = slave.try_clone().unwrap();
+    let s = Setup::with_config(&config);
+    let command = s.stopit(&["run", "--quiet", "/bin/sh", "-i"]);
+    let mut t = OnTerminal::spawn(command, master, slave);
+    t.wait_for(b"sandbox$ ", 0);
+    // Raw while the sandbox runs.
+    let raw = rustix::termios::tcgetattr(&probe_slave).unwrap();
+    assert!(
+        !raw.local_modes
+            .contains(rustix::termios::LocalModes::ICANON)
+    );
+    kill(t.pid(), libc::SIGTERM);
+    let out = t.finish();
+    assert_eq!(code(&out), 128 + libc::SIGTERM, "{out:?}");
+    let after = rustix::termios::tcgetattr(&probe_slave).unwrap();
+    assert_eq!(after.local_modes, before.local_modes);
+    assert_eq!(after.input_modes, before.input_modes);
+    assert!(s.no_session_left());
 }
 
 #[test]

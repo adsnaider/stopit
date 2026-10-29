@@ -22,11 +22,15 @@
 //! (kitty graphics among them), `DCS tmux;` passthrough, C1 controls in any
 //! encoding, and invalid UTF-8, which becomes U+FFFD.
 //!
-//! The filter also records which terminal modes the sandbox turned on, so
-//! the supervisor can turn them off when the sandbox ends
-//! ([`OutputFilter::restore_sequence`]): a TUI killed in the alternate
+//! The filter also records which terminal modes the sandbox changed, so the
+//! supervisor can change them back when the sandbox ends
+//! ([`OutputFilter::restore_sequence`]). A TUI killed in the alternate
 //! screen with mouse reporting on would otherwise leave the host terminal
 //! unusable.
+//!
+//! The filter assumes a UTF-8 host terminal. A terminal that reads bytes as
+//! Latin-1 would take continuation bytes 0x80 to 0x9F of valid UTF-8 text
+//! as C1 controls.
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -117,26 +121,64 @@ pub struct OutputFilter {
     /// The character or sequence in progress: UTF-8 bytes, CSI parameters
     /// and intermediates, an OSC payload, or a DCS header.
     buf: Vec<u8>,
-    /// Whether the OSC payload in progress outgrew its bound.
+    /// Whether the sequence in progress outgrew its bound.
     overflow: bool,
     last_notification: Option<Instant>,
-    /// DEC private modes turned on and not off since, among those
-    /// [`restore_sequence`](Self::restore_sequence) turns off.
-    modes: BTreeSet<u32>,
-    /// Whether the cursor was hidden and not shown since.
-    cursor_hidden: bool,
-    /// Kitty keyboard flags pushed and not popped since.
-    kitty_pushes: u32,
-    /// Whether character attributes were set and not reset since.
-    attributes_set: bool,
+    /// What the sandbox changed in the terminal and did not change back.
+    left: Leftovers,
 }
 
-/// The DEC private modes turned off when the sandbox ends: cursor keys,
-/// the alternate screens, mouse reporting, focus events, bracketed paste
-/// and synchronized output.
-const RESTORED_MODES: &[u32] = &[
-    1, 47, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1015, 1016, 1047, 1049, 2004, 2026,
+/// Terminal state the sandbox changed and did not change back, for
+/// [`OutputFilter::restore_sequence`].
+#[derive(Debug, Default)]
+struct Leftovers {
+    /// DEC private modes of [`OFF_BY_DEFAULT`] turned on.
+    on: BTreeSet<u32>,
+    /// DEC private modes of [`ON_BY_DEFAULT`] turned off.
+    off: BTreeSet<u32>,
+    /// ANSI insert mode (IRM).
+    insert: bool,
+    /// Application keypad (`ESC =`).
+    keypad: bool,
+    /// The line drawing character set as G0 (`ESC ( 0`).
+    line_drawing: bool,
+    /// A scroll region (DECSTBM).
+    scroll_region: bool,
+    /// xterm key modifier resources set with `CSI > Pp ; Pv m`.
+    key_modifiers: BTreeSet<u32>,
+    /// Kitty keyboard flags pushed on the main and the alternate screen,
+    /// whose stacks are separate.
+    kitty_main: u32,
+    kitty_alt: u32,
+    /// Kitty keyboard flags set without a push on either screen.
+    kitty_set_main: bool,
+    kitty_set_alt: bool,
+    /// Character attributes.
+    attributes: bool,
+}
+
+impl Leftovers {
+    fn on_alt_screen(&self) -> bool {
+        ALT_SCREENS.iter().any(|m| self.on.contains(m))
+    }
+}
+
+/// The alternate screen modes.
+const ALT_SCREENS: [u32; 3] = [47, 1047, 1049];
+
+/// DEC private modes that are off in a fresh terminal and outlast a
+/// program: cursor keys, reverse video, origin, X10 and later mouse
+/// reporting, focus events, alternate scroll, numeric keypad, the
+/// alternate screens, bracketed paste, synchronized output, theme change
+/// and in-band resize reports.
+const OFF_BY_DEFAULT: &[u32] = &[
+    1, 5, 6, 9, 47, 66, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1015, 1016, 1047, 1049,
+    2004, 2026, 2031, 2048,
 ];
+
+/// DEC private modes that are on in a fresh terminal: autowrap and the
+/// visible cursor.
+const ON_BY_DEFAULT: &[u32] = &[7, 25];
 
 impl OutputFilter {
     /// A filter in its initial state, applying `clipboard` to OSC 52 writes.
@@ -147,10 +189,7 @@ impl OutputFilter {
             buf: Vec::new(),
             overflow: false,
             last_notification: None,
-            modes: BTreeSet::new(),
-            cursor_hidden: false,
-            kitty_pushes: 0,
-            attributes_set: false,
+            left: Leftovers::default(),
         }
     }
 
@@ -178,29 +217,61 @@ impl OutputFilter {
         self.overflow = false;
     }
 
-    /// The bytes that undo the terminal modes the sandbox left on: each
-    /// mode of [`RESTORED_MODES`] it turned on, a hidden cursor, pushed
-    /// kitty keyboard flags, and character attributes it set. Empty when it
-    /// left none of them on, so plain output stays as it was.
+    /// The bytes that undo what the sandbox changed in the terminal and
+    /// left changed: the modes of [`OFF_BY_DEFAULT`] it turned on and of
+    /// [`ON_BY_DEFAULT`] it turned off, insert mode, the application keypad,
+    /// line drawing, a scroll region, key modifier resources, kitty keyboard
+    /// flags on either screen, and character attributes. Empty when it left
+    /// none of them changed, so plain output stays as it was.
     pub fn restore_sequence(&self) -> Vec<u8> {
+        let left = &self.left;
         let mut out = Vec::new();
-        // The alternate screen last, so the other modes are turned off on
-        // the screen they were turned on in. Mode 1049 also restores the
-        // cursor saved when it was entered.
-        for mode in self.modes.iter().filter(|m| ![47, 1047, 1049].contains(*m)) {
-            out.extend_from_slice(format!("\x1b[?{mode}l").as_bytes());
+        let mut put = |s: &str| out.extend_from_slice(s.as_bytes());
+        // The alternate screen's kitty stack first, while it is current;
+        // leaving the alternate screen also restores the cursor saved when
+        // mode 1049 was entered.
+        if left.on_alt_screen() {
+            if left.kitty_alt > 0 {
+                put(&format!("\x1b[<{}u", left.kitty_alt));
+            }
+            if left.kitty_set_alt {
+                put("\x1b[=0u");
+            }
         }
-        if self.kitty_pushes > 0 {
-            out.extend_from_slice(format!("\x1b[<{}u", self.kitty_pushes).as_bytes());
+        for mode in ALT_SCREENS.iter().rev().filter(|m| left.on.contains(m)) {
+            put(&format!("\x1b[?{mode}l"));
         }
-        if self.cursor_hidden {
-            out.extend_from_slice(b"\x1b[?25h");
+        if left.kitty_main > 0 {
+            put(&format!("\x1b[<{}u", left.kitty_main));
         }
-        if self.attributes_set {
-            out.extend_from_slice(b"\x1b[0m");
+        if left.kitty_set_main {
+            put("\x1b[=0u");
         }
-        for mode in self.modes.iter().filter(|m| [47, 1047, 1049].contains(*m)) {
-            out.extend_from_slice(format!("\x1b[?{mode}l").as_bytes());
+        for mode in left.on.iter().filter(|m| !ALT_SCREENS.contains(m)) {
+            put(&format!("\x1b[?{mode}l"));
+        }
+        for mode in &left.off {
+            put(&format!("\x1b[?{mode}h"));
+        }
+        if left.insert {
+            put("\x1b[4l");
+        }
+        if left.keypad {
+            put("\x1b>");
+        }
+        if left.line_drawing {
+            put("\x1b(B");
+        }
+        if left.scroll_region {
+            // Resetting the region homes the cursor, so it is saved and
+            // restored around it.
+            put("\x1b7\x1b[r\x1b8");
+        }
+        for resource in &left.key_modifiers {
+            put(&format!("\x1b[>{resource}m"));
+        }
+        if left.attributes {
+            put("\x1b[0m");
         }
         out
     }
@@ -234,16 +305,20 @@ impl OutputFilter {
                     if self.buf.len() < MAX_ESC_INTER {
                         self.buf.push(b);
                     } else {
-                        self.buf.push(0xff);
+                        self.overflow = true;
                     }
                 }
                 0x30..=0x7e => {
-                    let allowed =
-                        matches!(self.buf.as_slice(), [b'(' | b')']) && matches!(b, b'0' | b'B');
+                    let allowed = !self.overflow
+                        && matches!(self.buf.as_slice(), [b'(' | b')'])
+                        && matches!(b, b'0' | b'B');
                     if allowed {
                         out.push(ESC);
                         out.extend_from_slice(&self.buf);
                         out.push(b);
+                        if self.buf == b"(" {
+                            self.left.line_drawing = b == b'0';
+                        }
                     }
                     self.reset_to_ground();
                 }
@@ -426,6 +501,7 @@ impl OutputFilter {
 
     fn esc(&mut self, b: u8, out: &mut Vec<u8>) {
         self.buf.clear();
+        self.overflow = false;
         match b {
             b'[' => self.state = State::Csi,
             b']' => {
@@ -446,11 +522,11 @@ impl OutputFilter {
                     b'7' | b'8' | b'=' | b'>' | b'D' | b'E' | b'H' | b'M' | b'c'
                 ) {
                     out.extend_from_slice(&[ESC, b]);
-                    if b == b'c' {
-                        self.modes.clear();
-                        self.cursor_hidden = false;
-                        self.kitty_pushes = 0;
-                        self.attributes_set = false;
+                    match b {
+                        b'=' => self.left.keypad = true,
+                        b'>' => self.left.keypad = false,
+                        b'c' => self.left = Leftovers::default(),
+                        _ => {}
                     }
                 }
                 self.state = State::Ground;
@@ -490,28 +566,79 @@ impl OutputFilter {
                 }
             }
             (b't', _, _) => return,
+            // ANSI modes: only insert mode. Keyboard lock, local echo and
+            // newline mode would change how the host terminal takes input
+            // after the sandbox ends.
+            (b'h' | b'l', None, []) => {
+                if numbers.is_empty() || numbers.iter().any(|n| *n != Some(4)) {
+                    return;
+                }
+                self.left.insert = fin == b'h';
+            }
+            // DECSCL can turn on 8-bit replies.
+            (b'p', _, b"\"") => return,
             (b'h' | b'l', Some(b'?'), []) => {
+                let was_alt = self.left.on_alt_screen();
                 for mode in numbers.iter().flatten() {
-                    if *mode == 25 {
-                        self.cursor_hidden = fin == b'l';
-                    } else if RESTORED_MODES.contains(mode) {
-                        if fin == b'h' {
-                            self.modes.insert(*mode);
-                        } else {
-                            self.modes.remove(mode);
-                        }
+                    let (set, set_when_on) = if OFF_BY_DEFAULT.contains(mode) {
+                        (&mut self.left.on, true)
+                    } else if ON_BY_DEFAULT.contains(mode) {
+                        (&mut self.left.off, false)
+                    } else {
+                        continue;
+                    };
+                    if (fin == b'h') == set_when_on {
+                        set.insert(*mode);
+                    } else {
+                        set.remove(mode);
                     }
                 }
+                if was_alt != self.left.on_alt_screen() {
+                    // Each entry to the alternate screen starts its stack
+                    // afresh, and leaving it makes its stack irrelevant.
+                    self.left.kitty_alt = 0;
+                    self.left.kitty_set_alt = false;
+                }
             }
+            (b'r', None, []) => self.left.scroll_region = !params.is_empty(),
             (b'm', None, []) => {
                 // A plain reset (`CSI m`, `CSI 0 m`) clears them; anything
                 // else may set some, as far as this filter knows.
-                self.attributes_set = !params.iter().all(|&b| b == b'0' || b == b';');
+                self.left.attributes = !params.iter().all(|&b| b == b'0' || b == b';');
             }
-            (b'u', Some(b'>'), []) => self.kitty_pushes = self.kitty_pushes.saturating_add(1),
+            (b'm', Some(b'>'), []) => {
+                if let Some(Some(resource)) = numbers.first() {
+                    if numbers.len() > 1 {
+                        self.left.key_modifiers.insert(*resource);
+                    } else {
+                        self.left.key_modifiers.remove(resource);
+                    }
+                }
+            }
+            (b'u', Some(b'>'), []) => {
+                let pushes = if self.left.on_alt_screen() {
+                    &mut self.left.kitty_alt
+                } else {
+                    &mut self.left.kitty_main
+                };
+                *pushes = pushes.saturating_add(1);
+            }
             (b'u', Some(b'<'), []) => {
                 let n = numbers.first().copied().flatten().unwrap_or(1).max(1);
-                self.kitty_pushes = self.kitty_pushes.saturating_sub(n);
+                let pushes = if self.left.on_alt_screen() {
+                    &mut self.left.kitty_alt
+                } else {
+                    &mut self.left.kitty_main
+                };
+                *pushes = pushes.saturating_sub(n);
+            }
+            (b'u', Some(b'='), []) => {
+                let set = !matches!(numbers.first(), None | Some(None | Some(0)));
+                if self.left.on_alt_screen() {
+                    self.left.kitty_set_alt = set;
+                } else {
+                    self.left.kitty_set_main = set;
+                }
             }
             _ => {}
         }
@@ -573,7 +700,19 @@ impl OutputFilter {
                 None => false,
             },
             ("133", Some(_)) => true,
+            // ConEmu progress. Its other numbered OSC 9 commands set the
+            // working directory, run macros and more.
             ("9", Some(rest)) if rest.starts_with("4;") => true,
+            ("9", Some(rest))
+                if rest
+                    .split(';')
+                    .next()
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) =>
+            {
+                false
+            }
+            // urxvt hands other OSC 777 commands to its extensions.
+            ("777", Some(rest)) if !rest.starts_with("notify;") => false,
             ("9" | "99" | "777", Some(_)) => {
                 let due = self
                     .last_notification
@@ -856,6 +995,13 @@ mod tests {
     fn prompt_marks_and_progress_pass() {
         passes(b"\x1b]133;A\x07\x1b]133;D;0\x1b\\");
         passes(b"\x1b]9;4;1;50\x07\x1b]9;4;1;60\x07");
+        // Other numbered OSC 9 commands and OSC 777 extensions are not
+        // notifications.
+        dropped(b"\x1b]9;9;/home/user\x07");
+        dropped(b"\x1b]9;7;cmd.exe\x07");
+        dropped(b"\x1b]9;1\x07");
+        dropped(b"\x1b]777;preexec;x\x07");
+        passes(b"\x1b]9;build done\x07");
     }
 
     #[test]
@@ -958,6 +1104,16 @@ mod tests {
         assert_eq!(filter(long_dcs.as_bytes()), b"after");
         let long_esc = b"\x1b((((((B after";
         assert_eq!(filter(long_esc), b" after");
+        let mut f = OutputFilter::new(ClipboardPolicy::Block);
+        let mut out = Vec::new();
+        f.feed(b"\x1b", &mut out);
+        let spaces = vec![b' '; 1 << 16];
+        for _ in 0..16 {
+            f.feed(&spaces, &mut out);
+            assert!(f.buf.len() <= MAX_ESC_INTER, "{}", f.buf.len());
+        }
+        f.feed(b"(0after", &mut out);
+        assert_eq!(out, b"after");
         let long_title = format!("\x1b]2;{}\x07after", "x".repeat(MAX_OSC + 1));
         assert_eq!(filter(long_title.as_bytes()), b"after");
     }
@@ -1031,34 +1187,125 @@ mod tests {
         );
     }
 
-    #[test]
-    fn modes_left_on_are_turned_off_at_the_end() {
+    fn restore_after(input: &[u8]) -> String {
         let mut f = OutputFilter::new(ClipboardPolicy::Block);
         let mut out = Vec::new();
-        assert_eq!(f.restore_sequence(), b"");
-        f.feed(b"\x1b[1;31mx\x1b[0m", &mut out);
-        assert_eq!(f.restore_sequence(), b"");
-        f.feed(b"\x1b[38;5;0m", &mut out);
-        assert_eq!(f.restore_sequence(), b"\x1b[0m");
-        f.feed(b"\x1b[m", &mut out);
-        assert_eq!(f.restore_sequence(), b"");
-        f.feed(
-            b"\x1b[4m\x1b[?1049h\x1b[?1000;1006h\x1b[?2004h\x1b[?25l\x1b[>1u\x1b[>3u\x1b[?1h\x1b[?1h",
-            &mut out,
-        );
-        f.feed(b"\x1b[?2004l\x1b[?7l\x1b[?9999h", &mut out);
+        f.feed(input, &mut out);
+        String::from_utf8(f.restore_sequence()).unwrap()
+    }
+
+    #[test]
+    fn modes_left_on_are_turned_off_at_the_end() {
+        assert_eq!(restore_after(b""), "");
+        assert_eq!(restore_after(b"plain \x1b[1;31mx\x1b[0m"), "");
+        assert_eq!(restore_after(b"\x1b[38;5;0m"), "\x1b[0m");
+        assert_eq!(restore_after(b"\x1b[38;5;0m\x1b[m"), "");
         assert_eq!(
-            String::from_utf8(f.restore_sequence()).unwrap(),
-            "\x1b[?1l\x1b[?1000l\x1b[?1006l\x1b[<2u\x1b[?25h\x1b[0m\x1b[?1049l"
+            restore_after(
+                b"\x1b[4m\x1b[?1000;1006h\x1b[?2004h\x1b[?25l\x1b[?1h\x1b[?1h\x1b[?2004l\
+                  \x1b[?7l\x1b[?9999h\x1b[?9h\x1b[?2048h\x1b[?2031h\x1b[?5h\x1b[?6h\x1b[?66h"
+            ),
+            "\x1b[?1l\x1b[?5l\x1b[?6l\x1b[?9l\x1b[?66l\x1b[?1000l\x1b[?1006l\x1b[?2031l\
+             \x1b[?2048l\x1b[?7h\x1b[?25h\x1b[0m"
         );
-        // Popping and showing undo what was pushed and hidden.
-        f.feed(
-            b"\x1b[<5u\x1b[?25h\x1b[?1049l\x1b[?1000;1006;1l\x1b[0m",
-            &mut out,
+        // Turned back on or off, nothing is left.
+        assert_eq!(
+            restore_after(b"\x1b[?25l\x1b[?7l\x1b[?1000h\x1b[?25h\x1b[?7h\x1b[?1000l"),
+            ""
         );
-        assert_eq!(f.restore_sequence(), b"");
+        // Insert mode, keypad, line drawing, scroll region, key modifiers.
+        assert_eq!(
+            restore_after(b"\x1b[4h\x1b=\x1b(0\x1b[2;20r\x1b[>4;2m\x1b[>1;1m"),
+            "\x1b[4l\x1b>\x1b(B\x1b7\x1b[r\x1b8\x1b[>1m\x1b[>4m"
+        );
+        assert_eq!(
+            restore_after(
+                b"\x1b[4h\x1b=\x1b(0\x1b[2;20r\x1b[>4;2m\x1b[4l\x1b>\x1b(B\x1b[r\x1b[>4m"
+            ),
+            ""
+        );
         // A full reset forgets everything.
-        f.feed(b"\x1b[?1049h\x1b[7m\x1bc", &mut out);
-        assert_eq!(f.restore_sequence(), b"");
+        assert_eq!(restore_after(b"\x1b[?1049h\x1b[7m\x1b[4h\x1b=\x1bc"), "");
+    }
+
+    #[test]
+    fn kitty_keyboard_stacks_are_restored_per_screen() {
+        // Pushed on the main screen, then two on the alternate screen: the
+        // alternate pops come first, then the screen is left, then the main
+        // pops.
+        assert_eq!(
+            restore_after(b"\x1b[>1u\x1b[?1049h\x1b[>3u\x1b[>5u\x1b[?1000h"),
+            "\x1b[<2u\x1b[?1049l\x1b[<1u\x1b[?1000l"
+        );
+        // Leaving the alternate screen forgets its stack; pops apply to the
+        // current screen.
+        assert_eq!(
+            restore_after(b"\x1b[>1u\x1b[>1u\x1b[?1049h\x1b[>3u\x1b[?1049l\x1b[<u"),
+            "\x1b[<1u"
+        );
+        assert_eq!(restore_after(b"\x1b[?1049h\x1b[>3u\x1b[<9u"), "\x1b[?1049l");
+        // Flags set without a push are reset to zero.
+        assert_eq!(restore_after(b"\x1b[=5;1u"), "\x1b[=0u");
+        assert_eq!(restore_after(b"\x1b[=5;1u\x1b[=0u"), "");
+        assert_eq!(restore_after(b"\x1b[?1049h\x1b[=1u"), "\x1b[=0u\x1b[?1049l");
+    }
+
+    #[test]
+    fn ansi_modes_other_than_insert_and_decscl_are_dropped() {
+        passes(b"\x1b[4h\x1b[4l");
+        for seq in [
+            &b"\x1b[12l"[..],
+            b"\x1b[12h",
+            b"\x1b[2h",
+            b"\x1b[20h",
+            b"\x1b[4;12l",
+            b"\x1b[h",
+            b"\x1b[61;1\"p",
+            b"\x1b[64\"p",
+        ] {
+            dropped(seq);
+        }
+    }
+
+    /// A deterministic stream of bytes biased towards escape sequences.
+    fn noise(seed: u64, len: usize) -> Vec<u8> {
+        const PICKS: &[u8] =
+            b"\x1b\x1b\x1b[]P_^X\\;?>=<0123456789:mhlqtu\x07\x18\x9b\xc2\xe6 abc\r\n";
+        let mut x = seed;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                if x % 7 == 0 {
+                    (x >> 8) as u8
+                } else {
+                    PICKS[(x >> 16) as usize % PICKS.len()]
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn filtering_twice_changes_nothing_more() {
+        // What the filter emits must parse back to itself, or the host
+        // terminal could read it differently from the filter.
+        let now = Instant::now();
+        let run = |input: &[u8]| {
+            let mut f = OutputFilter::new(ClipboardPolicy::Allow);
+            let mut out = Vec::new();
+            f.feed_at(input, now, &mut out);
+            f.finish(&mut out);
+            out
+        };
+        for seed in 1..400u64 {
+            let input = noise(seed, 512);
+            let once = run(&input);
+            assert_eq!(run(&once), once, "seed {seed}: {input:?}");
+        }
+        for input in corpus() {
+            let once = run(&input);
+            assert_eq!(run(&once), once, "{input:?}");
+        }
     }
 }

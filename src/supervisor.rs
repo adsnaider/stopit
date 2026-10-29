@@ -52,7 +52,6 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use rustix::io::Errno;
 use rustix::process::Pid;
-use rustix::termios::Termios;
 use thiserror::Error;
 
 use crate::bwrap::{BwrapCommand, BwrapError, TerminalSession, working_dir};
@@ -69,7 +68,7 @@ use crate::provider::{
     layered_session_providers, protected_sources, static_outputs,
 };
 use crate::provision::{ProvisionError, provision_self};
-use crate::pty::{Pty, PtyRelay, RawMode};
+use crate::pty::{HostTerminal, Pty, PtyRelay, RawMode};
 use crate::resolve::{PlanWarning, PlanWarningKind};
 use crate::session::{SessionDir, SessionError};
 use crate::spec::{
@@ -721,7 +720,7 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     let terminal = terminal_session(stdio);
     let clipboard = match config.terminal.clipboard_write {
         ClipboardWrite::Allow => ClipboardPolicy::Allow,
-        // TODO(§5.4): `ask` needs a prompt; until then it blocks.
+        // TODO(§5.2): `ask` needs a prompt; until then it blocks.
         ClipboardWrite::Block | ClipboardWrite::Ask => ClipboardPolicy::Block,
     };
     let command = BwrapCommand::for_init(
@@ -737,14 +736,12 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     if terminal != TerminalSession::Keep {
         check_foreground(stdio)?;
     }
-    let saved = TerminalState::save(stdio);
     let pty = if terminal == TerminalSession::Pty {
         Some(SandboxTerminal::open(stdio, clipboard).map_err(RunError::Pty)?)
     } else {
         None
     };
     let status = wait_foreground(command, pty);
-    saved.restore();
     // The sandbox is gone, or going: bwrap returns once its namespace's
     // init exits, and if bwrap itself was killed, `--die-with-parent` kills
     // the init and so the namespace. Its mounts go with it.
@@ -963,46 +960,23 @@ fn stdio_fds(stdio: [bool; 3]) -> impl Iterator<Item = BorrowedFd<'static>> {
         .map(|(fd, _)| unsafe { BorrowedFd::borrow_raw(fd) })
 }
 
-/// The terminal settings of the supervisor's stdio, to restore after the
-/// command: a sandbox detached from the terminal still has it as its stdio,
-/// and can change them (raw mode, echo off) and exit without restoring
-/// them.
-struct TerminalState(Vec<(BorrowedFd<'static>, Termios)>);
-
-impl TerminalState {
-    /// The settings of every stdio among `stdio` that is a terminal, or of
-    /// none if they cannot be read.
-    fn save(stdio: [bool; 3]) -> Self {
-        TerminalState(
-            stdio_fds(stdio)
-                .filter_map(|fd| Some((fd, rustix::termios::tcgetattr(fd).ok()?)))
-                .collect(),
-        )
-    }
-
-    /// Restores them, as far as possible: there is nothing to do about a
-    /// failure but leave the terminal as the command left it.
-    fn restore(self) {
-        for (fd, termios) in self.0 {
-            let _ = rustix::termios::tcsetattr(fd, rustix::termios::OptionalActions::Now, &termios);
-        }
-    }
-}
-
 /// The PTY a sandbox runs on when the supervisor's stdio includes a
-/// terminal (DESIGN.md §5.1), with what the relay needs to reach the host
-/// terminal.
+/// terminal (DESIGN.md §5.1), with the host terminal it is relayed to.
 struct SandboxTerminal {
     /// The PTY's master, until the relay takes it.
     master: Option<OwnedFd>,
-    /// The PTY's slave, until the sandbox has its copies.
+    /// The PTY's slave, until the relay takes it once the sandbox has its
+    /// copies.
     slave: Option<OwnedFd>,
     /// Which of stdin, stdout and stderr the slave replaces.
     stdio: [bool; 3],
-    /// The host terminal's raw mode while the relay reads keys.
+    /// The host terminal, until the relay takes it.
+    host: Option<HostTerminal>,
+    /// stdin, when it is a terminal and the relay reads keys from it.
+    keys_from: Option<BorrowedFd<'static>>,
+    /// The host terminal's raw mode while the relay reads keys. Dropped
+    /// last, after the relay's final output.
     raw: Option<RawMode>,
-    relay_input: Option<BorrowedFd<'static>>,
-    relay_output: BorrowedFd<'static>,
     clipboard: ClipboardPolicy,
 }
 
@@ -1010,8 +984,9 @@ impl SandboxTerminal {
     /// Opens the PTY for the supervisor's stdio, of which those `stdio`
     /// says are terminals (at least one). The slave starts with the host
     /// terminal's settings and window size. Keys are read from stdin when
-    /// it is a terminal, which is then put into raw mode; the sandbox's
-    /// output goes to the first of stdout, stderr and stdin that is one.
+    /// it is a terminal, which is put into raw mode before the sandbox
+    /// starts; the sandbox's output goes to the first of stdout, stderr and
+    /// stdin that is one.
     fn open(stdio: [bool; 3], clipboard: ClipboardPolicy) -> io::Result<SandboxTerminal> {
         let fds: Vec<BorrowedFd<'static>> = stdio_fds([true; 3]).collect();
         let input = stdio[0].then_some(fds[0]);
@@ -1020,16 +995,15 @@ impl SandboxTerminal {
             .find(|&i| stdio[i])
             .map(|i| fds[i])
             .expect("at least one stdio is a terminal");
-        let settings_from = input.unwrap_or(output);
-        let termios = rustix::termios::tcgetattr(settings_from).ok();
+        let termios = rustix::termios::tcgetattr(input.unwrap_or(output)).ok();
         let pty = Pty::open(termios.as_ref(), Some(output))?;
         Ok(SandboxTerminal {
             master: Some(pty.master),
             slave: Some(pty.slave),
             stdio,
+            host: Some(HostTerminal::open(input, output)?),
+            keys_from: input,
             raw: None,
-            relay_input: input,
-            relay_output: output,
             clipboard,
         })
     }
@@ -1074,9 +1048,18 @@ fn wait_foreground(
         command.stdin(slave(0)?).stdout(slave(1)?).stderr(slave(2)?);
     }
     let old = mask.old;
-    // SAFETY: `pthread_sigmask` is async-signal-safe, and `old` a copy.
+    let leave_session = terminal.is_some();
+    // SAFETY: `pthread_sigmask` and `setsid` are async-signal-safe, and
+    // `old` is a copy.
     unsafe {
         command.pre_exec(move || {
+            // On a PTY, bwrap itself leaves the host terminal's session
+            // too, so no process of the sandbox's tree keeps the host
+            // terminal as its controlling terminal. `__init` then starts
+            // its own session below bwrap's.
+            if leave_session && libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
             match libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) {
                 0 => Ok(()),
                 e => Err(io::Error::from_raw_os_error(e)),
@@ -1086,9 +1069,9 @@ fn wait_foreground(
     // Raw before the spawn, so no key typed while the sandbox starts is
     // taken by the host terminal's line discipline.
     if let Some(t) = &mut terminal
-        && let Some(input) = t.relay_input
+        && let Some(keys) = t.keys_from
     {
-        t.raw = Some(RawMode::enter(input).map_err(RunError::Pty)?);
+        t.raw = Some(RawMode::enter(keys).map_err(RunError::Pty)?);
     }
     let mut child = command.spawn().map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
@@ -1098,15 +1081,14 @@ fn wait_foreground(
         }
     })?;
     // Close our copies of the status pipe's write end, so `status_reader`
-    // sees EOF when bwrap finishes or execs `__init`, and of the slave, so
-    // the master reports the end once the sandbox has none open.
+    // sees EOF when bwrap finishes or execs `__init`, and of the slaves
+    // given to the sandbox.
     drop(command);
     let mut relay = terminal.as_mut().and_then(|t| {
-        t.slave = None;
         Some(PtyRelay::new(
             t.master.take()?,
-            t.relay_input,
-            t.relay_output,
+            t.slave.take()?,
+            t.host.take()?,
             OutputFilter::new(t.clipboard),
         ))
     });
@@ -1114,30 +1096,46 @@ fn wait_foreground(
         r.resize();
     }
     let pid = Pid::from_child(&child);
+    let kill_child = |signal| {
+        // SAFETY: a plain syscall. The child is not reaped yet, so its pid
+        // is still its own.
+        unsafe { libc::kill(pid.as_raw_nonzero().get(), signal) };
+    };
     // Waiting through a pidfd lets `ppoll` wait for the child, the signals
-    // and the PTY at once. Without one (impossible on the kernels stopit
-    // supports), signals are only forwarded once bwrap is done.
-    if let Ok(pidfd) = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) {
+    // and the PTY at once.
+    let pidfd = match rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) {
+        Ok(pidfd) => Some(pidfd),
+        // Without the relay the sandbox would block on its terminal, and
+        // keys would never arrive.
+        Err(e) if relay.is_some() => {
+            kill_child(libc::SIGKILL);
+            let _ = child.wait();
+            return Err(RunError::Pty(io::Error::other(format!(
+                "cannot wait for bwrap and relay its terminal: pidfd_open failed: {e}"
+            ))));
+        }
+        // Signals are then only forwarded once bwrap is done.
+        Err(_) => None,
+    };
+    if let Some(pidfd) = &pidfd {
         loop {
             if let Some(signal) = take_signal() {
-                // SAFETY: a plain syscall. The child is not reaped yet, so
-                // its pid is still its own.
-                unsafe { libc::kill(pid.as_raw_nonzero().get(), signal) };
+                kill_child(signal);
             }
             if WINCH.swap(false, Ordering::SeqCst)
                 && let Some(r) = &relay
             {
                 r.resize();
             }
-            let interest = relay.as_ref().map(PtyRelay::poll_fds);
             let mut fds = vec![libc::pollfd {
                 fd: pidfd.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             }];
-            let mut slots = [None, None];
-            if let Some(interest) = interest {
-                for (slot, wanted) in slots.iter_mut().zip([interest.master, interest.input]) {
+            let mut slots = [None; 3];
+            if let Some(interest) = relay.as_ref().map(PtyRelay::poll_fds) {
+                let wanted = [interest.master, interest.input, interest.output];
+                for (slot, wanted) in slots.iter_mut().zip(wanted) {
                     if let Some((fd, events)) = wanted {
                         *slot = Some(fds.len());
                         fds.push(libc::pollfd {
@@ -1151,11 +1149,18 @@ fn wait_foreground(
             match mask.wait(&mut fds) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
+                Err(e) => {
+                    if relay.is_some() {
+                        kill_child(libc::SIGKILL);
+                        let _ = child.wait();
+                        return Err(RunError::Pty(e));
+                    }
+                    break;
+                }
             }
             if let Some(r) = &mut relay {
                 let revents = |slot: Option<usize>| slot.map_or(0, |i| fds[i].revents);
-                r.handle(revents(slots[0]), revents(slots[1]));
+                r.handle(revents(slots[0]), revents(slots[1]), revents(slots[2]));
             }
             if fds[0].revents != 0 {
                 break;
