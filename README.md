@@ -290,7 +290,7 @@ profile = "publish"
 network = { mode = "proxy", allow_domains = ["crates.io", "index.crates.io", "static.crates.io"] }
 ```
 
-The publish profile still has no registry token, since the default filter drops `CARGO_REGISTRY_TOKEN`. DESIGN.md section 7.1 describes the rules.
+The publish profile still has no registry token, since the default filter drops `CARGO_REGISTRY_TOKEN`. Set `tty = true` on a shim for a full-screen TUI or interactive shell so foreground terminal calls get a pseudo-terminal and window-size updates of their own. DESIGN.md section 7.1 describes the rules.
 
 ### Let a command ask for more
 

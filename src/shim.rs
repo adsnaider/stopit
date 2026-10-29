@@ -59,7 +59,7 @@ const TRAMPOLINE_FILE: &str = "shim";
 pub const HELLO: u8 = b'S';
 
 /// The version of the shim's messages. It changes whenever they do.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// What a shim tells the broker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,18 +77,24 @@ pub enum ShimMessage {
         /// The shim's working directory, as the sandbox sees it.
         #[serde(with = "crate::control::hex_bytes")]
         cwd: Vec<u8>,
+        /// Whether the shim is in the foreground on a terminal.
+        foreground: bool,
     },
     /// A signal the shim caught, for the broker to pass to the command.
     Signal {
         /// The signal number.
         signal: i32,
     },
+    /// The shim's terminal changed size (`SIGWINCH`).
+    Resize,
 }
 
 /// What the broker tells a shim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrokerMessage {
+    /// The command runs on its own PTY, so the shim forwards window resizes.
+    Tty,
     /// The command ended, or was refused. The shim exits with this status.
     Exit {
         /// The exit status.
@@ -286,8 +292,16 @@ pub fn run(args: &[OsString]) -> u8 {
 }
 
 fn call(name: &OsStr, args: &[OsString]) -> Result<u8, String> {
-    use crate::supervisor::{BlockedSignals, catch_signals, take_signal};
+    use crate::supervisor::{
+        BlockedSignals, catch_signals, catch_winch, check_foreground, ignore_job_control,
+        stdio_terminals, take_signal, take_winch,
+    };
     catch_signals().map_err(|e| format!("cannot set up signal handling: {e}"))?;
+    let terms = stdio_terminals();
+    let foreground = terms[0] && terms[1] && check_foreground(terms).is_ok();
+    if foreground {
+        catch_winch().map_err(|e| format!("cannot set up signal handling: {e}"))?;
+    }
     let cwd =
         std::env::current_dir().map_err(|e| format!("cannot tell the current directory: {e}"))?;
     // `O_PATH`, which needs no right to read the directory.
@@ -317,15 +331,20 @@ fn call(name: &OsStr, args: &[OsString]) -> Result<u8, String> {
             shim: name.to_string_lossy().into_owned(),
             args: args.iter().map(|a| a.as_bytes().to_vec()).collect(),
             cwd: cwd.into_os_string().into_vec(),
+            foreground,
         },
     )
     .map_err(lost)?;
     drop(here);
+    let mut tty_active = false;
     loop {
         if let Some(signal) = take_signal()
             && FORWARDED.contains(&signal)
         {
             let _ = crate::control::write_frame(&conn, &ShimMessage::Signal { signal });
+        }
+        if tty_active && take_winch() {
+            let _ = crate::control::write_frame(&conn, &ShimMessage::Resize);
         }
         let mut fds = [libc::pollfd {
             fd: std::os::fd::AsRawFd::as_raw_fd(&conn),
@@ -338,6 +357,10 @@ fn call(name: &OsStr, args: &[OsString]) -> Result<u8, String> {
             Err(e) => return Err(lost(e)),
         }
         match crate::control::read_frame::<BrokerMessage>(&conn).map_err(lost)? {
+            Some(BrokerMessage::Tty) => {
+                ignore_job_control();
+                tty_active = true;
+            }
             Some(BrokerMessage::Exit { code }) => return Ok(code),
             Some(BrokerMessage::Error { message }) => return Err(message),
             None => return Err("the broker closed the connection".to_owned()),

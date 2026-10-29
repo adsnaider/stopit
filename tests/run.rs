@@ -2016,11 +2016,29 @@ fn shell_config() -> Option<String> {
         eprintln!("skipping: no /bin/sh or /usr/bin/stty on the host");
         return None;
     }
-    let dirs: Vec<String> = ["/usr", "/bin", "/lib", "/lib64"]
-        .into_iter()
-        .filter(|d| Path::new(d).exists())
-        .map(|d| format!("{d:?}"))
-        .collect();
+    // Mount the system subtrees under `/usr` rather than `/usr` whole so hosts
+    // whose password-database home lives under `/usr/local` do not pull the
+    // user's real `~/.config/stopit` and `~/.local/share/stopit` into every
+    // shell test.
+    let dirs: Vec<String> = [
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/lib",
+        "/usr/lib64",
+        "/usr/libexec",
+        "/usr/share",
+        "/usr/grte",
+        "/usr/local/bin",
+        "/usr/local/lib",
+        "/usr/local/share",
+        "/bin",
+        "/lib",
+        "/lib64",
+    ]
+    .into_iter()
+    .filter(|d| Path::new(d).exists())
+    .map(|d| format!("{d:?}"))
+    .collect();
     Some(format!(
         "[[provider]]\ntype = \"config\"\nname = \"sh\"\n[provider.sandbox]\n\
          fs.ro = [{}]\nenv.path_prepend = [\"/usr/bin\", \"/bin\"]\n\
@@ -4807,6 +4825,124 @@ fn a_shims_signals_and_its_end_reach_the_command() {
         "{out:?}"
     );
     assert!(s.no_session_left());
+}
+
+#[test]
+fn a_tty_shim_gets_its_own_pty_resizes_and_restores_modes() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((master, slave)) = open_pty() else {
+        return;
+    };
+    let size = |rows, cols| rustix::termios::Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    rustix::termios::tcsetwinsize(&slave, size(24, 80)).unwrap();
+    let s = Setup::with_config(&format!(
+        "{config}[profiles.tui]\n\
+         [[provider]]\ntype = \"config\"\nname = \"tui-shim\"\n[provider.sandbox]\n\
+         shims.tui = {{ binary = \"sh\", tty = true, default = {{ decision = \"allow\", profile = \"tui\" }} }}\n\
+         [[provider]]\ntype = \"config\"\nname = \"tui-env\"\nprofile = \"tui\"\n[provider.sandbox]\n\
+         env.set = {{ PS1 = \"tui$ \" }}\n"
+    ));
+    let command = s.stopit(&["run", "--quiet", "/bin/sh", "-i"]);
+    let mut t = OnTerminal::spawn(command, master, slave);
+    let at = t.wait_for(b"sandbox$ ", 0);
+
+    // Foreground terminal calls get a controlling terminal and live resizes.
+    t.type_keys(b"tui -i\r");
+    let at = t.wait_for(b"tui$ ", at);
+    t.type_keys(b"echo ctl >/dev/tty && stty size\r");
+    let at = t.wait_for(b"24 80", at);
+    let at = t.wait_for(b"tui$ ", at);
+    rustix::termios::tcsetwinsize(&t.master, size(42, 118)).unwrap();
+    let mut from = at;
+    wait_until(|| {
+        t.type_keys(b"stty size\r");
+        from = t.wait_for(b"tui$ ", from);
+        let seen = t.seen();
+        String::from_utf8_lossy(&seen[at..])
+            .contains("42 118")
+            .then_some(())
+    });
+    t.type_keys(b"exit\r");
+    let at = t.wait_for(b"sandbox$ ", from);
+
+    // A killed child leaving alternate screen on has its modes and outer
+    // termios restored before the caller's shell resumes.
+    t.type_keys(b"tui -c 'printf \"\\033[?1049hALT-ON\\n\"; kill -9 $$'\r");
+    let at = t.wait_for(b"\x1b[?1049l", at);
+    let at = t.wait_for(b"sandbox$ ", at);
+    t.type_keys(b"stty\r");
+    let at = t.wait_for(b"sandbox$ ", at);
+
+    // Pipelines and background jobs fall back to detached stdio without a
+    // controlling terminal.
+    t.type_keys(
+        b"printf 'in-pipe\\n' | tui -c '(: >/dev/tty) 2>/dev/null && echo has-tty || cat'\r",
+    );
+    let at = t.wait_for(b"in-pipe", at);
+    let at = t.wait_for(b"sandbox$ ", at);
+    t.type_keys(b"tui -c '(: >/dev/tty) 2>/dev/null && echo has-tty || echo out-pipe' | cat\r");
+    let at = t.wait_for(b"out-pipe", at);
+    let at = t.wait_for(b"sandbox$ ", at);
+    t.type_keys(b"tui -c '(: >/dev/tty) 2>/dev/null && echo has-tty || echo bg-ok' &\r");
+    let at = t.wait_for(b"bg-ok", at);
+    t.type_keys(b"wait\r");
+    let at = t.wait_for(b"sandbox$ ", at);
+
+    t.type_keys(b"exit 0\r");
+    let out = t.finish();
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert!(t.seen().len() >= at);
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn a_tty_shim_asking_approval_survives_a_window_resize() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((server_master, server_slave)) = open_pty() else {
+        return;
+    };
+    let Some((client_master, client_slave)) = open_pty() else {
+        return;
+    };
+    let size = |rows, cols| rustix::termios::Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    rustix::termios::tcsetwinsize(&client_slave, size(24, 80)).unwrap();
+    let s = Setup::with_config(&format!(
+        "{config}[approval]\ntimeout = \"20s\"\n[profiles.tui]\n\
+         [[provider]]\ntype = \"config\"\nname = \"tui-shim\"\n[provider.sandbox]\n\
+         shims.ask-tui = {{ binary = \"sh\", tty = true, default = {{ decision = \"ask\", profile = \"tui\" }} }}\n"
+    ));
+    let server = Server::start_on_terminal(&s, &server_master, server_slave);
+    let command = s.stopit(&[
+        "run",
+        "--quiet",
+        "/bin/sh",
+        "-c",
+        "ask-tui -c 'echo size:$(stty size)'",
+    ]);
+    let mut t = OnTerminal::spawn(command, client_master, client_slave);
+    server.wait_for_log("through shim ask-tui");
+    // Resizing the client's terminal while the prompt is up must not send a
+    // frame that cancels the approval wait.
+    rustix::termios::tcsetwinsize(&t.master, size(37, 109)).unwrap();
+    thread::sleep(Duration::from_millis(150));
+    answer(&server, &server_master, b"y", "allowed once");
+    t.wait_for(b"size:37 109", 0);
+    let out = t.finish();
+    assert_eq!(code(&out), 0, "{out:?}");
 }
 
 // --- The vcs provider ---

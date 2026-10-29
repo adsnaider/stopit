@@ -1252,6 +1252,11 @@ pub(crate) fn catch_winch() -> io::Result<()> {
     Ok(())
 }
 
+/// Returns whether `SIGWINCH` arrived since the last check, clearing the flag.
+pub(crate) fn take_winch() -> bool {
+    WINCH.swap(false, Ordering::SeqCst)
+}
+
 /// Non-blocking self-pipe waking threads blocked in `poll` when a caught
 /// signal arrives.
 static SIGNAL_READ_FD: AtomicI32 = AtomicI32::new(-1);
@@ -1755,7 +1760,7 @@ pub(crate) fn relay_until(
         if let Some(signal) = take_signal() {
             on_signal(signal);
         }
-        if WINCH.swap(false, Ordering::SeqCst)
+        if take_winch()
             && let Some(r) = &relay
         {
             r.resize();

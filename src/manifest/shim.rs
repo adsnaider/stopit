@@ -427,6 +427,8 @@ pub struct ShimSpec {
     pub args: Vec<ShimArg>,
     /// Flags refused for every invocation.
     pub deny_flags: Vec<Flag>,
+    /// Whether foreground terminal calls run on a pseudo-terminal of their own.
+    pub tty: bool,
     /// What to do with subcommands no rule covers.
     pub default: ShimAction,
     /// Per-subcommand rules.
@@ -441,6 +443,8 @@ struct RawShimSpec {
     args: Vec<ShimArg>,
     #[serde(default)]
     deny_flags: Vec<Flag>,
+    #[serde(default)]
+    tty: bool,
     default: ShimAction,
     #[serde(default)]
     rules: Vec<ShimRule>,
@@ -452,6 +456,7 @@ impl From<MapOnly<RawShimSpec>> for ShimSpec {
             binary: raw.binary,
             args: raw.args,
             deny_flags: raw.deny_flags,
+            tty: raw.tty,
             default: raw.default,
             rules: raw.rules,
         }
@@ -501,8 +506,47 @@ mod tests {
             binary: binary.parse().unwrap(),
             args: Vec::new(),
             deny_flags: flags(deny),
+            tty: false,
             default,
             rules,
+        }
+    }
+
+    #[test]
+    fn shim_tty_defaults_to_false_and_parses_boolean() {
+        let m = toml_ok(
+            r#"
+            [shims.tui]
+            binary = "tui"
+            tty = true
+            default = { decision = "allow", profile = "main" }
+
+            [shims.plain]
+            binary = "plain"
+            tty = false
+            default = { decision = "allow", profile = "main" }
+            "#,
+        );
+        assert!(m.grants.shims[&sn("tui")].tty);
+        assert!(!m.grants.shims[&sn("plain")].tty);
+        let j = jv_ok(
+            r#""shims": {
+                "tui": {"binary": "tui", "tty": true, "default": {"decision": "allow", "profile": "main"}},
+                "plain": {"binary": "plain", "tty": false, "default": {"decision": "allow", "profile": "main"}}
+            }"#,
+        );
+        assert_eq!(j, m);
+        for bad in [r#"tty = "yes""#, r#"tty = 1"#, r#"tty = []"#, r#"tty = {}"#] {
+            let text = format!(
+                "[shims.tui]\nbinary = \"tui\"\n{bad}\ndefault = {{ decision = \"deny\" }}\n"
+            );
+            assert!(toml::from_str::<Manifest>(&text).is_err(), "{bad}");
+        }
+        for bad in [r#""yes""#, "1", "[]", "{}", "null"] {
+            let msg = jv_err(&format!(
+                r#""shims": {{"tui": {{"binary": "tui", "tty": {bad}, "default": {{"decision": "deny"}}}}}}"#
+            ));
+            assert!(!msg.is_empty(), "{bad}");
         }
     }
 

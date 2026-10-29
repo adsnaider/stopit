@@ -448,6 +448,7 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
         shim,
         args,
         cwd,
+        foreground,
     }) = serde_json::from_value::<ShimMessage>(request)
     else {
         return Err("bad shim request: no command".to_owned());
@@ -561,6 +562,7 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
         [stdin, stdout, stderr],
         cwd_fd,
         &rel,
+        spec.tty && foreground,
     )
 }
 
@@ -579,6 +581,7 @@ fn start_and_wait(
     stdio: [OwnedFd; 3],
     cwd_fd: OwnedFd,
     rel: &Path,
+    want_tty: bool,
 ) -> Result<u8, Failure> {
     let (dev, ino) = check_cwd(ctx.loaded.workspace_dir(), rel, cwd_fd.as_fd())?;
     drop(cwd_fd);
@@ -587,19 +590,22 @@ fn start_and_wait(
         dev,
         ino,
     };
-    let mut launched = launch(ctx, target, command, stdio, start).map_err(|e| e.to_string())?;
+    let launched =
+        launch(ctx, target, command, stdio, start, want_tty).map_err(|e| e.to_string())?;
     let tracked = match launched.pidfd.try_clone() {
         Ok(pidfd) => pidfd,
         Err(e) => {
             // Untracked, the sandbox would outlive the broker.
-            let _ = pidfd_send_signal(&launched.pidfd, Signal::KILL);
-            let _ = launched.child.wait();
+            launched.abort();
             return Err(e.to_string());
         }
     };
     lock(&shared.commands).insert(number, tracked);
     // Stopping between the spawn and the line above would miss it.
     if shared.stop.load(Ordering::SeqCst) {
+        let _ = pidfd_send_signal(&launched.pidfd, Signal::KILL);
+    }
+    if launched.relay.is_some() && write_frame(conn, &BrokerMessage::Tty).is_err() {
         let _ = pidfd_send_signal(&launched.pidfd, Signal::KILL);
     }
     let code = launched.wait(conn);
@@ -810,7 +816,7 @@ fn run_grant(
         .map(OsString::from_vec)
         .collect();
     let started = start_and_wait(
-        conn, shared, number, &granted, &target, &command, stdio, cwd_fd, rel,
+        conn, shared, number, &granted, &target, &command, stdio, cwd_fd, rel, false,
     );
     // The error may name host paths, which the sandbox is not told.
     started.map_err(|e| {
@@ -1117,21 +1123,62 @@ fn check_cwd(workspace: &Path, rel: &Path, dir: BorrowedFd<'_>) -> Result<(u64, 
     Ok((a.st_dev, a.st_ino))
 }
 
+/// Returns the `(st_dev, st_ino)` of `fd` when it is an open terminal whose
+/// access mode satisfies `access`.
+fn terminal_id(
+    fd: BorrowedFd<'_>,
+    access: impl FnOnce(rustix::fs::OFlags) -> bool,
+) -> Option<(u64, u64)> {
+    use rustix::fs::{OFlags, fcntl_getfl, fstat};
+    let fl = fcntl_getfl(fd).ok()?;
+    if fl.contains(OFlags::PATH) || !access(fl & OFlags::RWMODE) || !rustix::termios::isatty(fd) {
+        return None;
+    }
+    let stat = fstat(fd).ok()?;
+    Some((stat.st_dev, stat.st_ino))
+}
+
+fn is_readable_mode(mode: rustix::fs::OFlags) -> bool {
+    use rustix::fs::OFlags;
+    matches!(mode, OFlags::RDONLY | OFlags::RDWR)
+}
+
+fn is_writable_mode(mode: rustix::fs::OFlags) -> bool {
+    use rustix::fs::OFlags;
+    matches!(mode, OFlags::WRONLY | OFlags::RDWR)
+}
+
 /// A command's sandbox, running.
 struct Launched {
     child: std::process::Child,
     pidfd: OwnedFd,
     status: std::fs::File,
+    relay: Option<crate::pty::PtyRelay>,
+    raw: Option<crate::pty::RawMode>,
     /// Kept until the sandbox ends.
     _proxy: Option<crate::proxy::Proxy>,
     _broker: Option<Broker>,
 }
 
 impl Launched {
-    /// Waits for the sandbox, passing on the signals the shim on `conn`
-    /// forwards and killing it if the shim goes away, and returns its exit
-    /// status.
+    /// Kills and reaps the sandbox when tracking fails, finishing the PTY
+    /// relay before restoring terminal settings.
+    fn abort(mut self) {
+        let relay = self.relay.take();
+        let raw = self.raw.take();
+        let _ = pidfd_send_signal(&self.pidfd, Signal::KILL);
+        let _ = self.child.wait();
+        if let Some(relay) = relay {
+            relay.finish();
+        }
+        drop(raw);
+    }
+
+    /// Waits for the sandbox, passing on the signals and window resizes the
+    /// shim on `conn` forwards and killing it if the shim goes away, and
+    /// returns its exit status.
     fn wait(mut self, conn: &UnixStream) -> u8 {
+        let _ = conn.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
         let mut shim_open = true;
         loop {
             let mut fds = vec![libc::pollfd {
@@ -1139,12 +1186,28 @@ impl Launched {
                 events: libc::POLLIN,
                 revents: 0,
             }];
-            if shim_open {
+            let conn_slot = shim_open.then(|| {
+                let slot = fds.len();
                 fds.push(libc::pollfd {
                     fd: conn.as_raw_fd(),
                     events: libc::POLLIN,
                     revents: 0,
                 });
+                slot
+            });
+            let mut relay_slots = [None; 3];
+            if let Some(interest) = self.relay.as_ref().map(crate::pty::PtyRelay::poll_fds) {
+                let wanted = [interest.master, interest.input, interest.output];
+                for (slot, wanted) in relay_slots.iter_mut().zip(wanted) {
+                    if let Some((fd, events)) = wanted {
+                        *slot = Some(fds.len());
+                        fds.push(libc::pollfd {
+                            fd,
+                            events,
+                            revents: 0,
+                        });
+                    }
+                }
             }
             // SAFETY: valid pollfds for the duration of the call.
             let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
@@ -1155,15 +1218,30 @@ impl Launched {
                 let _ = pidfd_send_signal(&self.pidfd, Signal::KILL);
                 break;
             }
+            if let Some(r) = &mut self.relay {
+                let revents = |slot: Option<usize>| slot.map_or(0, |i| fds[i].revents);
+                r.handle(
+                    revents(relay_slots[0]),
+                    revents(relay_slots[1]),
+                    revents(relay_slots[2]),
+                );
+            }
             if fds[0].revents != 0 {
                 break;
             }
-            if shim_open && fds[1].revents != 0 {
+            if let Some(slot) = conn_slot
+                && fds[slot].revents != 0
+            {
                 match read_frame::<ShimMessage>(conn) {
                     Ok(Some(ShimMessage::Signal { signal })) if FORWARDED.contains(&signal) => {
                         // SAFETY: `signal` is one of `FORWARDED`, all valid.
                         let signal = unsafe { Signal::from_raw_unchecked(signal) };
                         let _ = pidfd_send_signal(&self.pidfd, signal);
+                    }
+                    Ok(Some(ShimMessage::Resize)) => {
+                        if let Some(r) = &self.relay {
+                            r.resize();
+                        }
                     }
                     Ok(Some(_)) => {}
                     Ok(None) | Err(_) => {
@@ -1173,23 +1251,32 @@ impl Launched {
                 }
             }
         }
-        match self.child.wait() {
+        let relay = self.relay.take();
+        let raw = self.raw.take();
+        let status = self.child.wait();
+        if let Some(relay) = relay {
+            relay.finish();
+        }
+        drop(raw);
+        match status {
             Ok(status) => bwrap_exit_code(status, &read_nonblocking_status(self.status)),
             Err(_) => crate::supervisor::EXIT_SUPERVISOR_FAILED,
         }
     }
 }
 
-/// Starts `command` in a sandbox of `profile` on `stdio`, entering
-/// `cwd`. The sandbox gets a proxy in proxy mode, a broker of its own if
-/// the profile has shims, and pasta with `network = "full"`. Its command
-/// is never looked up among its own shims.
+/// Starts `command` in a sandbox of `profile` on `stdio` (or on a fresh PTY
+/// relayed to `stdio` when `want_tty` is set and stdin and stdout share a
+/// terminal), entering `cwd`. The sandbox gets a proxy in proxy mode, a
+/// broker of its own if the profile has shims, and pasta with
+/// `network = "full"`. Its command is never looked up among its own shims.
 fn launch(
     ctx: &Arc<RunContext>,
     profile: &ProfileRef,
     command: &[OsString],
     stdio: [OwnedFd; 3],
     cwd: crate::init::StartDir,
+    want_tty: bool,
 ) -> Result<Launched, RunError> {
     let loaded = &ctx.loaded;
     let (name, compiled) = profile_in(&ctx.compiled, Some(profile.as_str()))?;
@@ -1207,11 +1294,20 @@ fn launch(
         cwd: Some(cwd),
         skip_shims: true,
     };
+    let [stdin, stdout, stderr] = stdio;
+    let in_id = terminal_id(stdin.as_fd(), is_readable_mode);
+    let out_id = terminal_id(stdout.as_fd(), is_writable_mode);
+    let use_pty = want_tty && in_id.is_some() && in_id == out_id;
+    let terminal = if use_pty {
+        TerminalSession::Pty
+    } else {
+        TerminalSession::Detach
+    };
     let bwrap = loaded.command(
         compiled,
         command,
         ctx.host_env.iter().cloned(),
-        TerminalSession::Detach,
+        terminal,
         &extras,
     )?;
     let pasta = match bwrap.needs_pasta() {
@@ -1219,7 +1315,27 @@ fn launch(
         false => None,
     };
     let (mut child_command, status, block) = bwrap.into_command_with_status()?;
-    let [stdin, stdout, stderr] = stdio;
+    let (pty_parts, raw, stdin, stdout, stderr) = if use_pty {
+        let replace_stderr = terminal_id(stderr.as_fd(), is_writable_mode) == out_id;
+        let termios = rustix::termios::tcgetattr(&stdin).ok();
+        let pty =
+            crate::pty::Pty::open(termios.as_ref(), Some(stdout.as_fd())).map_err(RunError::Pty)?;
+        let host = crate::pty::HostTerminal::open(Some(stdin.as_fd()), stdout.as_fd())
+            .map_err(RunError::Pty)?;
+        let child_in = pty.slave.try_clone().map_err(RunError::Pty)?;
+        let child_out = pty.slave.try_clone().map_err(RunError::Pty)?;
+        let child_err = if replace_stderr {
+            pty.slave.try_clone().map_err(RunError::Pty)?
+        } else {
+            stderr
+        };
+        let raw = crate::pty::RawMode::enter(stdin.as_fd()).map_err(RunError::Pty)?;
+        drop(stdin);
+        drop(stdout);
+        (Some((pty, host)), Some(raw), child_in, child_out, child_err)
+    } else {
+        (None, None, stdin, stdout, stderr)
+    };
     child_command
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
@@ -1258,10 +1374,18 @@ fn launch(
         return Err(e.into());
     }
     drop(block);
+    let relay = pty_parts.map(|(pty, host)| {
+        let filter = crate::filter::OutputFilter::new(crate::filter::ClipboardPolicy::Allow);
+        let relay = crate::pty::PtyRelay::new(pty.master, pty.slave, host, filter);
+        relay.resize();
+        relay
+    });
     Ok(Launched {
         child,
         pidfd,
         status,
+        relay,
+        raw,
         _proxy: proxy,
         _broker: broker,
     })
@@ -1303,6 +1427,7 @@ mod tests {
             binary: "git".parse().unwrap(),
             args: Vec::new(),
             deny_flags: deny.iter().map(|f| f.parse::<Flag>().unwrap()).collect(),
+            tty: false,
             default: ShimAction {
                 decision: default.0,
                 profile: default.1.map(pr),
@@ -1636,5 +1761,49 @@ mod tests {
         let a = open(&ws.path().join("a"));
         assert!(check_cwd(ws.path(), Path::new("link"), a.as_fd()).is_err());
         assert!(check_cwd(ws.path(), Path::new("missing"), a.as_fd()).is_err());
+    }
+
+    #[test]
+    fn terminal_id_checks_access_mode_and_terminal_identity() {
+        use rustix::fs::{Mode, OFlags, open};
+        let Ok(pty_a) = crate::pty::Pty::open(None, None) else {
+            return;
+        };
+        let Ok(pty_b) = crate::pty::Pty::open(None, None) else {
+            return;
+        };
+        let id_in = terminal_id(pty_a.slave.as_fd(), is_readable_mode);
+        let id_out = terminal_id(pty_a.slave.as_fd(), is_writable_mode);
+        assert!(id_in.is_some());
+        assert_eq!(id_in, id_out);
+        assert_ne!(id_in, terminal_id(pty_b.slave.as_fd(), is_writable_mode));
+
+        // Read-only or write-only terminal descriptors cannot stand in for the
+        // opposite direction.
+        let path = format!("/proc/self/fd/{}", pty_a.slave.as_raw_fd());
+        let ro = open(
+            &path,
+            OFlags::RDONLY | OFlags::NOCTTY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let wo = open(
+            &path,
+            OFlags::WRONLY | OFlags::NOCTTY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let opath = open(&path, OFlags::PATH | OFlags::CLOEXEC, Mode::empty()).unwrap();
+        assert_eq!(terminal_id(ro.as_fd(), is_readable_mode), id_in);
+        assert_eq!(terminal_id(ro.as_fd(), is_writable_mode), None);
+        assert_eq!(terminal_id(wo.as_fd(), is_writable_mode), id_out);
+        assert_eq!(terminal_id(wo.as_fd(), is_readable_mode), None);
+        assert_eq!(terminal_id(opath.as_fd(), is_readable_mode), None);
+        assert_eq!(terminal_id(opath.as_fd(), is_writable_mode), None);
+
+        // Pipes and regular files are not terminals.
+        let (r, w) = std::io::pipe().unwrap();
+        assert_eq!(terminal_id(r.as_fd(), is_readable_mode), None);
+        assert_eq!(terminal_id(w.as_fd(), is_writable_mode), None);
     }
 }
