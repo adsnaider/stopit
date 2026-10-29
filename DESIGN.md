@@ -9,15 +9,15 @@
 
 ## 1. Scope, threat model and invariants
 
-`stopit` is a general-purpose sandbox for running programs with **minimum-required privilege**. Interactive LLM agents are the primary motivating use case, but `stopit` has **no harness-specific features**: agents, their shells, and any other program are all described with the same configuration primitives (see §7.6 for a worked example).
+`stopit` is a general-purpose sandbox for running programs with **minimum-required privilege**. Interactive LLM agents are the primary motivating use case, but `stopit` has **no harness-specific features**: agents, their shells, and any other program are all described with the same configuration settings (see §7.6 for a worked example).
 
 ### 1.1 Threat classes
 
-1. **The Actively Hostile Program (e.g. a prompt-injected agent):**
+1. **The actively hostile program**, such as a prompt-injected agent.
    * Attempts sandbox escape, data exfiltration, or planting delayed-execution backdoors that run when the human next interacts with the workspace on the host (`.git/hooks`, `.envrc`, `flake.nix` + `use flake`, editor configs).
-2. **The Clumsy Program (e.g. a hallucinating agent):**
+2. **The clumsy program**, such as a hallucinating agent.
    * Runs destructive commands (`rm -rf ..`, `git clean -fdx`, `jj abandon`), forkbombs, or corrupts VCS state outside its task scope.
-3. **Silent Secret Harvesting:**
+3. **Silent secret harvesting.**
    * Reads sensitive host files (`~/.ssh`, `~/.aws`, `~/.config/gh`, `.env`, harness credential directories, `/run/user/$UID/bus`, Nix tokens) which may then be sent to third parties (e.g. model providers as context).
 
 ### 1.2 Non-goals
@@ -70,16 +70,16 @@ Some current behaviour does not follow this principle yet; see §11, Behaviour n
 
 `stopit` is a **single Rust binary** with several personas selected via `argv[0]` / subcommands:
 
-1. **Supervisor (host process, `stopit run` / `stopit shell`):**
+1. **Supervisor**, the host process of `stopit run` and `stopit shell`.
    * Owns the real host terminal; runs the **PTY proxy** with output filtering, and the **approval overlay** (§5).
    * Runs **providers** at session start to compute each profile's grants (§3.6).
    * Runs the **Capability Broker** for brokered tools (§7).
    * Runs the **Protected-File Service**: a narrow FUSE filesystem plus the seccomp rename-notify handler (§4).
    * Runs the **Network Proxy** for domain-allowlisted access (§8).
    * Applies optional **resource limits** (§10).
-2. **Sandbox Init Helper (`stopit __init`, first process inside every sandbox):**
+2. **Sandbox init helper**, `stopit __init`, the first process inside every sandbox.
    * Fills the gaps bubblewrap does not cover: controlling-terminal setup, Landlock, the seccomp filter (including the rename user-notify listener, whose FD is sent to the supervisor), then `execve` of the target (§6.3).
-3. **Capability Shim (`/run/stopit/bin/<tool>`):**
+3. **Capability shim**, `/run/stopit/bin/<tool>`.
    * Symlinks to a small static trampoline placed at the front of `PATH`. On execution, the trampoline runs the provisioned stopit as `__shim`, which sends a request plus `stdin`/`stdout`/`stderr` FDs to the broker (§7.1).
 
 ### 2.1 Session runtime directory
@@ -945,6 +945,7 @@ Session-wide, so not a provider setting. Off unless configured. Mitigates forkbo
 ## 11. Known limitations and future work
 
 * **Nested repository creation.** The sandbox can create `subdir/.git` (or `.jj`) with hostile config (e.g. `core.fsmonitor`) that a shell prompt running `git status` on `cd` would execute on the host. Not mitigated in v1. Future fix: full-workspace FUSE (below) can intercept `mkdir .git` anywhere.
+* **Self-loading settings created in the session.** Protected rules for agent and editor settings (`.claude`, `.gemini`, `.mcp.json`, `.vscode`, `.envrc` and others, Appendix A) cover only paths that exist at session start (§3.4). In a project without them, the sandbox can create, say, `.claude/settings.json` with a hook or `opencode.json` with an MCP command, which the host tool runs the next time it starts there. §3.4's reasoning that new files are safe because every file that could reference them is protected does not hold for tools that load a directory by name. The future fix is the same as for nested repositories.
 * **Ignored `close()` errors** make denied in-place writes look successful to some programs (§4.3).
 * **Auto-import patterns** (`import-tree`, haumea, `listFilesRecursive`) evaluate *new* `.nix` files without any protected file changing. Data files read during provider evaluation (`rust-toolchain.toml`, `Cargo.toml`) are not protected by default.
 * **Secrets inside granted tool closures** (packages that embed tokens) are visible.

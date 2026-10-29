@@ -12,7 +12,7 @@ With an empty `.stopit.toml` (or none), a sandbox has:
 
 - your project, read-write, at `/workspace`, which is also the working directory;
 - secrets in the project masked: `.env`, `.env.*`, `*.pem`, `*.key`, `.npmrc`, `.pypirc`, `.netrc`, SSH keys and others show up empty and unreadable;
-- files that would let it escape on your next run made read-only: `.stopit.toml`, `*.nix`, `flake.lock`, `.envrc`, `.vscode`, `.idea`, `.github/workflows`, the project settings of Claude Code, Gemini CLI and some editors (`.claude`, `.gemini`, `.cursor`, `.mcp.json`, `.zed`), and others (DESIGN.md, Appendix A);
+- files that exist when the session starts and would let it escape on your next run made read-only: `.stopit.toml`, `*.nix`, `flake.lock`, `.envrc`, `.vscode`, `.idea`, `.github/workflows`, the project settings of Claude Code, Gemini CLI and some editors (`.claude`, `.gemini`, `.cursor`, `.mcp.json`, `.zed`), and others (DESIGN.md, Appendix A);
 - the repository's `.git` and `.jj` masked, with `git` and `jj` brokered instead (see [Version control](#version-control));
 - an empty home directory at `/home/user` and an empty `/tmp`, both deleted when the session ends;
 - its own `/proc` and a minimal `/dev`;
@@ -69,7 +69,7 @@ imports = [ stopit.homeModules.default ];   # adds stopit to home.packages
    env.path_prepend = ["/run/current-system/sw/bin"]
    ```
 
-   `/usr/bin/env` and `/bin/sh` are there for scripts that start with `#!/usr/bin/env`. For packages from Home Manager, add your profile (`/etc/profiles/per-user/<you>`, or the target of `~/.nix-profile`) to `fs.ro` and its `bin` to `env.path_prepend`, both as absolute paths. Granting all of `/nix/store` is fine for trying stopit out. On NixOS the store can hold rendered secrets, so a careful setup grants only the paths a development shell needs (DESIGN.md section 3.6).
+   `/usr/bin/env` and `/bin/sh` are there for scripts that start with `#!/usr/bin/env`. For packages from Home Manager, add your profile (`/etc/profiles/per-user/<you>`, or `~/.nix-profile`, which the rule follows) to `fs.ro` and its `bin` to `env.path_prepend`, both as absolute paths. Granting all of `/nix/store` is fine for trying stopit out. On NixOS the store can hold rendered secrets, so a careful setup grants only the paths a development shell needs (DESIGN.md section 3.6).
 
    This file needs no `stopit allow`. stopit trusts it because only you can write it, and it checks that no sandbox can.
 
@@ -109,9 +109,9 @@ stopit run --profile claude claude    # terminal 2
 
 A profile is a complete sandbox description. `main` is used unless you pass `--profile`. Put an agent's profile in `~/.config/stopit/config.toml` next to the tools, so every project has it.
 
-Each recipe below gives the agent a state directory of its own on the host, `~/.stopit-agents/<agent>`, which appears in the sandbox where the agent looks for its state. Do not grant the agent's usual directory (`~/.claude`, `~/.gemini`, `~/.codex`, `~/.config/opencode`) instead if you also run the agent outside stopit. The agent could rewrite its own settings there, such as hooks, MCP servers and plugins, which then run unsandboxed the next time you start it on the host, and it could read every past session you had with it. Create each directory first, since stopit skips a rule whose path is missing, with a warning. Then log in from inside the sandbox if the agent lets you paste a code, or copy just its credentials file into the new directory. Login flows that open a browser and wait on a local port cannot reach a sandbox.
+Each recipe below gives the agent a state directory of its own on the host, `~/.stopit-agents/<agent>`, which appears in the sandbox where the agent looks for its state. Do not grant the agent's usual directory (`~/.claude`, `~/.gemini`, `~/.codex`, `~/.config/opencode`) instead if you also run the agent outside stopit. The agent could rewrite its own settings there, such as hooks, MCP servers and plugins, which then run unsandboxed the next time you start it on the host, and it could read every past session you had with it. Create each directory first, since stopit skips a rule whose path is missing, with a warning. Then log in from inside the sandbox if the agent lets you paste a code. Copying the credentials file of a host login into the new directory works too, but a provider that rotates its refresh tokens can then log one of the two copies out. The agent can still change its settings in its own directory, and the change applies in every project where you run it in stopit. Login flows that open a browser and wait on a local port cannot reach a sandbox.
 
-Each recipe lets the agent reach only its provider, through stopit's filtering proxy. The proxy lets a tool reach the listed names on ports 443 and 80, plus any names `main` already allows, and lists the first ten names it refused when the run ends, in the server's terminal for an attached run. If an agent cannot log in or fetch something, add the names it needs, or use `network = { mode = "full" }`, which reaches whatever your machine reaches except services on its loopback. Anything the agent can read, it can send to the allowed names. The startup summary lists them on its `uploads` line. Agents on Node.js need Node 24 or newer to use the proxy.
+Each recipe lets the agent reach only the names it lists, plus any `main` allows, through stopit's filtering proxy. The proxy reaches them on ports 443 and 80 and lists the first ten names it refused when the run ends, in the server's terminal for an attached run. If an agent cannot log in or fetch something, add the names it needs, or use `network = { mode = "full" }`, which reaches whatever your machine reaches except services on its loopback. Anything the agent can read, it can send to the allowed names. The startup summary lists them on its `uploads` line. Node.js programs that do not read the proxy variables themselves need Node 24 or newer, where stopit's `NODE_USE_ENV_PROXY=1` takes effect.
 
 The agent's program must be visible in the sandbox too. If you installed it through Nix or the system's packages, the tools provider covers it. If you installed it into your home, grant it there, as the Claude Code and Gemini recipes do.
 
@@ -150,7 +150,7 @@ env.path_prepend = ["/home/user/.npm-global/bin"]
 network = { mode = "proxy", allow_domains = ["generativelanguage.googleapis.com", "cloudcode-pa.googleapis.com", "oauth2.googleapis.com"] }
 ```
 
-`~/.npm-global` stands for wherever `npm install -g` put it. Set `"usageStatisticsEnabled": false` in the new directory's `settings.json`. Gemini CLI reads an API key from `GEMINI_API_KEY`, which the default filter drops (`*_KEY`). Prefer its login. If you set the key with `env.set` instead, which the filter does not touch, put it only in `~/.config/stopit/config.toml`, never in a `.stopit.toml` that goes into a repository, and keep that file mode 600. Every program in the profile, including the commands the agent runs, can read it.
+`~/.npm-global` stands for wherever `npm install -g` put it. Turn off its usage statistics in the new directory's `settings.json`. Gemini CLI reads an API key from `GEMINI_API_KEY`, which the default filter drops (`*_KEY`). Prefer its login. If you set the key with `env.set` instead, which the filter does not touch, put it only in `~/.config/stopit/config.toml`, never in a `.stopit.toml` that goes into a repository, and keep that file mode 600. Every program in the profile, including the commands the agent runs, can read it.
 
 **Codex**
 
@@ -168,7 +168,7 @@ network = { mode = "proxy", allow_domains = ["api.openai.com", "chatgpt.com", "a
 
 Codex has a sandbox of its own. If Codex cannot start it inside stopit, `--sandbox danger-full-access` turns it off. stopit then still limits what Codex's commands can do, but Codex no longer keeps them out of `~/.codex` or off the network, so they can rewrite its configuration and reach the allowed names.
 
-Codex reads project settings from `.codex/` in the project, which the default rules do not protect. In a project that has one, add `fs.protected = ["{workspace}/.codex"]` to its `.stopit.toml`. A rule in `config.toml` would warn in every project without one.
+Codex reads project settings from `.codex/` in the project, which the default rules do not protect. In a project that has one, add `fs.protected = ["{workspace}/.codex"]` to its `.stopit.toml`. A rule in `config.toml` would warn in every project without one. The agent can also create the directory in a project that has none.
 
 **OpenCode**
 
@@ -187,7 +187,7 @@ fs.bind = [
 network = { mode = "proxy", allow_domains = ["models.dev", "registry.npmjs.org", "api.anthropic.com", "api.openai.com"] }
 ```
 
-List the API of each model provider you use with it. `registry.npmjs.org` is there because OpenCode installs packages at run time, which it then runs, and the proxy lets it upload there too. Its cache stays in the session's home. OpenCode also reads `opencode.json` and `.opencode/` from the project, whose plugins run when you start it on the host, and the default rules do not protect them. In a project that has them, add `fs.protected = ["{workspace}/opencode.json", "{workspace}/.opencode"]` to its `.stopit.toml`.
+List the API of each model provider you use with it. `registry.npmjs.org` is there because OpenCode installs packages at run time, which it then runs, and the proxy lets it upload there too. Its cache stays in the session's home. OpenCode also reads `opencode.json` and `.opencode/` from the project, whose plugins run when you start it on the host, and the default rules do not protect them. In a project that has them, add `fs.protected = ["{workspace}/opencode.json", "{workspace}/.opencode"]` to its `.stopit.toml`. The agent can also create them in a project that has none.
 
 ### What an agent sees
 
@@ -265,7 +265,7 @@ fs.ephemeral = ["{workspace}/target"]
 - `protected` is read-only for now. A later version will ask you to approve each write.
 - `ephemeral` gives a writable, empty directory that is discarded at the end of the session, here so build output never lands in your project.
 
-The most specific rule wins: an exact path beats a glob, and between rules for the same path the stricter mode wins.
+The most specific rule wins. An exact path beats a glob, and between rules for the same path the stricter mode wins.
 
 ### Brokered commands of your own
 
@@ -309,6 +309,7 @@ A script provider runs on your host at every start and prints a manifest as JSON
 
 ```toml
 [[provider]]
+name = "env-script"
 type = "script"
 source = "scripts/stopit-env.sh"
 ```
@@ -346,7 +347,7 @@ Before the sandbox starts, `stopit run` and `stopit shell` print to stderr what 
 - A prompt holds up the run's output until you answer it.
 - `tty` and `ttyname` fail inside the sandbox.
 - Script providers are not hashed by `stopit allow`. A script you change after allowing still runs.
-- A sandbox can create a `.git` in a subdirectory, or in the project when it has none, which `git` on the host then trusts. Look before running `git` there.
+- A sandbox can create files that host tools run or trust where none existed when the session started: a `.git` in a subdirectory (or in the project when it has none), or agent and editor settings such as `.claude/`, `.gemini/`, `.mcp.json`, `opencode.json`, `.opencode/`, `.codex/` and `.vscode/`. Look before running git or an agent on the host there.
 
 DESIGN.md section 11 has the complete list.
 
