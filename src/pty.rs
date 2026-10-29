@@ -290,8 +290,9 @@ impl PtyRelay {
     /// Ends the relay once the sandbox is gone: passes on what it wrote
     /// last, closes any sequence it left open, and turns off the terminal
     /// modes it left on. Gives up on a host terminal that takes nothing for
-    /// [`FINISH_TIMEOUT_MS`].
-    pub fn finish(mut self) {
+    /// [`FINISH_TIMEOUT_MS`]. Returns how many clipboard writes the filter
+    /// denied ([`OutputFilter::denied_writes`]).
+    pub fn finish(mut self) -> usize {
         self.slave = None;
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_millis(FINISH_TIMEOUT_MS as u64);
@@ -332,6 +333,7 @@ impl PtyRelay {
             }
             self.write_queued();
         }
+        self.filter.denied_writes()
     }
 
     /// Waits up to `ms` for the host terminal to take output.

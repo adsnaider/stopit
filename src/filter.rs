@@ -42,7 +42,23 @@ pub enum ClipboardPolicy {
     Block,
     /// Pass clipboard writes whose payload is well-formed base64.
     Allow,
+    /// Ask about each well-formed clipboard write
+    /// ([`OutputFilter::with_asker`]), and drop it without an answer yes.
+    Ask,
 }
+
+/// An OSC 52 clipboard write the filter asks about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardRequest {
+    /// The selections written, such as `c` for the clipboard.
+    pub targets: String,
+    /// The content, base64.
+    pub data: String,
+}
+
+/// Decides clipboard writes under [`ClipboardPolicy::Ask`]: `true` passes
+/// one.
+pub type ClipboardAsker = Box<dyn FnMut(&ClipboardRequest) -> bool + Send>;
 
 /// The most bytes of a CSI sequence kept; a longer one is dropped whole.
 const MAX_CSI: usize = 256;
@@ -114,9 +130,11 @@ enum State {
 }
 
 /// The streaming escape-sequence filter. See the module documentation.
-#[derive(Debug)]
 pub struct OutputFilter {
     clipboard: ClipboardPolicy,
+    asker: Option<ClipboardAsker>,
+    /// Clipboard writes dropped under [`ClipboardPolicy::Ask`].
+    denied: usize,
     state: State,
     /// The character or sequence in progress: UTF-8 bytes, CSI parameters
     /// and intermediates, an OSC payload, or a DCS header.
@@ -180,17 +198,42 @@ const OFF_BY_DEFAULT: &[u32] = &[
 /// visible cursor.
 const ON_BY_DEFAULT: &[u32] = &[7, 25];
 
+impl std::fmt::Debug for OutputFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutputFilter")
+            .field("clipboard", &self.clipboard)
+            .field("asks", &self.asker.is_some())
+            .field("denied", &self.denied)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
 impl OutputFilter {
     /// A filter in its initial state, applying `clipboard` to OSC 52 writes.
     pub fn new(clipboard: ClipboardPolicy) -> Self {
         OutputFilter {
             clipboard,
+            asker: None,
+            denied: 0,
             state: State::Ground,
             buf: Vec::new(),
             overflow: false,
             last_notification: None,
             left: Leftovers::default(),
         }
+    }
+
+    /// A filter that asks `asker` about each clipboard write.
+    pub fn with_asker(asker: ClipboardAsker) -> Self {
+        let mut filter = OutputFilter::new(ClipboardPolicy::Ask);
+        filter.asker = Some(asker);
+        filter
+    }
+
+    /// How many clipboard writes were dropped for want of a yes.
+    pub fn denied_writes(&self) -> usize {
+        self.denied
     }
 
     /// Filters `input`, appending what may reach the host terminal to `out`.
@@ -732,11 +775,26 @@ impl OutputFilter {
             ("52", Some(rest)) => match rest.split_once(';') {
                 Some((_, "?")) | None => false,
                 Some((targets, data)) => {
-                    self.clipboard == ClipboardPolicy::Allow
-                        && targets.bytes().all(|b| b"cpqs01234567".contains(&b))
+                    let well_formed = targets.bytes().all(|b| b"cpqs01234567".contains(&b))
                         && data
                             .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='));
+                    match self.clipboard {
+                        ClipboardPolicy::Block => false,
+                        ClipboardPolicy::Allow => well_formed,
+                        ClipboardPolicy::Ask if !well_formed => false,
+                        ClipboardPolicy::Ask => {
+                            let request = ClipboardRequest {
+                                targets: targets.to_owned(),
+                                data: data.to_owned(),
+                            };
+                            let yes = self.asker.as_mut().is_some_and(|ask| ask(&request));
+                            if !yes {
+                                self.denied += 1;
+                            }
+                            yes
+                        }
+                    }
                 }
             },
             _ => false,
@@ -976,6 +1034,44 @@ mod tests {
         let data = "A".repeat(MAX_OSC52);
         let big = format!("\x1b]52;c;{data}\x07ok");
         assert_eq!(filter_with(ClipboardPolicy::Allow, big.as_bytes()), b"ok");
+    }
+
+    #[test]
+    fn clipboard_writes_are_asked_about_under_ask() {
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = asked.clone();
+        let mut f = OutputFilter::with_asker(Box::new(move |r: &ClipboardRequest| {
+            log.lock().unwrap().push(r.clone());
+            r.data == "eWVz"
+        }));
+        let mut out = Vec::new();
+        f.feed(
+            b"\x1b]52;c;eWVz\x07\x1b]52;c;bm8=\x07\x1b]52;c;?\x07\x1b]52;c;bad!\x07",
+            &mut out,
+        );
+        assert_eq!(out, b"\x1b]52;c;eWVz\x07");
+        // Reads and malformed writes are never asked about.
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [
+                ClipboardRequest {
+                    targets: "c".into(),
+                    data: "eWVz".into()
+                },
+                ClipboardRequest {
+                    targets: "c".into(),
+                    data: "bm8=".into()
+                },
+            ]
+        );
+        assert_eq!(f.denied_writes(), 1);
+        // Without an asker, every write is denied and counted.
+        let mut f = OutputFilter::new(ClipboardPolicy::Ask);
+        let mut out = Vec::new();
+        f.feed(b"x\x1b]52;c;eWVz\x07y\x1b]52;p;eWVz\x1b\\", &mut out);
+        assert_eq!(out, b"xy");
+        assert_eq!(f.denied_writes(), 2);
+        assert_eq!(OutputFilter::new(ClipboardPolicy::Block).denied_writes(), 0);
     }
 
     #[test]

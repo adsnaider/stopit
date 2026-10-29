@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
@@ -2646,7 +2646,27 @@ impl Server {
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         let mut child = command.spawn().unwrap();
-        let mut stderr = child.stderr.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        Server::collect(child, File::from(OwnedFd::from(stderr)))
+    }
+
+    /// Starts `stopit server` with the terminal `slave` as its stdin and
+    /// stderr, as from a terminal window, and collects what it shows from
+    /// `master`, where the test also types.
+    fn start_on_terminal(s: &Setup, master: &File, slave: File) -> Server {
+        let mut command = s.stopit(&["server"]);
+        command
+            .stdin(slave.try_clone().unwrap())
+            .stdout(Stdio::null())
+            .stderr(slave.try_clone().unwrap());
+        with_controlling_terminal(&mut command, &slave);
+        let child = command.spawn().unwrap();
+        drop(command);
+        drop(slave);
+        Server::collect(child, master.try_clone().unwrap())
+    }
+
+    fn collect(child: Child, mut stderr: File) -> Server {
         let log = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let sink = log.clone();
         thread::spawn(move || {
@@ -3051,4 +3071,77 @@ fn a_server_that_does_not_answer_is_skipped_with_a_warning() {
         stderr(&out).contains("cannot reach the stopit server"),
         "{out:?}"
     );
+}
+
+/// A sandbox that writes "hi" to the clipboard with OSC 52, then `done`.
+const CLIPBOARD_SCRIPT: &str = "printf 'A\\033]52;c;aGk=\\007B'; echo done";
+
+#[test]
+fn clipboard_writes_are_asked_about_on_the_server_terminal() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((server_master, server_slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::with_config(&format!("{config}[terminal]\nclipboard_write = \"ask\"\n"));
+    let server = Server::start_on_terminal(&s, &server_master, server_slave);
+    for (key, passes, verdict) in [(b"y", true, "allowed once"), (b"n", false, "denied")] {
+        let Some((master, slave)) = open_pty() else {
+            return;
+        };
+        let command = s.stopit(&["run", "--quiet", "/bin/sh", "-c", CLIPBOARD_SCRIPT]);
+        let mut t = OnTerminal::spawn(command, master, slave);
+        // The prompt shows on the server's terminal, with what is written.
+        let prompt = server.wait_for_log("[n] deny: ");
+        assert!(prompt.contains("[y] allow once"), "{prompt:?}");
+        assert!(
+            server.log().contains("write 2 bytes to the clipboard (c)"),
+            "{}",
+            server.log()
+        );
+        assert!(server.log().contains("content: hi"), "{}", server.log());
+        // Past the arming delay.
+        thread::sleep(Duration::from_millis(600));
+        (&server_master).write_all(key).unwrap();
+        let out = t.finish();
+        assert_eq!(code(&out), 0, "{out:?}");
+        t.wait_for(b"done", 0);
+        let seen = String::from_utf8_lossy(&t.seen()).into_owned();
+        assert_eq!(
+            seen.contains("\x1b]52;c;aGk=\x07"),
+            passes,
+            "{key:?}: {seen:?}"
+        );
+        assert!(seen.starts_with("AB") != passes, "{seen:?}");
+        server.wait_for_log(verdict);
+        // The next prompt starts after this one's verdict.
+        let log = server.log();
+        let cut = log.rfind(verdict).unwrap();
+        server
+            .log
+            .lock()
+            .unwrap()
+            .replace_range(..cut + verdict.len(), "");
+    }
+}
+
+#[test]
+fn a_standalone_run_blocks_clipboard_asks_and_says_so() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((master, slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::with_config(&format!("{config}[terminal]\nclipboard_write = \"ask\"\n"));
+    let command = s.stopit(&["run", "--quiet", "/bin/sh", "-c", CLIPBOARD_SCRIPT]);
+    let mut t = OnTerminal::spawn(command, master, slave);
+    let out = t.finish();
+    assert_eq!(code(&out), 0, "{out:?}");
+    let at = t.wait_for(b"done", 0);
+    t.wait_for(b"1 clipboard write(s) blocked", at);
+    let seen = String::from_utf8_lossy(&t.seen()).into_owned();
+    assert!(seen.starts_with("ABdone"), "{seen:?}");
+    assert!(!seen.contains("]52;"), "{seen:?}");
 }

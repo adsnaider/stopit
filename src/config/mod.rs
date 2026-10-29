@@ -659,7 +659,7 @@ impl From<MapOnly<RawTerminal>> for Terminal {
 }
 
 /// Policy for OSC 52 clipboard writes from the sandbox (DESIGN.md §5.3).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ClipboardWrite {
     /// Drop clipboard writes.

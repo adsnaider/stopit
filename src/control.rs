@@ -3,9 +3,10 @@
 //!
 //! The server listens on a Unix stream socket in its session's private
 //! `control/` directory and accepts connections only from its own user
-//! ([`peer_uid`]). A client first sends one byte carrying the three
-//! descriptors that become the sandbox's stdin, stdout and stderr
-//! ([`send_stdio`]), then frames, each a 4-byte big-endian length and that
+//! ([`peer_uid`]). A client that runs a command first sends one byte
+//! carrying the three descriptors that become the sandbox's stdin, stdout
+//! and stderr ([`send_stdio`]). One that asks for an approval sends one
+//! other byte ([`send_approval_hello`]). Then come frames, each a 4-byte big-endian length and that
 //! many bytes of JSON, at most [`MAX_FRAME`]. Byte strings, which need not
 //! be UTF-8, travel as hex.
 
@@ -46,6 +47,14 @@ pub enum ClientMessage {
         /// The signal number.
         signal: i32,
     },
+    /// Ask the user about `request` from a sandbox of `profile`, on an
+    /// approval connection.
+    Approve {
+        /// The profile the sandbox runs in.
+        profile: String,
+        /// What it asks for.
+        request: crate::approval::ApprovalRequest,
+    },
 }
 
 /// What the server tells a client.
@@ -57,9 +66,14 @@ pub enum ServerMessage {
     Started {
         /// The lines.
         lines: Vec<String>,
-        /// Whether the client's output filter passes OSC 52 clipboard
-        /// writes (`terminal.clipboard_write = "allow"`).
-        clipboard_allow: bool,
+        /// What the client's output filter does with OSC 52 clipboard
+        /// writes (`terminal.clipboard_write`).
+        clipboard: crate::config::ClipboardWrite,
+    },
+    /// The answer to an approval request.
+    Decision {
+        /// Whether it is allowed.
+        allow: bool,
     },
     /// The sandbox ended; exit with this status.
     Exit {
@@ -210,10 +224,25 @@ pub fn send_stdio(sock: &UnixStream, fds: [BorrowedFd<'_>; 3]) -> io::Result<()>
     }
 }
 
-/// Receives the byte [`send_stdio`] sends and exactly three descriptors
-/// with it, close-on-exec. Anything else is an error, and every descriptor
-/// received is closed.
-pub fn recv_stdio(sock: &UnixStream) -> io::Result<[OwnedFd; 3]> {
+/// Starts an approval connection: one byte, no descriptors.
+pub fn send_approval_hello(mut sock: &UnixStream) -> io::Result<()> {
+    sock.write_all(b"A")
+}
+
+/// What a connection is for, from its first byte.
+#[derive(Debug)]
+pub enum Hello {
+    /// Running a command on these stdin, stdout and stderr.
+    Run([OwnedFd; 3]),
+    /// Asking for an approval.
+    Approve,
+}
+
+/// Receives the first byte of a connection: [`send_stdio`]'s, with exactly
+/// three descriptors, close-on-exec, or [`send_approval_hello`]'s, with
+/// none. Anything else is an error, and every descriptor received is
+/// closed.
+pub fn recv_hello(sock: &UnixStream) -> io::Result<Hello> {
     let mut byte = [0u8; 1];
     let mut iov = libc::iovec {
         iov_base: byte.as_mut_ptr().cast(),
@@ -257,6 +286,9 @@ pub fn recv_stdio(sock: &UnixStream) -> io::Result<[OwnedFd; 3]> {
         }
         (n, msg.msg_flags)
     };
+    if n == 1 && byte[0] == b'A' && received.is_empty() && flags & libc::MSG_CTRUNC == 0 {
+        return Ok(Hello::Approve);
+    }
     if n != 1 || byte[0] != b'F' || flags & libc::MSG_CTRUNC != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -264,7 +296,7 @@ pub fn recv_stdio(sock: &UnixStream) -> io::Result<[OwnedFd; 3]> {
         ));
     }
     let count = received.len();
-    received.try_into().map_err(|_| {
+    received.try_into().map(Hello::Run).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("the client sent {count} descriptors instead of 3"),
@@ -332,7 +364,9 @@ mod tests {
         let (a, b) = UnixStream::pair().unwrap();
         let (r, w) = std::io::pipe().unwrap();
         send_stdio(&a, [r.as_fd(), w.as_fd(), w.as_fd()]).unwrap();
-        let [fd0, fd1, _fd2] = recv_stdio(&b).unwrap();
+        let Hello::Run([fd0, fd1, _fd2]) = recv_hello(&b).unwrap() else {
+            panic!("not a run")
+        };
         for fd in [&fd0, &fd1] {
             assert!(
                 rustix::io::fcntl_getfd(fd)
@@ -348,7 +382,11 @@ mod tests {
         // A plain byte without descriptors is refused.
         let (mut a, b) = UnixStream::pair().unwrap();
         a.write_all(b"F").unwrap();
-        assert!(recv_stdio(&b).is_err());
+        assert!(recv_hello(&b).is_err());
+        // The approval byte comes without descriptors.
+        let (a, b) = UnixStream::pair().unwrap();
+        send_approval_hello(&a).unwrap();
+        assert!(matches!(recv_hello(&b).unwrap(), Hello::Approve));
         assert_eq!(peer_uid(&b).unwrap(), rustix::process::getuid().as_raw());
     }
 
@@ -411,10 +449,10 @@ mod tests {
     fn anything_but_three_descriptors_and_the_marker_is_refused() {
         let (r, _w) = std::io::pipe().unwrap();
         let fd = r.as_raw_fd();
-        for (byte, count) in [(b'F', 2), (b'F', 4), (b'F', 12), (b'X', 3)] {
+        for (byte, count) in [(b'F', 2), (b'F', 4), (b'F', 12), (b'X', 3), (b'A', 1)] {
             let (a, b) = UnixStream::pair().unwrap();
             send_raw(&a, byte, &vec![fd; count]);
-            let e = recv_stdio(&b).unwrap_err();
+            let e = recv_hello(&b).unwrap_err();
             assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{byte} {count}: {e}");
         }
     }

@@ -972,13 +972,24 @@ impl LoadedSession {
         )?)
     }
 
-    /// The OSC 52 policy for the session's output filter.
+    /// The OSC 52 policy for a standalone run's output filter. `ask` has no
+    /// one to ask there, and denies every write.
     pub(crate) fn clipboard(&self) -> ClipboardPolicy {
         match self.config.terminal.clipboard_write {
             ClipboardWrite::Allow => ClipboardPolicy::Allow,
-            // TODO(§5.2): `ask` needs a prompt; until then it blocks.
-            ClipboardWrite::Block | ClipboardWrite::Ask => ClipboardPolicy::Block,
+            ClipboardWrite::Block => ClipboardPolicy::Block,
+            ClipboardWrite::Ask => ClipboardPolicy::Ask,
         }
+    }
+
+    /// The session's `terminal.clipboard_write`.
+    pub(crate) fn clipboard_write(&self) -> ClipboardWrite {
+        self.config.terminal.clipboard_write
+    }
+
+    /// The session's `approval.timeout`.
+    pub(crate) fn approval_timeout(&self) -> crate::config::ApprovalTimeout {
+        self.config.approval.timeout
     }
 }
 
@@ -1211,6 +1222,8 @@ pub(crate) struct SandboxTerminal {
     /// last, after the relay's final output.
     raw: Option<RawMode>,
     clipboard: ClipboardPolicy,
+    /// Who decides clipboard writes under [`ClipboardPolicy::Ask`].
+    asker: Option<crate::filter::ClipboardAsker>,
 }
 
 impl SandboxTerminal {
@@ -1241,6 +1254,7 @@ impl SandboxTerminal {
             keys_from: input,
             raw: None,
             clipboard,
+            asker: None,
         })
     }
 
@@ -1265,14 +1279,24 @@ impl SandboxTerminal {
         self.clipboard = clipboard;
     }
 
+    /// Asks `asker` about each clipboard write.
+    pub(crate) fn set_asker(&mut self, asker: crate::filter::ClipboardAsker) {
+        self.clipboard = ClipboardPolicy::Ask;
+        self.asker = Some(asker);
+    }
+
     /// Starts relaying once the sandbox has its copies of the slave. The
     /// relay takes the master, the slave and the host terminal.
     pub(crate) fn start_relay(&mut self) -> Option<PtyRelay> {
+        let filter = match self.asker.take() {
+            Some(asker) => OutputFilter::with_asker(asker),
+            None => OutputFilter::new(self.clipboard),
+        };
         Some(PtyRelay::new(
             self.master.take()?,
             self.slave.take()?,
             self.host.take()?,
-            OutputFilter::new(self.clipboard),
+            filter,
         ))
     }
 }
@@ -1390,11 +1414,16 @@ fn wait_foreground(
         }
     }
     let status = child.wait().map_err(RunError::Spawn)?;
-    if let Some(r) = relay {
-        r.finish();
-    }
+    let denied = relay.map_or(0, PtyRelay::finish);
     // Restores the host terminal's settings, after the last output.
     drop(terminal);
+    if denied > 0 {
+        eprintln!(
+            "stopit: warning: {denied} clipboard write(s) blocked; with \
+             terminal.clipboard_write = \"ask\", run `stopit server` in the workspace to \
+             approve them"
+        );
+    }
     let json_status = read_nonblocking_status(status_reader);
     Ok(bwrap_exit_code(status, &json_status))
 }

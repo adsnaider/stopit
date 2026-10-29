@@ -502,7 +502,7 @@ The same four decisions are used for brokered-tool approvals (§7.4), where "per
 
 ### 5.2 State Machine
 
-The overlay below is not built. Without a screen model the supervisor cannot repaint the sandbox's screen after drawing on it, so approval prompts are to move to a separate supervisor terminal instead (§11).
+The overlay below is not built. Without a screen model the supervisor cannot repaint the sandbox's screen after drawing on it, so approval prompts appear on the terminal of `stopit server` instead (§5.4, §5.5).
 
 ```mermaid
 stateDiagram-v2
@@ -544,7 +544,7 @@ Raw sandbox output reaching the host terminal is an escape channel: OSC 52 can s
 | OSC 9;4 progress | Allow | Updates a progress indicator only |
 | OSC 133 prompt marks | Allow | Emitted by fish 4 and others |
 | OSC 52 clipboard **read** | Always block | Would leak the host clipboard |
-| OSC 52 clipboard **write** | Block (`[terminal] clipboard_write = "block" \| "allow" \| "ask"`; `ask` shows the content) | Malicious paste risk |
+| OSC 52 clipboard **write** | Block (`[terminal] clipboard_write = "block" \| "allow" \| "ask"`). `ask` prompts on the server's terminal with the content, and blocks in a standalone run, which warns after the command how many it blocked | Malicious paste risk |
 | OSC 7 (cwd) | Drop | Sandbox paths are meaningless on the host |
 | OSC 1337, OSC 5113, every APC, PM and SOS string including all kitty graphics, DCS other than sixel and the DECRQSS and XTGETTCAP queries | Block | File transfer, host file reads, `DCS tmux;` passthrough bypassing an outer tmux's filter |
 | CSI 20t / 21t (title report) | Block | Classic input-injection vector |
@@ -555,12 +555,15 @@ TIOCSTI from inside the sandbox only reaches the sandbox's own PTY and is harmle
 
 ### 5.4 Approval Prompt Safeguards
 
-* **Ground truth:** prompts display resolved facts, not sandbox claims: the exact binary path, arguments, working directory, capability delta; for pushes, the resolved remote URL plus the commits and bookmarks being pushed; for protected files, the diff.
-* **No typeahead:** pending host input is flushed and keys are ignored for a short arming delay when an overlay opens, so keystrokes meant for the program cannot land on `y`.
-* **Rate limiting:** repeated requests are coalesced or throttled to prevent approval fatigue.
-* **Unforgeable marker:** the sandbox can draw anything in its own screen, including a fake prompt. The overlay carries a per-session secret word/color chosen at startup and shown in the supervisor's startup banner, so a genuine prompt is recognizable.
-* **Precise session rules:** "Allow for this session" matches exactly the displayed scope (e.g. this remote *and* this bookmark), not the whole subcommand.
-* **Deny feedback:** brokered commands return exit code `126` with `[stopit: denied by user]` on stderr; file writes return `EROFS` (§4.3).
+Approval prompts appear on the terminal of `stopit server`, which no sandbox can write to. A run attached to the server sends each request over a connection of its own to the control socket, and the server asks about one request at a time. Only OSC 52 clipboard writes under `clipboard_write = "ask"` ask today. Brokered commands and `stopit-grant` will use the same prompt (§7). A standalone run has no one to ask, so it denies every request and says how many it denied after the command.
+
+* **Ground truth:** prompts display resolved facts, not sandbox claims. A clipboard write shows its byte count, its selections, and up to 200 characters of its content, escaped. Planned prompts show the exact binary path, arguments, working directory and capability delta; for pushes, the resolved remote URL plus the commits and bookmarks being pushed.
+* **No typeahead:** the prompt rings the bell, discards pending input on the server's terminal, waits 300 ms, and discards it again before reading one key, so keystrokes meant for something else cannot land on `y`.
+* **Answers:** `y` allows once, `s` allows for the rest of the session within the request's scope, and any other key, Ctrl-C and Escape included, denies. So does `approval.timeout` passing, the client going away, the server stopping, or a server without a terminal on stdin.
+* **Rate limiting:** after a denial, requests in the same scope are denied without a prompt for five seconds, so a sandbox cannot bury the user in prompts.
+* **Unforgeable by construction:** the sandbox draws only on its own PTY, and the prompt is in another window, so no secret marker is needed.
+* **Precise session rules:** "Allow for this session" matches exactly the displayed scope, here clipboard writes from that profile. Planned broker rules use this remote *and* this bookmark, not the whole subcommand. Session answers live in the server's memory and end with it. Writing them to `.stopit.toml` is planned with the broker, whose rules are what one would persist.
+* **Deny feedback:** a denied clipboard write is dropped. Brokered commands will return exit code `126` with `[stopit: denied by user]` on stderr.
 
 ### 5.5 `stopit server`
 
@@ -915,7 +918,7 @@ Session-wide, so not a provider setting. Off unless configured. Applied by launc
   * **Sandbox-`HOME` stubs** (§6.2 step 4): the spec has no content for them yet (e.g. a `.gitconfig` with `user.name`/`user.email`), so none is generated. The synthesized `/etc` files are.
   * **Protected files** in §4 remain strict read-only kernel binds returning `EROFS`, without the FUSE shadow or `rename*` `SECCOMP_RET_USER_NOTIF` listener in §4.1.
 * **`stopit run` / `stopit shell` are incomplete** (§5). They find the workspace and its `.stopit.toml`, check that the user allowed it (§3), run the providers, compile the session, and run the command in `main` or `--profile`'s sandbox on the host's stdio, but:
-  * **No approval prompts yet.** The PTY proxy of §5.1, the filter of §5.3 and `stopit server` of §5.5 run, but nothing asks for approval yet, so `clipboard_write = "ask"` blocks for now. Approval prompts are planned on the server's terminal instead of the overlay of §5.2.
+  * **Only clipboard writes ask.** The prompt of §5.4 works, but the broker and `stopit-grant` that would ask about commands and capabilities are not built yet. A clipboard prompt holds up the sandbox's output, and its client's keys, until it is answered.
   * **`stopit server` does not reload.** A changed configuration needs a server restart, and script providers run only when it starts (§5.5).
   * **`ttyname` fails inside the sandbox.** The slave belongs to the host's devpts instance, while the sandbox mounts a fresh one, so `/proc/self/fd/0` names a `/dev/pts/N` that does not exist there or is another terminal. `tty` prints nothing useful, and `GPG_TTY=$(tty)` breaks. `/dev/tty` works.
   * **stopit reads the terminal while stdin is one.** In `stopit run git log | less`, stopit and `less` both read the terminal, as with `ssh` without `-n`. Run such commands with `</dev/null`.
