@@ -185,6 +185,43 @@ impl fmt::Display for Flag {
     }
 }
 
+/// An argument a shim puts before the caller's, such as `--no-pager`.
+///
+/// Non-empty, and containing no NUL.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(try_from = "String")]
+pub struct ShimArg(String);
+
+impl ShimArg {
+    /// The validated argument.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for ShimArg {
+    type Err = ValueError;
+
+    fn from_str(s: &str) -> Result<Self, ValueError> {
+        let bad = |why: &str| ValueError::new(format!("invalid shim argument {s:?}: {why}"));
+        if s.is_empty() {
+            return Err(bad("must not be empty"));
+        }
+        if s.contains('\0') {
+            return Err(bad("must not contain NUL bytes"));
+        }
+        Ok(ShimArg(s.to_owned()))
+    }
+}
+
+impl TryFrom<String> for ShimArg {
+    type Error = ValueError;
+
+    fn try_from(s: String) -> Result<Self, ValueError> {
+        s.parse()
+    }
+}
+
 /// A subcommand to match, such as `status`, `op log`, `git push` or
 /// `bookmark *`.
 ///
@@ -377,6 +414,8 @@ impl TryFrom<MapOnly<RawShimRule>> for ShimRule {
 pub struct ShimSpec {
     /// The program to run, resolved in the target profile's `PATH`.
     pub binary: BinaryName,
+    /// Arguments put before the caller's, which the rules never see.
+    pub args: Vec<ShimArg>,
     /// Flags refused for every invocation.
     pub deny_flags: Vec<Flag>,
     /// What to do with subcommands no rule covers.
@@ -390,6 +429,8 @@ pub struct ShimSpec {
 struct RawShimSpec {
     binary: BinaryName,
     #[serde(default)]
+    args: Vec<ShimArg>,
+    #[serde(default)]
     deny_flags: Vec<Flag>,
     default: ShimAction,
     #[serde(default)]
@@ -400,6 +441,7 @@ impl From<MapOnly<RawShimSpec>> for ShimSpec {
     fn from(MapOnly(raw): MapOnly<RawShimSpec>) -> Self {
         ShimSpec {
             binary: raw.binary,
+            args: raw.args,
             deny_flags: raw.deny_flags,
             default: raw.default,
             rules: raw.rules,
@@ -448,9 +490,35 @@ mod tests {
     fn spec(binary: &str, deny: &[&str], default: ShimAction, rules: Vec<ShimRule>) -> ShimSpec {
         ShimSpec {
             binary: binary.parse().unwrap(),
+            args: Vec::new(),
             deny_flags: flags(deny),
             default,
             rules,
+        }
+    }
+
+    #[test]
+    fn shim_args_go_before_the_callers() {
+        let m = toml_ok(
+            r#"
+            [shims.jj]
+            binary = "jj"
+            args = ["--no-pager", "-R", "/workspace"]
+            default = { decision = "ask", profile = "main" }
+            "#,
+        );
+        let spec = &m.grants.shims[&"jj".parse::<ShimName>().unwrap()];
+        assert_eq!(
+            spec.args.iter().map(ShimArg::as_str).collect::<Vec<_>>(),
+            ["--no-pager", "-R", "/workspace"]
+        );
+        // No arguments by default.
+        assert!(cargo_publish_expected().args.is_empty());
+        for bad in [r#"args = [""]"#, r#"args = ["a\u0000b"]"#, r#"args = "x""#] {
+            let text = format!(
+                "[shims.jj]\nbinary = \"jj\"\n{bad}\ndefault = {{ decision = \"deny\" }}\n"
+            );
+            assert!(toml::from_str::<Manifest>(&text).is_err(), "{bad}");
         }
     }
 

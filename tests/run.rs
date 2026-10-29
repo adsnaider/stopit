@@ -4103,11 +4103,19 @@ fn git_runs_through_the_broker_while_main_sees_no_metadata() {
     .unwrap();
     host_git(&s.ws(), &["init", "-q", "-b", "main"]);
     fs::write(s.ws().join("a.txt"), "a\n").unwrap();
+    // A repository below the workspace, as `main` could make one, which git
+    // would find first from `sub`.
+    let sub = s.ws().join("sub");
+    fs::create_dir(&sub).unwrap();
+    host_git(&sub, &["init", "-q", "-b", "main"]);
+    host_git(&sub, &["commit", "-q", "--allow-empty", "-m", "forged"]);
     let script = "ls -A .git | wc -l; \
                   git add a.txt && GIT_AUTHOR_NAME=x git -c user.name=x commit -qm one; \
                   echo \"inject=$?\"; \
                   git commit -qm one --author='A <a@a>'; echo \"commit=$?\"; \
                   git log --format=%s; \
+                  (cd sub && git log --format=%s); \
+                  git commit -q --allow-empty 2>/dev/null; echo \"editor=$?\"; \
                   git rebase main; echo \"rebase=$?\"; \
                   git push origin main; echo \"push=$?\"; \
                   echo 'x' > .git/config; echo \"write=$?\"";
@@ -4117,7 +4125,9 @@ fn git_runs_through_the_broker_while_main_sees_no_metadata() {
     // The mask: an empty `.git`, which cannot be written.
     assert!(shown.starts_with("0\n"), "{shown}");
     assert!(shown.contains("inject=126\n"), "{shown}");
-    assert!(shown.contains("commit=0\none\n"), "{shown}");
+    // From `sub`, git still uses the workspace's repository, and it starts
+    // no editor.
+    assert!(shown.contains("commit=0\none\none\neditor=1\n"), "{shown}");
     // Asked about, with no server to ask; denied outright.
     assert!(shown.contains("rebase=126\n"), "{shown}");
     assert!(shown.contains("push=126\n"), "{shown}");

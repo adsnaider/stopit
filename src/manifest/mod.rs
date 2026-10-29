@@ -38,7 +38,9 @@ use crate::serde_util::MapOnly;
 pub use env::{EnvGrants, EnvName, EnvPattern, EnvValue, SearchPathEntry};
 pub use network::{Domain, NetworkGrants};
 pub use sandbox::{OptInSyscall, SandboxGrants, ShareableNamespace};
-pub use shim::{BinaryName, Flag, ShimAction, ShimName, ShimRule, ShimSpec, SubcommandPattern};
+pub use shim::{
+    BinaryName, Flag, ShimAction, ShimArg, ShimName, ShimRule, ShimSpec, SubcommandPattern,
+};
 pub use system::{DevMode, EtcFile, SandboxHome, SystemGrants};
 
 /// Error produced while loading a manifest document from JSON.

@@ -477,6 +477,7 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
     })?;
     // What runs, the shim's binary with the arguments.
     let command_line: String = std::iter::once(spec.binary.as_str().as_bytes())
+        .chain(spec.args.iter().map(|a| a.as_str().as_bytes()))
         .chain(args.iter().map(Vec::as_slice))
         .map(crate::escape::shell_quote)
         .collect::<Vec<_>>()
@@ -522,6 +523,7 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
     let (dev, ino) = check_cwd(ctx.loaded.workspace_dir(), &rel, cwd_fd.as_fd())?;
     drop(cwd_fd);
     let mut command = vec![OsString::from(spec.binary.as_str())];
+    command.extend(spec.args.iter().map(|a| OsString::from(a.as_str())));
     command.extend(args.into_iter().map(OsString::from_vec));
     let start = crate::init::StartDir {
         path: ctx.loaded.workspace_mount().join(&rel),
@@ -857,6 +859,7 @@ mod tests {
     fn spec(deny: &[&str], rules: Vec<ShimRule>, default: (Decision, Option<&str>)) -> ShimSpec {
         ShimSpec {
             binary: "git".parse().unwrap(),
+            args: Vec::new(),
             deny_flags: deny.iter().map(|f| f.parse::<Flag>().unwrap()).collect(),
             default: ShimAction {
                 decision: default.0,

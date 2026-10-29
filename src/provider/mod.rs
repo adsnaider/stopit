@@ -65,15 +65,6 @@ pub struct ProviderOutput {
 /// Error produced while running a provider.
 #[derive(Debug, Error)]
 pub enum ProviderError {
-    /// The `vcs` provider cannot express the repository's layout.
-    #[error("provider {name:?}: {reason}")]
-    Vcs {
-        /// Its name.
-        name: ProviderName,
-        /// Why.
-        reason: String,
-    },
-
     /// The provider type exists in the configuration schema but has no
     /// implementation yet.
     #[error("provider type {kind:?} (entry {name:?}) is not implemented yet")]
@@ -323,6 +314,15 @@ pub enum ProviderError {
         key: String,
         /// Why it cannot be converted.
         reason: &'static str,
+    },
+
+    /// The `vcs` provider cannot express the repository's layout.
+    #[error("provider {name:?}: {reason}")]
+    Vcs {
+        /// Its name.
+        name: ProviderName,
+        /// Why.
+        reason: String,
     },
 }
 
