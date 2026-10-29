@@ -4131,10 +4131,7 @@ fn git_runs_through_the_broker_while_main_sees_no_metadata() {
     assert!(shown.contains("commit=0\none\none\neditor=1\n"), "{shown}");
     // Nor a signing program, which would read configuration from a home
     // `main` can write.
-    assert!(
-        shown.contains("sign=") && !shown.contains("sign=0"),
-        "{shown}"
-    );
+    assert!(shown.contains("sign=128\n"), "{shown}");
     // Asked about, with no server to ask; denied outright.
     assert!(shown.contains("rebase=126\n"), "{shown}");
     assert!(shown.contains("push=126\n"), "{shown}");
@@ -4157,6 +4154,32 @@ fn git_runs_through_the_broker_while_main_sees_no_metadata() {
     let config = fs::read_to_string(s.ws().join(".git/config")).unwrap();
     assert!(config.contains("[core]"), "{config}");
     assert!(s.no_session_left());
+}
+
+#[test]
+fn the_vcs_profiles_have_a_home_main_cannot_write() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    if !sandbox_has("git") {
+        eprintln!("skipping: no git in /usr/bin or /bin");
+        return;
+    }
+    // A shim of the test's own into vcs.local, to look around there.
+    let s = Setup::with_config(&format!(
+        "{config}[[provider]]\ntype = \"config\"\nname = \"look\"\n[provider.sandbox]\n\
+         shims.in-vcs = {{ binary = \"sh\", default = {{ decision = \"allow\", profile = \"vcs.local\" }} }}\n"
+    ));
+    host_git(&s.ws(), &["init", "-q", "-b", "main"]);
+    let script = "echo \"main $HOME\"; echo planted > ~/.gitconfig; \
+                  in-vcs -c 'echo \"vcs $HOME $(ls -A \"$HOME\" | wc -l)\"; \
+                  grep -c \"^user:.*:/home/vcs:\" /etc/passwd'";
+    let out = output(s.stopit(&["run", "--quiet", "/bin/sh", "-c", script]), b"");
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "main /home/user\nvcs /home/vcs 0\n1\n"
+    );
 }
 
 /// Runs `jj args` on the host in `dir`, with no user configuration.

@@ -476,7 +476,6 @@ impl VcsProvider {
         set("GIT_PAGER", "cat".into());
         set("JJ_CONFIG", "/dev/null".into());
         set("JJ_EDITOR", "false".into());
-        set("HOME", VCS_HOME.into());
         set("GNUPGHOME", format!("{VCS_HOME}/.gnupg-unused"));
         let mut config: Vec<(&str, &str)> = SAFE_GIT_CONFIG.to_vec();
         for (key, value) in identity {
@@ -498,9 +497,14 @@ impl VcsProvider {
         // (`git --no-pager push` takes the default) still reaches no remote
         // over the network.
         let offline = || Value::Table(table([("mode", "none".into())]));
+        // `system.home` sets `HOME` and the home in `/etc/passwd`, and
+        // the profiles' own `ephemeral` rule for it beats the `~` they
+        // inherit, whose backing directory `main` shares.
         let home = || list(vec![VCS_HOME.to_owned()]);
+        let system = || Value::Table(table([("home", VCS_HOME.into())]));
         let mut ro = toml::Table::new();
         ro.insert("network".into(), offline());
+        ro.insert("system".into(), system());
         ro.insert(
             "fs".into(),
             Value::Table(table([
@@ -522,6 +526,7 @@ impl VcsProvider {
         }
         let mut local = toml::Table::new();
         local.insert("network".into(), offline());
+        local.insert("system".into(), system());
         local.insert("fs".into(), Value::Table(local_fs));
         local.insert(
             "env".into(),
@@ -904,7 +909,10 @@ mod tests {
             assert_eq!(env(p, "GIT_CONFIG_KEY_11"), Some("user.name"));
             assert_eq!(env(p, "GIT_CONFIG_VALUE_11"), Some("Ann"));
             // A home of their own, which `main` never sees.
-            assert_eq!(env(p, "HOME"), Some(VCS_HOME));
+            assert_eq!(
+                p.grants.system.home.as_ref().map(|h| h.as_str()),
+                Some(VCS_HOME)
+            );
             assert_eq!(env(p, "GNUPGHOME"), Some("/home/vcs/.gnupg-unused"));
             assert_eq!(patterns(&p.grants.fs.ephemeral), [VCS_HOME]);
         }
