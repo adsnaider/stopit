@@ -60,8 +60,10 @@ const SAFE_GIT_CONFIG: [(&str, &str); 11] = [
 /// shared home.
 const VCS_HOME: &str = "/home/vcs";
 
-/// Where jj keeps repository configuration outside the repository.
-const JJ_REPO_CONFIG: &str = "~/.config/jj/repos";
+/// `XDG_CONFIG_HOME` in the VCS profiles: inside their own home, at a path
+/// no `~` grant of `main` names, so jj's repository configuration
+/// (`jj/repos`) and git's attributes and ignore files there are their own.
+const VCS_XDG_CONFIG: &str = "/home/vcs/.xdg-config";
 
 /// The `vcs` provider.
 #[derive(Debug, Clone)]
@@ -429,7 +431,7 @@ impl VcsProvider {
             }
         }
         let mut locked = Vec::new();
-        let mut hooks = Vec::new();
+        let mut masked = Vec::new();
         for dir in &layout.git_dirs {
             for file in ["config", "config.worktree", "info/attributes"] {
                 if is_present(&dir.join(file)) {
@@ -438,13 +440,13 @@ impl VcsProvider {
             }
             if is_real_dir(&dir.join("modules")) {
                 locked.push(format!("{}/modules/*/config", path(dir)?));
-                hooks.push(format!("{}/modules/*/hooks", path(dir)?));
+                masked.push(format!("{}/modules/*/hooks", path(dir)?));
             }
             if is_real_dir(&dir.join("worktrees")) {
                 locked.push(format!("{}/worktrees/*/config.worktree", path(dir)?));
             }
             if is_present(&dir.join("hooks")) {
-                hooks.push(path(&dir.join("hooks"))?);
+                masked.push(path(&dir.join("hooks"))?);
             }
         }
         if let Some(dot_jj) = &layout.dot_jj {
@@ -480,6 +482,7 @@ impl VcsProvider {
         set("JJ_CONFIG", "/dev/null".into());
         set("JJ_EDITOR", "false".into());
         set("GNUPGHOME", format!("{VCS_HOME}/.gnupg-unused"));
+        set("XDG_CONFIG_HOME", VCS_XDG_CONFIG.into());
         let mut config: Vec<(&str, &str)> = SAFE_GIT_CONFIG.to_vec();
         for (key, value) in identity {
             config.push((key, value));
@@ -513,7 +516,6 @@ impl VcsProvider {
             Value::Table(table([
                 ("ro", list(storage.clone())),
                 ("ephemeral", home()),
-                ("masked", list(vec![JJ_REPO_CONFIG.to_owned()])),
             ])),
         );
         ro.insert(
@@ -525,11 +527,9 @@ impl VcsProvider {
         if !locked.is_empty() {
             local_fs.insert("ro".into(), list(locked));
         }
-        // jj reads repository configuration from the user's
-        // `~/.config/jj/repos`, which a grant of `main` covering `~/.config`
-        // would let `main` write.
-        hooks.push(JJ_REPO_CONFIG.to_owned());
-        local_fs.insert("masked".into(), list(hooks));
+        if !masked.is_empty() {
+            local_fs.insert("masked".into(), list(masked));
+        }
         let mut local = toml::Table::new();
         local.insert("network".into(), offline());
         local.insert("system".into(), system());
@@ -891,7 +891,7 @@ mod tests {
         assert_eq!(patterns(&local.grants.fs.ro), ["{workspace}/.git/config"]);
         assert_eq!(
             patterns(&local.grants.fs.masked),
-            ["{workspace}/.git/hooks", JJ_REPO_CONFIG]
+            ["{workspace}/.git/hooks"]
         );
         let ro = profile(&m, "ro");
         assert_eq!(patterns(&ro.grants.fs.ro), ["{workspace}/.git"]);
@@ -920,6 +920,7 @@ mod tests {
                 Some(VCS_HOME)
             );
             assert_eq!(env(p, "GNUPGHOME"), Some("/home/vcs/.gnupg-unused"));
+            assert_eq!(env(p, "XDG_CONFIG_HOME"), Some(VCS_XDG_CONFIG));
             assert_eq!(patterns(&p.grants.fs.ephemeral), [VCS_HOME]);
         }
         // No jj repository, no jj shim.
