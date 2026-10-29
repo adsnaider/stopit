@@ -1110,6 +1110,9 @@ fn wait_foreground(
         Err(e) if relay.is_some() => {
             kill_child(libc::SIGKILL);
             let _ = child.wait();
+            if let Some(r) = relay {
+                r.finish();
+            }
             return Err(RunError::Pty(io::Error::other(format!(
                 "cannot wait for bwrap and relay its terminal: pidfd_open failed: {e}"
             ))));
@@ -1150,9 +1153,10 @@ fn wait_foreground(
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => {
-                    if relay.is_some() {
+                    if let Some(r) = relay {
                         kill_child(libc::SIGKILL);
                         let _ = child.wait();
+                        r.finish();
                         return Err(RunError::Pty(e));
                     }
                     break;

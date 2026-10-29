@@ -168,11 +168,11 @@ const ALT_SCREENS: [u32; 3] = [47, 1047, 1049];
 
 /// DEC private modes that are off in a fresh terminal and outlast a
 /// program: cursor keys, reverse video, origin, X10 and later mouse
-/// reporting, focus events, alternate scroll, numeric keypad, the
-/// alternate screens, bracketed paste, synchronized output, theme change
+/// reporting, numeric keypad, left and right margins, focus events,
+/// alternate scroll, the alternate screens, bracketed paste, synchronized output, theme change
 /// and in-band resize reports.
 const OFF_BY_DEFAULT: &[u32] = &[
-    1, 5, 6, 9, 47, 66, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1015, 1016, 1047, 1049,
+    1, 5, 6, 9, 47, 66, 69, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1015, 1016, 1047, 1049,
     2004, 2026, 2031, 2048,
 ];
 
@@ -577,6 +577,21 @@ impl OutputFilter {
             }
             // DECSCL can turn on 8-bit replies.
             (b'p', _, b"\"") => return,
+            // Modes behind other private markers, and xterm's key modifier
+            // switches that the restore does not undo.
+            (b'h' | b'l', Some(b'>' | b'=' | b'<'), _) => return,
+            (b'n' | b'f', Some(b'>'), []) => return,
+            // XTRESTORE can bring back any saved mode: each tracked one it
+            // names counts as changed, and the restore undoes it either way.
+            (b'r', Some(b'?'), []) => {
+                for mode in numbers.iter().flatten() {
+                    if OFF_BY_DEFAULT.contains(mode) {
+                        self.left.on.insert(*mode);
+                    } else if ON_BY_DEFAULT.contains(mode) {
+                        self.left.off.insert(*mode);
+                    }
+                }
+            }
             (b'h' | b'l', Some(b'?'), []) => {
                 let was_alt = self.left.on_alt_screen();
                 for mode in numbers.iter().flatten() {
@@ -1248,6 +1263,25 @@ mod tests {
         assert_eq!(restore_after(b"\x1b[=5;1u"), "\x1b[=0u");
         assert_eq!(restore_after(b"\x1b[=5;1u\x1b[=0u"), "");
         assert_eq!(restore_after(b"\x1b[?1049h\x1b[=1u"), "\x1b[=0u\x1b[?1049l");
+    }
+
+    #[test]
+    fn xtrestore_and_margins_are_restored_and_other_switches_dropped() {
+        assert_eq!(
+            restore_after(b"\x1b[?2048h\x1b[?2048s\x1b[?2048l\x1b[?2048;7;9999r"),
+            "\x1b[?2048l\x1b[?7h"
+        );
+        assert_eq!(restore_after(b"\x1b[?69h"), "\x1b[?69l");
+        passes(b"\x1b[?2048s");
+        for seq in [
+            &b"\x1b[>1n"[..],
+            b"\x1b[>4f",
+            b"\x1b[>1h",
+            b"\x1b[=1l",
+            b"\x1b[<1h",
+        ] {
+            dropped(seq);
+        }
     }
 
     #[test]

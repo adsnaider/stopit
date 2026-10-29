@@ -68,23 +68,36 @@ fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
     Ok(())
 }
 
-/// A descriptor of the terminal `fd` of its own, non-blocking.
+/// A non-blocking descriptor of the terminal `fd`, and whether it shares
+/// its file description with `fd`.
 ///
 /// The file description behind the supervisor's stdio is shared with the
 /// shell that started it, so setting `O_NONBLOCK` there would change the
 /// shell's too. Opening the terminal again through `/proc/self/fd` gives a
-/// new file description. If that fails, a duplicate of `fd` is used as it
-/// is, blocking.
-fn own_terminal_fd(fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+/// new file description. If that fails, a duplicate of `fd` is made
+/// non-blocking instead, and [`HostTerminal`] makes it blocking again when
+/// dropped.
+fn own_terminal_fd(fd: BorrowedFd<'_>) -> io::Result<(OwnedFd, bool)> {
     use rustix::fs::{Mode, OFlags, open};
     match open(
         format!("/proc/self/fd/{}", fd.as_raw_fd()).as_str(),
         OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC | OFlags::NONBLOCK,
         Mode::empty(),
     ) {
-        Ok(own) if rustix::termios::isatty(&own) => Ok(own),
-        _ => Ok(rustix::io::fcntl_dupfd_cloexec(fd, 3)?),
+        Ok(own) if rustix::termios::isatty(&own) => Ok((own, false)),
+        _ => {
+            let dup = rustix::io::fcntl_dupfd_cloexec(fd, 3)?;
+            set_nonblocking(dup.as_fd())?;
+            Ok((dup, true))
+        }
     }
+}
+
+fn set_blocking(fd: BorrowedFd<'_>) -> io::Result<()> {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    let flags = fcntl_getfl(fd)?;
+    fcntl_setfl(fd, flags - OFlags::NONBLOCK)?;
+    Ok(())
 }
 
 /// The host terminal in raw mode, restored to its earlier settings when
@@ -126,16 +139,43 @@ impl Drop for RawMode {
 pub struct HostTerminal {
     input: Option<OwnedFd>,
     output: OwnedFd,
+    /// Descriptors sharing a file description with the supervisor's stdio,
+    /// made blocking again when dropped.
+    shared: Vec<BorrowedFd<'static>>,
 }
 
 impl HostTerminal {
     /// The host terminal reading keys from `input`, if given, and writing
     /// output to `output`.
     pub fn open(input: Option<BorrowedFd<'_>>, output: BorrowedFd<'_>) -> io::Result<Self> {
-        Ok(HostTerminal {
-            input: input.map(own_terminal_fd).transpose()?,
-            output: own_terminal_fd(output)?,
-        })
+        let input = input.map(own_terminal_fd).transpose()?;
+        let (output, output_shared) = own_terminal_fd(output)?;
+        let mut terminal = HostTerminal {
+            input: None,
+            output,
+            shared: Vec::new(),
+        };
+        // SAFETY: the descriptors are owned by `terminal`, which drops
+        // `shared` before them.
+        let borrow = |fd: &OwnedFd| unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) };
+        if output_shared {
+            terminal.shared.push(borrow(&terminal.output));
+        }
+        if let Some((input, input_shared)) = input {
+            if input_shared {
+                terminal.shared.push(borrow(&input));
+            }
+            terminal.input = Some(input);
+        }
+        Ok(terminal)
+    }
+}
+
+impl Drop for HostTerminal {
+    fn drop(&mut self) {
+        for fd in self.shared.drain(..) {
+            let _ = set_blocking(fd);
+        }
     }
 }
 
@@ -259,23 +299,52 @@ impl PtyRelay {
     /// [`FINISH_TIMEOUT_MS`].
     pub fn finish(mut self) {
         self.slave = None;
-        while self.master_open && self.read_master() {}
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(FINISH_TIMEOUT_MS as u64);
+        let left = || {
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis() as i32
+        };
+        // What the sandbox wrote last, while the queue has room. A process
+        // that outlives the sandbox can keep writing to the slave, so the
+        // drain stops at the deadline too.
+        while self.master_open && left() > 0 {
+            if self.queued.len() >= MAX_QUEUED {
+                if !self.wait_writable(left()) {
+                    break;
+                }
+                self.write_queued();
+                continue;
+            }
+            if !self.read_master() {
+                break;
+            }
+            self.write_queued();
+        }
         let mut tail = Vec::new();
         self.filter.finish(&mut tail);
         tail.extend_from_slice(&self.filter.restore_sequence());
         self.queued.extend_from_slice(&tail);
         while self.output_open && !self.queued.is_empty() {
-            let mut pollfd = libc::pollfd {
-                fd: self.host.output.as_raw_fd(),
-                events: libc::POLLOUT,
-                revents: 0,
-            };
-            // SAFETY: one valid pollfd for the duration of the call.
-            if unsafe { libc::poll(&mut pollfd, 1, FINISH_TIMEOUT_MS) } <= 0 {
+            // The restore always gets a fresh chance at the terminal.
+            let wait = left().max(FINISH_TIMEOUT_MS / 4);
+            if !self.wait_writable(wait) {
                 break;
             }
             self.write_queued();
         }
+    }
+
+    /// Waits up to `ms` for the host terminal to take output.
+    fn wait_writable(&self, ms: i32) -> bool {
+        let mut pollfd = libc::pollfd {
+            fd: self.host.output.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd for the duration of the call.
+        self.output_open && unsafe { libc::poll(&mut pollfd, 1, ms) } > 0
     }
 
     fn read_input(&mut self) {
@@ -562,6 +631,21 @@ mod tests {
         }
         assert_eq!(got, written);
 
+        // Invalid UTF-8 grows threefold through U+FFFD, still bounded.
+        let bad = vec![0xffu8; 4096];
+        for _ in 0..200 {
+            let _ = rustix::io::write(&sandbox.slave, &bad);
+            step(&mut relay, 0);
+            assert!(
+                relay.queued.len() <= MAX_QUEUED + 3 * CHUNK,
+                "{}",
+                relay.queued.len()
+            );
+        }
+        while !read_some_nowait(host.master.as_fd()).is_empty() || !relay.queued.is_empty() {
+            step(&mut relay, 10);
+        }
+
         // The sandbox stops reading: keys stay with the host terminal once
         // the PTY's input buffer is full, and the relay keeps one chunk.
         let keys = vec![b'k'; 4096];
@@ -589,6 +673,37 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn finish_ends_while_a_leftover_process_keeps_writing() {
+        // Without a pid namespace, a process of the sandbox can outlive it
+        // and keep its terminal busy.
+        let (host, sandbox, relay) = relayed();
+        let writer = sandbox.slave.try_clone().unwrap();
+        drop(sandbox.slave);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_writer = stop.clone();
+        let busy = std::thread::spawn(move || {
+            let chunk = vec![b'y'; 4096];
+            while !stop_writer.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = rustix::io::write(&writer, &chunk);
+            }
+        });
+        let reader = std::thread::spawn(move || {
+            let mut buf = vec![0u8; 65536];
+            while rustix::io::read(&host.master, &mut buf).is_ok_and(|n| n > 0) {}
+        });
+        let start = std::time::Instant::now();
+        relay.finish();
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(FINISH_TIMEOUT_MS as u64 * 3),
+            "{:?}",
+            start.elapsed()
+        );
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        busy.join().unwrap();
+        drop(reader);
     }
 
     #[test]
