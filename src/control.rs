@@ -6,9 +6,13 @@
 //! ([`peer_uid`]). A client that runs a command first sends one byte
 //! carrying the three descriptors that become the sandbox's stdin, stdout
 //! and stderr ([`send_stdio`]). One that asks for an approval sends one
-//! other byte ([`send_approval_hello`]). Then come frames, each a 4-byte big-endian length and that
-//! many bytes of JSON, at most [`MAX_FRAME`]. Byte strings, which need not
-//! be UTF-8, travel as hex.
+//! other byte ([`send_approval_hello`]). Then come frames, each a 4-byte
+//! big-endian length and that many bytes of JSON, at most [`MAX_FRAME`].
+//! Byte strings, which need not be UTF-8, travel as hex.
+//!
+//! A run request carries [`PROTOCOL_VERSION`], and a server refuses a
+//! client of another version with an error both understand, so a client
+//! and a server from different builds fail plainly.
 
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -22,12 +26,17 @@ use serde::{Deserialize, Serialize};
 /// hex.
 pub const MAX_FRAME: usize = 8 << 20;
 
+/// The version of the messages below. It changes whenever they do.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// What a client asks of the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientMessage {
     /// Run a command in a profile's sandbox, on the descriptors sent first.
     Run {
+        /// The client's [`PROTOCOL_VERSION`].
+        version: u32,
         /// `--profile`, if given.
         profile: Option<String>,
         /// The command and its arguments.
@@ -47,11 +56,11 @@ pub enum ClientMessage {
         /// The signal number.
         signal: i32,
     },
-    /// Ask the user about `request` from a sandbox of `profile`, on an
+    /// Ask the user about `request` from the sandbox of run `run`, on an
     /// approval connection.
     Approve {
-        /// The profile the sandbox runs in.
-        profile: String,
+        /// The run number the server gave in `Started`.
+        run: u64,
         /// What it asks for.
         request: crate::approval::ApprovalRequest,
     },
@@ -64,6 +73,8 @@ pub enum ServerMessage {
     /// The sandbox started; print these lines (warnings and the summary,
     /// formatted and escaped) to stderr.
     Started {
+        /// The server's number for the run, which approval requests name.
+        run: u64,
         /// The lines.
         lines: Vec<String>,
         /// What the client's output filter does with OSC 52 clipboard
@@ -74,6 +85,12 @@ pub enum ServerMessage {
     Decision {
         /// Whether it is allowed.
         allow: bool,
+        /// Whether the user allowed requests like it for the rest of the
+        /// server's life, so the client need not ask again.
+        session: bool,
+        /// Whether the user denied it, so the client denies requests like
+        /// it without asking for [`crate::approval::QUIET_AFTER_DENY`].
+        quiet: bool,
     },
     /// The sandbox ended; exit with this status.
     Exit {
@@ -180,6 +197,30 @@ pub fn read_frame<T: DeserializeOwned>(mut sock: &UnixStream) -> io::Result<Opti
     let mut body = vec![0u8; len];
     sock.read_exact(&mut body)?;
     serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Reads a client's request, refusing a client of another
+/// [`PROTOCOL_VERSION`] before the rest of the frame, whose shape may
+/// differ, is parsed. `None` at the end of the stream.
+pub fn read_request(sock: &UnixStream) -> io::Result<Option<ClientMessage>> {
+    let Some(value) = read_frame::<serde_json::Value>(sock)? else {
+        return Ok(None);
+    };
+    if value.get("type").and_then(|t| t.as_str()) == Some("run") {
+        let version = value.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+        if version != u64::from(PROTOCOL_VERSION) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "the stopit server speaks protocol {PROTOCOL_VERSION} and this stopit \
+                     speaks {version}; stop the server and start it again with this stopit"
+                ),
+            ));
+        }
+    }
+    serde_json::from_value(value)
         .map(Some)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
@@ -319,6 +360,7 @@ mod tests {
     fn frames_round_trip_and_end_cleanly() {
         let (a, b) = UnixStream::pair().unwrap();
         let run = ClientMessage::Run {
+            version: PROTOCOL_VERSION,
             profile: Some("harness".into()),
             command: vec![b"ls".to_vec(), vec![0xff, b'-']],
             env: vec![(b"TERM".to_vec(), b"xterm".to_vec())],
@@ -334,6 +376,41 @@ mod tests {
             Some(ClientMessage::Signal { signal: 2 })
         );
         assert_eq!(read_frame::<ClientMessage>(&b).unwrap(), None);
+    }
+
+    #[test]
+    fn requests_of_another_version_are_refused_first() {
+        let send = |body: &str| {
+            let (mut a, b) = UnixStream::pair().unwrap();
+            a.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+            a.write_all(body.as_bytes()).unwrap();
+            drop(a);
+            read_request(&b)
+        };
+        let current = format!(
+            r#"{{"type":"run","version":{PROTOCOL_VERSION},"profile":null,"command":["6c73"],"env":[],"pty":false,"quiet":false}}"#
+        );
+        assert!(matches!(
+            send(&current).unwrap(),
+            Some(ClientMessage::Run { .. })
+        ));
+        // Older clients sent no version, and newer ones may send fields
+        // this server does not know. Both get the version error.
+        for body in [
+            r#"{"type":"run","profile":null,"command":["6c73"],"env":[],"pty":false,"quiet":false}"#.to_owned(),
+            current.replace(&format!(r#""version":{PROTOCOL_VERSION}"#), r#""version":99,"new":1"#),
+        ] {
+            let e = send(&body).unwrap_err();
+            assert!(e.to_string().contains("start it again"), "{body}: {e}");
+        }
+        // Other requests and the end of the stream pass through.
+        assert_eq!(
+            send(r#"{"type":"signal","signal":2}"#).unwrap(),
+            Some(ClientMessage::Signal { signal: 2 })
+        );
+        let (a, b) = UnixStream::pair().unwrap();
+        drop(a);
+        assert_eq!(read_request(&b).unwrap(), None);
     }
 
     #[test]
@@ -393,6 +470,7 @@ mod tests {
     #[test]
     fn byte_strings_travel_as_hex() {
         let run = ClientMessage::Run {
+            version: PROTOCOL_VERSION,
             profile: None,
             command: vec![vec![0x00, 0xff, b'a']],
             env: vec![(b"K".to_vec(), vec![])],
@@ -404,7 +482,7 @@ mod tests {
         assert!(json.contains(r#""env":[["4b",""]]"#), "{json}");
         for bad in ["0", "zz", "0g", "+f", "-1"] {
             let json = format!(
-                r#"{{"type":"run","profile":null,"command":["{bad}"],"env":[],"pty":false,"quiet":false}}"#
+                r#"{{"type":"run","version":1,"profile":null,"command":["{bad}"],"env":[],"pty":false,"quiet":false}}"#
             );
             assert!(
                 serde_json::from_str::<ClientMessage>(&json).is_err(),

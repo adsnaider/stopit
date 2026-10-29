@@ -36,7 +36,7 @@
 //! filesystem (often sandbox-writable) put text in them. bwrap's own
 //! messages are not stopit's, and are not escaped.
 //!
-//! Not done yet: approval prompts (§5.2), the broker, and the network proxy.
+//! Not done yet: the broker, and the network proxy.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -1419,13 +1419,54 @@ fn wait_foreground(
     drop(terminal);
     if denied > 0 {
         eprintln!(
-            "stopit: warning: {denied} clipboard write(s) blocked; with \
-             terminal.clipboard_write = \"ask\", run `stopit server` in the workspace to \
-             approve them"
+            "stopit: warning: {}; with terminal.clipboard_write = \"ask\", run \
+             `stopit server` in the workspace to approve them",
+            blocked_writes(denied)
         );
     }
     let json_status = read_nonblocking_status(status_reader);
     Ok(bwrap_exit_code(status, &json_status))
+}
+
+/// "N clipboard writes blocked", for `denied` writes.
+pub(crate) fn blocked_writes(denied: usize) -> String {
+    match denied {
+        1 => "1 clipboard write blocked".to_owned(),
+        n => format!("{n} clipboard writes blocked"),
+    }
+}
+
+/// Waits until `fd` is readable, with [`CAUGHT`] unblocked meanwhile.
+/// `Ok(false)` when a caught signal arrives first. The signal stays
+/// pending for the caller's next [`take_signal`].
+pub(crate) fn readable_unless_signal(fd: BorrowedFd<'_>) -> io::Result<bool> {
+    loop {
+        if pending_signal().is_some() {
+            return Ok(false);
+        }
+        let mut pollfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: plain libc calls on a local signal set and one valid
+        // pollfd. A caught signal blocked until `ppoll` is delivered there,
+        // so none is missed between the check above and the wait.
+        unsafe {
+            let mut waiting: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut waiting);
+            for signal in CAUGHT {
+                libc::sigdelset(&mut waiting, signal);
+            }
+            if libc::ppoll(&mut pollfd, 1, std::ptr::null(), &waiting) >= 0 {
+                return Ok(true);
+            }
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
 }
 
 /// Waits until `until` is ready, passing caught signals to `on_signal`

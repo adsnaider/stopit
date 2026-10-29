@@ -2706,12 +2706,18 @@ impl Server {
     /// Waits until the log has a line containing `needle`, and returns it.
     #[track_caller]
     fn wait_for_log(&self, needle: &str) -> String {
-        wait_until(|| {
-            self.log()
-                .lines()
-                .find(|l| l.contains(needle))
-                .map(str::to_owned)
-        })
+        let deadline = Instant::now() + BWRAP_DEADLINE;
+        loop {
+            let log = self.log();
+            if let Some(line) = log.lines().find(|l| l.contains(needle)) {
+                return line.to_owned();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{needle:?} not logged; the log is {log:?}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Stops the server with `SIGTERM` and returns its exit status.
@@ -3076,6 +3082,9 @@ fn a_server_that_does_not_answer_is_skipped_with_a_warning() {
 /// A sandbox that writes "hi" to the clipboard with OSC 52, then `done`.
 const CLIPBOARD_SCRIPT: &str = "printf 'A\\033]52;c;aGk=\\007B'; echo done";
 
+/// A sandbox that writes "hi" to the clipboard twice, then `done`.
+const TWO_WRITES_SCRIPT: &str = "printf 'A\\033]52;c;aGk=\\007B\\033]52;c;aGk=\\007C'; echo done";
+
 #[test]
 fn clipboard_writes_are_asked_about_on_the_server_terminal() {
     let Some(config) = shell_config() else {
@@ -3084,45 +3093,107 @@ fn clipboard_writes_are_asked_about_on_the_server_terminal() {
     let Some((server_master, server_slave)) = open_pty() else {
         return;
     };
-    let s = Setup::with_config(&format!("{config}[terminal]\nclipboard_write = \"ask\"\n"));
+    // A finite timeout, so a lost key fails the test rather than hangs it.
+    let s = Setup::with_config(&format!(
+        "{config}[terminal]\nclipboard_write = \"ask\"\n[approval]\ntimeout = \"20s\"\n"
+    ));
     let server = Server::start_on_terminal(&s, &server_master, server_slave);
-    for (key, passes, verdict) in [(b"y", true, "allowed once"), (b"n", false, "denied")] {
-        let Some((master, slave)) = open_pty() else {
-            return;
-        };
-        let command = s.stopit(&["run", "--quiet", "/bin/sh", "-c", CLIPBOARD_SCRIPT]);
+    // Runs `script` on a terminal of its own. With `key`, answers the
+    // prompt on the server's terminal, sending the key again every 200 ms
+    // until `verdict` shows. Returns what the run's terminal showed and the
+    // server's log since the last call.
+    let run = |script: &str, answer: Option<(&[u8], &str)>| {
+        let (master, slave) = open_pty().unwrap();
+        let command = s.stopit(&["run", "--quiet", "/bin/sh", "-c", script]);
         let mut t = OnTerminal::spawn(command, master, slave);
-        // The prompt shows on the server's terminal, with what is written.
-        let prompt = server.wait_for_log("[n] deny: ");
-        assert!(prompt.contains("[y] allow once"), "{prompt:?}");
-        assert!(
-            server.log().contains("write 2 bytes to the clipboard (c)"),
-            "{}",
-            server.log()
-        );
-        assert!(server.log().contains("content: hi"), "{}", server.log());
-        // Past the arming delay.
-        thread::sleep(Duration::from_millis(600));
-        (&server_master).write_all(key).unwrap();
+        if let Some((key, verdict)) = answer {
+            server.wait_for_log("[n] deny: ");
+            let deadline = Instant::now() + BWRAP_DEADLINE;
+            while !server.log().contains(verdict) {
+                assert!(Instant::now() < deadline, "{}", server.log());
+                (&server_master).write_all(key).unwrap();
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
         let out = t.finish();
         assert_eq!(code(&out), 0, "{out:?}");
         t.wait_for(b"done", 0);
-        let seen = String::from_utf8_lossy(&t.seen()).into_owned();
-        assert_eq!(
-            seen.contains("\x1b]52;c;aGk=\x07"),
-            passes,
-            "{key:?}: {seen:?}"
-        );
-        assert!(seen.starts_with("AB") != passes, "{seen:?}");
-        server.wait_for_log(verdict);
-        // The next prompt starts after this one's verdict.
-        let log = server.log();
-        let cut = log.rfind(verdict).unwrap();
-        server
-            .log
-            .lock()
-            .unwrap()
-            .replace_range(..cut + verdict.len(), "");
+        let log = std::mem::take(&mut *server.log.lock().unwrap());
+        (String::from_utf8_lossy(&t.seen()).into_owned(), log)
+    };
+    let write = "\x1b]52;c;aGk=\x07";
+
+    // Allowed once: the write reaches the terminal. The prompt says which
+    // run asks and shows what it writes.
+    let (seen, log) = run(CLIPBOARD_SCRIPT, Some((b"y", "allowed once")));
+    assert!(seen.starts_with(&format!("A{write}B")), "{seen:?}");
+    assert!(
+        log.contains("(profile \"main\", /bin/sh -c printf"),
+        "{log}"
+    );
+    assert!(
+        log.contains("write 2 bytes with 0 newlines to the clipboard (c)"),
+        "{log}"
+    );
+    assert!(log.contains("content: hi"), "{log}");
+
+    // Denied: neither write passes, and the second is denied without a
+    // prompt, as the denial quiets requests for a while. The run says so.
+    let denied_at = Instant::now();
+    let (seen, log) = run(TWO_WRITES_SCRIPT, Some((b"n", "denied")));
+    assert!(seen.starts_with("ABC"), "{seen:?}");
+    assert!(seen.contains("2 clipboard writes blocked"), "{seen:?}");
+    assert_eq!(log.matches("asks to").count(), 1, "{log}");
+
+    // Past the quiet period, allowed for the session: both writes pass with
+    // one prompt, and a later run's write passes with none.
+    thread::sleep(Duration::from_secs(6).saturating_sub(denied_at.elapsed()));
+    let (seen, log) = run(TWO_WRITES_SCRIPT, Some((b"s", "allowed for this session")));
+    assert!(seen.starts_with(&format!("A{write}B{write}C")), "{seen:?}");
+    assert_eq!(log.matches("asks to").count(), 1, "{log}");
+    let (seen, log) = run(CLIPBOARD_SCRIPT, None);
+    assert!(seen.starts_with(&format!("A{write}B")), "{seen:?}");
+    assert!(!log.contains("asks to"), "{log}");
+}
+
+#[test]
+fn a_server_without_its_terminal_in_the_foreground_denies() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let s = Setup::with_config(&format!("{config}[terminal]\nclipboard_write = \"ask\"\n"));
+    // First on the terminal, but not as its controlling terminal, as for a
+    // server whose shell moved it to the background: it must not touch the
+    // terminal. Then with stdin not a terminal at all. Both deny at once.
+    // The default timeout is off, so a prompt would hang.
+    for on_terminal in [true, false] {
+        // A terminal for each server, as each one's log reader reads it.
+        let Some((server_master, server_slave)) = open_pty() else {
+            return;
+        };
+        let mut command = s.stopit(&["server"]);
+        if on_terminal {
+            command.stdin(server_slave.try_clone().unwrap());
+        } else {
+            command.stdin(Stdio::null());
+        }
+        command
+            .stdout(Stdio::null())
+            .stderr(server_slave.try_clone().unwrap());
+        without_controlling_terminal(&mut command);
+        let child = command.spawn().unwrap();
+        drop(command);
+        let mut server = Server::collect(child, server_master.try_clone().unwrap());
+        let (master, slave) = open_pty().unwrap();
+        let command = s.stopit(&["run", "--quiet", "/bin/sh", "-c", CLIPBOARD_SCRIPT]);
+        let mut t = OnTerminal::spawn(command, master, slave);
+        let out = t.finish();
+        assert_eq!(code(&out), 0, "{on_terminal}: {out:?}");
+        let at = t.wait_for(b"done", 0);
+        t.wait_for(b"1 clipboard write blocked", at);
+        assert!(t.seen().starts_with(b"AB"), "{on_terminal}");
+        assert!(!server.log().contains("asks to"), "{}", server.log());
+        assert_eq!(server.stop(), 128 + libc::SIGTERM, "{on_terminal}");
     }
 }
 
@@ -3140,7 +3211,7 @@ fn a_standalone_run_blocks_clipboard_asks_and_says_so() {
     let out = t.finish();
     assert_eq!(code(&out), 0, "{out:?}");
     let at = t.wait_for(b"done", 0);
-    t.wait_for(b"1 clipboard write(s) blocked", at);
+    t.wait_for(b"1 clipboard write blocked", at);
     let seen = String::from_utf8_lossy(&t.seen()).into_owned();
     assert!(seen.starts_with("ABdone"), "{seen:?}");
     assert!(!seen.contains("]52;"), "{seen:?}");

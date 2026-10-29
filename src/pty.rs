@@ -77,7 +77,9 @@ fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
 /// new file description. If that fails, a duplicate of `fd` is made
 /// non-blocking instead, and [`HostTerminal`] puts its earlier flags back
 /// when dropped.
-fn own_terminal_fd(fd: BorrowedFd<'_>) -> io::Result<(OwnedFd, Option<rustix::fs::OFlags>)> {
+pub(crate) fn own_terminal_fd(
+    fd: BorrowedFd<'_>,
+) -> io::Result<(OwnedFd, Option<rustix::fs::OFlags>)> {
     use rustix::fs::{Mode, OFlags, open};
     match open(
         format!("/proc/self/fd/{}", fd.as_raw_fd()).as_str(),

@@ -43,7 +43,7 @@ pub enum ClipboardPolicy {
     /// Pass clipboard writes whose payload is well-formed base64.
     Allow,
     /// Ask about each well-formed clipboard write
-    /// ([`OutputFilter::with_asker`]), and drop it without an answer yes.
+    /// ([`OutputFilter::with_asker`]), and drop it unless the answer is yes.
     Ask,
 }
 
@@ -775,10 +775,10 @@ impl OutputFilter {
             ("52", Some(rest)) => match rest.split_once(';') {
                 Some((_, "?")) | None => false,
                 Some((targets, data)) => {
+                    // Strict base64, so what a prompt shows decoded is what
+                    // the host terminal decodes.
                     let well_formed = targets.bytes().all(|b| b"cpqs01234567".contains(&b))
-                        && data
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='));
+                        && crate::approval::is_strict_base64(data);
                     match self.clipboard {
                         ClipboardPolicy::Block => false,
                         ClipboardPolicy::Allow => well_formed,
@@ -1046,7 +1046,8 @@ mod tests {
         }));
         let mut out = Vec::new();
         f.feed(
-            b"\x1b]52;c;eWVz\x07\x1b]52;c;bm8=\x07\x1b]52;c;?\x07\x1b]52;c;bad!\x07",
+            b"\x1b]52;c;eWVz\x07\x1b]52;c;bm8=\x07\x1b]52;c;?\x07\x1b]52;c;bad!\x07\
+              \x1b]52;c;aGk=cm0gLXJmIH4K\x07\x1b]52;c;a\x07",
             &mut out,
         );
         assert_eq!(out, b"\x1b]52;c;eWVz\x07");

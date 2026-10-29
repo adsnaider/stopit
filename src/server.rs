@@ -24,16 +24,16 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 
-use crate::approval::{ApprovalRequest, Approver};
+use crate::approval::{ApprovalRequest, Approver, Asker, QUIET_AFTER_DENY, Verdict};
 use crate::bwrap::TerminalSession;
 use crate::config::ClipboardWrite;
 use crate::control::{
-    ClientMessage, Hello, ServerMessage, peer_uid, read_frame, recv_hello, send_approval_hello,
-    send_stdio, write_frame,
+    ClientMessage, Hello, PROTOCOL_VERSION, ServerMessage, peer_uid, read_frame, read_request,
+    recv_hello, send_approval_hello, send_stdio, write_frame,
 };
 use crate::escape::escape_message;
 use crate::filter::ClipboardPolicy;
@@ -41,9 +41,9 @@ use crate::filter::ClipboardRequest;
 use crate::session::{CONTROL_SOCKET, LiveServer, ServerRecord, live_servers};
 use crate::supervisor::{
     BlockedSignals, EXIT_SUPERVISOR_FAILED, Invocation, LoadedSession, RunError, SandboxTerminal,
-    bwrap_exit_code, catch_signals, catch_winch, check_foreground, discover_workspace,
-    ignore_job_control, print_error, profile_in, read_nonblocking_status, relay_until,
-    signal_exit_code, stdio_terminals, take_signal,
+    blocked_writes, bwrap_exit_code, catch_signals, catch_winch, check_foreground,
+    discover_workspace, ignore_job_control, print_error, profile_in, read_nonblocking_status,
+    readable_unless_signal, relay_until, signal_exit_code, stdio_terminals, take_signal,
 };
 
 /// The signals a client may pass to its sandbox.
@@ -82,6 +82,8 @@ struct Run {
     /// A pidfd of the run's bwrap while it runs. Signals sent through it
     /// can never reach another process, even once bwrap is reaped.
     pidfd: Option<OwnedFd>,
+    /// Who the run is, for approval prompts, once its sandbox starts.
+    asker: Option<Asker>,
 }
 
 /// What the server and its workers share.
@@ -113,6 +115,9 @@ fn run_server(workspace: Option<&Path>, quiet: bool) -> Result<ExitCode, RunErro
     for line in loaded.warning_lines() {
         eprintln!("{line}");
     }
+    // From here on, every line goes through the approver, which holds it
+    // back while a prompt is up.
+    let approver = Arc::new(Approver::on_stdio(loaded.approval_timeout()));
     let control = loaded.session.control_dir()?;
     let socket_path = control.join(CONTROL_SOCKET);
     check_socket_path(&socket_path)?;
@@ -131,13 +136,12 @@ fn run_server(workspace: Option<&Path>, quiet: bool) -> Result<ExitCode, RunErro
             source,
         })?;
     if !quiet {
-        eprintln!(
+        approver.log(&format!(
             "stopit: serving {} as session {}; `stopit run` and `stopit shell` there attach to it",
             escape_message(&format!("{:?}", loaded.workspace.dir)),
             loaded.session.id()
-        );
+        ));
     }
-    let approver = Arc::new(Approver::on_stdio(loaded.approval_timeout()));
     let loaded = Arc::new(loaded);
     // Blocked from here on in every thread, including the workers spawned
     // below, and only unblocked while the main thread waits.
@@ -191,6 +195,7 @@ fn run_server(workspace: Option<&Path>, quiet: bool) -> Result<ExitCode, RunErro
                         Run {
                             conn: copy,
                             pidfd: None,
+                            asker: None,
                         },
                     );
                     None
@@ -223,7 +228,7 @@ fn run_server(workspace: Option<&Path>, quiet: bool) -> Result<ExitCode, RunErro
         }
     };
     if !quiet {
-        eprintln!("stopit: stopping the server and its sandboxes");
+        approver.log("stopit: stopping the server and its sandboxes");
     }
     {
         let mut runs = lock(&runs);
@@ -322,9 +327,9 @@ fn serve_client(
         .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
         .and_then(|()| recv_hello(&conn));
     let result = match hello {
-        Ok(Hello::Run(stdio)) => run_for_client(&conn, stdio, loaded, runs, run, quiet),
+        Ok(Hello::Run(stdio)) => run_for_client(&conn, stdio, loaded, approver, runs, run, quiet),
         Ok(Hello::Approve) => {
-            approve_for_client(&conn, approver, quiet);
+            approve_for_client(&conn, approver, runs);
             lock(runs).by_number.remove(&run);
             return;
         }
@@ -337,10 +342,10 @@ fn serve_client(
         }
         Err(e) => {
             if !quiet {
-                eprintln!(
+                approver.log(&format!(
                     "stopit: run {run} failed: {}",
                     escape_message(&e.to_string())
-                );
+                ));
             }
             let _ = write_frame(
                 &conn,
@@ -353,44 +358,48 @@ fn serve_client(
 }
 
 /// Reads an approval request from `conn`, asks `approver`, and answers.
-/// The request is denied if the client goes away or the server stops while
-/// the prompt is up.
-fn approve_for_client(conn: &UnixStream, approver: &Approver, quiet: bool) {
-    let request = read_frame::<ClientMessage>(conn);
+/// The request names its run, whose profile and command the server knows,
+/// and a run the server does not know is denied. So is the request if the
+/// client goes away or the server stops while the prompt is up.
+fn approve_for_client(conn: &UnixStream, approver: &Approver, runs: &SharedRuns) {
+    let request = read_request(conn);
     let _ = conn.set_read_timeout(None);
-    let Ok(Some(ClientMessage::Approve { profile, request })) = request else {
+    let Ok(Some(ClientMessage::Approve { run, request })) = request else {
         return;
     };
-    let allow = approver.decide(&profile, &request, conn.as_fd());
-    if !quiet {
-        let what = match &request {
-            ApprovalRequest::ClipboardWrite { .. } => "clipboard write",
-        };
-        let verdict = if allow { "allowed" } else { "denied" };
-        eprintln!(
-            "stopit: {what} from profile {} {verdict}",
-            escape_message(&format!("{profile:?}"))
-        );
-    }
-    let _ = write_frame(conn, &ServerMessage::Decision { allow });
+    let asker = lock(runs).by_number.get(&run).and_then(|r| r.asker.clone());
+    let verdict = match asker {
+        Some(asker) => approver.decide(&asker, &request, conn.as_fd()),
+        None => Verdict::Denied,
+    };
+    let _ = write_frame(
+        conn,
+        &ServerMessage::Decision {
+            allow: verdict.allows(),
+            session: verdict == Verdict::Session,
+            quiet: verdict == Verdict::DeniedByUser,
+        },
+    );
 }
 
 fn run_for_client(
     conn: &UnixStream,
     stdio: [OwnedFd; 3],
     loaded: &LoadedSession,
+    approver: &Approver,
     runs: &SharedRuns,
     run: u64,
     quiet: bool,
 ) -> Result<u8, RunError> {
     let protocol = RunError::Client;
     let Some(ClientMessage::Run {
+        version: _,
         profile,
         command,
         env,
         pty,
         quiet: client_quiet,
-    }) = read_frame::<ClientMessage>(conn).map_err(protocol)?
+    }) = read_request(conn).map_err(protocol)?
     else {
         return Err(protocol(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -449,7 +458,7 @@ fn run_for_client(
     }
     // Spawned under the lock, so a stopping server either sees the pidfd
     // and kills the sandbox, or this run sees `stopping` and starts none.
-    let (mut child, pidfd) = {
+    let (mut child, pidfd, asker) = {
         let mut runs = lock(runs);
         if runs.stopping {
             return Err(RunError::ServerStopping);
@@ -470,28 +479,35 @@ fn run_for_client(
                 return Err(RunError::Spawn(e.into()));
             }
         };
-        if let Some(entry) = runs.by_number.get_mut(&run) {
-            entry.pidfd = pidfd.try_clone().ok();
-        }
-        (child, pidfd)
-    };
-    drop(child_command);
-    if !quiet {
-        eprintln!(
-            "stopit: run {run} started: profile {:?}: {}",
-            profile_name.as_str(),
-            escape_message(
+        let asker = Asker {
+            run,
+            profile: profile_name.as_str().to_owned(),
+            command: escape_message(
                 &command
                     .iter()
                     .map(|a| String::from_utf8_lossy(a.as_bytes()).into_owned())
                     .collect::<Vec<_>>()
-                    .join(" ")
-            )
-        );
+                    .join(" "),
+            ),
+        };
+        if let Some(entry) = runs.by_number.get_mut(&run) {
+            entry.pidfd = pidfd.try_clone().ok();
+            entry.asker = Some(asker.clone());
+        }
+        (child, pidfd, asker)
+    };
+    drop(child_command);
+    if !quiet {
+        approver.log(&format!(
+            "stopit: run {run} started: profile {}: {}",
+            escape_message(&format!("{:?}", asker.profile)),
+            asker.command
+        ));
     }
     let started = write_frame(
         conn,
         &ServerMessage::Started {
+            run,
             lines,
             clipboard: loaded.clipboard_write(),
         },
@@ -504,7 +520,7 @@ fn run_for_client(
     let status = child.wait().map_err(RunError::Spawn)?;
     let code = bwrap_exit_code(status, &read_nonblocking_status(status_reader));
     if !quiet {
-        eprintln!("stopit: run {run} ended with status {code}");
+        approver.log(&format!("stopit: run {run} ended with status {code}"));
     }
     Ok(code)
 }
@@ -638,29 +654,68 @@ fn connect(server: &LiveServer) -> Result<Attached, RunError> {
     })
 }
 
-/// Asks the server at `socket` whether the clipboard write `request` of a
-/// sandbox of `profile` passes. The output relay waits meanwhile. Anything
-/// but a yes from the server, a lost connection included, is a no.
-fn ask_server(socket: &Path, profile: &str, request: &ClipboardRequest) -> bool {
-    let ask = || -> io::Result<bool> {
+/// What a client remembers of the server's answers for its run, so it
+/// asks no more than it must.
+#[derive(Default)]
+struct Answers {
+    /// The user allowed clipboard writes for the session.
+    allowed: bool,
+    /// The user denied one, and later ones are denied without asking until
+    /// then.
+    quiet_until: Option<Instant>,
+}
+
+/// Asks the server at `socket` whether the clipboard write `request` of
+/// run `run` passes, unless `answers` decides it. The output relay waits
+/// meanwhile. Anything but a yes from the server is a no: a lost
+/// connection, and a caught signal, which stays pending for the relay to
+/// pass on.
+fn ask_server(socket: &Path, run: u64, request: &ClipboardRequest, answers: &mut Answers) -> bool {
+    if answers.allowed {
+        return true;
+    }
+    if answers
+        .quiet_until
+        .is_some_and(|until| Instant::now() < until)
+    {
+        return false;
+    }
+    let ask = || -> io::Result<Option<ServerMessage>> {
         let conn = UnixStream::connect(socket)?;
+        if peer_uid(&conn)? != rustix::process::getuid().as_raw() {
+            return Err(io::Error::other("the server runs as another user"));
+        }
         send_approval_hello(&conn)?;
         write_frame(
             &conn,
             &ClientMessage::Approve {
-                profile: profile.to_owned(),
+                run,
                 request: ApprovalRequest::ClipboardWrite {
                     targets: request.targets.clone(),
                     data: request.data.clone(),
                 },
             },
         )?;
-        Ok(matches!(
-            read_frame::<ServerMessage>(&conn)?,
-            Some(ServerMessage::Decision { allow: true })
-        ))
+        // Dropping the connection on a signal cancels the prompt.
+        if !readable_unless_signal(conn.as_fd())? {
+            return Ok(None);
+        }
+        read_frame::<ServerMessage>(&conn)
     };
-    ask().unwrap_or(false)
+    match ask() {
+        Ok(Some(ServerMessage::Decision {
+            allow,
+            session,
+            quiet,
+        })) => {
+            answers.allowed = allow && session;
+            if quiet {
+                answers.quiet_until = Some(Instant::now() + QUIET_AFTER_DENY);
+            }
+            allow
+        }
+        _ => false,
+    }
 }
 
 /// Waits until `fd` is readable, or a caught signal arrives (returned).
@@ -721,6 +776,7 @@ pub(crate) fn attach(attached: Attached, invocation: &Invocation) -> Result<u8, 
     write_frame(
         &conn,
         &ClientMessage::Run {
+            version: PROTOCOL_VERSION,
             profile: invocation.profile.clone(),
             command: invocation
                 .command
@@ -741,7 +797,11 @@ pub(crate) fn attach(attached: Attached, invocation: &Invocation) -> Result<u8, 
         return Ok(signal_exit_code(signal));
     }
     match read_frame::<ServerMessage>(&conn).map_err(client)? {
-        Some(ServerMessage::Started { lines, clipboard }) => {
+        Some(ServerMessage::Started {
+            run,
+            lines,
+            clipboard,
+        }) => {
             // With the terminal raw, a line feed alone does not return the
             // cursor.
             let end = if terminal.is_some() { "\r\n" } else { "\n" };
@@ -753,13 +813,10 @@ pub(crate) fn attach(attached: Attached, invocation: &Invocation) -> Result<u8, 
                     ClipboardWrite::Block => t.set_clipboard(ClipboardPolicy::Block),
                     ClipboardWrite::Allow => t.set_clipboard(ClipboardPolicy::Allow),
                     ClipboardWrite::Ask => {
-                        let profile = invocation
-                            .profile
-                            .clone()
-                            .unwrap_or_else(|| "main".to_owned());
                         let socket = socket.clone();
+                        let mut answers = Answers::default();
                         t.set_asker(Box::new(move |request| {
-                            ask_server(&socket, &profile, request)
+                            ask_server(&socket, run, request, &mut answers)
                         }));
                     }
                 }
@@ -798,10 +855,14 @@ pub(crate) fn attach(attached: Attached, invocation: &Invocation) -> Result<u8, 
             }
         }
     }
-    if let Some(r) = relay {
-        r.finish();
-    }
+    let denied = relay.map_or(0, |r| r.finish());
     drop(terminal);
+    if denied > 0 {
+        eprintln!(
+            "stopit: warning: {}; they need a yes on the stopit server's terminal",
+            blocked_writes(denied)
+        );
+    }
     Ok(exit.unwrap_or(EXIT_SUPERVISOR_FAILED))
 }
 
