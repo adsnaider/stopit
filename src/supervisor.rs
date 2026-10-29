@@ -1036,7 +1036,9 @@ impl LoadedSession {
     /// Adds `rw`, the `rw` paths of a request that passed its checks, to
     /// the paths every later compile of the session treats as untrusted
     /// roots, whatever the user answers. A path that passed cannot break a
-    /// later compile, since no profile reaches below it by path.
+    /// later compile on its own, since no profile reaches below it by path
+    /// now. A link its command plants where a rule names a missing path
+    /// makes that rule an error, as in any `rw` grant.
     ///
     /// Returns the generation for [`current_grant`](Self::current_grant):
     /// the new one, or `generation`, from

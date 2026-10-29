@@ -702,25 +702,25 @@ fn run_grant(
         say("denied by user a moment ago; wait before asking again");
         return Ok(EXIT_DENIED);
     }
-    // Past the cap, refusals go unlogged, so the host is not looked at.
-    if approver.refusals_exhausted(ctx.run) {
+    // Room in the log for a refusal, taken before the host is looked at,
+    // so no refusal goes unseen. Past the cap, the run gets no more.
+    if !approver.reserve_refusal(ctx.run) {
         say("this run has had too many requests refused; stopit-grant takes no more");
         return Ok(EXIT_DENIED);
     }
-    let refuse_when = |when: &str, why: &str| {
-        approver.log_refusal(
+    let line = |when: &str, why: &str| {
+        format!(
+            "stopit: run {} ({}): stopit-grant refused {when}: {}",
             ctx.run,
-            &format!(
-                "stopit: run {} ({}): stopit-grant refused {when}: {}",
-                ctx.run,
-                crate::escape::escape_message(&format!("profile {:?}", shared.caller.as_str())),
-                crate::escape::escape_message(why)
-            ),
-        );
+            crate::escape::escape_message(&format!("profile {:?}", shared.caller.as_str())),
+            crate::escape::escape_message(why)
+        )
+    };
+    let refuse = |why: &str| {
+        approver.log_reserved_refusal(ctx.run, &line("without asking", why));
         say("refused; the stopit server's terminal says why");
         Ok(EXIT_DENIED)
     };
-    let refuse = |why: &str| refuse_when("without asking", why);
     let home = ctx.loaded.host_home();
     let mut paths = Vec::new();
     for (path, rw) in request.paths() {
@@ -770,6 +770,8 @@ fn run_grant(
         return refuse(&why);
     }
     let generation = ctx.loaded.admit_grant(&rw, generation);
+    // Not refused unseen: the user sees it.
+    approver.release_refusal(ctx.run);
     let network = mode.map(|_| &compiled.get(&target).expect("checked above").spec.network);
     let ask = ApprovalRequest::Grant {
         grants: GrantRequest::describe(home, network, &paths),
@@ -786,7 +788,11 @@ fn run_grant(
     // Another request may have asked for rw paths since the compile, and
     // its command may write there by now. Compiled again with them, the
     // grant's mounts cannot follow a link planted there.
-    let refuse = |why: &str| refuse_when("after the prompt", why);
+    let refuse = |why: &str| {
+        approver.log_refusal(ctx.run, &line("after the prompt", why));
+        say("refused; the stopit server's terminal says why");
+        Ok(EXIT_DENIED)
+    };
     let compiled = match ctx.loaded.current_grant(extra, generation, compiled) {
         Ok(compiled) => compiled,
         Err(e) => return refuse(&e.to_string()),
@@ -833,8 +839,9 @@ fn run_grant(
 ///   later sandboxes would follow.
 /// * A grant must not land on or inside the workspace mount, which is the
 ///   sandbox's to write already, or a path the caller masks or protects,
-///   or a read-only or ephemeral path inside a writable one. A profile's own rule beats
-///   an inherited one, so the grant would lift the caller's rule.
+///   or a read-only or ephemeral path inside a writable one. A profile's
+///   own rule beats an inherited one, so the grant would lift the
+///   caller's rule.
 /// * The grant must add no compile warning to the caller's, since a
 ///   warning means a rule did not take as the prompt would show it.
 fn check_grant(

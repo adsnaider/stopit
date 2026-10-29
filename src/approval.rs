@@ -238,8 +238,11 @@ struct State {
     held: Vec<String>,
     /// Log lines dropped while a prompt was up, once `held` was full.
     dropped: usize,
-    /// How many refusals each run had logged ([`Approver::log_refusal`]).
+    /// How many refusals each run had logged, or has room taken for
+    /// ([`Approver::reserve_refusal`]).
     refusals: HashMap<u64, u32>,
+    /// Runs whose log says they have no refusals left.
+    refusals_noticed: HashSet<u64>,
     /// Runs already told about in the log that the server cannot ask
     /// for them, so the log says it once per run.
     told_unasked: HashSet<u64>,
@@ -349,21 +352,44 @@ impl Approver {
             .then_some(Verdict::Denied)
     }
 
-    /// Logs `line`, a request run `run` made that was refused without
-    /// asking, as [`log`](Self::log) does, for the first
-    /// [`MAX_REFUSALS_LOGGED`] of the run. The last of them comes with a
-    /// line saying so, and later ones log nothing.
-    pub fn log_refusal(&self, run: u64, line: &str) {
-        let count = {
-            let mut state = self.state();
-            let count = state.refusals.entry(run).or_insert(0);
-            *count = count.saturating_add(1);
-            *count
-        };
-        if count <= MAX_REFUSALS_LOGGED {
-            self.log(line);
+    /// Takes one of run `run`'s [`MAX_REFUSALS_LOGGED`] logged refusals
+    /// for a request about to be checked, or says there is none left.
+    /// Taken before the check, so requests at once cannot pass the cap.
+    /// A request that passes gives it back with
+    /// [`release_refusal`](Self::release_refusal).
+    pub fn reserve_refusal(&self, run: u64) -> bool {
+        let mut state = self.state();
+        let count = state.refusals.entry(run).or_insert(0);
+        if *count >= MAX_REFUSALS_LOGGED {
+            return false;
         }
-        if count == MAX_REFUSALS_LOGGED {
+        *count += 1;
+        true
+    }
+
+    /// Gives back a refusal [`reserve_refusal`](Self::reserve_refusal)
+    /// took for a request that was not refused.
+    pub fn release_refusal(&self, run: u64) {
+        if let Some(count) = self.state().refusals.get_mut(&run) {
+            *count = count.saturating_sub(1);
+        }
+    }
+
+    /// Logs `line`, a refusal of run `run` that
+    /// [`reserve_refusal`](Self::reserve_refusal) made room for, as
+    /// [`log`](Self::log) does. Once the run has none left, a line says so,
+    /// once.
+    pub fn log_reserved_refusal(&self, run: u64, line: &str) {
+        self.log(line);
+        let first = {
+            let mut state = self.state();
+            state
+                .refusals
+                .get(&run)
+                .is_some_and(|&n| n >= MAX_REFUSALS_LOGGED)
+                && state.refusals_noticed.insert(run)
+        };
+        if first {
             self.log(&format!(
                 "stopit: run {run} has had {MAX_REFUSALS_LOGGED} requests refused; it gets no \
                  more stopit-grant, and later refusals are not logged"
@@ -371,13 +397,13 @@ impl Approver {
         }
     }
 
-    /// Whether run `run` has had [`MAX_REFUSALS_LOGGED`] refusals logged,
-    /// so another would go unseen.
-    pub fn refusals_exhausted(&self, run: u64) -> bool {
-        self.state()
-            .refusals
-            .get(&run)
-            .is_some_and(|&n| n >= MAX_REFUSALS_LOGGED)
+    /// Logs `line`, a request of run `run` refused without asking, for the
+    /// first [`MAX_REFUSALS_LOGGED`] of the run, the last with a line
+    /// saying so. Later ones log nothing.
+    pub fn log_refusal(&self, run: u64, line: &str) {
+        if self.reserve_refusal(run) {
+            self.log_reserved_refusal(run, line);
+        }
     }
 
     /// Whether a denial from `asker`'s profile still quiets `request`, so
@@ -1137,12 +1163,18 @@ mod tests {
             approver.log_refusal(7, "refused");
         }
         approver.log_refusal(8, "other run");
-        assert!(approver.refusals_exhausted(7));
-        assert!(!approver.refusals_exhausted(8));
-        assert!(!approver.refusals_exhausted(9));
+        assert!(!approver.reserve_refusal(7));
+        // A slot given back can be taken again, and the notice stays
+        // single.
+        approver.release_refusal(7);
+        assert!(approver.reserve_refusal(7));
+        approver.log_reserved_refusal(7, "again");
+        assert!(approver.reserve_refusal(8));
+        assert!(approver.reserve_refusal(9));
         let state = approver.state();
         let n = MAX_REFUSALS_LOGGED as usize;
-        assert_eq!(state.held.len(), n + 2);
+        assert_eq!(state.held.len(), n + 3);
+        assert_eq!(state.held[n + 2], "again");
         assert!(state.held[..n].iter().all(|l| l == "refused"));
         assert!(
             state.held[n].contains("run 7 has had 20 requests refused; it gets no more"),
