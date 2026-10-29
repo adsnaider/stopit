@@ -4157,6 +4157,71 @@ fn git_runs_through_the_broker_while_main_sees_no_metadata() {
 }
 
 #[test]
+fn git_runs_in_a_worktree_whose_storage_is_outside_the_workspace() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    if !sandbox_has("git") {
+        eprintln!("skipping: no git in /usr/bin or /bin");
+        return;
+    }
+    let s = Setup::with_config(&config);
+    let home = s.root.join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join(".gitconfig"),
+        "[user]\n\tname = Host User\n\temail = host@example.com\n",
+    )
+    .unwrap();
+    // The repository lives outside the workspace, which is a worktree.
+    let repo = s.root.join("repo");
+    fs::create_dir(&repo).unwrap();
+    host_git(&repo, &["init", "-q", "-b", "main"]);
+    host_git(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+    // `git worktree add` wants an empty directory, so the workspace's files
+    // (its allowed `.stopit.toml`) step aside and come back.
+    let saved: Vec<(OsString, Vec<u8>)> = fs::read_dir(s.ws())
+        .unwrap()
+        .flatten()
+        .map(|e| (e.file_name(), fs::read(e.path()).unwrap()))
+        .collect();
+    fs::remove_dir_all(s.ws()).unwrap();
+    let ws = s.ws();
+    host_git(
+        &repo,
+        &["worktree", "add", "-q", "-b", "wt", ws.to_str().unwrap()],
+    );
+    for (name, bytes) in saved {
+        fs::write(s.ws().join(name), bytes).unwrap();
+    }
+    let admin = fs::canonicalize(repo.join(".git/worktrees/ws")).unwrap();
+    let script = format!(
+        "ls -A {admin} 2>/dev/null | wc -l; echo $(ls -A {common} 2>/dev/null); \
+         git commit -q --allow-empty -m from-sandbox; echo \"commit=$?\"; \
+         git log --format=%s",
+        admin = admin.display(),
+        common = fs::canonicalize(repo.join(".git")).unwrap().display(),
+    );
+    let out = output(s.stopit(&["run", "--quiet", "/bin/sh", "-c", &script]), b"");
+    assert_eq!(code(&out), 0, "{out:?}");
+    // main sees the admin directory empty, and in the common directory only
+    // the way to the admin directory's mask. The commit goes through the
+    // broker into the repository outside.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "0\nworktrees\ncommit=0\nfrom-sandbox\nbase\n",
+        "{}",
+        stderr(&out)
+    );
+    let log = Command::new("git")
+        .args(["log", "wt", "--format=%s"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&log.stdout), "from-sandbox\nbase\n");
+}
+
+#[test]
 fn the_vcs_profiles_have_a_home_main_cannot_write() {
     let Some(config) = shell_config() else {
         return;
