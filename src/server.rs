@@ -299,7 +299,7 @@ fn lock_workspace(workspace: &Path) -> Result<std::fs::File, RunError> {
 }
 
 /// Fails when `path` does not fit in a Unix socket address.
-fn check_socket_path(path: &Path) -> Result<(), RunError> {
+pub(crate) fn check_socket_path(path: &Path) -> Result<(), RunError> {
     let len = path.as_os_str().len();
     if len > MAX_SOCKET_PATH {
         return Err(RunError::SocketPathTooLong {
@@ -438,7 +438,8 @@ fn run_for_client(
     } else {
         TerminalSession::Detach
     };
-    let bwrap = loaded.command(profile, &command, env, terminal)?;
+    let proxy = loaded.start_proxy(profile, &run.to_string())?;
+    let bwrap = loaded.command(profile, &command, env, terminal, proxy.as_ref())?;
     let pasta = match bwrap.needs_pasta() {
         true => Some(crate::net::find_pasta()?),
         false => None,
@@ -537,6 +538,12 @@ fn run_for_client(
     }
     let status = child.wait().map_err(RunError::Spawn)?;
     let code = bwrap_exit_code(status, &read_nonblocking_status(status_reader));
+    if let Some(proxy) = proxy {
+        let (hosts, count) = proxy.denied();
+        if let Some(report) = crate::proxy::denied_report(&hosts, count) {
+            approver.log(&format!("stopit: run {run}: {}", escape_message(&report)));
+        }
+    }
     if !quiet {
         approver.log(&format!("stopit: run {run} ended with status {code}"));
     }

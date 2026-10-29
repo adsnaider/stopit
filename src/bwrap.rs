@@ -377,6 +377,23 @@ impl BwrapCommand {
         target: &[OsString],
         terminal: TerminalSession,
     ) -> Result<BwrapCommand, BwrapError> {
+        Self::for_init_with_proxy(spec, session, provisioned, cwd, env, target, terminal, None)
+    }
+
+    /// [`for_init`](Self::for_init), with the network proxy's socket at
+    /// `proxy_socket` on the host mounted at
+    /// [`crate::proxy::SANDBOX_PROXY_SOCKET`], if given.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_init_with_proxy(
+        spec: &SandboxSpec,
+        session: &SessionDir,
+        provisioned: &Provisioned,
+        cwd: &Path,
+        env: &[(OsString, OsString)],
+        target: &[OsString],
+        terminal: TerminalSession,
+        proxy_socket: Option<&Path>,
+    ) -> Result<BwrapCommand, BwrapError> {
         if target.is_empty() {
             return Err(BwrapError::NoCommand);
         }
@@ -396,6 +413,7 @@ impl BwrapCommand {
             &argv,
             terminal,
             init_spec.lo_down,
+            proxy_socket,
         )?;
         command.env_fd = Some(env_fd);
         command.spec_fd = Some(spec_fd);
@@ -430,9 +448,11 @@ impl BwrapCommand {
             argv_after_prefix,
             terminal,
             false,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build(
         spec: &SandboxSpec,
         session: &SessionDir,
@@ -441,12 +461,14 @@ impl BwrapCommand {
         argv_after_prefix: &[OsString],
         terminal: TerminalSession,
         retain_init_caps: bool,
+        proxy_socket: Option<&Path>,
     ) -> Result<BwrapCommand, BwrapError> {
         let runtime = RuntimeBinds {
             exe: provisioned.exe().to_path_buf(),
             lib_dir: provisioned.lib_dir().to_path_buf(),
             bin: session.bin(),
             prefix: provisioned.command_prefix(Path::new(SANDBOX_RUNTIME_DIR)),
+            proxy_socket: proxy_socket.map(Path::to_path_buf),
         };
         let mut untrusted_roots = spec.untrusted_roots.clone();
         untrusted_roots.insert(session.ephemeral());
@@ -929,6 +951,8 @@ struct RuntimeBinds {
     lib_dir: PathBuf,
     bin: PathBuf,
     prefix: Vec<OsString>,
+    /// The network proxy's socket on the host, if the sandbox has one.
+    proxy_socket: Option<PathBuf>,
 }
 
 /// The generated invocation, before any descriptor exists.
@@ -1204,6 +1228,14 @@ fn plan_with_caps(
             OsStr::new("--ro-bind"),
             host.as_os_str(),
             base.join(name).as_os_str(),
+        ])?;
+    }
+    // A socket connects through a read-only mount too.
+    if let Some(socket) = &runtime.proxy_socket {
+        plan.push([
+            OsStr::new("--ro-bind"),
+            socket.as_os_str(),
+            OsStr::new(crate::proxy::SANDBOX_PROXY_SOCKET),
         ])?;
     }
 
@@ -1552,6 +1584,7 @@ mod tests {
             lib_dir: "/s/lib".into(),
             bin: "/s/bin".into(),
             prefix: vec!["/run/stopit/stopit".into()],
+            proxy_socket: None,
         }
     }
 
@@ -2259,6 +2292,32 @@ mod tests {
         assert_eq!(args[end - RUNTIME.len()..end], RUNTIME);
         // Only the provisioned pieces, never the session directory itself.
         assert!(!args.iter().any(|a| a == "/s" || a == "/run/stopit"));
+    }
+
+    #[test]
+    fn the_proxy_socket_is_mounted_read_only_after_the_runtime() {
+        let mut runtime = runtime();
+        runtime.proxy_socket = Some("/s/proxy-3.sock".into());
+        let plan = plan(
+            &SandboxSpec::default(),
+            &BTreeSet::new(),
+            &runtime,
+            IDS,
+            Path::new("/"),
+            &[],
+            TerminalSession::Keep,
+            &|_| true,
+            &|_| None,
+            &mut |_, _| unreachable!(),
+        )
+        .unwrap();
+        let args = strings(&plan);
+        let end = args.len() - ROOT_RO.len();
+        assert_eq!(
+            args[end - 3..end],
+            ["--ro-bind", "/s/proxy-3.sock", "/run/stopit/proxy.sock"]
+        );
+        assert_eq!(args[end - 3 - RUNTIME.len()..end - 3], RUNTIME);
     }
 
     #[test]

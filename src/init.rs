@@ -214,18 +214,20 @@ pub struct InitSpec {
     pub landlock: LandlockSpec,
     /// Opt-in syscall groups permitted through seccomp.
     pub allow_syscalls: BTreeSet<OptInSyscall>,
+    /// Start the bridge to the network proxy ([`crate::proxy::run_bridge`]).
+    pub proxy_bridge: bool,
 }
 
 impl InitSpec {
     /// Derives the `__init` specification for `spec`.
     pub fn from_sandbox_spec(spec: &SandboxSpec) -> Self {
-        let lo_down = spec.network == NetworkSpec::None
-            && !spec.namespaces.is_shared(ShareableNamespace::Net);
+        let own_net = !spec.namespaces.is_shared(ShareableNamespace::Net);
         InitSpec {
-            lo_down,
+            lo_down: spec.network == NetworkSpec::None && own_net,
             pty_slave: false,
             landlock: LandlockSpec::from_sandbox_spec(spec),
             allow_syscalls: spec.allow_syscalls.clone(),
+            proxy_bridge: matches!(spec.network, NetworkSpec::Proxy { .. }) && own_net,
         }
     }
 }
@@ -453,6 +455,17 @@ pub fn run(args: &[OsString]) -> u8 {
         return EXIT_INIT_FAILED;
     }
 
+    // After Landlock and seccomp, so the bridge has no more rights than
+    // the target.
+    if spec.proxy_bridge
+        && let Err(e) = start_proxy_bridge()
+    {
+        report(format_args!(
+            "cannot start the bridge to the network proxy: {e}"
+        ));
+        return EXIT_INIT_FAILED;
+    }
+
     if let Err(e) = reset_signals() {
         report(format_args!("cannot reset the signal state: {e}"));
         return EXIT_INIT_FAILED;
@@ -660,6 +673,73 @@ fn set_no_new_privs() -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+/// Starts the bridge to the network proxy in a process of its own, a
+/// grandchild, so the target never sees it as a child. It listens on the
+/// loopback addresses before this returns, so the target can connect at
+/// once, and it ends when the target, which keeps this process's pid,
+/// does.
+fn start_proxy_bridge() -> io::Result<()> {
+    use std::net::{Ipv4Addr, Ipv6Addr, TcpListener};
+    let port = crate::proxy::BRIDGE_PORT;
+    let mut listeners = vec![TcpListener::bind((Ipv4Addr::LOCALHOST, port))?];
+    // A kernel without IPv6 has no `::1`; the IPv4 one is enough then.
+    if let Ok(v6) = TcpListener::bind((Ipv6Addr::LOCALHOST, port)) {
+        listeners.push(v6);
+    }
+    let target = rustix::process::pidfd_open(
+        rustix::process::getpid(),
+        rustix::process::PidfdFlags::empty(),
+    )?;
+    // SAFETY: `__init` is single-threaded here, so the child may do
+    // anything the parent could.
+    match unsafe { libc::fork() } {
+        -1 => Err(io::Error::last_os_error()),
+        0 => {
+            // SAFETY: as above, in the single-threaded child.
+            match unsafe { libc::fork() } {
+                0 => {
+                    for signal in [
+                        libc::SIGINT,
+                        libc::SIGQUIT,
+                        libc::SIGHUP,
+                        libc::SIGTSTP,
+                        libc::SIGTTIN,
+                        libc::SIGTTOU,
+                        libc::SIGPIPE,
+                    ] {
+                        // SAFETY: setting a signal to be ignored.
+                        unsafe { libc::signal(signal, libc::SIG_IGN) };
+                    }
+                    // The bridge has nothing to say, and must not keep the
+                    // terminal open.
+                    for fd in 0..3 {
+                        // SAFETY: closing stdio, which nothing else uses.
+                        unsafe { libc::close(fd) };
+                    }
+                    crate::proxy::run_bridge(
+                        listeners,
+                        std::path::Path::new(crate::proxy::SANDBOX_PROXY_SOCKET),
+                        target,
+                    )
+                }
+                // SAFETY: `_exit` skips the parent's atexit handlers and
+                // buffers, which belong to `__init`.
+                _ => unsafe { libc::_exit(0) },
+            }
+        }
+        child => {
+            drop(listeners);
+            drop(target);
+            let mut status = 0;
+            // SAFETY: waits for the child just forked.
+            if unsafe { libc::waitpid(child, &mut status, 0) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
     }
 }
 
@@ -920,6 +1000,28 @@ mod tests {
     }
 
     // --- InitSpec encoding ---
+
+    #[test]
+    fn only_proxy_mode_in_its_own_namespace_starts_the_bridge() {
+        use crate::manifest::ShareableNamespace;
+        let mut sb = SandboxSpec::default();
+        for (network, bridge) in [
+            (NetworkSpec::None, false),
+            (NetworkSpec::Loopback, false),
+            (NetworkSpec::Full, false),
+            (
+                NetworkSpec::Proxy {
+                    allow_domains: Default::default(),
+                },
+                true,
+            ),
+        ] {
+            sb.network = network;
+            assert_eq!(InitSpec::from_sandbox_spec(&sb).proxy_bridge, bridge);
+        }
+        sb.namespaces.shared = [ShareableNamespace::Net].into();
+        assert!(!InitSpec::from_sandbox_spec(&sb).proxy_bridge);
+    }
 
     #[test]
     fn init_spec_round_trips_and_enforces_size_limit() {

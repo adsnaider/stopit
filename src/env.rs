@@ -57,6 +57,18 @@ impl EffectiveEnv {
         home: &SandboxHome,
         host: impl IntoIterator<Item = (OsString, OsString)>,
     ) -> Vec<(OsString, OsString)> {
+        self.apply_with(home, host, &[])
+    }
+
+    /// [`apply`](Self::apply), with `defaults` added after the identity
+    /// variables and before `set`: they override passed host variables, and
+    /// `set` overrides them.
+    pub fn apply_with(
+        &self,
+        home: &SandboxHome,
+        host: impl IntoIterator<Item = (OsString, OsString)>,
+        defaults: &[(&str, String)],
+    ) -> Vec<(OsString, OsString)> {
         let mut env: BTreeMap<OsString, OsString> = BTreeMap::new();
         for (name, value) in host {
             let key = name.as_bytes();
@@ -79,6 +91,9 @@ impl EffectiveEnv {
         env.insert(HOME.into(), home.as_str().into());
         env.insert(USER.into(), SANDBOX_USER.into());
         env.insert(LOGNAME.into(), SANDBOX_USER.into());
+        for (name, value) in defaults {
+            env.insert(name.into(), value.into());
+        }
         for (name, value) in &self.set {
             env.insert(name.as_str().into(), value.as_str().into());
         }
@@ -93,17 +108,29 @@ impl EffectiveEnv {
 impl SandboxSpec {
     /// The environment the target gets in this sandbox, built from the
     /// `host` environment (typically [`std::env::vars_os`]). See
-    /// [`EffectiveEnv::apply`].
+    /// [`EffectiveEnv::apply`]. In proxy mode, with a network namespace of
+    /// its own, the proxy variables point at the bridge
+    /// ([`crate::proxy::proxy_env`]), whatever the host's say.
     pub fn target_env(
         &self,
         host: impl IntoIterator<Item = (OsString, OsString)>,
     ) -> Vec<(OsString, OsString)> {
-        self.env.apply(&self.system.home, host)
+        let proxied = matches!(self.network, crate::spec::NetworkSpec::Proxy { .. })
+            && !self
+                .namespaces
+                .is_shared(crate::manifest::ShareableNamespace::Net);
+        let defaults = if proxied {
+            crate::proxy::proxy_env()
+        } else {
+            Vec::new()
+        };
+        self.env.apply_with(&self.system.home, host, &defaults)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::os::unix::ffi::OsStringExt;
 
     use super::*;
@@ -407,6 +434,57 @@ mod tests {
             crate::init::encode_env(out.iter().map(|(k, v)| (k, v))).unwrap(),
             b"A=\0B=x=y\0HOME=/home/user\0LOGNAME=user\0PATH=/bin\0USER=user\0"
         );
+    }
+
+    #[test]
+    fn proxy_mode_points_the_proxy_variables_at_the_bridge() {
+        use crate::spec::{NetworkSpec, SandboxSpec};
+        let mut spec = SandboxSpec {
+            env: policy(&["*_PROXY", "*_proxy"], &[], &[("NO_PROXY", "mine")], &[]),
+            network: NetworkSpec::Proxy {
+                allow_domains: Default::default(),
+            },
+            ..SandboxSpec::default()
+        };
+        let host = vars(&[
+            ("HTTPS_PROXY", "http://corp:3128"),
+            ("FTP_PROXY", "ftp://corp"),
+        ]);
+        let env: BTreeMap<OsString, OsString> = spec.target_env(host.clone()).into_iter().collect();
+        let get = |k: &str| {
+            env.get(OsStr::new(k))
+                .map(|v| v.to_str().unwrap().to_owned())
+        };
+        // The host's proxy is no use in the sandbox; ours wins over it.
+        assert_eq!(get("HTTPS_PROXY").as_deref(), Some("http://127.0.0.1:1080"));
+        assert_eq!(get("https_proxy").as_deref(), Some("http://127.0.0.1:1080"));
+        assert_eq!(
+            get("ALL_PROXY").as_deref(),
+            Some("socks5h://127.0.0.1:1080")
+        );
+        assert_eq!(get("NODE_USE_ENV_PROXY").as_deref(), Some("1"));
+        assert_eq!(get("no_proxy").as_deref(), Some("localhost,127.0.0.1,::1"));
+        // `env.set` wins over ours, and a passed host variable we do not
+        // set stays.
+        assert_eq!(get("NO_PROXY").as_deref(), Some("mine"));
+        assert_eq!(get("FTP_PROXY").as_deref(), Some("ftp://corp"));
+        // Other modes, and a shared network namespace, set nothing.
+        for network in [NetworkSpec::None, NetworkSpec::Loopback, NetworkSpec::Full] {
+            spec.network = network;
+            let env: BTreeMap<_, _> = spec.target_env(host.clone()).into_iter().collect();
+            assert_eq!(
+                env.get(OsStr::new("HTTPS_PROXY"))
+                    .map(|v| v.to_str().unwrap()),
+                Some("http://corp:3128")
+            );
+            assert!(!env.contains_key(OsStr::new("ALL_PROXY")));
+        }
+        spec.network = NetworkSpec::Proxy {
+            allow_domains: Default::default(),
+        };
+        spec.namespaces.shared = [crate::manifest::ShareableNamespace::Net].into();
+        let env: BTreeMap<_, _> = spec.target_env(host).into_iter().collect();
+        assert!(!env.contains_key(OsStr::new("ALL_PROXY")));
     }
 
     #[test]

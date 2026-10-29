@@ -3628,3 +3628,135 @@ fn an_attached_run_gets_the_full_network_too() {
     assert!(server.log().contains("run 1 started"), "{}", server.log());
     assert_eq!(server.stop(), 128 + libc::SIGTERM);
 }
+
+// --- network = "proxy" ---
+
+/// [`shell_config`] in proxy mode allowing `domains`, if the host has a
+/// shell and bash.
+fn proxy_config(domains: &[&str]) -> Option<String> {
+    let config = shell_config()?;
+    if !sandbox_has("bash") {
+        eprintln!("skipping: no bash in /usr/bin or /bin on the host");
+        return None;
+    }
+    let list: Vec<String> = domains.iter().map(|d| format!("{d:?}")).collect();
+    Some(format!(
+        "{config}network = {{ mode = \"proxy\", allow_domains = [{}] }}\n",
+        list.join(", ")
+    ))
+}
+
+/// A bash line that sends `CONNECT host:443` to the bridge at `addr` and
+/// prints the first line of the answer, prefixed with `label`.
+fn connect_through(label: &str, addr: &str, host: &str) -> String {
+    format!(
+        "exec 3<>/dev/tcp/{addr}/1080 && printf 'CONNECT {host}:443 HTTP/1.1\\r\\n\\r\\n' >&3 \
+         && read -r line <&3 && echo \"{label} ${{line%$'\\r'}}\"; exec 3>&-; "
+    )
+}
+
+#[test]
+fn proxy_mode_tunnels_through_the_bridge_and_reports_refusals() {
+    let Some(config) = proxy_config(&["allowed.test"]) else {
+        return;
+    };
+    let s = Setup::with_config(&config);
+    let mut script = String::from("echo \"proxy $HTTPS_PROXY $ALL_PROXY\"; ");
+    script += &connect_through("other", "127.0.0.1", "other.test");
+    // Allowed, so the proxy tries to resolve it, which fails on the host.
+    script += &connect_through("allowed", "127.0.0.1", "allowed.test");
+    if Path::new("/proc/net/if_inet6").exists() {
+        script += &connect_through("v6", "::1", "other.test");
+    }
+    // The sandbox has no other way out, and the bridge is no child of the
+    // target's.
+    script += "if timeout 2 bash -c 'exec 3<>/dev/tcp/192.0.2.1/443' 2>/dev/null; \
+               then echo direct reached; else echo direct refused; fi; \
+               read -r kids < /proc/$$/task/$$/children; echo \"children [$kids]\"";
+    let out = output(s.stopit(&["run", "--quiet", "bash", "-c", &script]), b"");
+    assert_eq!(code(&out), 0, "{out:?}");
+    let shown = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        shown.contains("proxy http://127.0.0.1:1080 socks5h://127.0.0.1:1080\n"),
+        "{shown}"
+    );
+    assert!(shown.contains("other HTTP/1.1 403 Forbidden\n"), "{shown}");
+    assert!(
+        shown.contains("allowed HTTP/1.1 502 Bad Gateway\n"),
+        "{shown}"
+    );
+    if Path::new("/proc/net/if_inet6").exists() {
+        assert!(shown.contains("v6 HTTP/1.1 403 Forbidden\n"), "{shown}");
+    }
+    assert!(shown.contains("direct refused\n"), "{shown}");
+    assert!(shown.contains("children []"), "{shown}");
+    // Two refusals of one host, said once after the run.
+    let err = stderr(&out);
+    assert!(
+        err.contains("the network proxy refused 2 connections, to other.test;"),
+        "{err}"
+    );
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn proxy_mode_reaches_allowed_sites_where_the_host_does() {
+    let host = "www.google.com";
+    let Some(config) = proxy_config(&[host]) else {
+        return;
+    };
+    if !sandbox_has("curl") {
+        return;
+    }
+    let reachable = std::net::ToSocketAddrs::to_socket_addrs(&(host, 443))
+        .ok()
+        .and_then(|mut addrs| addrs.next())
+        .is_some_and(|addr| {
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3)).is_ok()
+        });
+    if !reachable {
+        eprintln!("skipping: the host does not reach {host}");
+        return;
+    }
+    let certs: Vec<String> = ["/etc/ssl", "/etc/ca-certificates", "/etc/pki"]
+        .into_iter()
+        .filter(|d| Path::new(d).exists())
+        .map(|d| format!("{d:?}"))
+        .collect();
+    let s = Setup::with_config(&format!(
+        "{config}[[provider]]\ntype = \"config\"\nname = \"certs\"\n[provider.sandbox]\n\
+         fs.ro = [{}]\n",
+        certs.join(", ")
+    ));
+    let script = format!(
+        "curl -sS -o /dev/null -w 'https %{{http_code}}\\n' --max-time 20 https://{host}/; \
+         curl -sS -o /dev/null -w 'socks %{{http_code}}\\n' --max-time 20 \
+         --proxy socks5h://127.0.0.1:1080 https://{host}/"
+    );
+    let out = output(s.stopit(&["run", "--quiet", "bash", "-c", &script]), b"");
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "https 200\nsocks 200\n",
+        "{out:?}"
+    );
+}
+
+#[test]
+fn an_attached_run_gets_the_proxy_and_the_server_logs_refusals() {
+    let Some(config) = proxy_config(&["allowed.test"]) else {
+        return;
+    };
+    let s = Setup::with_config(&config);
+    let mut server = Server::start(&s);
+    let script = connect_through("other", "127.0.0.1", "other.test");
+    let out = output(s.stopit(&["run", "--quiet", "bash", "-c", &script]), b"");
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "other HTTP/1.1 403 Forbidden\n"
+    );
+    server.wait_for_log("run 1: the network proxy refused 1 connection, to other.test");
+    assert_eq!(server.stop(), 128 + libc::SIGTERM);
+    assert!(s.no_session_left());
+}

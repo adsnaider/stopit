@@ -4,7 +4,7 @@ stopit runs a program, such as an LLM coding agent, a shell or a build, in a Lin
 
 It is a single Rust binary built on [bubblewrap](https://github.com/containers/bubblewrap). Each session's policy comes from a `.stopit.toml` in the project, and stopit refuses to use one until you have reviewed and allowed it.
 
-> **Status: early development.** The filesystem, environment and configuration-trust parts work and are tested against real sandboxes. Seccomp, Landlock, network filtering, the terminal proxy and brokered tools (`git`, `jj`) are not built yet. Do not rely on stopit to contain hostile code yet. [DESIGN.md](DESIGN.md) describes the full design, and its section 11 lists what is missing.
+> **Status: early development.** The filesystem, environment, configuration trust, seccomp, Landlock, the terminal filter, `stopit server` and both network modes work and are tested against real sandboxes. Brokered tools (`git`, `jj`), resource limits and prompts for protected files are not built yet. Do not rely on stopit to contain hostile code yet. [DESIGN.md](DESIGN.md) describes the full design, and its section 11 lists what is missing.
 
 ## What the sandbox gets by default
 
@@ -97,7 +97,13 @@ network = { mode = "full" }
 fs.ro = ["/etc/ssl/certs"]
 ```
 
-`full` gives the sandbox a network of its own, connected to yours by `pasta` from the passt package, which must be installed. The sandbox reaches what your machine reaches, except services on your machine's loopback. Only DNS queries, on ports 53 and 853, reach your machine's resolver there. The planned `proxy` mode, which allows only listed domains, is not built yet.
+`full` gives the sandbox a network of its own, connected to yours by `pasta` from the passt package, which must be installed. The sandbox reaches what your machine reaches, except services on your machine's loopback. Only DNS queries, on ports 53 and 853, reach your machine's resolver there. To allow only some sites, use `proxy` mode instead:
+
+```toml
+network = { mode = "proxy", allow_domains = ["index.crates.io", "static.crates.io"] }
+```
+
+The sandbox then reaches only those names, over HTTPS through a proxy that stopit runs and that checks each TLS server name. Tools find it through `HTTPS_PROXY` and the other proxy variables, which stopit sets.
 
 ### Keep a build cache between sessions
 

@@ -252,13 +252,26 @@ fn network_line(network: &NetworkSpec, lines: &mut Vec<String>) {
         NetworkSpec::Proxy { allow_domains } if allow_domains.is_empty() => {
             lines.push(grant("network", "proxy (no domains)"));
         }
-        NetworkSpec::Proxy { allow_domains } => lines.push(grant(
-            "network",
-            &format!(
-                "proxy to {}",
-                name_list(allow_domains.iter().map(|d| d.as_str()))
-            ),
-        )),
+        NetworkSpec::Proxy { allow_domains } => {
+            lines.push(grant(
+                "network",
+                &format!(
+                    "proxy to {}",
+                    name_list(allow_domains.iter().map(|d| d.as_str()))
+                ),
+            ));
+            let uploads: Vec<&str> = allow_domains
+                .iter()
+                .map(|d| d.as_str())
+                .filter(|d| crate::proxy::accepts_uploads(d))
+                .collect();
+            if !uploads.is_empty() {
+                lines.push(grant(
+                    "uploads",
+                    &format!("{}  (these accept uploads)", name_list(uploads)),
+                ));
+            }
+        }
     }
 }
 
@@ -553,6 +566,18 @@ mod tests {
                 allow_domains: ["b.com", "a.com"].map(|d| d.parse().unwrap()).into()
             }),
             ["  network  proxy to a.com, b.com"]
+        );
+        // Domains a sandbox could send data out through get a line.
+        assert_eq!(
+            net(NetworkSpec::Proxy {
+                allow_domains: ["static.crates.io", "api.anthropic.com", "github.com"]
+                    .map(|d| d.parse().unwrap())
+                    .into()
+            }),
+            [
+                "  network  proxy to api.anthropic.com, github.com, static.crates.io",
+                "  uploads  api.anthropic.com, github.com  (these accept uploads)"
+            ]
         );
     }
 

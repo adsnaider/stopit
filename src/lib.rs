@@ -20,6 +20,7 @@ pub mod net;
 pub mod policy;
 pub mod provider;
 pub mod provision;
+pub mod proxy;
 pub mod pty;
 pub mod resolve;
 pub mod seccomp;

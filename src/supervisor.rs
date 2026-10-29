@@ -287,6 +287,16 @@ pub enum RunError {
     #[error(transparent)]
     Network(#[from] crate::net::NetError),
 
+    /// The network proxy cannot listen.
+    #[error("cannot start the network proxy on {path:?}: {source}")]
+    Proxy {
+        /// Its socket.
+        path: PathBuf,
+        /// What went wrong.
+        #[source]
+        source: io::Error,
+    },
+
     /// The signal handlers cannot be installed.
     #[error("cannot set up signal handling: {0}")]
     Signals(#[source] io::Error),
@@ -651,7 +661,14 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     }
     let stdio = stdio_terminals();
     let terminal = terminal_session(stdio);
-    let command = loaded.command(profile, &invocation.command, std::env::vars_os(), terminal)?;
+    let proxy = loaded.start_proxy(profile, "run")?;
+    let command = loaded.command(
+        profile,
+        &invocation.command,
+        std::env::vars_os(),
+        terminal,
+        proxy.as_ref(),
+    )?;
     ignore_job_control();
     if terminal != TerminalSession::Keep {
         check_foreground(stdio)?;
@@ -662,6 +679,12 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
         None
     };
     let status = wait_foreground(command, pty);
+    if let Some(proxy) = proxy {
+        let (hosts, count) = proxy.denied();
+        if let Some(report) = crate::proxy::denied_report(&hosts, count) {
+            eprintln!("stopit: warning: {}", escape_message(&report));
+        }
+    }
     // The sandbox is gone, or going: bwrap returns once its namespace's
     // init exits, and if bwrap itself was killed, `--die-with-parent` kills
     // the init and so the namespace. Its mounts go with it.
@@ -955,17 +978,19 @@ impl LoadedSession {
     }
 
     /// The bwrap command running `command` in `profile`, with the target
-    /// environment built from `host_env` (§9).
+    /// environment built from `host_env` (§9), and `proxy`'s socket
+    /// mounted if given.
     pub(crate) fn command(
         &self,
         profile: &CompiledProfile,
         command: &[OsString],
         host_env: impl IntoIterator<Item = (OsString, OsString)>,
         terminal: TerminalSession,
+        proxy: Option<&crate::proxy::Proxy>,
     ) -> Result<BwrapCommand, RunError> {
         let env = profile.spec.target_env(host_env);
         let sandbox_cwd = working_dir(&profile.spec, self.config.workspace.mount.as_path());
-        Ok(BwrapCommand::for_init(
+        Ok(BwrapCommand::for_init_with_proxy(
             &profile.spec,
             &self.session,
             &self.provisioned,
@@ -973,7 +998,33 @@ impl LoadedSession {
             &env,
             command,
             terminal,
+            proxy.map(crate::proxy::Proxy::path),
         )?)
+    }
+
+    /// The network proxy for a sandbox of `profile`, if it is in proxy
+    /// mode with a network namespace of its own, on a socket named for
+    /// `label` in the session directory.
+    pub(crate) fn start_proxy(
+        &self,
+        profile: &CompiledProfile,
+        label: &str,
+    ) -> Result<Option<crate::proxy::Proxy>, RunError> {
+        let crate::spec::NetworkSpec::Proxy { allow_domains } = &profile.spec.network else {
+            return Ok(None);
+        };
+        if profile
+            .spec
+            .namespaces
+            .is_shared(crate::manifest::ShareableNamespace::Net)
+        {
+            return Ok(None);
+        }
+        let path = self.session.root().join(format!("proxy-{label}.sock"));
+        crate::server::check_socket_path(&path)?;
+        crate::proxy::Proxy::start(path.clone(), allow_domains.clone())
+            .map(Some)
+            .map_err(|source| RunError::Proxy { path, source })
     }
 
     /// The OSC 52 policy for a standalone run's output filter. `ask` has no
@@ -1385,6 +1436,11 @@ fn wait_foreground(
         // Killed before `block` closes, which would let bwrap go on.
         let _ = child.kill();
         let _ = child.wait();
+        // A Ctrl-C without a PTY kills bwrap too, and pasta then fails to
+        // join it. The run then ends by the signal, not by pasta.
+        if let Some(signal) = blocked_pending_signal() {
+            return Ok(signal_exit_code(signal));
+        }
         return Err(e.into());
     }
     drop(block);
@@ -1460,6 +1516,20 @@ pub(crate) fn spawn_error(e: io::Error, own_netns: bool) -> RunError {
             RunError::Network(crate::net::NetError::Namespace(e))
         }
         _ => RunError::Spawn(e),
+    }
+}
+
+/// A caught signal ([`CAUGHT`]) waiting while the caller blocks it, if any.
+fn blocked_pending_signal() -> Option<libc::c_int> {
+    // SAFETY: plain libc calls on a local signal set.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        if libc::sigpending(&mut set) != 0 {
+            return None;
+        }
+        CAUGHT
+            .into_iter()
+            .find(|&signal| libc::sigismember(&set, signal) == 1)
     }
 }
 
