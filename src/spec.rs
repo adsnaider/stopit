@@ -43,8 +43,8 @@ use crate::config::{Config, ProfileRef, ProviderName};
 use crate::error::is_missing;
 use crate::expand::{EntryKind, ExpansionContext, expand_bind, expand_pattern};
 use crate::manifest::{
-    BindMode, DevMode, Domain, EtcFile, OptInSyscall, SandboxHome, ShareableNamespace, ShimName,
-    ShimSpec,
+    BindMode, DevMode, Domain, EtcFile, GroupName, OptInSyscall, SandboxHome, ShareableNamespace,
+    ShimName, ShimSpec,
 };
 use crate::policy::{NetworkMode, PathMode};
 use crate::provider::{ProtectedSource, ProviderOutput, SUPERVISOR_PROVIDER_NAME};
@@ -104,6 +104,9 @@ pub struct SystemSpec {
     /// no provider sets one. It is where `~` rules are mounted; nothing is
     /// mounted there unless a rule grants it.
     pub home: SandboxHome,
+    /// More names for the overflow gid in the synthesized `/etc/group`
+    /// (`system.groups`).
+    pub groups: BTreeSet<GroupName>,
 }
 
 /// Which namespaces are shared with the host (§6.2 step 1).
@@ -3057,6 +3060,7 @@ fn finish_profile(
             dev: grants.system.dev,
             etc,
             home,
+            groups: grants.system.groups.clone(),
         },
         namespaces: Namespaces {
             shared: grants.sandbox.share.clone(),
@@ -3658,6 +3662,30 @@ mod tests {
                 "{workspace}/.lldbinit",
             ]
         );
+    }
+
+    #[test]
+    fn extra_group_names_are_a_union_down_the_profiles() {
+        let f = Fixture::new();
+        let s = f.compile(&format!(
+            "[profiles.child]\n[profiles.bare]\ninherit = \"none\"\n{}{}{}",
+            prov("a", "main", "system.groups = [\"nobody\"]"),
+            prov("b", "main", "system.groups = [\"audio\", \"nobody\"]"),
+            prov("c", "child", "system.groups = [\"video\"]"),
+        ));
+        let names = |p: &str| {
+            spec(&s, p)
+                .system
+                .groups
+                .iter()
+                .map(|g| g.as_str().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names("main"), ["audio", "nobody"]);
+        assert_eq!(names("child"), ["audio", "nobody", "video"]);
+        assert!(names("bare").is_empty());
+        // None by default.
+        assert!(spec(&f.compile(""), "main").system.groups.is_empty());
     }
 
     #[test]

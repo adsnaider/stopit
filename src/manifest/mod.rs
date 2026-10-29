@@ -41,7 +41,7 @@ pub use sandbox::{OptInSyscall, SandboxGrants, ShareableNamespace};
 pub use shim::{
     BinaryName, Flag, ShimAction, ShimArg, ShimName, ShimRule, ShimSpec, SubcommandPattern,
 };
-pub use system::{DevMode, EtcFile, SandboxHome, SystemGrants};
+pub use system::{DevMode, EtcFile, GroupName, SandboxHome, SystemGrants};
 
 /// Error produced while loading a manifest document from JSON.
 #[derive(Debug, Error)]

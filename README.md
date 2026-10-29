@@ -208,7 +208,7 @@ The `vcs` provider, on by default, masks the project's `.git` and `.jj` in the s
 
 A refused command exits with 126 and says why on its stderr, as `[stopit: git: ...]`. Commits carry the `user.name` and `user.email` that `git config --global` gives on the host. jj's own user settings are not read.
 
-The broker supports a plain git repository, a jj repository, colocated or not, and a git worktree. Others (a jj secondary workspace, a project below a checkout's root) get the mask without the broker, with a warning. Some builds of jj need `/sys/devices/system/cpu` granted read-only to start.
+The broker supports a plain git repository, a jj repository, colocated or not, and a git worktree. Others (a jj secondary workspace, a project below a checkout's root) get the mask without the broker, with a warning.
 
 For projects whose build reads `.git` itself, show it read-only instead. This shows `.git/config` too, including any credentials in remote URLs.
 

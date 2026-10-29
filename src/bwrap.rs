@@ -1190,7 +1190,8 @@ fn plan_with_caps(
     // unaffected: bwrap creates `/etc` and the mount points in its root
     // tmpfs, in whichever order.
     for &file in &spec.system.etc {
-        let data = etc::contents(file, ids, &spec.system.home, hostname).into_bytes();
+        let data =
+            etc::contents(file, ids, &spec.system.home, &spec.system.groups, hostname).into_bytes();
         plan.data_file(ETC_FILE_PERMS, data, &etc::sandbox_path(file))?;
     }
     // TODO(§6.2 step 4): the sandbox-`HOME` stubs (`.gitconfig`, …), which
@@ -2103,7 +2104,7 @@ mod tests {
             [
                 "user:x:1000:100::/home/agent:/bin/sh\n\
                  nobody:x:65534:65534::/nonexistent:/bin/false\n",
-                "user:x:100:\nnogroup:x:65534:\nnobody:x:65534:\n",
+                "user:x:100:\nnogroup:x:65534:\n",
                 etc::hosts(Some(etc::SANDBOX_HOSTNAME)).as_str(),
                 etc::NSSWITCH_CONF,
                 "nameserver 169.254.1.1\n",
@@ -2144,7 +2145,14 @@ mod tests {
                 .map(|&f| {
                     (
                         etc::sandbox_path(f).to_str().unwrap().to_owned(),
-                        etc::contents(f, IDS, &home, Some(etc::SANDBOX_HOSTNAME)).into_bytes(),
+                        etc::contents(
+                            f,
+                            IDS,
+                            &home,
+                            &Default::default(),
+                            Some(etc::SANDBOX_HOSTNAME),
+                        )
+                        .into_bytes(),
                     )
                 })
                 .collect();

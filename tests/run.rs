@@ -4222,6 +4222,32 @@ fn git_runs_in_a_worktree_whose_storage_is_outside_the_workspace() {
 }
 
 #[test]
+fn extra_group_names_reach_the_group_file() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let s = Setup::with_config(&format!(
+        "{config}[[provider]]\ntype = \"config\"\nname = \"groups\"\n[provider.sandbox]\n\
+         system.groups = [\"nobody\", \"audio\"]\n"
+    ));
+    let out = output(
+        s.stopit(&[
+            "run",
+            "--quiet",
+            "/bin/sh",
+            "-c",
+            "grep -v '^user:' /etc/group",
+        ]),
+        b"",
+    );
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "nogroup:x:65534:\naudio:x:65534:\nnobody:x:65534:\n"
+    );
+}
+
+#[test]
 fn the_vcs_profiles_have_a_home_main_cannot_write() {
     let Some(config) = shell_config() else {
         return;
@@ -4282,14 +4308,14 @@ fn jj_runs_through_the_broker_while_main_sees_no_metadata() {
         eprintln!("skipping: no jj or git in /usr/bin or /bin");
         return;
     }
-    // Some builds of jj read the CPU count from `/sys`.
+    // Some builds of jj read the CPU count from `/sys` and look up a group
+    // named `nobody`.
     let s = Setup::with_config(&format!(
         "{config}[[provider]]\ntype = \"config\"\nname = \"cpus\"\n[provider.sandbox]\n\
-         fs.ro = [\"/sys/devices/system/cpu\"]\n"
+         fs.ro = [\"/sys/devices/system/cpu\"]\nsystem.groups = [\"nobody\"]\n"
     ));
-    // Some builds of jj need more of the host than a sandbox has (`/sys`
-    // for the CPU count, a group named `nobody`), so jj must run in one
-    // first. Outside a repository, `jj root` exits with 1.
+    // jj must run in a sandbox at all. Outside a repository, `jj root`
+    // exits with 1.
     let probe = output(s.stopit(&["run", "--quiet", "jj", "root"]), b"");
     if code(&probe) != 1 {
         eprintln!("skipping: jj does not run in a sandbox: {}", stderr(&probe));

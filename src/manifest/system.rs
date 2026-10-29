@@ -26,6 +26,8 @@ pub struct SystemGrants {
     pub etc: Vec<EtcFile>,
     /// The sandbox `HOME`.
     pub home: Option<SandboxHome>,
+    /// More names for the overflow gid in the synthesized `/etc/group`.
+    pub groups: Vec<GroupName>,
 }
 
 #[derive(Default, Deserialize)]
@@ -35,6 +37,7 @@ struct RawSystemGrants {
     dev: Option<DevMode>,
     etc: Vec<EtcFile>,
     home: Option<SandboxHome>,
+    groups: Vec<GroupName>,
 }
 
 impl From<MapOnly<RawSystemGrants>> for SystemGrants {
@@ -44,7 +47,65 @@ impl From<MapOnly<RawSystemGrants>> for SystemGrants {
             dev: raw.dev,
             etc: raw.etc,
             home: raw.home,
+            groups: raw.groups,
         }
+    }
+}
+
+/// A group name `system.groups` adds to the synthesized `/etc/group`, as
+/// another name for the overflow gid.
+///
+/// 1 to 32 bytes from `[a-z0-9_-]`, starting with a letter or `_`, as
+/// `groupadd` accepts by default. `user` is refused, since it names the
+/// sandbox user's own group.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(try_from = "String")]
+pub struct GroupName(String);
+
+impl GroupName {
+    /// The validated name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for GroupName {
+    type Err = ValueError;
+
+    fn from_str(s: &str) -> Result<Self, ValueError> {
+        let bad = |why: &str| ValueError::new(format!("invalid group name {s:?}: {why}"));
+        if s.is_empty() || s.len() > 32 {
+            return Err(bad("must be 1 to 32 bytes long"));
+        }
+        if !s.starts_with(|c: char| c.is_ascii_lowercase() || c == '_') {
+            return Err(bad("must start with a lowercase letter or `_`"));
+        }
+        if !s
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        {
+            return Err(bad(
+                "may only contain lowercase letters, digits, `_` and `-`",
+            ));
+        }
+        if s == crate::etc::SANDBOX_USER {
+            return Err(bad("names the sandbox user's own group"));
+        }
+        Ok(GroupName(s.to_owned()))
+    }
+}
+
+impl TryFrom<String> for GroupName {
+    type Error = ValueError;
+
+    fn try_from(s: String) -> Result<Self, ValueError> {
+        s.parse()
+    }
+}
+
+impl fmt::Display for GroupName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -231,12 +292,48 @@ mod tests {
     }
 
     #[test]
+    fn group_names_follow_groupadd() {
+        let m = toml_ok("system.groups = [\"nobody\", \"_x\", \"a-1\"]");
+        assert_eq!(
+            m.grants
+                .system
+                .groups
+                .iter()
+                .map(GroupName::as_str)
+                .collect::<Vec<_>>(),
+            ["nobody", "_x", "a-1"]
+        );
+        let json = jv_ok(r#""system": { "groups": ["nobody"] }"#);
+        assert_eq!(json.grants.system.groups.len(), 1);
+        assert!(toml_ok("").grants.system.groups.is_empty());
+        let longest = "a".repeat(32);
+        assert!(longest.parse::<GroupName>().is_ok());
+        for bad in [
+            "",
+            "Nobody",
+            "1abc",
+            "-a",
+            "a b",
+            "a:b",
+            "a\nb",
+            "user",
+            "é",
+            &"a".repeat(33),
+        ] {
+            assert!(bad.parse::<GroupName>().is_err(), "{bad:?}");
+        }
+        toml_err("system.groups = \"nobody\"");
+        toml_err("system.groups = [\"a:b\"]");
+    }
+
+    #[test]
     fn full_system_table_parses_from_toml_and_json() {
         let want = SystemGrants {
             proc: Some(true),
             dev: Some(DevMode::Minimal),
             etc: ETC_FILES.to_vec(),
             home: Some(home("/home/user")),
+            groups: Vec::new(),
         };
         let toml = r#"
             system = { proc = true, dev = "minimal", etc = ["passwd", "group", "hosts", "nsswitch.conf"], home = "/home/user" }

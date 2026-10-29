@@ -21,8 +21,9 @@ use thiserror::Error;
 use super::graph::{Contribution, ProfileGraph};
 use crate::config::{ProfileRef, ProviderName, ProviderOrigin};
 use crate::manifest::{
-    Bind, DevMode, Domain, EnvName, EnvPattern, EnvValue, EtcFile, FsGrants, OptInSyscall,
-    PathPattern, SandboxHome, SearchPathEntry, ShareableNamespace, ShimName, ShimSpec,
+    Bind, DevMode, Domain, EnvName, EnvPattern, EnvValue, EtcFile, FsGrants, GroupName,
+    OptInSyscall, PathPattern, SandboxHome, SearchPathEntry, ShareableNamespace, ShimName,
+    ShimSpec,
 };
 use crate::policy::{NetworkMode, PathMode};
 
@@ -68,6 +69,8 @@ pub struct EffectiveSystem {
     pub etc: BTreeSet<EtcFile>,
     /// The sandbox `HOME`, if any provider set one.
     pub home: Option<SandboxHome>,
+    /// More names for the overflow gid in `/etc/group`.
+    pub groups: BTreeSet<GroupName>,
 }
 
 /// The effective `env` section.
@@ -288,6 +291,10 @@ fn merge_profile(
             dev: merge_dev(inherited.system.dev, own),
             etc: merge_etc(&inherited.system.etc, own),
             home: merge_home(profile, inherited.system.home.as_ref(), own)?,
+            groups: union(
+                &inherited.system.groups,
+                own.iter().map(|c| &c.grants.system.groups),
+            ),
         },
         env: EffectiveEnv {
             pass: union_ordered(&inherited.env.pass, own.iter().map(|c| &c.grants.env.pass)),

@@ -533,8 +533,15 @@ fn default_base_synthesizes_read_only_etc_files() {
     // For this process's ids, the sandbox user's (the line format is
     // checked against the probe's ids below, and golden in `stopit::etc`).
     let home = "/home/user".parse().unwrap();
-    let expected = EtcFile::ALL
-        .map(|f| etc::contents(f, SandboxIds::current(), &home, Some(etc::SANDBOX_HOSTNAME)));
+    let expected = EtcFile::ALL.map(|f| {
+        etc::contents(
+            f,
+            SandboxIds::current(),
+            &home,
+            &Default::default(),
+            Some(etc::SANDBOX_HOSTNAME),
+        )
+    });
     for (i, (name, want)) in files.iter().zip(&expected).enumerate() {
         let r = &results[1 + i * 7..1 + (i + 1) * 7];
         let st = stat_data(&r[0]);

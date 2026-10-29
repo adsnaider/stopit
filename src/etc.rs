@@ -15,9 +15,9 @@
 //!   not the sandbox has one.
 //! * Inside the user namespace only that uid and gid are mapped; every other
 //!   id, host root included, shows as the overflow id [`OVERFLOW_ID`]. So
-//!   the files also name it (`nobody`, and `nogroup` and `nobody` for the
-//!   group), which `ls -l` and `id` show for files owned by other host
-//!   users and for supplementary groups.
+//!   the files also name it (`nobody`, `nogroup`), which `ls -l` and `id`
+//!   show for files owned by other host users and for supplementary groups.
+//!   `system.groups` adds more names for that gid.
 //!   There is no `root` entry: host root is unmapped and shows as `nobody`,
 //!   so uid 0 does not exist in the sandbox unless stopit runs as root.
 //! * `hosts` maps `localhost`, and [`SANDBOX_HOSTNAME`] too when stopit sets
@@ -37,7 +37,9 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use crate::manifest::{EtcFile, SandboxHome};
+use std::collections::BTreeSet;
+
+use crate::manifest::{EtcFile, GroupName, SandboxHome};
 
 /// The name of the sandbox user and of its primary group.
 pub const SANDBOX_USER: &str = "user";
@@ -105,18 +107,19 @@ pub fn sandbox_path(file: EtcFile) -> PathBuf {
     PathBuf::from("/etc").join(file.as_str())
 }
 
-/// The content of `file` for the sandbox user `ids` with the `HOME` `home`,
-/// in a sandbox whose hostname is `hostname` (`None` if stopit does not set
-/// one).
+/// The content of `file` for the sandbox user `ids` with the `HOME` `home`
+/// and the extra group names `groups`, in a sandbox whose hostname is
+/// `hostname` (`None` if stopit does not set one).
 pub fn contents(
     file: EtcFile,
     ids: SandboxIds,
     home: &SandboxHome,
+    groups: &BTreeSet<GroupName>,
     hostname: Option<&str>,
 ) -> String {
     match file {
         EtcFile::Passwd => passwd(ids, home),
-        EtcFile::Group => group(ids),
+        EtcFile::Group => group(ids, groups),
         EtcFile::Hosts => hosts(hostname),
         EtcFile::NsswitchConf => NSSWITCH_CONF.to_owned(),
         EtcFile::ResolvConf => resolv_conf(),
@@ -164,14 +167,17 @@ pub fn passwd(ids: SandboxIds, home: &SandboxHome) -> String {
     out
 }
 
-/// `/etc/group`: the sandbox user's primary group, then, unless that group
-/// has its gid, the overflow gid as `nogroup`, Debian's name, and again as
-/// `nobody`, Fedora's, which some programs look up by name.
-pub fn group(ids: SandboxIds) -> String {
+/// `/etc/group`: the sandbox user's primary group, then `nogroup` unless
+/// that group has its gid, then each of `extra` (`system.groups`) as
+/// another name for the overflow gid, for programs that look a group up by
+/// a name the file does not otherwise have.
+pub fn group(ids: SandboxIds, extra: &BTreeSet<GroupName>) -> String {
     let mut out = format!("{SANDBOX_USER}:x:{}:\n", ids.gid);
     if ids.gid != OVERFLOW_ID {
         writeln!(out, "{OVERFLOW_GROUP}:x:{OVERFLOW_ID}:").expect("writing to a String");
-        writeln!(out, "{OVERFLOW_USER}:x:{OVERFLOW_ID}:").expect("writing to a String");
+    }
+    for name in extra.iter().filter(|n| n.as_str() != OVERFLOW_GROUP) {
+        writeln!(out, "{name}:x:{OVERFLOW_ID}:").expect("writing to a String");
     }
     out
 }
@@ -184,6 +190,10 @@ mod tests {
         uid: 1000,
         gid: 100,
     };
+
+    fn none() -> BTreeSet<GroupName> {
+        BTreeSet::new()
+    }
 
     fn home(s: &str) -> SandboxHome {
         s.parse().unwrap()
@@ -205,9 +215,15 @@ mod tests {
 
     #[test]
     fn group_golden() {
+        assert_eq!(group(IDS, &none()), "user:x:100:\nnogroup:x:65534:\n");
+        // Extra names for the overflow gid, sorted, `nogroup` once.
+        let extra: BTreeSet<GroupName> = ["nobody", "nogroup", "audio"]
+            .iter()
+            .map(|n| n.parse().unwrap())
+            .collect();
         assert_eq!(
-            group(IDS),
-            "user:x:100:\nnogroup:x:65534:\nnobody:x:65534:\n"
+            group(IDS, &extra),
+            "user:x:100:\nnogroup:x:65534:\naudio:x:65534:\nnobody:x:65534:\n"
         );
     }
 
@@ -223,19 +239,19 @@ mod tests {
             passwd(ids, &home("/home/user")),
             "user:x:65534:65534::/home/user:/bin/sh\n"
         );
-        assert_eq!(group(ids), "user:x:65534:\n");
+        assert_eq!(group(ids, &none()), "user:x:65534:\n");
         // Only the one that collides is left out.
         let ids = SandboxIds {
             uid: 1000,
             gid: OVERFLOW_ID,
         };
         assert_eq!(passwd(ids, &home("/h")).lines().count(), 2);
-        assert_eq!(group(ids), "user:x:65534:\n");
+        assert_eq!(group(ids, &none()), "user:x:65534:\n");
     }
 
     #[test]
     fn root_is_not_listed() {
-        let text = passwd(IDS, &home("/home/user")) + &group(IDS);
+        let text = passwd(IDS, &home("/home/user")) + &group(IDS, &none());
         assert!(!text.lines().any(|l| l.starts_with("root:")), "{text}");
         assert!(!text.contains(":0:"), "{text}");
     }
@@ -246,7 +262,7 @@ mod tests {
         for line in passwd(ids, &home("/a b/c")).lines() {
             assert_eq!(line.split(':').count(), 7, "{line}");
         }
-        for line in group(ids).lines() {
+        for line in group(ids, &none()).lines() {
             assert_eq!(line.split(':').count(), 4, "{line}");
         }
     }
@@ -286,12 +302,12 @@ mod tests {
             for file in EtcFile::ALL {
                 let want = match file {
                     EtcFile::Passwd => passwd(IDS, &h),
-                    EtcFile::Group => group(IDS),
+                    EtcFile::Group => group(IDS, &none()),
                     EtcFile::Hosts => hosts(hostname),
                     EtcFile::NsswitchConf => NSSWITCH_CONF.to_owned(),
                     EtcFile::ResolvConf => resolv_conf(),
                 };
-                assert_eq!(contents(file, IDS, &h, hostname), want, "{file}");
+                assert_eq!(contents(file, IDS, &h, &none(), hostname), want, "{file}");
                 assert!(want.ends_with('\n'), "{file}");
             }
         }
