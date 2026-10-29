@@ -68,32 +68,47 @@ fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
     Ok(())
 }
 
+/// Whether `stat` names a concrete terminal endpoint rather than a
+/// multiplexor like `/dev/tty`, `/dev/console`, or `/dev/tty0`, or a PTY
+/// master like `/dev/ptmx` or `/dev/pts/ptmx`. Reopening a multiplexor or
+/// master through `/proc/self/fd` resolves against the opener's session or
+/// allocates a new master.
+pub(crate) fn is_concrete_tty(stat: &rustix::fs::Stat) -> bool {
+    use rustix::fs::{FileType, major, minor};
+    if FileType::from_raw_mode(stat.st_mode) != FileType::CharacterDevice {
+        return false;
+    }
+    let (maj, min) = (major(stat.st_rdev), minor(stat.st_rdev));
+    maj != 5 && maj != 2 && !(maj == 4 && min == 0)
+}
+
 /// A non-blocking descriptor of the terminal `fd`, and the file status
 /// flags to put back when it shares its file description with `fd`.
 ///
 /// The file description behind the supervisor's stdio is shared with the
 /// shell that started it, so setting `O_NONBLOCK` there would change the
-/// shell's too. Opening the terminal again through `/proc/self/fd` gives a
-/// new file description. If that fails, a duplicate of `fd` is made
-/// non-blocking instead, and [`HostTerminal`] puts its earlier flags back
-/// when dropped.
+/// shell's too. Opening a concrete terminal again through `/proc/self/fd`
+/// gives a new file description. If `fd` is not a concrete terminal or
+/// reopening fails, a duplicate of `fd` is made non-blocking instead, and
+/// [`HostTerminal`] puts its earlier flags back when dropped.
 pub(crate) fn own_terminal_fd(
     fd: BorrowedFd<'_>,
 ) -> io::Result<(OwnedFd, Option<rustix::fs::OFlags>)> {
-    use rustix::fs::{Mode, OFlags, open};
-    match open(
-        format!("/proc/self/fd/{}", fd.as_raw_fd()).as_str(),
-        OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC | OFlags::NONBLOCK,
-        Mode::empty(),
-    ) {
-        Ok(own) if rustix::termios::isatty(&own) => Ok((own, None)),
-        _ => {
-            let dup = rustix::io::fcntl_dupfd_cloexec(fd, 3)?;
-            let flags = rustix::fs::fcntl_getfl(&dup)?;
-            set_nonblocking(dup.as_fd())?;
-            Ok((dup, Some(flags)))
-        }
+    use rustix::fs::{Mode, OFlags, fstat, open};
+    if fstat(fd).is_ok_and(|stat| is_concrete_tty(&stat))
+        && let Ok(own) = open(
+            format!("/proc/self/fd/{}", fd.as_raw_fd()).as_str(),
+            OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        && rustix::termios::isatty(&own)
+    {
+        return Ok((own, None));
     }
+    let dup = rustix::io::fcntl_dupfd_cloexec(fd, 3)?;
+    let flags = rustix::fs::fcntl_getfl(&dup)?;
+    set_nonblocking(dup.as_fd())?;
+    Ok((dup, Some(flags)))
 }
 
 /// The host terminal in raw mode, restored to its earlier settings when
@@ -727,5 +742,35 @@ mod tests {
         relay.finish();
         assert!(start.elapsed() < std::time::Duration::from_secs(10));
         drop(host);
+    }
+
+    #[test]
+    fn concrete_tty_check_rejects_multiplexors_and_masters() {
+        use rustix::fs::{Mode, OFlags, fstat, open};
+        let pty = Pty::open(None, None).unwrap();
+        assert!(is_concrete_tty(&fstat(&pty.slave).unwrap()));
+        assert!(!is_concrete_tty(&fstat(&pty.master).unwrap()));
+        let (_, shared) = own_terminal_fd(pty.slave.as_fd()).unwrap();
+        assert!(shared.is_none());
+        let (_, master_shared) = own_terminal_fd(pty.master.as_fd()).unwrap();
+        assert!(master_shared.is_some());
+        if let Ok(ptmx) = open(
+            "/dev/ptmx",
+            OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            assert!(!is_concrete_tty(&fstat(&ptmx).unwrap()));
+            let (_, ptmx_shared) = own_terminal_fd(ptmx.as_fd()).unwrap();
+            assert!(ptmx_shared.is_some());
+        }
+        if let Ok(tty) = open(
+            "/dev/tty",
+            OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            assert!(!is_concrete_tty(&fstat(&tty).unwrap()));
+            let (_, tty_shared) = own_terminal_fd(tty.as_fd()).unwrap();
+            assert!(tty_shared.is_some());
+        }
     }
 }

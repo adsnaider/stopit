@@ -4846,6 +4846,7 @@ fn a_tty_shim_gets_its_own_pty_resizes_and_restores_modes() {
         "{config}[profiles.tui]\n\
          [[provider]]\ntype = \"config\"\nname = \"tui-shim\"\n[provider.sandbox]\n\
          shims.tui = {{ binary = \"sh\", tty = true, default = {{ decision = \"allow\", profile = \"tui\" }} }}\n\
+         shims.plain = {{ binary = \"sh\", default = {{ decision = \"allow\", profile = \"main\" }} }}\n\
          [[provider]]\ntype = \"config\"\nname = \"tui-env\"\nprofile = \"tui\"\n[provider.sandbox]\n\
          env.set = {{ PS1 = \"tui$ \" }}\n"
     ));
@@ -4880,8 +4881,21 @@ fn a_tty_shim_gets_its_own_pty_resizes_and_restores_modes() {
     t.type_keys(b"stty\r");
     let at = t.wait_for(b"sandbox$ ", at);
 
-    // Pipelines and background jobs fall back to detached stdio without a
-    // controlling terminal.
+    // Redirected stderr leaves stdin and stdout on the terminal, so the shim
+    // still gets a PTY while stderr writes to the redirected file.
+    t.type_keys(
+        b"tui -c 'echo tty-out; echo file-err >&2; (: >/dev/tty) && echo stderr-redir-ctty' 2>/workspace/err.log\r",
+    );
+    let at = t.wait_for(b"tty-out", at);
+    let at = t.wait_for(b"stderr-redir-ctty", at);
+    let at = t.wait_for(b"sandbox$ ", at);
+    assert_eq!(
+        fs::read_to_string(s.ws().join("err.log")).unwrap(),
+        "file-err\n"
+    );
+
+    // Pipelines, detached sessions, and background jobs fall back to detached
+    // stdio without a controlling terminal.
     t.type_keys(
         b"printf 'in-pipe\\n' | tui -c '(: >/dev/tty) 2>/dev/null && echo has-tty || cat'\r",
     );
@@ -4889,6 +4903,11 @@ fn a_tty_shim_gets_its_own_pty_resizes_and_restores_modes() {
     let at = t.wait_for(b"sandbox$ ", at);
     t.type_keys(b"tui -c '(: >/dev/tty) 2>/dev/null && echo has-tty || echo out-pipe' | cat\r");
     let at = t.wait_for(b"out-pipe", at);
+    let at = t.wait_for(b"sandbox$ ", at);
+    t.type_keys(
+        b"plain -c 'tui -c \"(: >/dev/tty) 2>/dev/null && echo has-tty || echo detached-ok\"'\r",
+    );
+    let at = t.wait_for(b"detached-ok", at);
     let at = t.wait_for(b"sandbox$ ", at);
     t.type_keys(b"tui -c '(: >/dev/tty) 2>/dev/null && echo has-tty || echo bg-ok' &\r");
     let at = t.wait_for(b"bg-ok", at);
@@ -4943,6 +4962,117 @@ fn a_tty_shim_asking_approval_survives_a_window_resize() {
     t.wait_for(b"size:37 109", 0);
     let out = t.finish();
     assert_eq!(code(&out), 0, "{out:?}");
+}
+
+#[test]
+fn ctrl_z_during_tty_shim_approval_keeps_the_shell_usable() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((server_master, server_slave)) = open_pty() else {
+        return;
+    };
+    let Some((client_master, client_slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::with_config(&format!(
+        "{config}[approval]\ntimeout = \"20s\"\n[profiles.tui]\n\
+         [[provider]]\ntype = \"config\"\nname = \"tui-shim\"\n[provider.sandbox]\n\
+         shims.ask-tui = {{ binary = \"sh\", tty = true, default = {{ decision = \"ask\", profile = \"tui\" }} }}\n"
+    ));
+    let server = Server::start_on_terminal(&s, &server_master, server_slave);
+    let command = s.stopit(&["run", "--quiet", "/bin/sh", "-i"]);
+    let mut t = OnTerminal::spawn(command, client_master, client_slave);
+    let at = t.wait_for(b"sandbox$ ", 0);
+    t.type_keys(b"set -m\r");
+    let at = t.wait_for(b"sandbox$ ", at);
+
+    // Stopping and backgrounding the shim while approval is pending makes it
+    // decline PTY mode once approved and run detached instead of stealing raw
+    // mode from the interactive shell.
+    t.type_keys(b"ask-tui -c '(: >/dev/tty) 2>/dev/null && echo got-pty || echo bg-detached'\r");
+    server.wait_for_log("through shim ask-tui");
+    t.type_keys(b"\x1a");
+    let at = t.wait_for(b"sandbox$ ", at);
+    t.type_keys(b"bg\r");
+    let at = t.wait_for(b"sandbox$ ", at);
+    answer(&server, &server_master, b"y", "allowed once");
+    let at = t.wait_for(b"bg-detached", at);
+    t.type_keys(b"wait\r");
+    let at = t.wait_for(b"sandbox$ ", at);
+
+    // Keeping the shim stopped across approval leaves the shell cooked until
+    // `fg` brings the shim back to the foreground to claim its PTY.
+    t.type_keys(b"ask-tui -c '(: >/dev/tty) && echo fg-pty'\r");
+    wait_until(|| (server.log().matches("[n] deny: ").count() >= 2).then_some(()));
+    t.type_keys(b"\x1a");
+    let at = t.wait_for(b"sandbox$ ", at);
+    wait_until(|| {
+        (&server_master).write_all(b"y").unwrap();
+        thread::sleep(Duration::from_millis(100));
+        (server.log().matches("allowed once").count() >= 2).then_some(())
+    });
+    t.type_keys(b"echo still-cooked\r");
+    let at = t.wait_for(b"still-cooked", at);
+    let at = t.wait_for(b"sandbox$ ", at);
+    t.type_keys(b"fg\r");
+    let at = t.wait_for(b"fg-pty", at);
+    let at = t.wait_for(b"sandbox$ ", at);
+
+    t.type_keys(b"exit 0\r");
+    let out = t.finish();
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert!(t.seen().len() >= at);
+}
+
+#[test]
+fn dev_tty_passed_to_the_broker_never_reaches_the_servers_terminal() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    if !Path::new("/usr/bin/script").exists() {
+        eprintln!("skipping: no /usr/bin/script");
+        return;
+    }
+    let Some((server_master, server_slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::with_config(&format!(
+        "{config}[profiles.tui]\n\
+         [[provider]]\ntype = \"config\"\nname = \"tui-shim\"\n[provider.sandbox]\n\
+         shims.tui = {{ binary = \"sh\", tty = true, default = {{ decision = \"allow\", profile = \"tui\" }} }}\n\
+         shims.nope = {{ binary = \"sh\", default = {{ decision = \"deny\" }} }}\n"
+    ));
+    let server = Server::start_on_terminal(&s, &server_master, server_slave);
+    // `/usr/bin/script` allocates a PTY inside the sandbox and makes it the
+    // child's controlling terminal, so `exec 3<>/dev/tty` opens character
+    // device 5:0. Passing fd 3 over `SCM_RIGHTS` must never make the server
+    // reopen `/proc/self/fd/N` against its own controlling terminal.
+    let inner = "exec 3<>/dev/tty && test -t 3 && \
+        tui -c 'printf \"EVIL%s\\033]52;c;Z3VpbHR5\\007\\n\" _TUI' <&3 >&3 2>&3 && \
+        { nope <&3 >&3 2>&3; echo rc:$?; }";
+    let out = output(
+        s.stopit(&[
+            "run",
+            "--quiet",
+            "/usr/bin/script",
+            "-q",
+            "-e",
+            "-c",
+            inner,
+            "/dev/null",
+        ]),
+        b"",
+    );
+    assert_eq!(code(&out), 0, "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("EVIL_TUI"), "{stdout:?}");
+    assert!(stdout.contains("rc:126"), "{stdout:?}");
+    thread::sleep(Duration::from_millis(100));
+    let server_log = server.log();
+    assert!(!server_log.contains("EVIL_TUI"), "{server_log:?}");
+    assert!(!server_log.contains("\x1b]52;"), "{server_log:?}");
+    assert!(!server_log.contains("[stopit: nope:"), "{server_log:?}");
 }
 
 // --- The vcs provider ---

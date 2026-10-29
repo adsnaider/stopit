@@ -87,13 +87,20 @@ pub enum ShimMessage {
     },
     /// The shim's terminal changed size (`SIGWINCH`).
     Resize,
+    /// Reply to [`BrokerMessage::Tty`] confirming whether the shim is still in
+    /// the foreground of its controlling terminal.
+    TtyReady {
+        /// Whether the broker should open a PTY and enter raw mode.
+        foreground: bool,
+    },
 }
 
 /// What the broker tells a shim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrokerMessage {
-    /// The command runs on its own PTY, so the shim forwards window resizes.
+    /// Asks the shim to ignore job-control signals and confirm that it still
+    /// holds the foreground of its controlling terminal before opening a PTY.
     Tty,
     /// The command ended, or was refused. The shim exits with this status.
     Exit {
@@ -291,14 +298,43 @@ pub fn run(args: &[OsString]) -> u8 {
     }
 }
 
+/// Returns whether this process is in the foreground process group of its
+/// controlling terminal on both stdin and stdout, and on stderr when stderr
+/// is also that controlling terminal.
+fn in_foreground(stdio: [BorrowedFd<'_>; 3], terms: [bool; 3]) -> bool {
+    if !terms[0] || !terms[1] {
+        return false;
+    }
+    let own = rustix::process::getpgrp();
+    let stdin_fg = rustix::termios::tcgetpgrp(stdio[0]).ok() == Some(own);
+    let stdout_fg = rustix::termios::tcgetpgrp(stdio[1]).ok() == Some(own);
+    let stderr_ok = !terms[2]
+        || matches!(
+            rustix::termios::tcgetpgrp(stdio[2]),
+            Ok(pgrp) if pgrp == own
+        )
+        || matches!(
+            rustix::termios::tcgetpgrp(stdio[2]),
+            Err(rustix::io::Errno::NOTTY)
+        );
+    stdin_fg && stdout_fg && stderr_ok
+}
+
 fn call(name: &OsStr, args: &[OsString]) -> Result<u8, String> {
     use crate::supervisor::{
-        BlockedSignals, catch_signals, catch_winch, check_foreground, ignore_job_control,
+        BlockedSignals, catch_signals, catch_winch, ignore_job_control, restore_job_control,
         stdio_terminals, take_signal, take_winch,
     };
     catch_signals().map_err(|e| format!("cannot set up signal handling: {e}"))?;
-    let terms = stdio_terminals();
-    let foreground = terms[0] && terms[1] && check_foreground(terms).is_ok();
+    // SAFETY: stdio stays open for the life of the process.
+    let stdio: [BorrowedFd<'static>; 3] = unsafe {
+        [
+            BorrowedFd::borrow_raw(0),
+            BorrowedFd::borrow_raw(1),
+            BorrowedFd::borrow_raw(2),
+        ]
+    };
+    let foreground = in_foreground(stdio, stdio_terminals());
     if foreground {
         catch_winch().map_err(|e| format!("cannot set up signal handling: {e}"))?;
     }
@@ -312,14 +348,6 @@ fn call(name: &OsStr, args: &[OsString]) -> Result<u8, String> {
         .map_err(|e| format!("cannot open the current directory: {e}"))?;
     let conn = UnixStream::connect(SANDBOX_BROKER_SOCKET)
         .map_err(|e| format!("cannot reach the broker at {SANDBOX_BROKER_SOCKET}: {e}"))?;
-    // SAFETY: stdio stays open for the life of the process.
-    let stdio: [BorrowedFd<'static>; 3] = unsafe {
-        [
-            BorrowedFd::borrow_raw(0),
-            BorrowedFd::borrow_raw(1),
-            BorrowedFd::borrow_raw(2),
-        ]
-    };
     let fds = [stdio[0], stdio[1], stdio[2], here.as_fd()];
     let lost = |e: io::Error| format!("lost the broker: {e}");
     let mask = BlockedSignals::block().map_err(|e| format!("cannot block signals: {e}"))?;
@@ -359,7 +387,18 @@ fn call(name: &OsStr, args: &[OsString]) -> Result<u8, String> {
         match crate::control::read_frame::<BrokerMessage>(&conn).map_err(lost)? {
             Some(BrokerMessage::Tty) => {
                 ignore_job_control();
-                tty_active = true;
+                let still_fg = in_foreground(stdio, stdio_terminals());
+                if !still_fg {
+                    restore_job_control();
+                }
+                tty_active = still_fg;
+                crate::control::write_frame(
+                    &conn,
+                    &ShimMessage::TtyReady {
+                        foreground: still_fg,
+                    },
+                )
+                .map_err(lost)?;
             }
             Some(BrokerMessage::Exit { code }) => return Ok(code),
             Some(BrokerMessage::Error { message }) => return Err(message),

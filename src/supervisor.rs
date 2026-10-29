@@ -1393,6 +1393,14 @@ pub(crate) fn ignore_job_control() {
     }
 }
 
+/// Restores `SIGTSTP`, `SIGTTIN` and `SIGTTOU` to `SIG_DFL`.
+pub(crate) fn restore_job_control() {
+    for signal in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
+        // SAFETY: `signal` with `SIG_DFL` resets this process's disposition.
+        unsafe { libc::signal(signal, libc::SIG_DFL) };
+    }
+}
+
 /// Fails unless the supervisor is in the foreground process group of every
 /// stdio that is a terminal (`stdio`, see [`stdio_terminals`]) and its
 /// controlling terminal. A terminal that is not its controlling terminal

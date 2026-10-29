@@ -42,7 +42,7 @@ use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 use crate::approval::{ApprovalRequest, Approver, Asker};
 use crate::bwrap::{RunExtras, TerminalSession};
 use crate::config::ProfileRef;
-use crate::control::{read_frame, recv_fds, write_frame};
+use crate::control::{read_frame_by, recv_fds, write_frame};
 use crate::grant::GrantRequest;
 use crate::manifest::{GRANT_SHIM, ShimName, ShimSpec, SubcommandPattern};
 use crate::policy::Decision;
@@ -585,13 +585,20 @@ fn start_and_wait(
 ) -> Result<u8, Failure> {
     let (dev, ino) = check_cwd(ctx.loaded.workspace_dir(), rel, cwd_fd.as_fd())?;
     drop(cwd_fd);
+    let in_id = terminal_id(stdio[0].as_fd(), is_readable_mode);
+    let out_id = terminal_id(stdio[1].as_fd(), is_writable_mode);
+    let (use_pty, queued_signal) = if want_tty && in_id.is_some() && in_id == out_id {
+        confirm_tty(conn, &shared.stop)?
+    } else {
+        (false, None)
+    };
     let start = crate::init::StartDir {
         path: ctx.loaded.workspace_mount().join(rel),
         dev,
         ino,
     };
     let launched =
-        launch(ctx, target, command, stdio, start, want_tty).map_err(|e| e.to_string())?;
+        launch(ctx, target, command, stdio, start, use_pty).map_err(|e| e.to_string())?;
     let tracked = match launched.pidfd.try_clone() {
         Ok(pidfd) => pidfd,
         Err(e) => {
@@ -604,13 +611,60 @@ fn start_and_wait(
     // Stopping between the spawn and the line above would miss it.
     if shared.stop.load(Ordering::SeqCst) {
         let _ = pidfd_send_signal(&launched.pidfd, Signal::KILL);
-    }
-    if launched.relay.is_some() && write_frame(conn, &BrokerMessage::Tty).is_err() {
-        let _ = pidfd_send_signal(&launched.pidfd, Signal::KILL);
+    } else if let Some(signal) = queued_signal {
+        // SAFETY: `confirm_tty` keeps only signals in `FORWARDED`.
+        let signal = unsafe { Signal::from_raw_unchecked(signal) };
+        let _ = pidfd_send_signal(&launched.pidfd, signal);
     }
     let code = launched.wait(conn);
     lock(&shared.commands).remove(&number);
     Ok(code)
+}
+
+/// Asks the shim on `conn` whether it still holds the foreground of its
+/// controlling terminal, returning whether to open a PTY alongside any
+/// forwarded signal the shim sent while waiting.
+fn confirm_tty(conn: &UnixStream, stop: &AtomicBool) -> Result<(bool, Option<i32>), Failure> {
+    write_frame(conn, &BrokerMessage::Tty).map_err(|e| format!("lost the shim: {e}"))?;
+    let mut queued_signal = None;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return Err("the session ended".to_owned());
+        }
+        let mut pfd = libc::pollfd {
+            fd: conn.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd for the duration of the call.
+        let n = unsafe { libc::poll(&mut pfd, 1, 100) };
+        if n == 0 {
+            continue;
+        }
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!("lost the shim: {e}"));
+        }
+        let deadline = std::time::Instant::now() + HANDSHAKE_TIMEOUT;
+        match read_frame_by::<ShimMessage>(conn, deadline) {
+            Ok(Some(ShimMessage::TtyReady { foreground })) => {
+                return Ok((foreground, queued_signal));
+            }
+            Ok(Some(ShimMessage::Signal { signal })) if FORWARDED.contains(&signal) => {
+                queued_signal = Some(signal);
+            }
+            Ok(Some(ShimMessage::Resize | ShimMessage::Signal { .. })) => {}
+            Ok(Some(ShimMessage::Run { .. })) => {
+                return Err("bad shim request: unexpected run message".to_owned());
+            }
+            Ok(None) | Err(_) => {
+                return Err("the shim closed the connection".to_owned());
+            }
+        }
+    }
 }
 
 /// A `stopit-grant` call: the shim's connection, the broker, the
@@ -1051,8 +1105,9 @@ fn say_to(fd: BorrowedFd<'_>, text: &str) {
         FileType::Fifo | FileType::CharacterDevice => {
             let writable = rustix::fs::fcntl_getfl(fd)
                 .is_ok_and(|fl| matches!(fl & OFlags::RWMODE, OFlags::WRONLY | OFlags::RDWR));
-            if !writable || (file_type == FileType::CharacterDevice && !rustix::termios::isatty(fd))
-            {
+            let ok_device = file_type != FileType::CharacterDevice
+                || (crate::pty::is_concrete_tty(&stat) && rustix::termios::isatty(fd));
+            if !writable || !ok_device {
                 return;
             }
             let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
@@ -1123,18 +1178,21 @@ fn check_cwd(workspace: &Path, rel: &Path, dir: BorrowedFd<'_>) -> Result<(u64, 
     Ok((a.st_dev, a.st_ino))
 }
 
-/// Returns the `(st_dev, st_ino)` of `fd` when it is an open terminal whose
-/// access mode satisfies `access`.
+/// Returns the `(st_dev, st_ino)` of `fd` when it is an open concrete
+/// terminal whose access mode satisfies `access`.
 fn terminal_id(
     fd: BorrowedFd<'_>,
     access: impl FnOnce(rustix::fs::OFlags) -> bool,
 ) -> Option<(u64, u64)> {
     use rustix::fs::{OFlags, fcntl_getfl, fstat};
     let fl = fcntl_getfl(fd).ok()?;
-    if fl.contains(OFlags::PATH) || !access(fl & OFlags::RWMODE) || !rustix::termios::isatty(fd) {
+    if fl.contains(OFlags::PATH) || !access(fl & OFlags::RWMODE) {
         return None;
     }
     let stat = fstat(fd).ok()?;
+    if !crate::pty::is_concrete_tty(&stat) || !rustix::termios::isatty(fd) {
+        return None;
+    }
     Some((stat.st_dev, stat.st_ino))
 }
 
@@ -1178,7 +1236,6 @@ impl Launched {
     /// shim on `conn` forwards and killing it if the shim goes away, and
     /// returns its exit status.
     fn wait(mut self, conn: &UnixStream) -> u8 {
-        let _ = conn.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
         let mut shim_open = true;
         loop {
             let mut fds = vec![libc::pollfd {
@@ -1232,7 +1289,8 @@ impl Launched {
             if let Some(slot) = conn_slot
                 && fds[slot].revents != 0
             {
-                match read_frame::<ShimMessage>(conn) {
+                let deadline = std::time::Instant::now() + HANDSHAKE_TIMEOUT;
+                match crate::control::read_frame_by::<ShimMessage>(conn, deadline) {
                     Ok(Some(ShimMessage::Signal { signal })) if FORWARDED.contains(&signal) => {
                         // SAFETY: `signal` is one of `FORWARDED`, all valid.
                         let signal = unsafe { Signal::from_raw_unchecked(signal) };
@@ -1265,18 +1323,19 @@ impl Launched {
     }
 }
 
-/// Starts `command` in a sandbox of `profile` on `stdio` (or on a fresh PTY
-/// relayed to `stdio` when `want_tty` is set and stdin and stdout share a
-/// terminal), entering `cwd`. The sandbox gets a proxy in proxy mode, a
-/// broker of its own if the profile has shims, and pasta with
-/// `network = "full"`. Its command is never looked up among its own shims.
+/// Starts `command` in a sandbox of `profile` on `stdio`, entering `cwd`.
+/// When `use_pty` is true and stdin and stdout share a concrete terminal,
+/// the command runs on a fresh PTY relayed to `stdio`. The sandbox gets a
+/// proxy in proxy mode, a broker of its own if the profile has shims, and
+/// pasta with `network = "full"`. Its command is never looked up among its
+/// own shims.
 fn launch(
     ctx: &Arc<RunContext>,
     profile: &ProfileRef,
     command: &[OsString],
     stdio: [OwnedFd; 3],
     cwd: crate::init::StartDir,
-    want_tty: bool,
+    use_pty: bool,
 ) -> Result<Launched, RunError> {
     let loaded = &ctx.loaded;
     let (name, compiled) = profile_in(&ctx.compiled, Some(profile.as_str()))?;
@@ -1297,7 +1356,7 @@ fn launch(
     let [stdin, stdout, stderr] = stdio;
     let in_id = terminal_id(stdin.as_fd(), is_readable_mode);
     let out_id = terminal_id(stdout.as_fd(), is_writable_mode);
-    let use_pty = want_tty && in_id.is_some() && in_id == out_id;
+    let use_pty = use_pty && in_id.is_some() && in_id == out_id;
     let terminal = if use_pty {
         TerminalSession::Pty
     } else {
@@ -1805,5 +1864,27 @@ mod tests {
         let (r, w) = std::io::pipe().unwrap();
         assert_eq!(terminal_id(r.as_fd(), is_readable_mode), None);
         assert_eq!(terminal_id(w.as_fd(), is_writable_mode), None);
+
+        // Multiplexor and PTY master devices must never count as concrete
+        // terminals or receive diagnostic writes.
+        assert_eq!(terminal_id(pty_a.master.as_fd(), is_readable_mode), None);
+        assert_eq!(terminal_id(pty_a.master.as_fd(), is_writable_mode), None);
+        if let Ok(ptmx) = open(
+            "/dev/ptmx",
+            OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            assert_eq!(terminal_id(ptmx.as_fd(), is_readable_mode), None);
+            assert_eq!(terminal_id(ptmx.as_fd(), is_writable_mode), None);
+            say_to(ptmx.as_fd(), "hi");
+        }
+        if let Ok(tty) = open(
+            "/dev/tty",
+            OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            assert_eq!(terminal_id(tty.as_fd(), is_readable_mode), None);
+            assert_eq!(terminal_id(tty.as_fd(), is_writable_mode), None);
+        }
     }
 }
