@@ -16,8 +16,11 @@ use crate::error::ValueError;
 use crate::policy::Decision;
 use crate::serde_util::MapOnly;
 
+/// The name of the built-in `stopit-grant` command (DESIGN.md §7.5).
+pub const GRANT_SHIM: &str = "stopit-grant";
+
 /// Shim names that belong to the built-in commands.
-const RESERVED_SHIM_NAMES: [&str; 2] = ["stopit", "stopit-grant"];
+const RESERVED_SHIM_NAMES: [&str; 2] = ["stopit", GRANT_SHIM];
 
 /// The name a shim is installed under in `/run/stopit/bin`.
 ///
@@ -33,6 +36,12 @@ impl ShimName {
     /// The validated name.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The name of the built-in `stopit-grant`, which configuration cannot
+    /// use.
+    pub fn grant() -> Self {
+        ShimName(GRANT_SHIM.to_owned())
     }
 }
 

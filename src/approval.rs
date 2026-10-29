@@ -59,6 +59,20 @@ pub enum ApprovalRequest {
         /// The working directory in the sandbox, escaped.
         cwd: String,
     },
+    /// A command through `stopit-grant` (DESIGN.md §7.5).
+    Grant {
+        /// What is granted, one line each, unescaped.
+        grants: Vec<String>,
+        /// The grants as one canonical string, which a session answer
+        /// covers.
+        key: String,
+        /// The commands a session answer covers, as written, unescaped.
+        scope: String,
+        /// The command line, each argument quoted for a shell, escaped.
+        command: String,
+        /// The working directory in the sandbox, escaped.
+        cwd: String,
+    },
 }
 
 impl ApprovalRequest {
@@ -72,6 +86,9 @@ impl ApprovalRequest {
                 profile: target,
                 ..
             } => format!("{profile}\0command\0{shim}\0{rule}\0{target}"),
+            ApprovalRequest::Grant { key, scope, .. } => {
+                format!("{profile}\0grant\0{scope}\0{key}")
+            }
         }
     }
 
@@ -115,6 +132,24 @@ impl ApprovalRequest {
                     escape_message(rule)
                 ),
             ]),
+            ApprovalRequest::Grant {
+                grants,
+                scope,
+                command,
+                cwd,
+                ..
+            } => {
+                let mut lines = vec![
+                    format!("run {command}"),
+                    format!("from {cwd}, in this run's sandbox plus:"),
+                ];
+                lines.extend(grants.iter().map(|g| format!("  {}", escape_message(g))));
+                lines.push(format!(
+                    "[s] covers these grants for {} ... until the session ends",
+                    escape_message(scope)
+                ));
+                Some(lines)
+            }
         }
     }
 }
@@ -589,6 +624,55 @@ mod tests {
             targets: "c".into(),
             data: encode(content),
         }
+    }
+
+    fn grant(key: &str, scope: &str) -> ApprovalRequest {
+        ApprovalRequest::Grant {
+            grants: vec!["read-only /home/me/x\x1b[2J (in your home)".into()],
+            key: key.into(),
+            scope: scope.into(),
+            command: "cargo publish".into(),
+            cwd: "/workspace".into(),
+        }
+    }
+
+    #[test]
+    fn grant_prompts_list_the_grants_and_what_a_session_answer_covers() {
+        let lines = grant("ro:/home/me/x", "cargo publish").describe().unwrap();
+        assert_eq!(
+            lines,
+            [
+                "run cargo publish",
+                "from /workspace, in this run's sandbox plus:",
+                "  read-only /home/me/x\\u{1b}[2J (in your home)",
+                "[s] covers these grants for cargo publish ... until the session ends",
+            ]
+        );
+        // A session answer covers the profile, the scope and the grants,
+        // each exactly.
+        let a = grant("net:crates.io", "cargo publish");
+        assert_eq!(
+            a.scope("main"),
+            grant("net:crates.io", "cargo publish").scope("main")
+        );
+        assert_ne!(a.scope("main"), a.scope("claude"));
+        assert_ne!(
+            a.scope("main"),
+            grant("net:crates.io", "cargo").scope("main")
+        );
+        assert_ne!(
+            a.scope("main"),
+            grant("net:full", "cargo publish").scope("main")
+        );
+        // A grant's scope never equals a brokered command's.
+        let command = ApprovalRequest::Command {
+            shim: "cargo publish".into(),
+            rule: "net:crates.io".into(),
+            profile: "main".into(),
+            command: String::new(),
+            cwd: String::new(),
+        };
+        assert_ne!(a.scope("main"), command.scope("main"));
     }
 
     #[test]

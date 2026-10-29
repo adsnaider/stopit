@@ -4,7 +4,7 @@ stopit runs a program, such as an LLM coding agent, a shell or a build, in a Lin
 
 It is a single Rust binary built on [bubblewrap](https://github.com/containers/bubblewrap), Landlock and seccomp. Agents with full-screen terminal interfaces (Claude Code, Gemini CLI, Codex, OpenCode) run in it through a terminal proxy that filters what they may send to your terminal. `git` and `jj` run through a broker that keeps the repository's metadata out of the agent's reach.
 
-> **Status: usable, still young.** These work and are tested against real sandboxes: the sandbox itself, the configuration and its trust checks, the terminal proxy, `stopit server` with its prompts, the `full` and `proxy` network modes, brokered `git` and `jj` for local work, and resource limits. Fetch and push through the broker, prompts for writes to protected files, `stopit-grant` and saved approvals are not built yet. stopit has had no outside security review. [DESIGN.md](DESIGN.md) describes the design, and its section 11 lists the known gaps.
+> **Status: usable, still young.** These work and are tested against real sandboxes: the sandbox itself, the configuration and its trust checks, the terminal proxy, `stopit server` with its prompts, the `full` and `proxy` network modes, brokered `git` and `jj` for local work, and resource limits. `stopit-grant` works for network and paths. Fetch and push through the broker, prompts for writes to protected files, and saved approvals are not built yet. stopit has had no outside security review. [DESIGN.md](DESIGN.md) describes the design, and its section 11 lists the known gaps.
 
 ## What the sandbox gets by default
 
@@ -292,6 +292,21 @@ network = { mode = "proxy", allow_domains = ["crates.io", "index.crates.io", "st
 
 The publish profile still has no registry token, since the default filter drops `CARGO_REGISTRY_TOKEN`. DESIGN.md section 7.1 describes the rules.
 
+### Let a command ask for more
+
+A command in the sandbox, usually the agent, can ask for more network or files for one command with `stopit-grant`. You answer in the server's terminal:
+
+```sh
+stopit-grant +net:crates.io +ro:~/.cargo/credentials.toml -- cargo publish
+```
+
+- `+net:<domain>` reaches a domain through the proxy, and `+net:full` gives the full network.
+- `+rw:<path>` and `+ro:<path>` mount a host path. The path is absolute, or `~/…` for your home.
+- The command runs in a sandbox like the caller's, plus the grants, and gets nothing else.
+- stopit refuses, before asking you, what it would refuse in your configuration, such as your project at a second path or stopit's own state.
+- `s` allows the same grants again for the rest of the session, for commands in a scope. The agent can propose the scope with `--scope 'cargo publish'`. Otherwise it is the program and its subcommand words. The prompt shows it.
+- `sandbox.grant = false` in a provider removes `stopit-grant` from that profile and the ones inheriting it.
+
 ### Limit processes, memory and CPU
 
 ```toml
@@ -342,7 +357,7 @@ Before the sandbox starts, `stopit run` and `stopit shell` print to stderr what 
 - Brokered `git` and `jj` cannot fetch or push. Run those on the host.
 - `protected` files are read-only. There is no approval prompt for writes yet.
 - Answers to prompts last for the session at most. Nothing is saved to `.stopit.toml`.
-- `stopit-grant`, to ask for one more grant for one command, is not built.
+- `stopit-grant` cannot grant secrets or an SSH agent yet.
 - The proxy reaches ports 443 and 80 only, so SSH needs `full` mode.
 - A prompt holds up the run's output until you answer it.
 - `tty` and `ttyname` fail inside the sandbox.

@@ -39,7 +39,8 @@ pub use env::{EnvGrants, EnvName, EnvPattern, EnvValue, SearchPathEntry};
 pub use network::{Domain, NetworkGrants};
 pub use sandbox::{OptInSyscall, SandboxGrants, ShareableNamespace};
 pub use shim::{
-    BinaryName, Flag, ShimAction, ShimArg, ShimName, ShimRule, ShimSpec, SubcommandPattern,
+    BinaryName, Flag, GRANT_SHIM, ShimAction, ShimArg, ShimName, ShimRule, ShimSpec,
+    SubcommandPattern,
 };
 pub use system::{DevMode, EtcFile, GroupName, SandboxHome, SystemGrants};
 

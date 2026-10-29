@@ -375,9 +375,13 @@ fn approve_for_client(conn: &UnixStream, approver: &Approver, runs: &SharedRuns)
         return;
     };
     let asker = lock(runs).by_number.get(&run).and_then(|r| r.asker.clone());
+    // A client asks only about its terminal's clipboard. Brokered commands
+    // and grants come from the brokers in this process, and an answer for
+    // the session to a client's copy of one would cover the real one.
+    let from_client = matches!(request, ApprovalRequest::ClipboardWrite { .. });
     let verdict = match asker {
-        Some(asker) => approver.decide(&asker, &request, conn.as_fd()),
-        None => Verdict::Denied,
+        Some(asker) if from_client => approver.decide(&asker, &request, conn.as_fd()),
+        _ => Verdict::Denied,
     };
     let _ = write_frame(
         conn,

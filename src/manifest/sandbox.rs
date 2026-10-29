@@ -15,7 +15,8 @@ use crate::serde_util::MapOnly;
 /// The `sandbox` section.
 ///
 /// Deserializes from a table or object only, never from a sequence. Both
-/// lists are merged by union.
+/// lists are merged by union. `grant` is an `Option` so that merging can
+/// tell "unset" from an explicit value.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(from = "MapOnly<RawSandboxGrants>")]
 pub struct SandboxGrants {
@@ -23,6 +24,8 @@ pub struct SandboxGrants {
     pub share: Vec<ShareableNamespace>,
     /// Syscalls re-enabled in the seccomp filter.
     pub allow_syscalls: Vec<OptInSyscall>,
+    /// Whether the sandbox gets `stopit-grant` (DESIGN.md §7.5).
+    pub grant: Option<bool>,
 }
 
 #[derive(Default, Deserialize)]
@@ -30,6 +33,7 @@ pub struct SandboxGrants {
 struct RawSandboxGrants {
     share: Vec<ShareableNamespace>,
     allow_syscalls: Vec<OptInSyscall>,
+    grant: Option<bool>,
 }
 
 impl From<MapOnly<RawSandboxGrants>> for SandboxGrants {
@@ -37,6 +41,7 @@ impl From<MapOnly<RawSandboxGrants>> for SandboxGrants {
         SandboxGrants {
             share: raw.share,
             allow_syscalls: raw.allow_syscalls,
+            grant: raw.grant,
         }
     }
 }

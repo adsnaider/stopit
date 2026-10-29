@@ -5,6 +5,7 @@
 
 system = { proc = true, dev = "minimal", etc = ["passwd", "group", "hosts", "nsswitch.conf"] }
 network = { mode = "loopback" }
+sandbox = { grant = true }
 
 [fs]
 rw = ["{workspace}"]

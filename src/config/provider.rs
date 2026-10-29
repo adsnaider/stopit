@@ -351,6 +351,7 @@ profile = "main"
 [provider.sandbox]
 system = { proc = true, dev = "minimal", etc = ["passwd", "group", "hosts", "nsswitch.conf"] }
 network = { mode = "loopback" }
+sandbox = { grant = true }
 [provider.sandbox.fs]
 rw = ["{workspace}"]
 masked = [

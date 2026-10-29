@@ -52,6 +52,8 @@ fn default_base_golden() {
             ("HOME", "/home/user"),
             ("LANG", "en_US.UTF-8"),
             ("LOGNAME", "user"),
+            // `stopit-grant`'s directory, which the default base gives.
+            ("PATH", "/run/stopit/bin"),
             ("TERM", "xterm-256color"),
             ("USER", "user"),
         ])

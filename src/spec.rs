@@ -89,6 +89,8 @@ pub struct SandboxSpec {
     /// Brokered commands, each with the provider that granted it. Their
     /// profile references are resolved full names.
     pub shims: BTreeMap<ShimName, (ShimSpec, ProviderName)>,
+    /// Whether the sandbox gets `stopit-grant` (§7.5).
+    pub grant: bool,
 }
 
 /// System mounts and synthesized files (§6.2 steps 3 and 4).
@@ -165,6 +167,16 @@ impl NetworkSpec {
 }
 
 impl SandboxSpec {
+    /// The names in the sandbox's `/run/stopit/bin`: its shims, and
+    /// `stopit-grant` if it gets that.
+    pub fn installed_shims(&self) -> Vec<ShimName> {
+        let mut names: Vec<ShimName> = self.shims.keys().cloned().collect();
+        if self.grant {
+            names.push(ShimName::grant());
+        }
+        names
+    }
+
     /// The domains of the network proxy this sandbox gets, if it gets one.
     /// It does in proxy mode with a network namespace of its own, and then
     /// also the bridge and the proxy variables.
@@ -3069,6 +3081,7 @@ fn finish_profile(
         env: grants.env.clone(),
         allow_syscalls: grants.sandbox.allow_syscalls.clone(),
         shims: grants.shims.clone(),
+        grant: grants.sandbox.grant,
     };
     Ok(CompiledProfile { spec, warnings })
 }
@@ -3662,6 +3675,37 @@ mod tests {
                 "{workspace}/.lldbinit",
             ]
         );
+    }
+
+    #[test]
+    fn stopit_grant_is_on_under_the_default_base_until_turned_off() {
+        let f = Fixture::new();
+        let names = |s: &CompiledSession, p: &str| {
+            spec(s, p)
+                .installed_shims()
+                .iter()
+                .map(|n| n.as_str().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let s = f.compile("[profiles.child]\n[profiles.bare]\ninherit = \"none\"\n");
+        assert!(spec(&s, "main").grant && spec(&s, "child").grant);
+        assert_eq!(names(&s, "main"), ["stopit-grant"]);
+        // `inherit = "none"` starts from the empty sandbox, without it.
+        assert!(!spec(&s, "bare").grant);
+        assert!(names(&s, "bare").is_empty());
+        // Any provider of a profile turns it off there and below, whatever
+        // the others say, and a profile may turn it on again.
+        let s = f.compile(&format!(
+            "[profiles.child]\n[profiles.again]\n{}{}{}",
+            prov("off", "main", "sandbox.grant = false"),
+            prov("on", "main", "sandbox.grant = true"),
+            prov("again", "again", "sandbox.grant = true"),
+        ));
+        assert!(!spec(&s, "main").grant && !spec(&s, "child").grant);
+        assert!(spec(&s, "again").grant);
+        // `base = "none"` has no shims at all.
+        let s = f.compile("base = \"none\"\n");
+        assert!(!spec(&s, "main").grant);
     }
 
     #[test]

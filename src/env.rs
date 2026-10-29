@@ -121,16 +121,22 @@ impl SandboxSpec {
             Vec::new()
         };
         let mut env = self.env.apply_with(&self.system.home, host, &defaults);
-        // The profile's shims come first in `PATH`.
-        if !self.shims.is_empty() {
+        // The profile's shims come first in `PATH`, once.
+        if !self.installed_shims().is_empty() {
             let bin = OsString::from(crate::shim::SANDBOX_BIN);
             match env.iter_mut().find(|(k, _)| k == PATH) {
-                // An empty entry would mean the current directory.
-                Some((_, path)) if path.is_empty() => *path = bin,
                 Some((_, path)) => {
-                    let mut joined = bin;
-                    joined.push(":");
-                    joined.push(&*path);
+                    let mut joined = bin.clone();
+                    // An empty entry would mean the current directory, so
+                    // none is added.
+                    for entry in path
+                        .as_bytes()
+                        .split(|&b| b == b':')
+                        .filter(|e| !e.is_empty() && *e != bin.as_bytes())
+                    {
+                        joined.push(":");
+                        joined.push(std::ffi::OsStr::from_bytes(entry));
+                    }
                     *path = joined;
                 }
                 None => {

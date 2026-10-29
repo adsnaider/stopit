@@ -43,7 +43,8 @@ use crate::approval::{ApprovalRequest, Approver, Asker};
 use crate::bwrap::{RunExtras, TerminalSession};
 use crate::config::ProfileRef;
 use crate::control::{read_frame, recv_fds, write_frame};
-use crate::manifest::{ShimName, ShimSpec};
+use crate::grant::GrantRequest;
+use crate::manifest::{GRANT_SHIM, ShimName, ShimSpec, SubcommandPattern};
 use crate::policy::Decision;
 use crate::shim::{BrokerMessage, HELLO, PROTOCOL_VERSION, ShimMessage};
 use crate::spec::CompiledSession;
@@ -144,28 +145,18 @@ pub enum Outcome {
 /// among patterns alike the strictest decision wins. No match takes the
 /// shim's `default`.
 pub fn decide(spec: &ShimSpec, args: &[Vec<u8>]) -> (Outcome, String) {
-    // The leading arguments up to the first flag. A flag before a word
-    // may take a value that would read as one, so the pattern must match
-    // from the start.
-    let words: Vec<&[u8]> = args
-        .iter()
-        .map(Vec::as_slice)
-        .take_while(|a| !a.starts_with(b"-"))
-        .collect();
+    let words = leading_words(args);
     // The best match so far, ranked by its words, then its tokens, then
     // its strictness.
     let mut best: Option<((usize, usize, u8), &crate::manifest::ShimRule, String)> = None;
     for rule in &spec.rules {
         for pattern in &rule.subcommand {
-            let tokens: Vec<&str> = pattern.tokens().collect();
-            let wildcard = tokens.last() == Some(&"*");
-            let fixed = &tokens[..tokens.len() - usize::from(wildcard)];
-            let matches = words.len() >= fixed.len() + usize::from(wildcard)
-                && fixed.iter().zip(&words).all(|(t, w)| t.as_bytes() == *w);
-            if !matches {
+            if !pattern_matches(pattern, &words) {
                 continue;
             }
-            let rank = (fixed.len(), tokens.len(), strictness(rule.decision));
+            let tokens = pattern.tokens().count();
+            let fixed = tokens - usize::from(pattern.tokens().last() == Some("*"));
+            let rank = (fixed, tokens, strictness(rule.decision));
             if best.as_ref().is_none_or(|(best, _, _)| rank > *best) {
                 best = Some((rank, rule, pattern.as_str().to_owned()));
             }
@@ -205,6 +196,25 @@ pub fn decide(spec: &ShimSpec, args: &[Vec<u8>]) -> (Outcome, String) {
         }),
     };
     (outcome, name)
+}
+
+/// The arguments up to the first flag. A flag before a word may take a
+/// value that would read as one, so a pattern must match from the start.
+pub(crate) fn leading_words(args: &[Vec<u8>]) -> Vec<&[u8]> {
+    args.iter()
+        .map(Vec::as_slice)
+        .take_while(|a| !a.starts_with(b"-"))
+        .collect()
+}
+
+/// Whether `pattern` matches the leading `words` of a call: each of its
+/// words in its place, and a final `*` one more word of any kind.
+pub(crate) fn pattern_matches(pattern: &SubcommandPattern, words: &[&[u8]]) -> bool {
+    let tokens: Vec<&str> = pattern.tokens().collect();
+    let wildcard = tokens.last() == Some(&"*");
+    let fixed = &tokens[..tokens.len() - usize::from(wildcard)];
+    words.len() >= fixed.len() + usize::from(wildcard)
+        && fixed.iter().zip(words).all(|(t, w)| t.as_bytes() == *w)
 }
 
 fn strictness(decision: Decision) -> u8 {
@@ -446,12 +456,19 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
     let ctx = &shared.ctx;
     let (_, caller) =
         profile_in(&ctx.compiled, Some(shared.caller.as_str())).map_err(|e| e.to_string())?;
-    let name: ShimName = shim
-        .parse()
-        .map_err(|_| format!("no shim {}", crate::escape::escape_message(&shim)))?;
-    let Some((spec, _)) = caller.spec.shims.get(&name) else {
-        return Err(format!("no shim {name} in this sandbox"));
+    let grant = shim == GRANT_SHIM && caller.spec.grant;
+    let spec = if grant {
+        None
+    } else {
+        let name: ShimName = shim
+            .parse()
+            .map_err(|_| format!("no shim {}", crate::escape::escape_message(&shim)))?;
+        match caller.spec.shims.get(&name) {
+            Some((spec, _)) => Some((name, spec)),
+            None => return Err(format!("no shim {name} in this sandbox")),
+        }
     };
+    let name = crate::escape::escape_message(&shim);
     let say = |text: &str| say_to(stderr.as_fd(), text);
     // The limits come first, so no one is asked about a call that cannot
     // run anyway.
@@ -467,7 +484,6 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
         ));
         return Ok(EXIT_DENIED);
     };
-    let (outcome, rule) = decide(spec, &args);
     let cwd = PathBuf::from(OsString::from_vec(cwd));
     let rel = workspace_relative(&cwd, ctx.loaded.workspace_mount()).ok_or_else(|| {
         format!(
@@ -475,6 +491,18 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
             crate::escape::escape_bytes(cwd.as_os_str().as_bytes())
         )
     })?;
+    let Some((name, spec)) = spec else {
+        let call = GrantCall {
+            conn,
+            shared,
+            number,
+            caller,
+            cwd: &cwd,
+            rel: &rel,
+        };
+        return run_grant(call, args, cwd_fd, [stdin, stdout, stderr]);
+    };
+    let (outcome, rule) = decide(spec, &args);
     // What runs, the shim's binary with the arguments.
     let command_line: String = std::iter::once(spec.binary.as_str().as_bytes())
         .chain(spec.args.iter().map(|a| a.as_str().as_bytes()))
@@ -520,18 +548,46 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
             profile
         }
     };
-    let (dev, ino) = check_cwd(ctx.loaded.workspace_dir(), &rel, cwd_fd.as_fd())?;
-    drop(cwd_fd);
     let mut command = vec![OsString::from(spec.binary.as_str())];
     command.extend(spec.args.iter().map(|a| OsString::from(a.as_str())));
     command.extend(args.into_iter().map(OsString::from_vec));
+    start_and_wait(
+        conn,
+        shared,
+        number,
+        ctx,
+        &target,
+        &command,
+        [stdin, stdout, stderr],
+        cwd_fd,
+        &rel,
+    )
+}
+
+/// Checks the shim's working directory `cwd_fd` against `rel`, the
+/// workspace path it named, runs `command` on `stdio` in a sandbox of
+/// `target` from the session `ctx` compiled, and waits for it, passing on
+/// the signals the shim on `conn` forwards.
+#[allow(clippy::too_many_arguments)]
+fn start_and_wait(
+    conn: &UnixStream,
+    shared: &Shared,
+    number: u64,
+    ctx: &Arc<RunContext>,
+    target: &ProfileRef,
+    command: &[OsString],
+    stdio: [OwnedFd; 3],
+    cwd_fd: OwnedFd,
+    rel: &Path,
+) -> Result<u8, Failure> {
+    let (dev, ino) = check_cwd(ctx.loaded.workspace_dir(), rel, cwd_fd.as_fd())?;
+    drop(cwd_fd);
     let start = crate::init::StartDir {
-        path: ctx.loaded.workspace_mount().join(&rel),
+        path: ctx.loaded.workspace_mount().join(rel),
         dev,
         ino,
     };
-    let mut launched = launch(ctx, &target, &command, [stdin, stdout, stderr], start)
-        .map_err(|e| e.to_string())?;
+    let mut launched = launch(ctx, target, command, stdio, start).map_err(|e| e.to_string())?;
     let tracked = match launched.pidfd.try_clone() {
         Ok(pidfd) => pidfd,
         Err(e) => {
@@ -549,6 +605,118 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
     let code = launched.wait(conn);
     lock(&shared.commands).remove(&number);
     Ok(code)
+}
+
+/// A `stopit-grant` call: the shim's connection, the broker, the
+/// connection's number, the caller's profile, and the working directory as
+/// the sandbox sees it and relative to the workspace.
+struct GrantCall<'a> {
+    conn: &'a UnixStream,
+    shared: &'a Shared,
+    number: u64,
+    caller: &'a crate::spec::CompiledProfile,
+    cwd: &'a Path,
+    rel: &'a Path,
+}
+
+/// Serves a `stopit-grant` call (§7.5): parses it, refuses what cannot be
+/// granted before anyone is asked, compiles the temporary profile with
+/// the session's providers so every check of a rule applies, asks on the
+/// server's terminal, and runs the command in that profile.
+fn run_grant(
+    call: GrantCall<'_>,
+    args: Vec<Vec<u8>>,
+    cwd_fd: OwnedFd,
+    stdio: [OwnedFd; 3],
+) -> Result<u8, Failure> {
+    let GrantCall {
+        conn,
+        shared,
+        number,
+        caller,
+        cwd,
+        rel,
+    } = call;
+    let ctx = &shared.ctx;
+    let say = |text: &str| say_to(stdio[2].as_fd(), &format!("{GRANT_SHIM}: {text}"));
+    let request = match GrantRequest::parse(&args) {
+        Ok(request) => request,
+        Err(why) => {
+            say(&why);
+            say(crate::grant::USAGE);
+            return Ok(EXIT_DENIED);
+        }
+    };
+    let home = ctx.loaded.host_home();
+    let sandbox_home = Path::new(caller.spec.system.home.as_str());
+    for (path, _) in request.paths() {
+        if let Ok(rest) = Path::new(path).strip_prefix(sandbox_home) {
+            say(&format!(
+                "{path} is in this sandbox's home, not a host path; write it as ~/{}",
+                rest.display()
+            ));
+            return Ok(EXIT_DENIED);
+        }
+        let host = GrantRequest::host_path(path, home);
+        if std::fs::metadata(&host).is_err() {
+            say(&format!("{} does not exist on the host", host.display()));
+            return Ok(EXIT_DENIED);
+        }
+    }
+    let (output, target) = match request.output(&shared.caller, caller.spec.network.mode()) {
+        Ok(built) => built,
+        Err(why) => {
+            say(&why);
+            return Ok(EXIT_DENIED);
+        }
+    };
+    let provider = crate::provider::SUPERVISOR_PROVIDER_NAME
+        .parse()
+        .expect("the supervisor's name is a valid provider name");
+    let compiled = match ctx.loaded.compile_with((provider, output)) {
+        Ok(compiled) => compiled,
+        Err(e) => {
+            say(&format!("cannot grant this: {e}"));
+            return Ok(EXIT_DENIED);
+        }
+    };
+    let Some(approver) = &ctx.approver else {
+        say("this needs a yes on a stopit server's terminal; run `stopit server` in the workspace");
+        return Ok(EXIT_DENIED);
+    };
+    let ask = ApprovalRequest::Grant {
+        grants: request.describe(home),
+        key: request.key(home),
+        scope: request.scope.text(),
+        command: request
+            .command
+            .iter()
+            .map(|a| crate::escape::shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" "),
+        cwd: crate::escape::escape_bytes(cwd.as_os_str().as_bytes()),
+    };
+    let asker = Asker {
+        run: ctx.run,
+        profile: shared.caller.as_str().to_owned(),
+        command: ctx.command.clone(),
+    };
+    if !approver.decide(&asker, &ask, conn.as_fd()).allows() {
+        say("denied by user");
+        return Ok(EXIT_DENIED);
+    }
+    let granted = Arc::new(RunContext {
+        compiled: Arc::new(compiled),
+        ..(**ctx).clone()
+    });
+    let command: Vec<OsString> = request
+        .command
+        .into_iter()
+        .map(OsString::from_vec)
+        .collect();
+    start_and_wait(
+        conn, shared, number, &granted, &target, &command, stdio, cwd_fd, rel,
+    )
 }
 
 /// One of a run's [`MAX_LIVE`] shim commands, given back on drop.
@@ -833,7 +1001,7 @@ pub(crate) fn start_broker(
     profile: &crate::spec::CompiledProfile,
     label: &str,
 ) -> Result<Option<Broker>, RunError> {
-    if profile.spec.shims.is_empty() {
+    if profile.spec.installed_shims().is_empty() {
         return Ok(None);
     }
     let path = ctx

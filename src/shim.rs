@@ -215,7 +215,15 @@ pub fn shim_dir<'a>(
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(error(&parent)(e)),
     }
-    let dir = parent.join(profile.as_str());
+    // Named for the profile and the names in it, so two profiles called
+    // alike with other shims (`stopit-grant`'s profile, made from each
+    // caller's) never share a directory.
+    let names: Vec<&ShimName> = names.into_iter().collect();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in names.iter().flat_map(|n| n.as_str().bytes().chain([0])) {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let dir = parent.join(format!("{}-{hash:016x}", profile.as_str()));
     if dir.is_dir() {
         return Ok(dir);
     }

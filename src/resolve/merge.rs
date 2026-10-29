@@ -115,6 +115,8 @@ pub struct EffectiveSandbox {
     pub share: BTreeSet<ShareableNamespace>,
     /// Syscalls re-enabled in the seccomp filter.
     pub allow_syscalls: BTreeSet<OptInSyscall>,
+    /// Whether the sandbox gets `stopit-grant`.
+    pub grant: bool,
 }
 
 /// A profile's effective grants. The default value is the empty sandbox.
@@ -318,6 +320,7 @@ fn merge_profile(
                 &inherited.sandbox.allow_syscalls,
                 own.iter().map(|c| &c.grants.sandbox.allow_syscalls),
             ),
+            grant: merge_grant(inherited.sandbox.grant, own),
         },
         shims: merge_shims(profile, &inherited.shims, own)?,
     })
@@ -343,6 +346,13 @@ fn merge_proc(inherited: bool, own: &[Contribution]) -> bool {
 fn merge_dev(inherited: Option<DevMode>, own: &[Contribution]) -> Option<DevMode> {
     // `minimal` is the only mode, so OR is "any explicit value".
     within_profile(own.iter().map(|c| c.grants.system.dev), |a, _| a).or(inherited)
+}
+
+/// `sandbox.grant` (§3.5): within a profile `false` wins, so any provider
+/// can turn `stopit-grant` off; a profile's own explicit value overrides
+/// the inherited one. Default off, which the default base turns on.
+fn merge_grant(inherited: bool, own: &[Contribution]) -> bool {
+    within_profile(own.iter().map(|c| c.grants.sandbox.grant), |a, b| a && b).unwrap_or(inherited)
 }
 
 /// `system.etc` (§3.5): union with the inherited files.

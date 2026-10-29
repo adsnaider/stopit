@@ -981,6 +981,30 @@ impl LoadedSession {
         Ok((compiled, warnings))
     }
 
+    /// Compiles every profile again, as [`recompile`](Self::recompile)
+    /// does, with `extra` after the providers' outputs: the temporary
+    /// profile of a `stopit-grant` request (§7.5), which every check of
+    /// the compiler then applies to. Warnings are dropped.
+    pub(crate) fn compile_with(
+        &self,
+        extra: (ProviderName, ProviderOutput),
+    ) -> Result<CompiledSession, RunError> {
+        let mut outputs = self.outputs.clone();
+        outputs.push(extra);
+        Ok(compile_session(
+            &self.config,
+            outputs,
+            &self.protected,
+            &self.state,
+            &self.ctx,
+        )?)
+    }
+
+    /// The host user's home directory, which `~` in rules names.
+    pub(crate) fn host_home(&self) -> &Path {
+        &self.home
+    }
+
     /// The warnings of loading and of `compile_warnings`, as printed,
     /// `stopit: warning: …` and escaped.
     pub(crate) fn warning_lines_with(&self, compile_warnings: &[String]) -> Vec<String> {
@@ -1058,10 +1082,11 @@ impl LoadedSession {
         name: &ProfileRef,
         profile: &CompiledProfile,
     ) -> Result<Option<(PathBuf, PathBuf)>, RunError> {
-        if profile.spec.shims.is_empty() {
+        let names = profile.spec.installed_shims();
+        if names.is_empty() {
             return Ok(None);
         }
-        let dir = crate::shim::shim_dir(&self.session, name, profile.spec.shims.keys())?;
+        let dir = crate::shim::shim_dir(&self.session, name, &names)?;
         Ok(Some((dir, self.trampoline.clone())))
     }
 
