@@ -16,6 +16,7 @@ pub mod filter;
 pub mod init;
 pub mod landlock;
 pub mod manifest;
+pub mod net;
 pub mod policy;
 pub mod provider;
 pub mod provision;

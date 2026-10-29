@@ -25,9 +25,10 @@
             pkgs.bubblewrap
             pkgs.makeWrapper
           ];
+          # bwrap for every sandbox, and pasta for `network = "full"`.
           postInstall = ''
             wrapProgram $out/bin/stopit \
-              --prefix PATH : ${pkgs.lib.makeBinPath [pkgs.bubblewrap]}
+              --prefix PATH : ${pkgs.lib.makeBinPath [pkgs.bubblewrap pkgs.passt]}
           '';
         };
       in {
@@ -39,6 +40,7 @@
             rustfmt
             rust-analyzer
             bubblewrap
+            passt
             jujutsu
             git
           ];

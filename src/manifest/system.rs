@@ -88,15 +88,21 @@ pub enum EtcFile {
     /// `/etc/nsswitch.conf`.
     #[serde(rename = "nsswitch.conf")]
     NsswitchConf,
+    /// `/etc/resolv.conf`, naming pasta's DNS forwarder. The spec compiler
+    /// adds it with `network = "full"`, and configuration cannot ask for
+    /// it, since no other mode has that forwarder.
+    #[serde(skip_deserializing)]
+    ResolvConf,
 }
 
 impl EtcFile {
     /// Every variant, in declaration order.
-    pub const ALL: [EtcFile; 4] = [
+    pub const ALL: [EtcFile; 5] = [
         EtcFile::Passwd,
         EtcFile::Group,
         EtcFile::Hosts,
         EtcFile::NsswitchConf,
+        EtcFile::ResolvConf,
     ];
 
     /// The file name as written in configuration.
@@ -106,6 +112,7 @@ impl EtcFile {
             EtcFile::Group => "group",
             EtcFile::Hosts => "hosts",
             EtcFile::NsswitchConf => "nsswitch.conf",
+            EtcFile::ResolvConf => "resolv.conf",
         }
     }
 }
@@ -180,11 +187,21 @@ mod tests {
     use super::super::test_util::*;
     use super::*;
 
-    const ETC_FILES: [EtcFile; 4] = EtcFile::ALL;
+    /// The files configuration may ask for: all but `resolv.conf`.
+    const ETC_FILES: [EtcFile; 4] = [
+        EtcFile::Passwd,
+        EtcFile::Group,
+        EtcFile::Hosts,
+        EtcFile::NsswitchConf,
+    ];
     // Adding a variant breaks the build here, reminding to extend
     // `EtcFile::ALL` and the tests.
     const _: fn(EtcFile) = |e| match e {
-        EtcFile::Passwd | EtcFile::Group | EtcFile::Hosts | EtcFile::NsswitchConf => {}
+        EtcFile::Passwd
+        | EtcFile::Group
+        | EtcFile::Hosts
+        | EtcFile::NsswitchConf
+        | EtcFile::ResolvConf => {}
     };
     const _: fn(DevMode) = |d| match d {
         DevMode::Minimal => {}

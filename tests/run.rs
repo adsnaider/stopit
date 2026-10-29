@@ -301,7 +301,9 @@ fn summary_header(s: &Setup) -> String {
 
 #[test]
 fn the_summary_lists_what_the_profile_grants_beyond_the_default_base() {
-    let s = Setup::with_config("fs.rw = [\"~/data\"]\nnetwork.mode = \"full\"");
+    let s = Setup::with_config(
+        "fs.rw = [\"~/data\"]\nnetwork = { mode = \"proxy\", allow_domains = [\"example.org\"] }",
+    );
     fs::create_dir(s.root.join("home/data")).unwrap();
     let out = output(s.run_probe_command_with_summary(&[]), b"[]");
     assert_eq!(code(&out), 0, "{out:?}");
@@ -311,7 +313,7 @@ fn the_summary_lists_what_the_profile_grants_beyond_the_default_base() {
         format!(
             "{}stopit:   rw       ~/data  (provider \"tools\")\n\
              stopit:   ro       {}  (provider \"tools\")\n\
-             stopit:   network  full\n",
+             stopit:   network  proxy to example.org\n",
             summary_header(&s),
             probe_dir.display()
         )
@@ -321,7 +323,7 @@ fn the_summary_lists_what_the_profile_grants_beyond_the_default_base() {
 
 #[test]
 fn quiet_suppresses_the_summary_but_not_warnings() {
-    let s = Setup::with_config("fs.rw = [\"~/data\"]\nnetwork.mode = \"full\"");
+    let s = Setup::with_config("fs.rw = [\"~/data\"]");
     fs::create_dir(s.root.join("home/data")).unwrap();
     let out = output(s.run_probe_command(&[]), b"[]");
     assert_eq!(code(&out), 0, "{out:?}");
@@ -3282,4 +3284,255 @@ fn a_standalone_run_blocks_clipboard_asks_and_says_so() {
     let seen = String::from_utf8_lossy(&t.seen()).into_owned();
     assert!(seen.starts_with("ABdone"), "{seen:?}");
     assert!(!seen.contains("]52;"), "{seen:?}");
+}
+
+// --- network = "full" through pasta ---
+
+/// The host's `pasta`, or `None` (the test is skipped) if `PATH` has none.
+fn host_pasta() -> Option<PathBuf> {
+    let found = std::env::var_os("PATH").and_then(|p| stopit::net::find_pasta_in(&p));
+    if found.is_none() {
+        eprintln!("skipping: no pasta in PATH");
+    }
+    found
+}
+
+/// [`shell_config`] with `network = "full"`, if the host has a shell,
+/// bash and pasta.
+fn full_network_config() -> Option<String> {
+    let config = shell_config()?;
+    if !Path::new("/bin/bash").exists() || !Path::new("/usr/bin/timeout").exists() {
+        eprintln!("skipping: no /bin/bash or /usr/bin/timeout on the host");
+        return None;
+    }
+    host_pasta()?;
+    Some(format!("{config}network.mode = \"full\"\n"))
+}
+
+/// The host's default IPv4 gateway, from `/proc/net/route`.
+fn default_gateway() -> Option<std::net::Ipv4Addr> {
+    let routes = fs::read_to_string("/proc/net/route").ok()?;
+    routes.lines().skip(1).find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        (fields.get(1) == Some(&"00000000"))
+            .then(|| u32::from_str_radix(fields.get(2)?, 16).ok())
+            .flatten()
+            .map(|gw| std::net::Ipv4Addr::from(gw.swap_bytes()))
+    })
+}
+
+/// A bash line that prints `<label> reached` or `<label> refused` for a TCP
+/// connection to `host` and `port`, giving up after two seconds.
+fn try_connect(label: &str, host: &str, port: u16) -> String {
+    format!(
+        "if timeout 2 bash -c 'exec 3<>/dev/tcp/{host}/{port}' 2>/dev/null; \
+         then echo {label} reached; else echo {label} refused; fi; "
+    )
+}
+
+#[test]
+fn full_network_reaches_out_but_not_the_host_loopback() {
+    let Some(config) = full_network_config() else {
+        return;
+    };
+    let s = Setup::with_config(&config);
+    // Services on the host's loopback, which the sandbox must not reach,
+    // directly or through the gateway's address.
+    let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let v4_port = v4.local_addr().unwrap().port();
+    let v6 = std::net::TcpListener::bind("[::1]:0").ok();
+    let mut script = try_connect("v4", "127.0.0.1", v4_port);
+    if let Some(v6) = &v6 {
+        script += &try_connect("v6", "::1", v6.local_addr().unwrap().port());
+    }
+    let gateway = default_gateway();
+    if let Some(gw) = gateway {
+        script += &try_connect("gateway", &gw.to_string(), v4_port);
+    }
+    script += "cat /etc/resolv.conf; tail -n +3 /proc/net/dev | cut -d: -f1";
+    let out = output(
+        s.stopit(&["run", "--quiet", "/bin/bash", "-c", &script]),
+        b"",
+    );
+    assert_eq!(code(&out), 0, "{out:?}");
+    let shown = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(shown.contains("v4 refused"), "{shown}");
+    if v6.is_some() {
+        assert!(shown.contains("v6 refused"), "{shown}");
+    }
+    if gateway.is_some() {
+        assert!(shown.contains("gateway refused"), "{shown}");
+    }
+    // Nothing reached the listeners either.
+    v4.set_nonblocking(true).unwrap();
+    assert!(v4.accept().is_err());
+    // The sandbox's resolver is pasta's forwarder, and it has an interface
+    // besides `lo`.
+    assert!(shown.contains("nameserver 169.254.1.1\n"), "{shown}");
+    let interfaces: Vec<&str> = shown
+        .lines()
+        .skip_while(|l| !l.starts_with("nameserver"))
+        .skip(1)
+        .map(str::trim)
+        .collect();
+    assert!(interfaces.contains(&"lo"), "{shown}");
+    assert!(interfaces.len() >= 2, "{shown}");
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn full_network_resolves_and_connects_where_the_host_does() {
+    let Some(config) = full_network_config() else {
+        return;
+    };
+    // Only where the host itself reaches the outside.
+    let host = "www.google.com";
+    let reachable = std::net::ToSocketAddrs::to_socket_addrs(&(host, 443))
+        .ok()
+        .and_then(|mut addrs| addrs.next())
+        .is_some_and(|addr| {
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3)).is_ok()
+        });
+    if !reachable {
+        eprintln!("skipping: the host does not reach {host}");
+        return;
+    }
+    let s = Setup::with_config(&config);
+    let script = try_connect("out", host, 443);
+    let out = output(
+        s.stopit(&["run", "--quiet", "/bin/bash", "-c", &script]),
+        b"",
+    );
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "out reached\n");
+}
+
+#[test]
+fn full_network_without_pasta_fails_before_the_sandbox_starts() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Ok(bwrap) = which_bwrap() else {
+        return;
+    };
+    let s = Setup::with_config(&format!("{config}network.mode = \"full\"\n"));
+    // A PATH with bwrap and no pasta.
+    let bin = s.root.join("only-bwrap");
+    fs::create_dir(&bin).unwrap();
+    symlink(&bwrap, bin.join("bwrap")).unwrap();
+    let mut command = s.stopit(&["run", "--quiet", "/bin/sh", "-c", "echo ran"]);
+    command.env("PATH", &bin);
+    let out = output(command, b"");
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert!(
+        stderr(&out).contains("network = \"full\" needs pasta"),
+        "{out:?}"
+    );
+    assert!(s.no_session_left());
+}
+
+/// The `bwrap` in `PATH`.
+fn which_bwrap() -> Result<PathBuf, ()> {
+    std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join("bwrap"))
+                .find(|p| p.is_file())
+        })
+        .ok_or(())
+}
+
+#[test]
+fn pasta_failing_fails_the_run_and_pasta_ends_with_the_sandbox() {
+    let Some(config) = full_network_config() else {
+        return;
+    };
+    let pasta = host_pasta().unwrap();
+    let s = Setup::with_config(&config);
+    // A pasta that records the pid it is given, then runs the real one, or
+    // fails when told to.
+    let bin = s.root.join("pasta-bin");
+    fs::create_dir(&bin).unwrap();
+    let record = s.root.join("pasta-pid");
+    let fail = s.root.join("pasta-fail");
+    fs::write(
+        bin.join("pasta"),
+        format!(
+            "#!/bin/sh\nfor last; do :; done\necho \"$last\" > {record:?}\n\
+             if [ -e {fail:?} ]; then echo 'cannot join' >&2; exit 1; fi\n\
+             exec {pasta:?} \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("pasta"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run = |script: &str| {
+        let mut command = s.stopit(&["run", "--quiet", "/bin/sh", "-c", script]);
+        command.env("PATH", &path);
+        output(command, b"")
+    };
+
+    // The real pasta is gone soon after the sandbox.
+    let out = run("echo ran");
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ran\n");
+    let pid = fs::read_to_string(&record).unwrap().trim().to_owned();
+    wait_until(|| {
+        let left = fs::read_dir("/proc").unwrap().flatten().any(|entry| {
+            let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else {
+                return false;
+            };
+            let args: Vec<&[u8]> = cmdline
+                .split(|&b| b == 0)
+                .filter(|a| !a.is_empty())
+                .collect();
+            args.first()
+                .is_some_and(|a| a.ends_with(b"pasta") || a.ends_with(b"passt"))
+                && args.last() == Some(&pid.as_bytes())
+        });
+        (!left).then_some(())
+    });
+
+    // A failing pasta fails the run before the command runs.
+    fs::write(&fail, b"").unwrap();
+    let out = run("echo ran");
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    let err = stderr(&out);
+    assert!(
+        err.contains("pasta could not set up the sandbox's network"),
+        "{err}"
+    );
+    assert!(err.contains("cannot join"), "{err}");
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn an_attached_run_gets_the_full_network_too() {
+    let Some(config) = full_network_config() else {
+        return;
+    };
+    let s = Setup::with_config(&config);
+    let mut server = Server::start(&s);
+    let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let script = format!(
+        "{}cat /etc/resolv.conf",
+        try_connect("v4", "127.0.0.1", v4.local_addr().unwrap().port())
+    );
+    let out = output(
+        s.stopit(&["run", "--quiet", "/bin/bash", "-c", &script]),
+        b"",
+    );
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "v4 refused\nnameserver 169.254.1.1\n"
+    );
+    assert!(server.log().contains("run 1 started"), "{}", server.log());
+    assert_eq!(server.stop(), 128 + libc::SIGTERM);
 }

@@ -439,7 +439,11 @@ fn run_for_client(
         TerminalSession::Detach
     };
     let bwrap = loaded.command(profile, &command, env, terminal)?;
-    let (mut child_command, status_reader) = bwrap.into_command_with_status()?;
+    let pasta = match bwrap.needs_pasta() {
+        true => Some(crate::net::find_pasta()?),
+        false => None,
+    };
+    let (mut child_command, status_reader, block) = bwrap.into_command_with_status()?;
     let [stdin, stdout, stderr] = stdio;
     child_command
         .stdin(Stdio::from(stdin))
@@ -502,6 +506,15 @@ fn run_for_client(
         (child, pidfd, asker)
     };
     drop(child_command);
+    if let (Some(pasta), Some(block)) = (&pasta, &block)
+        && let Err(e) = crate::net::start_pasta(pasta, child.id(), block)
+    {
+        // Killed before `block` closes, which would let bwrap go on.
+        let _ = pidfd_send_signal(&pidfd, Signal::KILL);
+        let _ = child.wait();
+        return Err(e.into());
+    }
+    drop(block);
     if !quiet {
         approver.log(&format!(
             "stopit: run {run} started: profile {}: {}",

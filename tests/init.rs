@@ -1021,33 +1021,23 @@ fn landlock_and_netns_block_host_abstract_unix_socket() {
         loopback_res[0]
     );
 
-    // Network mode `full` currently shares the host network namespace, so only
-    // Landlock ABI v6+ abstract-socket scoping stands between the sandbox and
-    // the host listener when the kernel supports ABI v6+.
-    let abi = unsafe {
-        libc::syscall(
-            libc::SYS_landlock_create_ruleset,
-            std::ptr::null::<u8>(),
-            0usize,
-            1u32,
-        )
-    };
-    if abi >= 6 {
-        init.spec = init
-            .f
-            .compile(&init_config(&[], "network = { mode = \"full\" }"));
-        let full_res = init.probe(
-            &[],
-            &[],
-            &[Op::ConnectAbstract {
-                name: unique.clone(),
-            }],
-        );
-        assert_eq!(
-            errno(&full_res[0]),
-            "EPERM",
-            "expected Landlock ABI v6+ scope to reject host abstract socket, got {:?}",
-            full_res[0]
-        );
-    }
+    // Network mode `full` has a network namespace of its own, which pasta
+    // connects (here, without pasta, it has no network at all). The host's
+    // abstract sockets are not in it.
+    init.spec = init
+        .f
+        .compile(&init_config(&[], "network = { mode = \"full\" }"));
+    let full_res = init.probe(
+        &[],
+        &[],
+        &[Op::ConnectAbstract {
+            name: unique.clone(),
+        }],
+    );
+    assert_eq!(
+        errno(&full_res[0]),
+        "ECONNREFUSED",
+        "expected host abstract socket to be unreachable in full mode, got {:?}",
+        full_res[0]
+    );
 }

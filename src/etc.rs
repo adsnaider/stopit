@@ -1,5 +1,6 @@
 //! The synthesized `/etc` files (DESIGN.md §6.2 step 4): `/etc/passwd`,
-//! `/etc/group`, `/etc/hosts` and `/etc/nsswitch.conf`.
+//! `/etc/group`, `/etc/hosts`, `/etc/nsswitch.conf` and, with
+//! `network = "full"`, `/etc/resolv.conf`.
 //!
 //! Their content comes from the spec (the sandbox `HOME`) and the ids the
 //! sandbox user has, never from the host's `/etc`: the sandbox learns
@@ -26,8 +27,11 @@
 //!   after it for `hosts`, both built into glibc (2.34+), so glibc never
 //!   tries to load `systemd`, `sss`, `ldap` or `mymachines` modules, which
 //!   the sandbox lacks. With `network = "proxy"` the proxy resolves names
-//!   (§8) and DNS lookups fail fast; with `full` they work if a provider
-//!   grants `/etc/resolv.conf`.
+//!   (§8) and DNS lookups fail fast.
+//! * `resolv.conf` names pasta's DNS forwarder ([`crate::net::DNS_FORWARD`]),
+//!   which passes queries to the host's resolver, so a host resolver on
+//!   loopback works too. It names no search domains: the host's would tell
+//!   the sandbox where it runs.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -114,7 +118,13 @@ pub fn contents(
         EtcFile::Group => group(ids),
         EtcFile::Hosts => hosts(hostname),
         EtcFile::NsswitchConf => NSSWITCH_CONF.to_owned(),
+        EtcFile::ResolvConf => resolv_conf(),
     }
+}
+
+/// `/etc/resolv.conf`: pasta's DNS forwarder as the only nameserver.
+pub fn resolv_conf() -> String {
+    format!("nameserver {}\n", crate::net::DNS_FORWARD)
 }
 
 /// `/etc/hosts`: `localhost` for `127.0.0.1` and `::1`, which also name
@@ -273,6 +283,7 @@ mod tests {
                     EtcFile::Group => group(IDS),
                     EtcFile::Hosts => hosts(hostname),
                     EtcFile::NsswitchConf => NSSWITCH_CONF.to_owned(),
+                    EtcFile::ResolvConf => resolv_conf(),
                 };
                 assert_eq!(contents(file, IDS, &h, hostname), want, "{file}");
                 assert!(want.ends_with('\n'), "{file}");
@@ -284,7 +295,8 @@ mod tests {
                 "/etc/passwd",
                 "/etc/group",
                 "/etc/hosts",
-                "/etc/nsswitch.conf"
+                "/etc/nsswitch.conf",
+                "/etc/resolv.conf"
             ]
             .map(PathBuf::from)
         );

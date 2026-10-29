@@ -119,6 +119,9 @@ const ARGV_OVERHEAD: usize = 3;
 /// Argument count added to bwrap's argv for `--json-status-fd FD`.
 const STATUS_ARGV_OVERHEAD: usize = 2;
 
+/// Argument count added to bwrap's argv for `--block-fd FD`.
+const BLOCK_ARGV_OVERHEAD: usize = 2;
+
 /// The lowest descriptor number handed to bwrap. Lower ones are stdio, which
 /// the child's standard streams replace before the descriptors are
 /// inherited.
@@ -305,6 +308,13 @@ pub enum TerminalSession {
     Pty,
 }
 
+/// Whether stopit makes the sandbox's network namespace itself, for pasta
+/// to join ([`crate::net`]): with `network = "full"`, unless the profile
+/// shares the host's.
+pub fn own_network_namespace(spec: &SandboxSpec) -> bool {
+    spec.network == NetworkSpec::Full && !spec.namespaces.is_shared(ShareableNamespace::Net)
+}
+
 /// The working directory a sandbox starts in: the workspace mount if the
 /// spec mounts something there, else `/` (DESIGN.md §6.2).
 pub fn working_dir(spec: &SandboxSpec, workspace_mount: &Path) -> PathBuf {
@@ -340,6 +350,9 @@ pub struct BwrapCommand {
     spec_fd: Option<OwnedFd>,
     /// Mount count and largest provider for [`BwrapError::TooManyArgs`].
     mounts_summary: (usize, Option<ProviderName>, usize),
+    /// Whether bwrap runs in a user and network namespace of stopit's, for
+    /// pasta to join ([`own_network_namespace`]).
+    own_netns: bool,
 }
 
 impl BwrapCommand {
@@ -499,6 +512,7 @@ impl BwrapCommand {
             env_fd: None,
             spec_fd: None,
             mounts_summary: (spec.mounts.len(), provider, provider_mounts),
+            own_netns: own_network_namespace(spec),
         })
     }
 
@@ -510,6 +524,12 @@ impl BwrapCommand {
     /// The command bwrap runs in the sandbox, passed on argv after `--`.
     pub fn command(&self) -> &[OsString] {
         &self.command
+    }
+
+    /// Whether the sandbox needs pasta for its network: bwrap then waits
+    /// on `--block-fd` until [`crate::net::start_pasta`] lets it go on.
+    pub fn needs_pasta(&self) -> bool {
+        self.own_netns
     }
 
     /// The descriptor `--args` names.
@@ -552,15 +572,32 @@ impl BwrapCommand {
     /// dropped. It may be spawned more than once, each time with the same
     /// arguments: bwrap reads its descriptors to the end, so each child
     /// gets fresh ones, opened anew on the same memfds after the fork.
+    ///
+    /// When the sandbox [needs pasta](Self::needs_pasta), bwrap runs in a
+    /// network namespace of its own with no `--block-fd`, so the sandbox
+    /// has no network but an `lo` that is down.
     pub fn into_command(self) -> Command {
-        self.build_command(None)
+        self.build_command(None, None)
     }
 
     /// Builds the `bwrap` command with `--json-status-fd <fd>` and returns the
     /// non-blocking read end of the status pipe. Drop the returned `Command`
     /// after spawning so the parent's write end closes.
-    pub fn into_command_with_status(self) -> Result<(Command, File), BwrapError> {
-        let count = self.args.len() + ARGV_OVERHEAD + STATUS_ARGV_OVERHEAD + self.command.len();
+    ///
+    /// When the sandbox [needs pasta](Self::needs_pasta), bwrap also gets
+    /// `--block-fd`, and the write end of that pipe is returned, for
+    /// [`crate::net::start_pasta`].
+    pub fn into_command_with_status(self) -> Result<(Command, File, Option<OwnedFd>), BwrapError> {
+        let block_overhead = if self.own_netns {
+            BLOCK_ARGV_OVERHEAD
+        } else {
+            0
+        };
+        let count = self.args.len()
+            + ARGV_OVERHEAD
+            + STATUS_ARGV_OVERHEAD
+            + block_overhead
+            + self.command.len();
         if count > BWRAP_MAX_ARGS {
             let (mounts, provider, provider_mounts) = self.mounts_summary;
             return Err(BwrapError::TooManyArgs {
@@ -572,17 +609,50 @@ impl BwrapCommand {
             });
         }
         let (read_fd, write_fd) = cloexec_pipe().map_err(BwrapError::StatusPipe)?;
-        let command = self.build_command(Some(write_fd));
-        Ok((command, File::from(read_fd)))
+        let block = if self.own_netns {
+            let (block_read, block_write) = cloexec_pipe().map_err(BwrapError::StatusPipe)?;
+            // bwrap reads its end blocking.
+            rustix::fs::fcntl_setfl(&block_read, OFlags::empty())
+                .map_err(|e| BwrapError::StatusPipe(e.into()))?;
+            let block_read = if block_read.as_raw_fd() < MIN_FD {
+                fcntl_dupfd_cloexec(&block_read, MIN_FD)
+                    .map_err(|e| BwrapError::StatusPipe(e.into()))?
+            } else {
+                block_read
+            };
+            Some((block_read, block_write))
+        } else {
+            None
+        };
+        let (block_read, block_write) = block.unzip();
+        let command = self.build_command(Some(write_fd), block_read);
+        Ok((command, File::from(read_fd), block_write))
     }
 
-    fn build_command(self, status_write_fd: Option<OwnedFd>) -> Command {
+    fn build_command(
+        self,
+        status_write_fd: Option<OwnedFd>,
+        block_read_fd: Option<OwnedFd>,
+    ) -> Command {
         let mut command = Command::new(BWRAP);
         if let Some(ref sfd) = status_write_fd {
             command
                 .arg("--json-status-fd")
                 .arg(sfd.as_raw_fd().to_string());
         }
+        if let Some(ref bfd) = block_read_fd {
+            command.arg("--block-fd").arg(bfd.as_raw_fd().to_string());
+        }
+        // The id maps for the user namespace of `own_netns`, built before
+        // the fork so the child never allocates.
+        let netns_maps = self.own_netns.then(|| {
+            let uid = rustix::process::getuid().as_raw();
+            let gid = rustix::process::getgid().as_raw();
+            (
+                CString::new(format!("{uid} {uid} 1")).expect("no NUL in numbers"),
+                CString::new(format!("{gid} {gid} 1")).expect("no NUL in numbers"),
+            )
+        });
         command
             .arg("--args")
             .arg(self.args_fd.as_raw_fd().to_string())
@@ -603,6 +673,9 @@ impl BwrapCommand {
         if let Some(sfd) = status_write_fd {
             keep_fds.push(sfd);
         }
+        if let Some(bfd) = block_read_fd {
+            keep_fds.push(bfd);
+        }
         // SAFETY: the closure runs in the forked child before `exec`, where
         // only async-signal-safe operations are allowed. It allocates
         // nothing and takes no locks. First `close_range` marks every open
@@ -610,7 +683,10 @@ impl BwrapCommand {
         // supervisor never reach bwrap or the sandbox. Then the loop reopens
         // each memfd through `/proc/self/fd/N` at offset 0 and moves it onto
         // `N` with `dup2`, and clears close-on-exec on each `O_PATH` bind
-        // descriptor and any status pipe descriptor.
+        // descriptor and any status or block pipe descriptor. Last, for
+        // `own_netns`, it enters a new user and network namespace, mapping
+        // only the caller's ids, with `prctl`, `unshare`, `open` and
+        // `write`.
         unsafe {
             command.pre_exec(move || {
                 if libc::close_range(
@@ -632,11 +708,38 @@ impl BwrapCommand {
                 for fd in &keep_fds {
                     fcntl_setfd(fd, FdFlags::empty())?;
                 }
+                if let Some((uid_map, gid_map)) = &netns_maps {
+                    // A non-dumpable process (`stopit server`) has its
+                    // `/proc/self` files owned by root, so it could not write
+                    // its maps. `exec` makes bwrap dumpable a moment later
+                    // anyway.
+                    if libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    // A process without CAP_SETGID in the parent namespace
+                    // may map its gid only once `setgroups` is denied.
+                    write_proc(c"/proc/self/setgroups", b"deny")?;
+                    write_proc(c"/proc/self/uid_map", uid_map.as_bytes())?;
+                    write_proc(c"/proc/self/gid_map", gid_map.as_bytes())?;
+                }
                 Ok(())
             });
         }
         command
     }
+}
+
+/// Writes `data` to the `/proc` file `path` in one `write`, as files such
+/// as `uid_map` need. Async-signal-safe: it allocates nothing.
+fn write_proc(path: &std::ffi::CStr, data: &[u8]) -> io::Result<()> {
+    let fd = rustix::fs::open(path, OFlags::WRONLY | OFlags::CLOEXEC, Mode::empty())?;
+    if rustix::io::write(&fd, data)? != data.len() {
+        return Err(io::Error::other("short write to a /proc file"));
+    }
+    Ok(())
 }
 
 /// Creates a close-on-exec pipe with a non-blocking read end and a write end at
@@ -925,11 +1028,10 @@ fn plan_with_caps(
     // satisfy `--disable-userns`, and can share nothing but the network.
     // The mount namespace is always new.
     plan.push(["--unshare-user"])?;
-    let share_net = spec.namespaces.is_shared(ShareableNamespace::Net)
-        // TODO(§8): `full` is to run through pasta with `--no-map-gw`, so
-        // host localhost services stay unreachable; it shares the host's
-        // network namespace until then.
-        || matches!(spec.network, NetworkSpec::Full);
+    // With `full`, the network namespace is stopit's own, made before bwrap
+    // runs ([`own_network_namespace`]), so bwrap makes none.
+    let share_net =
+        spec.namespaces.is_shared(ShareableNamespace::Net) || own_network_namespace(spec);
     // A new UTS namespace starts with the host's hostname, so stopit gives it
     // its own (`hosts` names it too); a shared one is the host's, as chosen.
     let hostname =
@@ -1649,7 +1751,9 @@ mod tests {
     }
 
     #[test]
-    fn only_full_network_shares_the_network_namespace() {
+    fn full_network_gets_a_namespace_of_stopits_own() {
+        // bwrap makes the namespace in every mode but `full`, whose
+        // namespace stopit makes before bwrap runs, for pasta.
         for (network, unshared) in [
             (NetworkSpec::None, true),
             (NetworkSpec::Loopback, true),
@@ -1674,6 +1778,52 @@ mod tests {
             // The user namespace is always new, and userns creation off.
             assert!(args.contains(&"--unshare-user".to_string()));
             assert!(args.contains(&"--disable-userns".to_string()));
+            assert_eq!(own_network_namespace(&spec), !unshared, "{network:?}");
+        }
+        // Sharing the host's network namespace wins over `full`.
+        let mut spec = SandboxSpec {
+            network: NetworkSpec::Full,
+            ..SandboxSpec::default()
+        };
+        spec.namespaces.shared = [ShareableNamespace::Net].into_iter().collect();
+        assert!(!own_network_namespace(&spec));
+        assert!(!golden(&spec).contains(&"--unshare-net".to_string()));
+    }
+
+    #[test]
+    fn a_command_needing_pasta_blocks_on_a_pipe_of_its_own() {
+        let f = Fixture::new();
+        let full = SandboxSpec {
+            network: NetworkSpec::Full,
+            ..spec(vec![])
+        };
+        for (spec, pasta) in [(spec(vec![]), false), (full, true)] {
+            let cmd = f.command(&spec);
+            assert_eq!(cmd.needs_pasta(), pasta);
+            let (command, _status, block) = cmd.into_command_with_status().unwrap();
+            let argv: Vec<String> = command
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            let at = argv.iter().position(|a| a == "--block-fd");
+            assert_eq!(at.is_some(), pasta, "{argv:?}");
+            assert_eq!(block.is_some(), pasta);
+            if let (Some(at), Some(block)) = (at, block) {
+                // The read end is above stdio, blocking, and the other end
+                // of the returned pipe.
+                let fd: RawFd = argv[at + 1].parse().unwrap();
+                assert!(fd >= MIN_FD);
+                // SAFETY: the command owns `fd` and outlives this borrow.
+                let read = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+                let flags = rustix::fs::fcntl_getfl(read).unwrap();
+                assert!(!flags.contains(OFlags::NONBLOCK));
+                rustix::io::write(&block, b"x").unwrap();
+                let mut buf = [0u8; 1];
+                assert_eq!(rustix::io::read(read, &mut buf).unwrap(), 1);
+                // `--block-fd` comes before `--args`.
+                let args_at = argv.iter().position(|a| a == "--args").unwrap();
+                assert!(at < args_at, "{argv:?}");
+            }
         }
     }
 
@@ -1834,6 +1984,11 @@ mod tests {
                 "--ro-bind-data",
                 "<data 3>",
                 "/etc/nsswitch.conf",
+                "--perms",
+                "0444",
+                "--ro-bind-data",
+                "<data 4>",
+                "/etc/resolv.conf",
             ])
         );
         let data: Vec<String> = plan
@@ -1849,6 +2004,7 @@ mod tests {
                 "user:x:100:\nnogroup:x:65534:\n",
                 etc::hosts(Some(etc::SANDBOX_HOSTNAME)).as_str(),
                 etc::NSSWITCH_CONF,
+                "nameserver 169.254.1.1\n",
             ]
         );
     }
@@ -3062,7 +3218,7 @@ mod tests {
         let cmd = f.command(&SandboxSpec::default());
         let base = cmd.args().len() + ARGV_OVERHEAD + cmd.command().len();
         let args_fd = cmd.args_fd().to_string();
-        let (command, _status_reader) = cmd.into_command_with_status().unwrap();
+        let (command, _status_reader, _block) = cmd.into_command_with_status().unwrap();
         let argv: Vec<String> = command
             .get_args()
             .map(|a| a.to_str().unwrap().to_owned())

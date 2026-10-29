@@ -283,6 +283,10 @@ pub enum RunError {
     #[error("cannot run bwrap: {0}")]
     Spawn(#[source] io::Error),
 
+    /// The sandbox's network cannot be set up.
+    #[error(transparent)]
+    Network(#[from] crate::net::NetError),
+
     /// The signal handlers cannot be installed.
     #[error("cannot set up signal handling: {0}")]
     Signals(#[source] io::Error),
@@ -1327,7 +1331,12 @@ fn wait_foreground(
     if let Some(signal) = take_signal() {
         return Ok(signal_exit_code(signal));
     }
-    let (mut command, status_reader) = command.into_command_with_status()?;
+    // Found before anything starts, so a missing pasta fails the run early.
+    let pasta = match command.needs_pasta() {
+        true => Some(crate::net::find_pasta()?),
+        false => None,
+    };
+    let (mut command, status_reader, block) = command.into_command_with_status()?;
     if let Some(t) = &terminal {
         let slave = |i: usize| -> Result<Stdio, RunError> {
             match &t.slave {
@@ -1374,6 +1383,15 @@ fn wait_foreground(
     // sees EOF when bwrap finishes or execs `__init`, and of the slaves
     // given to the sandbox.
     drop(command);
+    if let (Some(pasta), Some(block)) = (&pasta, &block)
+        && let Err(e) = crate::net::start_pasta(pasta, child.id(), block)
+    {
+        // Killed before `block` closes, which would let bwrap go on.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e.into());
+    }
+    drop(block);
     let mut relay = terminal.as_mut().and_then(SandboxTerminal::start_relay);
     if let Some(r) = &relay {
         r.resize();

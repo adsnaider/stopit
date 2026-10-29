@@ -3002,6 +3002,12 @@ fn finish_profile(
     };
     let inherited_domains = parent.map(|p| &p.network.allow_domains);
     let network = network_spec(&grants.network, inherited_domains, &mut warnings);
+    let mut etc = grants.system.etc.clone();
+    // pasta's DNS forwarder is the sandbox's resolver, in a network
+    // namespace of stopit's own (`crate::bwrap::own_network_namespace`).
+    if network == NetworkSpec::Full && !grants.sandbox.share.contains(&ShareableNamespace::Net) {
+        etc.insert(EtcFile::ResolvConf);
+    }
     let spec = SandboxSpec {
         mounts,
         untrusted_roots,
@@ -3010,7 +3016,7 @@ fn finish_profile(
         system: SystemSpec {
             proc: grants.system.proc,
             dev: grants.system.dev,
-            etc: grants.system.etc.clone(),
+            etc,
             home,
         },
         namespaces: Namespaces {
@@ -3887,6 +3893,29 @@ mod tests {
     }
 
     #[test]
+    fn full_network_gets_a_resolv_conf_in_its_own_namespace_only() {
+        let f = Fixture::new();
+        let etc = |body: &str| {
+            let s = f.compile(&format!("base = \"none\"\n{}", prov("a", "main", body)));
+            strs(&get(&s, "main").spec.system.etc)
+        };
+        assert_eq!(etc("network.mode = \"full\""), ["resolv.conf"]);
+        assert_eq!(
+            etc("network.mode = \"full\"\nsystem.etc = [\"hosts\"]"),
+            ["hosts", "resolv.conf"]
+        );
+        // The host's namespace has the host's resolver, which a provider
+        // grants as it likes.
+        assert!(etc("network.mode = \"full\"\nsandbox.share = [\"net\"]").is_empty());
+        for mode in ["none", "loopback", "proxy"] {
+            assert!(
+                etc(&format!("network.mode = {mode:?}")).is_empty(),
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
     fn child_narrowing_a_proxy_parent_drops_inherited_domains_silently() {
         let f = Fixture::new();
         let s = f.compile(&format!(
@@ -4349,6 +4378,8 @@ mod tests {
                 "/etc/nsswitch.conf",
                 CoversReserved(p("/etc/nsswitch.conf")),
             ),
+            // Reserved in every network mode, though only `full` has it.
+            ("/etc/resolv.conf", CoversReserved(p("/etc/resolv.conf"))),
         ];
         for (dest, reason) in rejected {
             let e = compile_with_rule(&f, &bind_at(dest)).unwrap_err();

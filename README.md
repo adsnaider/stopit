@@ -94,10 +94,10 @@ Links outside your project, such as `/bin -> usr/bin`, are followed.
 type = "config"
 [provider.sandbox]
 network = { mode = "full" }
-fs.ro = ["/etc/ssl/certs", "/etc/resolv.conf"]
+fs.ro = ["/etc/ssl/certs"]
 ```
 
-`full` shares your network. The planned `proxy` mode, which allows only listed domains, is not built yet.
+`full` gives the sandbox a network of its own, connected to yours by `pasta` from the passt package, which must be installed. The sandbox reaches what your machine reaches, except services on your machine's loopback. The planned `proxy` mode, which allows only listed domains, is not built yet.
 
 ### Keep a build cache between sessions
 
