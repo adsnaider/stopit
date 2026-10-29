@@ -234,6 +234,10 @@ pub enum RunError {
     #[error(transparent)]
     State(#[from] StateError),
 
+    /// `[limits]` cannot be applied (§10).
+    #[error(transparent)]
+    Limits(#[from] crate::limits::LimitsError),
+
     /// `stopit shell` without `SHELL` in the environment.
     #[error("SHELL is not set; run a shell explicitly with `stopit run <shell>`")]
     ShellUnset,
@@ -860,6 +864,9 @@ impl LoadedSession {
             SandboxHome::default(),
         )?;
 
+        // With `[limits]`, stopit runs again in a scope of its own before
+        // anything runs or is created (§10).
+        crate::limits::enter_scope(&config.limits)?;
         // Before the providers, which are told where it is. From here on,
         // returning removes it.
         let session = SessionDir::create_from_env()?;

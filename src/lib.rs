@@ -16,6 +16,7 @@ pub mod expand;
 pub mod filter;
 pub mod init;
 pub mod landlock;
+pub mod limits;
 pub mod manifest;
 pub mod net;
 pub mod policy;

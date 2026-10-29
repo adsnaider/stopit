@@ -4216,3 +4216,115 @@ fn jj_runs_through_the_broker_while_main_sees_no_metadata() {
     assert_eq!(log, "hello\nHost User\n");
     assert!(s.no_session_left());
 }
+
+// --- Resource limits ---
+
+/// The user's session bus, for `systemd-run --user`, if the user's systemd
+/// runs scopes.
+fn user_bus() -> Option<String> {
+    let runtime = std::env::var("XDG_RUNTIME_DIR").ok()?;
+    let bus = format!("unix:path={runtime}/bus");
+    let ok = Command::new("systemd-run")
+        .args(["--user", "--scope", "--quiet", "--collect", "true"])
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    ok.then_some(bus)
+}
+
+#[test]
+fn limits_put_the_session_in_a_scope_of_its_own() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some(bus) = user_bus() else {
+        eprintln!("skipping: systemd-run --user --scope does not work here");
+        return;
+    };
+    let s = Setup::with_config(&format!(
+        "{config}[limits]\npids = 24\nmemory = \"512M\"\ncpu = \"50%\"\n"
+    ));
+    // systemd-run finds the user's systemd through `XDG_RUNTIME_DIR`, which
+    // is the test's own here.
+    let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+    for name in ["systemd", "bus"] {
+        symlink(runtime.join(name), s.runtime().join(name)).unwrap();
+    }
+    let script =
+        "sleep 2; i=0; while [ $i -lt 40 ]; do sleep 3 & i=$((i+1)); done; wait; echo ended";
+    let mut child = s
+        .stopit(&["run", "--quiet", "/bin/sh", "-c", script])
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // stopit keeps its pid in the scope, whose limits are the ones asked.
+    let deadline = Instant::now() + BWRAP_DEADLINE;
+    let cgroup = loop {
+        let text = fs::read_to_string(format!("/proc/{}/cgroup", child.id())).unwrap_or_default();
+        let path = text
+            .lines()
+            .find_map(|l| l.strip_prefix("0::"))
+            .unwrap_or("");
+        if path.contains("/stopit-") && path.ends_with(".scope") {
+            break PathBuf::from(format!("/sys/fs/cgroup{path}"));
+        }
+        if Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            panic!("not in a scope: {text}: {:?}", child.wait_with_output());
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    let read = |file: &str| {
+        fs::read_to_string(cgroup.join(file))
+            .unwrap()
+            .trim()
+            .to_owned()
+    };
+    assert_eq!(read("pids.max"), "24");
+    assert_eq!(read("memory.max"), "536870912");
+    assert_eq!(read("cpu.max"), "50000 100000");
+    let out = child.wait_with_output().unwrap();
+    // Forks beyond the limit fail, and the session still ends.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ended\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .to_lowercase()
+            .contains("fork"),
+        "{out:?}"
+    );
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn limits_without_systemd_run_fail_before_the_sandbox() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let s = Setup::with_config(&format!("{config}[limits]\npids = 24\n"));
+    // A PATH with bwrap but no systemd-run.
+    let dir = TempDir::new().unwrap();
+    let bwrap = std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|d| d.join("bwrap"))
+                .find(|p| p.exists())
+        })
+        .unwrap();
+    symlink(&bwrap, dir.path().join("bwrap")).unwrap();
+    let mut command = s.stopit(&["run", "--quiet", "/bin/sh", "-c", "echo ran"]);
+    command.env("PATH", dir.path());
+    let out = output(command, b"");
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert!(
+        stderr(&out).contains("[limits] needs systemd-run"),
+        "{out:?}"
+    );
+    // Before any session directory.
+    assert!(!s.runtime().join("stopit").exists());
+}

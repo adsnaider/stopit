@@ -929,7 +929,11 @@ memory = "8G"
 cpu    = "400%"   # of one CPU
 ```
 
-Session-wide, so not a provider setting. Off unless configured. Applied by launching the session's sandboxes in a transient cgroup scope (`systemd-run --user --scope` or direct cgroup v2 delegation), so limits are scoped to the session rather than the user's whole login. Mitigates forkbombs and runaway memory (threat class 2).
+Session-wide, so not a provider setting. Off unless configured. Mitigates forkbombs and runaway memory (threat class 2).
+
+* **The scope.** With any limit set, `stopit run`, `stopit shell` and `stopit server` run themselves again through `systemd-run --user --scope --collect --unit stopit-<pid>-<nanos>.scope` with `TasksMax`, `MemoryMax` (in bytes) and `CPUQuota`, right after the configuration is read, checked and layered and before the session directory exists or any provider runs. `systemd-run --scope` runs the command in its own process, so stopit keeps its pid, process group and terminal. Everything the session starts stays in the scope: its sandboxes, the commands its brokers start, pasta and the proxy bridges. So the limits hold for the session as a whole, stopit included, and the user's other processes do not count against them. A server's runs share its scope.
+* **Checks.** stopit sets `STOPIT_SCOPE` to the unit's name for the stopit it runs again. That stopit finds the scope in the cgroup v2 line of `/proc/self/cgroup` and reads its `pids.max`, `memory.max` and `cpu.max` below `/sys/fs/cgroup`. It refuses to go on, with exit 125, unless every configured limit is there (`memory.max` may be up to 64 KiB lower, as the kernel rounds it to pages), so a user systemd without a controller fails closed. Without `systemd-run` in `PATH` stopit also exits 125. A systemd-run that cannot reach the user's systemd prints its own error and exits.
+* **What the limits are not.** `MemoryMax` covers the scope's memory but not swap. Direct cgroup v2 delegation, without systemd, is not supported.
 
 ---
 
