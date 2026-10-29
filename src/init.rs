@@ -732,7 +732,8 @@ fn enter_directory(dir: &StartDir) -> io::Result<()> {
     let stat = rustix::fs::fstat(&opened)?;
     if (stat.st_dev as u64, stat.st_ino as u64) != (dir.dev, dir.ino) {
         return Err(io::Error::other(
-            "it is not the directory the broker checked; it was moved meanwhile",
+            "another directory is at this path in the profile's sandbox, moved there since the \
+             broker's check or mounted there by the profile",
         ));
     }
     rustix::process::fchdir(&opened)?;
@@ -906,12 +907,29 @@ fn exec(command: &[CString], env: &[CString], skip_shims: bool) -> ExecError {
     match env_value(env, b"PATH") {
         None => ExecError::NoPath,
         Some(path) if skip_shims => {
-            let bin = crate::shim::SANDBOX_BIN.as_bytes();
-            let kept: Vec<&[u8]> = path.split(|&b| b == b':').filter(|d| *d != bin).collect();
-            search_path(name, &kept.join(&b':'), execve)
+            let kept = without_dir(path, crate::shim::SANDBOX_BIN);
+            search_path(name, &kept, execve)
         }
         Some(path) => search_path(name, path, execve),
     }
+}
+
+/// `path` without its entries that name the directory `dir`, however they
+/// spell it (`/run/stopit//bin/`, or a relative entry that leads there),
+/// compared by device and inode. Entries that cannot be read stay, since
+/// nothing runs from them anyway.
+fn without_dir(path: &[u8], dir: &str) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let id = |p: &std::path::Path| rustix::fs::stat(p).ok().map(|s| (s.st_dev, s.st_ino));
+    let Some(target) = id(std::path::Path::new(dir)) else {
+        return path.to_vec();
+    };
+    path.split(|&b| b == b':')
+        .filter(|d| {
+            d.is_empty() || id(std::path::Path::new(std::ffi::OsStr::from_bytes(d))) != Some(target)
+        })
+        .collect::<Vec<_>>()
+        .join(&b':')
 }
 
 fn null_terminated(strings: &[CString]) -> Vec<*const libc::c_char> {
@@ -1094,6 +1112,25 @@ mod tests {
     // --- InitSpec encoding ---
 
     #[test]
+    fn the_shims_directory_leaves_path_in_any_spelling() {
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let t = tmp.path().display();
+        let path = format!("{t}/bin/:{t}//bin:/nonexistent::{t}/bin/../bin:/usr/bin");
+        assert_eq!(
+            without_dir(path.as_bytes(), bin.to_str().unwrap()),
+            b"/nonexistent::/usr/bin"
+        );
+        // Without the directory, PATH stays as it is.
+        let gone = tmp.path().join("gone");
+        assert_eq!(
+            without_dir(path.as_bytes(), gone.to_str().unwrap()),
+            path.as_bytes()
+        );
+    }
+
+    #[test]
     fn a_start_directory_must_be_the_one_checked() {
         let dir = tempfile::TempDir::new().unwrap();
         let wrong = StartDir {
@@ -1102,7 +1139,7 @@ mod tests {
             ino: 0,
         };
         let e = enter_directory(&wrong).unwrap_err();
-        assert!(e.to_string().contains("moved meanwhile"), "{e}");
+        assert!(e.to_string().contains("moved there since"), "{e}");
         // A link on the way is refused, whatever it leads to.
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(dir.path(), &link).unwrap();

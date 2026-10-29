@@ -3857,6 +3857,90 @@ fn shims_calling_shims_stop_four_deep() {
 }
 
 #[test]
+fn a_profile_without_shims_sees_an_empty_bin() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let s = Setup::with_config(&config);
+    let out = output(
+        s.stopit(&[
+            "run",
+            "--quiet",
+            "/bin/sh",
+            "-c",
+            "echo \"[$(ls -A /run/stopit/bin)]\"; ls /run/stopit",
+        ]),
+        b"",
+    );
+    assert_eq!(code(&out), 0, "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("[]\n"), "{stdout}");
+    assert!(!stdout.contains("shim"), "{stdout}");
+    assert!(!stdout.contains("broker"), "{stdout}");
+}
+
+#[test]
+fn a_broker_turns_away_the_65th_waiting_connection() {
+    use std::os::unix::net::UnixStream;
+    let Some(config) = harness_config() else {
+        return;
+    };
+    let s = Setup::with_config(&config);
+    let started = Instant::now();
+    let mut child = s
+        .stopit(&["run", "--quiet", "/bin/sh", "-c", "sleep 3"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // The run's broker socket, in its session directory.
+    let base = s.runtime().join("stopit");
+    let deadline = Instant::now() + BWRAP_DEADLINE;
+    let socket = loop {
+        let found = fs::read_dir(&base).ok().and_then(|sessions| {
+            sessions.flatten().find_map(|session| {
+                fs::read_dir(session.path()).ok()?.flatten().find_map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    (name.starts_with("broker-") && name.ends_with(".sock")).then(|| e.path())
+                })
+            })
+        });
+        if let Some(found) = found {
+            break found;
+        }
+        assert!(Instant::now() < deadline, "no broker socket");
+        thread::sleep(Duration::from_millis(50));
+    };
+    // Each connection that sends nothing holds a worker in the handshake.
+    let mut held = Vec::new();
+    for _ in 0..64 {
+        held.push(UnixStream::connect(&socket).unwrap());
+    }
+    let mut extra = UnixStream::connect(&socket).unwrap();
+    extra
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut reply = Vec::new();
+    extra.read_to_end(&mut reply).unwrap();
+    let text = String::from_utf8_lossy(&reply);
+    assert!(
+        text.contains("the broker already runs 64 commands"),
+        "{text}"
+    );
+    // The run ends when its command does, without waiting out the
+    // handshakes of the connections still open.
+    assert!(child.wait().unwrap().success());
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+    drop(held);
+    assert!(s.no_session_left());
+}
+
+#[test]
 fn refused_shim_calls_exit_126_and_say_why() {
     let Some(config) = harness_config() else {
         return;

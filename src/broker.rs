@@ -136,11 +136,13 @@ pub enum Outcome {
 /// What the rules of `spec` decide for `args`, and the rule that matched,
 /// its subcommand pattern or `default`.
 ///
-/// A refused flag anywhere in the arguments denies ([`flag_matches`]).
-/// Otherwise the rule whose pattern matches the most leading arguments
-/// wins, the words before the first flag. A word beats a `*` in its place,
-/// and among patterns alike the strictest decision wins. No match takes
-/// the shim's `default`.
+/// A refused flag anywhere in the arguments denies ([`flag_matches`]): the
+/// shim's own, the matched rule's, and when `default` decides, every
+/// rule's, since a flag before the subcommand sends a listed subcommand
+/// there too. Otherwise the rule whose pattern matches the most of the
+/// words before the first flag wins. A word beats a `*` in its place, and
+/// among patterns alike the strictest decision wins. No match takes the
+/// shim's `default`.
 pub fn decide(spec: &ShimSpec, args: &[Vec<u8>]) -> (Outcome, String) {
     // The leading arguments up to the first flag. A flag before a word
     // may take a value that would read as one, so the pattern must match
@@ -173,13 +175,13 @@ pub fn decide(spec: &ShimSpec, args: &[Vec<u8>]) -> (Outcome, String) {
         Some((_, rule, name)) => (
             rule.decision,
             rule.profile.clone(),
-            &rule.deny_flags[..],
+            rule.deny_flags.iter().collect::<Vec<_>>(),
             name.clone(),
         ),
         None => (
             spec.default.decision,
             spec.default.profile.clone(),
-            &[][..],
+            spec.rules.iter().flat_map(|r| &r.deny_flags).collect(),
             "default".to_owned(),
         ),
     };
@@ -421,6 +423,9 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
     let request = crate::control::read_frame_by::<serde_json::Value>(conn, deadline)
         .map_err(|e| format!("bad shim request: {e}"))?
         .ok_or("bad shim request: no command")?;
+    if request.get("type").and_then(|t| t.as_str()) != Some("run") {
+        return Err("bad shim request: no command".to_owned());
+    }
     let version = request.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
     if version != u64::from(PROTOCOL_VERSION) {
         return Err(format!(
@@ -448,6 +453,20 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
         return Err(format!("no shim {name} in this sandbox"));
     };
     let say = |text: &str| say_to(stderr.as_fd(), text);
+    // The limits come first, so no one is asked about a call that cannot
+    // run anyway.
+    if ctx.depth >= MAX_DEPTH {
+        say(&format!(
+            "{name}: shims call each other more than {MAX_DEPTH} deep"
+        ));
+        return Ok(EXIT_DENIED);
+    }
+    let Some(_slot) = LiveSlot::take(&ctx.live) else {
+        say(&format!(
+            "{name}: the run already has {MAX_LIVE} shim commands"
+        ));
+        return Ok(EXIT_DENIED);
+    };
     let (outcome, rule) = decide(spec, &args);
     let cwd = PathBuf::from(OsString::from_vec(cwd));
     let rel = workspace_relative(&cwd, ctx.loaded.workspace_mount()).ok_or_else(|| {
@@ -479,7 +498,9 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
             let request = ApprovalRequest::Command {
                 shim: name.to_string(),
                 rule: match rule.as_str() {
-                    "default" => "default, for every subcommand no rule lists".to_owned(),
+                    "default" => "default, for calls no rule matches, including any with a flag \
+                                  before the subcommand"
+                        .to_owned(),
                     rule => rule.to_owned(),
                 },
                 profile: profile.as_str().to_owned(),
@@ -507,56 +528,93 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
         dev,
         ino,
     };
-    if ctx.depth >= MAX_DEPTH {
-        say(&format!(
-            "{name}: shims call each other more than {MAX_DEPTH} deep"
-        ));
-        return Ok(EXIT_DENIED);
-    }
-    if ctx.live.fetch_add(1, Ordering::SeqCst) >= MAX_LIVE {
-        ctx.live.fetch_sub(1, Ordering::SeqCst);
-        say(&format!(
-            "{name}: the run already has {MAX_LIVE} shim commands"
-        ));
-        return Ok(EXIT_DENIED);
-    }
-    let launched = launch(ctx, &target, &command, [stdin, stdout, stderr], start);
-    let launched = match launched {
-        Ok(launched) => launched,
+    let mut launched = launch(ctx, &target, &command, [stdin, stdout, stderr], start)
+        .map_err(|e| e.to_string())?;
+    let tracked = match launched.pidfd.try_clone() {
+        Ok(pidfd) => pidfd,
         Err(e) => {
-            ctx.live.fetch_sub(1, Ordering::SeqCst);
+            // Untracked, the sandbox would outlive the broker.
+            let _ = pidfd_send_signal(&launched.pidfd, Signal::KILL);
+            let _ = launched.child.wait();
             return Err(e.to_string());
         }
     };
-    lock(&shared.commands).insert(
-        number,
-        launched.pidfd.try_clone().map_err(|e| e.to_string())?,
-    );
+    lock(&shared.commands).insert(number, tracked);
     // Stopping between the spawn and the line above would miss it.
     if shared.stop.load(Ordering::SeqCst) {
         let _ = pidfd_send_signal(&launched.pidfd, Signal::KILL);
     }
     let code = launched.wait(conn);
     lock(&shared.commands).remove(&number);
-    ctx.live.fetch_sub(1, Ordering::SeqCst);
     Ok(code)
 }
 
-/// Writes `[stopit: <text>]` to the shim's stderr, `fd`, if it takes it
-/// within a second. A full pipe must not hold the broker up.
-fn say_to(fd: BorrowedFd<'_>, text: &str) {
-    let mut pollfd = libc::pollfd {
-        fd: fd.as_raw_fd(),
-        events: libc::POLLOUT,
-        revents: 0,
-    };
-    // SAFETY: one valid pollfd for the duration of the call.
-    if unsafe { libc::poll(&mut pollfd, 1, 1000) } <= 0 {
-        return;
+/// One of a run's [`MAX_LIVE`] shim commands, given back on drop.
+struct LiveSlot<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> LiveSlot<'a> {
+    /// Takes a slot from `live`, unless all are taken.
+    fn take(live: &'a std::sync::atomic::AtomicUsize) -> Option<Self> {
+        live.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            (n < MAX_LIVE).then_some(n + 1)
+        })
+        .ok()
+        .map(|_| LiveSlot(live))
     }
-    // Short enough that a ready pipe takes it whole.
-    let line: String = format!("[stopit: {text}]\n").chars().take(512).collect();
-    let _ = rustix::io::write(fd, line.as_bytes());
+}
+
+impl Drop for LiveSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Writes `[stopit: <text>]` to the shim's stderr, `fd`, without ever
+/// waiting on it, since a sandbox can fill a pipe or stop a terminal at
+/// will. The sandbox shares the open file, so its flags stay as they
+/// are: a socket gets a non-blocking send, and a pipe or terminal is
+/// opened again, non-blocking, for one write. A regular file takes the
+/// write as it is. Anything else gets no message.
+fn say_to(fd: BorrowedFd<'_>, text: &str) {
+    use rustix::fs::{FileType, Mode, OFlags};
+    let line = message_line(text);
+    let Ok(stat) = rustix::fs::fstat(fd) else {
+        return;
+    };
+    let file_type = FileType::from_raw_mode(stat.st_mode);
+    match file_type {
+        FileType::Socket => {
+            let _ = rustix::net::send(
+                fd,
+                line.as_bytes(),
+                rustix::net::SendFlags::DONTWAIT | rustix::net::SendFlags::NOSIGNAL,
+            );
+        }
+        FileType::RegularFile => {
+            let _ = rustix::io::write(fd, line.as_bytes());
+        }
+        FileType::Fifo | FileType::CharacterDevice => {
+            if file_type == FileType::CharacterDevice && !rustix::termios::isatty(fd) {
+                return;
+            }
+            let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+            let flags = OFlags::WRONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+            if let Ok(own) = rustix::fs::open(path, flags, Mode::empty()) {
+                let _ = rustix::io::write(&own, line.as_bytes());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `[stopit: <text>]` and a newline, with `text` cut to 500 bytes at a
+/// character boundary, short enough that a pipe with room takes it whole.
+fn message_line(text: &str) -> String {
+    let mut end = text.len().min(500);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("[stopit: {}]\n", &text[..end])
 }
 
 /// `cwd` relative to the workspace `mount`, if it is inside it and holds no
@@ -574,8 +632,8 @@ fn workspace_relative(cwd: &Path, mount: &Path) -> Option<PathBuf> {
 fn check_cwd(workspace: &Path, rel: &Path, dir: BorrowedFd<'_>) -> Result<(u64, u64), Failure> {
     use rustix::fs::{Mode, OFlags, ResolveFlags, fstat, open, openat2};
     let mismatch = || {
-        "the shim's working directory is not the workspace's own directory at that path, \
-         as in an ephemeral or masked directory"
+        "the shim's working directory is not the workspace's own directory at that path. Is \
+         it in an ephemeral or masked directory?"
             .to_owned()
     };
     let root = open(
@@ -856,12 +914,10 @@ mod tests {
     fn refused_flags_deny_in_every_spelling() {
         let s = spec(
             &["-c", "--config", "-C"],
-            vec![rule(
-                &["commit"],
-                Decision::Allow,
-                Some("local"),
-                &["--amend"],
-            )],
+            vec![
+                rule(&["commit"], Decision::Allow, Some("local"), &["--amend"]),
+                rule(&["show"], Decision::Allow, Some("local"), &[]),
+            ],
             (Decision::Allow, Some("local")),
         );
         for bad in [
@@ -873,6 +929,10 @@ mod tests {
             &["-C", "/elsewhere", "status"],
             &["commit", "--amend"],
             &["commit", "--amend=x"],
+            // `default` decides these, so every rule's flags apply: a flag
+            // before `commit` must not shed its refusals.
+            &["--no-pager", "commit", "--amend"],
+            &["log", "--amend"],
         ] {
             assert!(
                 matches!(decide(&s, &args(bad)).0, Outcome::Deny(_)),
@@ -883,7 +943,6 @@ mod tests {
             &["status"][..],
             &["--configure"],
             &["commit", "-m", "x"],
-            &["log", "--amend"],
             &["commit", "-am", "x"],
         ] {
             assert!(
@@ -891,7 +950,7 @@ mod tests {
                 "{ok:?}"
             );
         }
-        // A rule's own flags apply only with that rule.
+        // A rule's own flags do not apply with another rule.
         assert!(matches!(
             decide(&s, &args(&["show", "--amend"])).0,
             Outcome::Allow(_)
@@ -1025,6 +1084,79 @@ mod tests {
                 "{outside}"
             );
         }
+    }
+
+    #[test]
+    fn messages_are_cut_by_bytes_at_a_character() {
+        assert_eq!(message_line("no"), "[stopit: no]\n");
+        let long = message_line(&"é".repeat(400));
+        assert!(long.ends_with("é]\n"), "{long}");
+        assert_eq!(long.len(), "[stopit: ".len() + 500 + 2);
+        let odd = message_line(&format!("a{}", "é".repeat(400)));
+        assert_eq!(odd.len(), "[stopit: ".len() + 499 + 2);
+    }
+
+    #[test]
+    fn a_message_never_waits_on_the_shims_stderr() {
+        use std::io::Read;
+        use std::time::{Duration, Instant};
+        let blocking = |fd: BorrowedFd<'_>| {
+            !rustix::fs::fcntl_getfl(fd)
+                .unwrap()
+                .contains(rustix::fs::OFlags::NONBLOCK)
+        };
+        // A pipe with room gets the line.
+        let (mut r, w) = std::io::pipe().unwrap();
+        say_to(w.as_fd(), "hi");
+        drop(w);
+        let mut got = String::new();
+        r.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "[stopit: hi]\n");
+        // A full pipe gets nothing, at once, and keeps its flags.
+        let (_r, w) = std::io::pipe().unwrap();
+        rustix::fs::fcntl_setfl(&w, rustix::fs::OFlags::NONBLOCK).unwrap();
+        while rustix::io::write(&w, &[0u8; 4096]).is_ok() {}
+        rustix::fs::fcntl_setfl(&w, rustix::fs::OFlags::empty()).unwrap();
+        let started = Instant::now();
+        say_to(w.as_fd(), "hi");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(blocking(w.as_fd()));
+        // So does a full socket.
+        let (a, _b) = UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        while rustix::io::write(&a, &[0u8; 4096]).is_ok() {}
+        a.set_nonblocking(false).unwrap();
+        let started = Instant::now();
+        say_to(a.as_fd(), "hi");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(blocking(a.as_fd()));
+        // A socket with room gets the line.
+        let (a, mut b) = UnixStream::pair().unwrap();
+        say_to(a.as_fd(), "hi");
+        drop(a);
+        let mut got = String::new();
+        b.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "[stopit: hi]\n");
+        // A file gets it where its own offset is.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("log");
+        std::fs::write(&path, "before\n").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        say_to(file.as_fd(), "hi");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "before\n[stopit: hi]\n"
+        );
+        // A directory, or a device that is not a terminal, gets nothing.
+        let null = std::fs::File::options()
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        say_to(null.as_fd(), "hi");
+        say_to(std::fs::File::open(dir.path()).unwrap().as_fd(), "hi");
     }
 
     #[test]
