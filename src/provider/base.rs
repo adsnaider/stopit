@@ -73,7 +73,6 @@ pub fn layered_session_providers(
                     name: entry.entry.name.clone(),
                 });
             }
-            // The `vcs` provider joins the default base in Phase 3.
             let name = BASE_PROVIDER_NAME
                 .parse::<ProviderName>()
                 .map_err(|e| ProviderError::BuiltinBase(e.to_string()))?;
@@ -83,6 +82,22 @@ pub fn layered_session_providers(
                 default_base_manifest()?,
                 ProviderOrigin::Builtin,
             )));
+            // The default `vcs` provider, unless the configuration declares
+            // one of its own, which then takes its place.
+            if !entries
+                .iter()
+                .any(|e| matches!(e.entry.kind, crate::config::ProviderKind::Vcs { .. }))
+            {
+                if let Some(entry) = entries
+                    .iter()
+                    .find(|e| e.entry.name.as_str() == super::VCS_PROVIDER_NAME)
+                {
+                    return Err(ProviderError::ReservedName {
+                        name: entry.entry.name.clone(),
+                    });
+                }
+                providers.push(Box::new(super::VcsProvider::builtin()));
+            }
         }
     }
     for entry in entries {
@@ -158,14 +173,12 @@ mod tests {
             assert!(masked.contains(&want.to_owned()), "{want}");
         }
         assert_eq!(g.fs.mask_sockets, Some(true));
-        assert_eq!(g.fs.protected.len(), 23);
+        assert_eq!(g.fs.protected.len(), 21);
         let protected = strs(&g.fs.protected, |p| p.as_str());
         for want in [
             "{workspace}/.stopit.toml",
             "{workspace}/**/.stopit.toml",
             "{workspace}/.github/workflows",
-            "{workspace}/.git",
-            "{workspace}/.jj",
             "{workspace}/.gitmodules",
             "{workspace}/.cargo/config.toml",
             "{workspace}/.cargo/config",
@@ -206,11 +219,11 @@ mod tests {
 
     #[test]
     fn base_default_comes_first_then_user_providers_in_order() {
-        assert_eq!(names(&cfg("")), ["base"]);
+        assert_eq!(names(&cfg("")), ["base", "vcs"]);
         let c = cfg("[[provider]]\ntype = \"config\"\nname = \"z\"\n\
              [[provider]]\ntype = \"script\"\nsource = \"x.sh\"\n\
              [[provider]]\ntype = \"config\"\nname = \"a\"");
-        assert_eq!(names(&c), ["base", "z", "script", "a"]);
+        assert_eq!(names(&c), ["base", "vcs", "z", "script", "a"]);
     }
 
     #[test]
@@ -248,15 +261,17 @@ mod tests {
     }
 
     #[test]
-    fn user_provider_errors_propagate() {
-        // `from_entry` has no other failure today (a script provider only
-        // fails when run), so use the unimplemented vcs type. Replace this
-        // trigger when the vcs provider lands in Phase 3.
-        let c = cfg("[[provider]]\ntype = \"vcs\"");
+    fn a_vcs_provider_of_the_users_replaces_the_default_one() {
+        let c = cfg("[[provider]]\ntype = \"vcs\"\nname = \"mine\"\nview = \"ro\"");
+        assert_eq!(names(&c), ["base", "mine"]);
+        // Another type may not take the default one's name.
+        let c = cfg("[[provider]]\ntype = \"config\"\nname = \"vcs\"");
         let Err(e) = session_providers(&c, Path::new("/cfg")) else {
-            panic!("vcs is unsupported");
+            panic!("the name is reserved");
         };
-        assert!(matches!(e, ProviderError::Unsupported { .. }), "{e:?}");
+        assert!(matches!(e, ProviderError::ReservedName { .. }), "{e:?}");
+        // Without the default base, there is no default one.
+        assert!(names(&cfg("base = \"none\"")).is_empty());
     }
 
     #[test]

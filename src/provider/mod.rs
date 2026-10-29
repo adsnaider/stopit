@@ -6,6 +6,7 @@
 mod base;
 mod config;
 mod script;
+mod vcs;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,7 @@ pub use base::{
 };
 pub use config::ConfigProvider;
 pub use script::{STDERR_LIMIT, STDOUT_LIMIT, ScriptProvider};
+pub use vcs::{Layout as VcsLayout, VCS_PROVIDER_NAME, VcsProvider, discover as discover_vcs};
 
 /// What every provider receives at session start.
 #[derive(Debug, Clone)]
@@ -63,6 +65,15 @@ pub struct ProviderOutput {
 /// Error produced while running a provider.
 #[derive(Debug, Error)]
 pub enum ProviderError {
+    /// The `vcs` provider cannot express the repository's layout.
+    #[error("provider {name:?}: {reason}")]
+    Vcs {
+        /// Its name.
+        name: ProviderName,
+        /// Why.
+        reason: String,
+    },
+
     /// The provider type exists in the configuration schema but has no
     /// implementation yet.
     #[error("provider type {kind:?} (entry {name:?}) is not implemented yet")]
@@ -426,10 +437,23 @@ pub fn from_entry_with_origin(
             config.clone(),
             origin,
         ))),
-        kind @ ProviderKind::Vcs { .. } => Err(ProviderError::Unsupported {
-            name: entry.name.clone(),
-            kind: kind.type_name(),
-        }),
+        ProviderKind::Vcs {
+            view,
+            tools,
+            fetch,
+            push,
+            signing,
+        } => Ok(Box::new(
+            VcsProvider::new(
+                entry.name.clone(),
+                *view,
+                tools.clone(),
+                *fetch,
+                *push,
+                origin,
+            )
+            .with_signing(*signing),
+        )),
     }
 }
 
@@ -520,10 +544,8 @@ mod tests {
             }
         }
         // Effective names: the default (type) and an explicit one.
-        assert_eq!(built, ["config", "approvals", "script"]);
-        let msg = failure.expect("the vcs entry is unsupported");
-        assert!(msg.contains("\"vcs\""), "{msg}");
-        assert!(msg.contains("not implemented"), "{msg}");
+        assert_eq!(built, ["config", "approvals", "script", "vcs"]);
+        assert_eq!(failure, None);
     }
 
     #[test]
@@ -628,15 +650,17 @@ mod tests {
     }
 
     #[test]
-    fn vcs_is_unsupported() {
-        let Err(e) = from_entry(
+    fn a_vcs_entry_builds_the_vcs_provider() {
+        let p = from_entry(
             &entries("[[provider]]\ntype = \"vcs\"")[0],
             Path::new("/cfg"),
-        ) else {
-            panic!("vcs should be unsupported");
-        };
-        let msg = e.to_string();
-        assert!(msg.contains("\"vcs\""), "{msg}");
-        assert!(msg.contains("not implemented"), "{msg}");
+        )
+        .unwrap();
+        assert_eq!(p.name().as_str(), "vcs");
+        // A workspace without a repository gets nothing from it.
+        let ws = tempfile::TempDir::new().unwrap();
+        let mut c = ctx("x");
+        c.workspace = ws.path().to_owned();
+        assert_eq!(p.manifest(&c).unwrap().manifest, Manifest::default());
     }
 }

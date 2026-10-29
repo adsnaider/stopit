@@ -4063,3 +4063,156 @@ fn a_shims_signals_and_its_end_reach_the_command() {
     );
     assert!(s.no_session_left());
 }
+
+// --- The vcs provider ---
+
+/// Runs `git args` on the host in `dir`, with no user configuration.
+fn host_git(dir: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?}");
+}
+
+#[test]
+fn git_runs_through_the_broker_while_main_sees_no_metadata() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    if !sandbox_has("git") {
+        eprintln!("skipping: no git in /usr/bin or /bin");
+        return;
+    }
+    let s = Setup::with_config(&config);
+    // The host user's identity, which the provider hands to git.
+    let home = s.root.join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join(".gitconfig"),
+        "[user]\n\tname = Host User\n\temail = host@example.com\n",
+    )
+    .unwrap();
+    host_git(&s.ws(), &["init", "-q", "-b", "main"]);
+    fs::write(s.ws().join("a.txt"), "a\n").unwrap();
+    let script = "ls -A .git | wc -l; \
+                  git add a.txt && GIT_AUTHOR_NAME=x git -c user.name=x commit -qm one; \
+                  echo \"inject=$?\"; \
+                  git commit -qm one --author='A <a@a>'; echo \"commit=$?\"; \
+                  git log --format=%s; \
+                  git rebase main; echo \"rebase=$?\"; \
+                  git push origin main; echo \"push=$?\"; \
+                  echo 'x' > .git/config; echo \"write=$?\"";
+    let out = output(s.stopit(&["run", "--quiet", "/bin/sh", "-c", script]), b"");
+    assert_eq!(code(&out), 0, "{out:?}");
+    let shown = String::from_utf8_lossy(&out.stdout).into_owned();
+    // The mask: an empty `.git`, which cannot be written.
+    assert!(shown.starts_with("0\n"), "{shown}");
+    assert!(shown.contains("inject=126\n"), "{shown}");
+    assert!(shown.contains("commit=0\none\n"), "{shown}");
+    // Asked about, with no server to ask; denied outright.
+    assert!(shown.contains("rebase=126\n"), "{shown}");
+    assert!(shown.contains("push=126\n"), "{shown}");
+    assert!(!shown.contains("write=0"), "{shown}");
+    let err = stderr(&out);
+    assert!(
+        err.contains("[stopit: git: the flag -c is refused]"),
+        "{err}"
+    );
+    // The commit is on the host, and the host's config is untouched.
+    let log = Command::new("git")
+        .args(["log", "--format=%s, %an, %cn <%ce>"])
+        .current_dir(s.ws())
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&log.stdout),
+        "one, A, Host User <host@example.com>\n"
+    );
+    let config = fs::read_to_string(s.ws().join(".git/config")).unwrap();
+    assert!(config.contains("[core]"), "{config}");
+    assert!(s.no_session_left());
+}
+
+/// Runs `jj args` on the host in `dir`, with no user configuration.
+fn host_jj(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("jj")
+        .args(args)
+        .current_dir(dir)
+        .env("JJ_CONFIG", "/dev/null")
+        .env("JJ_USER", "t")
+        .env("JJ_EMAIL", "t@t")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "jj {args:?}: {out:?}");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn jj_runs_through_the_broker_while_main_sees_no_metadata() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    if !sandbox_has("jj") || !sandbox_has("git") {
+        eprintln!("skipping: no jj or git in /usr/bin or /bin");
+        return;
+    }
+    let s = Setup::with_config(&config);
+    // Some builds of jj need more of the host than a sandbox has (`/sys`
+    // for the CPU count, a group named `nobody`), so jj must run in one
+    // first. Outside a repository, `jj root` exits with 1.
+    let probe = output(s.stopit(&["run", "--quiet", "jj", "root"]), b"");
+    if code(&probe) != 1 {
+        eprintln!("skipping: jj does not run in a sandbox: {}", stderr(&probe));
+        return;
+    }
+    let home = s.root.join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join(".gitconfig"),
+        "[user]\n\tname = Host User\n\temail = host@example.com\n",
+    )
+    .unwrap();
+    host_jj(&s.ws(), &["git", "init", "--colocate", "--quiet"]);
+    fs::write(s.ws().join("a.txt"), "a\n").unwrap();
+    let script = "ls -A .jj | wc -l; \
+                  jj log -r @ --no-graph -T 'change_id.short() ++ \"\\n\"' >/dev/null; \
+                  echo \"log=$?\"; \
+                  jj describe -m hello; echo \"describe=$?\"; \
+                  jj --config ui.pager=sh log; echo \"config=$?\"; \
+                  jj abandon; echo \"abandon=$?\"; \
+                  jj git push; echo \"push=$?\"; \
+                  jj new -A @; echo \"insert=$?\"";
+    let out = output(s.stopit(&["run", "--quiet", "/bin/sh", "-c", script]), b"");
+    assert_eq!(code(&out), 0, "{out:?}");
+    let shown = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(
+        shown,
+        "0\nlog=0\ndescribe=0\nconfig=126\nabandon=126\npush=126\ninsert=126\n",
+        "{}",
+        stderr(&out)
+    );
+    // The description is on the host, with the host user's identity.
+    let log = host_jj(
+        &s.ws(),
+        &[
+            "log",
+            "-r",
+            "@",
+            "--no-graph",
+            "-T",
+            "description ++ committer.name() ++ \"\\n\"",
+        ],
+    );
+    assert_eq!(log, "hello\nHost User\n");
+    assert!(s.no_session_left());
+}

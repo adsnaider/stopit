@@ -3645,8 +3645,6 @@ mod tests {
                 "{workspace}/.vscode",
                 "{workspace}/.idea",
                 "{workspace}/.github/workflows",
-                "{workspace}/.git",
-                "{workspace}/.jj",
                 "{workspace}/.gitmodules",
                 "{workspace}/.cargo/config.toml",
                 "{workspace}/.cargo/config",
@@ -3746,10 +3744,10 @@ mod tests {
                 row("/workspace/.exrc", Protected, "base"),
                 row("/workspace/.gdbinit", Protected, "base"),
                 row("/workspace/.gemini", Protected, "base"),
-                row("/workspace/.git", Protected, "base"),
+                row("/workspace/.git", Masked, "vcs"),
                 row("/workspace/.gitmodules", Protected, "base"),
                 row("/workspace/.idea", Protected, "base"),
-                row("/workspace/.jj", Protected, "base"),
+                row("/workspace/.jj", Masked, "vcs"),
                 row("/workspace/.lldbinit", Protected, "base"),
                 row("/workspace/.mcp.json", Protected, "base"),
                 row("/workspace/.netrc", Masked, "base"),
@@ -3819,7 +3817,7 @@ mod tests {
             prov("v", "bare", "fs.ro = [\"{workspace}/src\"]"),
         );
         let explicit = f.compile(&format!(
-            "{}\n{user}",
+            "{}\n[[provider]]\ntype = \"vcs\"\n{user}",
             crate::config::APPENDIX_A_WITHOUT_VCS
         ));
         let default = f.compile(&format!("base = \"default\"\n{user}"));
@@ -5568,7 +5566,7 @@ mod tests {
         // rule that could not inspect something there.
         let globs_masked = 13; // `**/.env`, `**/.env.*`, … in `fs.masked`.
         let globs_protected = 4; // `**/*.nix`, `**/.stopit.toml`, `**/.nvim.lua`, `**/.exrc`.
-        let literals_protected = 19; // `flake.lock`, `.envrc`, … in `fs.protected`.
+        let literals_protected = 17; // `flake.lock`, `.envrc`, … in `fs.protected`.
         // Each case: the files, the directory made inaccessible and its
         // mode, and the rules expected to mask it (by mode, in rule order).
         let all_globs: Vec<PathMode> =

@@ -169,7 +169,7 @@ When the workspace's `.stopit.toml` sets `base = "none"`, the global layer does 
 
 At startup the supervisor prints a short summary of every grant that **widens** access beyond the default base (binds, especially under `$HOME` or `/etc`; network domains; brokered commands; sockets that delegate to host daemons; providers with `protect = false`). This is informational and does not block.
 
-`stopit run` and `stopit shell` print it to stderr, one `stopit: `-prefixed line each, after the warnings and right before the sandbox starts, for the profile that runs (not for the session's other profiles). The first line names the profile, the workspace and the mode of the workspace mount (`stopit: profile "main" (workspace ~/proj rw at /workspace)`, or `(workspace ~/proj, not mounted)` when no mount is at the workspace mount point); each further line is one grant beyond what the default base gives, so under the default configuration there is only the header:
+`stopit run` and `stopit shell` print it to stderr, one `stopit: `-prefixed line each, after the warnings and right before the sandbox starts, for the profile that runs (not for the session's other profiles). The first line names the profile, the workspace and the mode of the workspace mount (`stopit: profile "main" (workspace ~/proj rw at /workspace)`, or `(workspace ~/proj, not mounted)` when no mount is at the workspace mount point); each further line is one grant beyond what the default base gives, so under the default configuration there is only the header, plus a `broker` line each for `jj` and `git` when the workspace is a repository the `vcs` provider supports (§7.3):
 
 ```
 stopit: profile "main" (workspace ~/proj rw at /workspace)
@@ -232,7 +232,7 @@ base = "default"   # "default" (the default) | "none"
 The design rule is: **restrictions default on, grants default off.** A base is a set of built-in providers placed **before** the user's providers.
 
 * `base = "none"` — no built-in providers. The sandbox is empty: nothing mounted (no `/proc`, no `/dev`), an environment of only `HOME`, `USER` and `LOGNAME` (§9), no network at all (not even `lo`), full hardening, no shims. `stopit run /bin/sh` fails because `/bin/sh` does not exist. That is intended.
-* `base = "default"` — a built-in `config` provider named `base` with the defaults below (the name is reserved: a user provider cannot use it under this base), plus the `vcs` provider (§7.3). Under every base, the provider name `stopit` is reserved too: it names the supervisor's own rules (the protection of the loaded configuration, §3), so a user provider cannot use it.
+* `base = "default"` — a built-in `config` provider named `base` with the defaults below (the name is reserved: a user provider cannot use it under this base), plus the `vcs` provider (§7.3) named `vcs`. A user provider of type `vcs` replaces the built-in one, so its options apply. Otherwise the name `vcs` is reserved too. Under every base, the provider name `stopit` is reserved too: it names the supervisor's own rules (the protection of the loaded configuration, §3), so a user provider cannot use it.
 
 | Aspect | `base = "none"` | `base = "default"` |
 | :--- | :--- | :--- |
@@ -675,7 +675,7 @@ When `__init` fails, it prints `stopit __init: ...` to stderr and exits 127 when
 
 * `/run/stopit/bin` (RO, front of `PATH`) holds one symbolic link per shim the profile has (`jj`, `git`, `stopit-grant`, user-defined shims), each to the trampoline at `/run/stopit/shim`. Each profile has a directory of its own in the session directory's `shims/`, made in a temporary directory and renamed into place, so a sandbox sees only its own shims and never part of them. A sandbox without shims gets an empty directory. The trampoline is a static program of a few kilobytes without `std`, built from `shim/trampoline.rs` with the rest of stopit, for x86_64 and aarch64. It needs no loader or library, so it runs in any sandbox. It takes the shim's name from the path it was run as (`AT_EXECFN`), not `argv[0]`, so callers that set `argv[0]` differently (`exec -a`, some spawn APIs) still reach the right shim. The name is not a security boundary. A caller can make a link of any name, or talk to the socket itself. It turns `<name> <args...>` into the command that runs the provisioned stopit (§2.1) followed by `__shim <name> -- <args...>`, which stopit writes into its copy of the trampoline when it provisions a session. The copy as built holds a marker there instead, and refuses to run until the buffer starts with the absolute path of a program.
 * `stopit __shim` sends its stdin, stdout, stderr and an `O_PATH` descriptor of its working directory over `SCM_RIGHTS` to `/run/stopit/broker.sock`, then a request with the shim's name, its arguments and the working directory as the sandbox sees it. It passes on `SIGINT`, `SIGQUIT`, `SIGTERM` and `SIGHUP`, and exits with the status the broker sends back, or with 125 and a message when it cannot reach the broker or the broker cannot run the command.
-* The supervisor, or the server for an attached run, starts one broker per sandbox whose profile has shims, on `broker-<run>.sock` in the session directory. A command the broker starts gets a proxy in proxy mode, pasta with `network = "full"`, and a broker of its own if its profile has shims. Its binary is looked up in its `PATH` without `/run/stopit/bin`, so a shim never runs itself again. Shim calls nest at most 4 deep, and a run's brokers run at most 128 commands at once at every depth and 64 per broker. The broker's threads block every signal but faults, as the proxy's do. It gives a shim 10 seconds in all for its descriptors and request, writes its refusals to the shim's stderr without waiting on it, and when its sandbox ends, kills the commands it runs and waits for them. The sandbox shares that stderr, so its flags stay as they are. A socket gets a non-blocking send and a regular file a plain write. A pipe or terminal is opened again with `O_NONBLOCK` for one write, and only when the sandbox opened it for writing, since opening it again checks neither the descriptor's access mode nor Landlock. Anything else gets no message.
+* The supervisor, or the server for an attached run, starts one broker per sandbox whose profile has shims, on `broker-<run>.sock` in the session directory. A command the broker starts gets a proxy in proxy mode, pasta with `network = "full"`, and a broker of its own if its profile has shims. Its binary is looked up in its `PATH` without `/run/stopit/bin`, so a shim never runs itself again. Shim calls nest at most 4 deep, and a run's brokers run at most 128 commands at once at every depth and 64 per broker. The broker's threads block every signal but faults, as the proxy's do. It gives a shim 10 seconds in all for its descriptors and request, writes its refusals to the shim's stderr without waiting on it, and when its sandbox ends, kills the commands it runs and waits for them. The sandbox shares that stderr, so its flags stay as they are. A socket gets a non-blocking send and a regular file a plain write. A pipe or terminal is opened again with `O_NONBLOCK` for one write, and only when the sandbox opened it for writing, since opening it again checks neither the descriptor's access mode, a read-only mount nor Landlock. Anything else gets no message.
 * **The shim is untrusted.** A sandboxed program can talk to the socket directly; the broker re-parses everything and trusts nothing from the request except what it verifies.
 * **cwd:** the shim sends its working directory as a path *and* an `O_PATH` FD. The path must be inside the workspace mount, without `..`. A shim elsewhere gets an error. The broker opens the matching host path below the workspace with `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` and checks the FD's `st_dev`/`st_ino` against it. A directory in an ephemeral or masked mount fails that check. The tool sandbox then opens the path itself from its root with `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS)` in `__init`, before Landlock, and starts only if it finds the same `st_dev`/`st_ino`. A rename in between stops it, and so does a target profile that mounts another directory at that path. (Passing the FD through and `fchdir()`-ing into it would keep the *caller's* mount, so `.jj` would resolve to the caller's masked view.)
 * **Lifecycle:** the broker relays signals (Ctrl+C, harness timeouts killing the shim) to the tool sandbox, kills the tool sandbox if the shim's connection closes, and returns the exit status to the shim.
@@ -703,6 +703,8 @@ rules      = [
 
 ### 7.2 Global-Flag Parsing
 
+**Implemented so far:** no handlers. The `vcs` shims are declarative like every other shim (§7.1). The words before the first flag pick a rule, and the refused flags below apply anywhere in `argv`, in every spelling §7.1 lists. A global flag before the subcommand sends the call to the default, which asks. The rest of this section is the plan.
+
 Policy is matched after parsing each tool's global options with the tool's own grammar, so that flags anywhere in `argv` are seen. The `vcs` provider's handlers implement this for `jj` (`-R/--repository`, `--at-op`, `--ignore-working-copy`, `--config`, `--config-file`, `--config-toml`) and `git` (`-C`, `-c`, `--git-dir`, `--work-tree`, `--exec-path`, `--config-env`, `--upload-pack`, `--receive-pack`). Config-injection flags are denied outright. Declarative shims (from `config`/`script` providers) match on the first non-flag arguments and `deny_flags`.
 
 ### 7.3 The `vcs` Provider
@@ -716,6 +718,13 @@ fetch   = "ask"         # "deny" | "ask" (default) | "allow"
 push    = "ask"         # "deny" | "ask" (default) | "allow"
 signing = false         # SSH commit signing in vcs.local (§7.3.4)
 ```
+
+**Implemented so far** (`src/provider/vcs.rs`). The rest of §7.3 is the plan, and this list says where the code stops short of it.
+
+* **Layouts.** The provider reads the layout itself and runs no VCS tool on the workspace. It supports a plain `.git` directory, a `.jj` directory with a `repo` directory (colocated or not), and a git worktree whose `.git` file names an admin directory below the common directory's `worktrees/` that names the `.git` file back in its `gitdir`. Every file it reads is a regular file of at most 4 KiB. A jj secondary workspace (`.jj/repo` is a file), a worktree that fails the checks, and a workspace below a checkout's root get the mask in `main` but no profiles or shims, with a warning. A jj secondary workspace's `.jj/repo` file can be written from inside the workspace and nothing names it back, so it is never followed.
+* **Profiles.** `vcs.ro` and `vcs.local` inherit `main`, add the metadata and backing storage `ro` or `rw`, and have `network = "none"`, whatever `main` has. In `vcs.local`, the git config files that exist at session start (`config`, `config.worktree`, `info/attributes`, `modules/*/config`, `worktrees/*/config.worktree`) and `.jj/repo/config.toml` are `ro`, and `hooks/` and `modules/*/hooks` are masked. `vcs.remote` is never created.
+* **Configuration.** The safe settings travel in the environment, not in files under `/run/stopit`: `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, and `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>` with `core.hooksPath=/dev/null`, `core.fsmonitor=false`, `core.pager=cat`, `protocol.ext.allow=never`, and the host user's `user.name` and `user.email` from `git config --global`. jj gets `JJ_CONFIG=/dev/null`, so no user configuration, and `JJ_USER` and `JJ_EMAIL` from the same identity. jj's repository configuration under `~/.config/jj/repos/` is not mounted.
+* **Remote commands** are refused whatever `fetch` and `push` say, and both profiles have no network, so a call the rules miss cannot reach a remote either. `fetch = "allow"`, `push = "allow"` and `signing = true` are accepted and warned about, since they have no effect yet. Fetch and push run on the host.
 
 #### 7.3.1 Layout Resolution
 
@@ -794,17 +803,17 @@ With `signing = true`, `vcs.local` (and `vcs.remote`) get a filtered SSH agent s
 
 | Tool | Subcommand | Decision | Profile | Notes |
 | :--- | :--- | :--- | :--- | :--- |
-| `jj` | `status`, `diff`, `log`, `show`, `evolog`, `op log` | Allow | `vcs.ro` | |
-| `jj` | `new` (without `-A`/`-B`), `commit`, `describe` | Allow | `vcs.local` | |
+| `jj` | `status`, `st`, `diff`, `log`, `show`, `evolog`, `op log`, `file show` | Allow | `vcs.ro` | |
+| `jj` | `new`, `commit`, `ci`, `describe`, `desc` | Allow | `vcs.local` | `-A`, `-B` and their long forms refused |
 | `jj` | `squash`, `rebase`, `abandon`, `restore`, `undo`, `bookmark *`, `op *` | Ask | `vcs.local` | |
-| `jj` | `git fetch`, `git clone` | `fetch` setting (default Ask) | `vcs.remote` | Named remotes only; clone only from a configured remote's URL (§7.3.3) |
-| `jj` | `git push` | `push` setting (default Ask) | `vcs.remote` | Shows resolved URL, commits, bookmarks |
+| `jj` | `git fetch`, `git clone` | `fetch` setting (default Ask). Deny for now | `vcs.remote` | Named remotes only, and clone only from a configured remote's URL (§7.3.3) |
+| `jj` | `git push` | `push` setting (default Ask). Deny for now | `vcs.remote` | Shows resolved URL, commits, bookmarks |
 | `git` | `status`, `diff`, `log`, `show`, `add`, `commit` | Allow | `vcs.local` | |
 | `git` | `reset`, `rebase`, `checkout`, `switch`, `branch`, `tag`, `clean`, `stash` | Ask | `vcs.local` | |
-| `git` | `fetch`, `pull`, `ls-remote`, `remote update`, `clone` | `fetch` setting (default Ask) | `vcs.remote` | Named remotes only; clone only from a configured remote's URL |
-| `git` | `push` | `push` setting (default Ask) | `vcs.remote` | Shows resolved URL, commits, refs |
-| any | Config-injection flags (§7.2) | Deny | — | |
-| any | Anything unlisted | Ask | `vcs.local` | |
+| `git` | `fetch`, `pull`, `ls-remote`, `remote update`, `clone` | `fetch` setting (default Ask). Deny for now | `vcs.remote` | Named remotes only, and clone only from a configured remote's URL |
+| `git` | `push` | `push` setting (default Ask). Deny for now | `vcs.remote` | Shows resolved URL, commits, refs |
+| any | Config-injection flags (§7.2), and for git also `--exec` (another name for `--upload-pack` and `--receive-pack`) and `--output` (writes to any path the profile can write) | Deny | | |
+| any | Anything unlisted, and anything with a flag before the subcommand | Ask | `vcs.local` | |
 
 ### 7.5 `stopit-grant` (Ad-Hoc Capability Requests)
 
@@ -941,7 +950,9 @@ Session-wide, so not a provider setting. Off unless configured. Applied by launc
   * **Sandbox-`HOME` stubs** (§6.2 step 4): the spec has no content for them yet (e.g. a `.gitconfig` with `user.name`/`user.email`), so none is generated. The synthesized `/etc` files are.
   * **Protected files** in §4 remain strict read-only kernel binds returning `EROFS`, without the FUSE shadow or `rename*` `SECCOMP_RET_USER_NOTIF` listener in §4.1.
 * **`stopit run` / `stopit shell` are incomplete** (§5). They find the workspace and its `.stopit.toml`, check that the user allowed it (§3), run the providers, compile the session, and run the command in `main` or `--profile`'s sandbox on the host's stdio, but:
-  * **The broker has no built-in providers yet.** Declarative shims work (§7.1), but the `vcs` provider and its handlers (§7.3), `stopit-grant` (§7.5) and writing approvals to `.stopit.toml` are not built. A prompt holds up the sandbox's output and its client's keys until it is answered. A signal the client catches meanwhile denies the request, and then reaches the sandbox.
+  * **The `vcs` provider is local only** (§7.3, Implemented so far). Remote commands are refused, so fetch and push run on the host. There are no handlers (§7.2), no commit signing, no jj repository configuration from `~/.config/jj/repos/`, and no support for jj secondary workspaces or a workspace below a checkout's root. A VCS config file or `hooks/` directory that does not exist at session start is neither locked nor masked, so a brokered command the user approves, such as `jj config set --repo` or `git worktree add .git/hooks`, can create one that the host's tools then use.
+  * **Not built yet:** `stopit-grant` (§7.5) and writing approvals to `.stopit.toml`.
+  * **Prompts block.** A prompt holds up the sandbox's output and its client's keys until it is answered. A signal the client catches meanwhile denies the request, and then reaches the sandbox.
   * **Shims run only from inside the workspace.** A shim called from `/tmp` or `~` gets an error.
   * **`stopit server` does not reload.** A changed configuration needs a server restart, and script providers run only when it starts (§5.5).
   * **`ttyname` fails inside the sandbox.** The slave belongs to the host's devpts instance, while the sandbox mounts a fresh one, so `/proc/self/fd/0` names a `/dev/pts/N` that does not exist there or is another terminal. `tty` prints nothing useful, and `GPG_TTY=$(tty)` breaks. `/dev/tty` works.
@@ -1078,7 +1089,7 @@ protected = [
   "{workspace}/**/*.nix", "{workspace}/flake.lock", "{workspace}/.envrc",
   "{workspace}/.stopit.toml", "{workspace}/**/.stopit.toml", "{workspace}/.vscode",
   "{workspace}/.idea", "{workspace}/.github/workflows",
-  "{workspace}/.git", "{workspace}/.jj", "{workspace}/.gitmodules",
+  "{workspace}/.gitmodules",
   "{workspace}/.cargo/config.toml", "{workspace}/.cargo/config",
   "{workspace}/.bazelrc", "{workspace}/.claude", "{workspace}/.gemini",
   "{workspace}/.cursor", "{workspace}/.mcp.json", "{workspace}/.zed",
