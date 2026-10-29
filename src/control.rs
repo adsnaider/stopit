@@ -16,8 +16,9 @@ use std::os::unix::net::UnixStream;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-/// The largest frame either side accepts: room for a command line and an
-/// environment as large as the kernel allows (`ARG_MAX`, 2 MiB), in hex.
+/// The largest frame either side accepts. It has room for a command line
+/// and an environment as large as the kernel allows (`ARG_MAX`, 2 MiB), in
+/// hex.
 pub const MAX_FRAME: usize = 8 << 20;
 
 /// What a client asks of the server.
@@ -91,6 +92,7 @@ mod hex_list {
             .step_by(2)
             .map(|i| {
                 s.get(i..i + 2)
+                    .filter(|pair| pair.bytes().all(|b| b.is_ascii_hexdigit()))
                     .and_then(|pair| u8::from_str_radix(pair, 16).ok())
                     .ok_or_else(|| E::custom("invalid hex string"))
             })
@@ -362,7 +364,7 @@ mod tests {
         let json = serde_json::to_string(&run).unwrap();
         assert!(json.contains(r#""command":["00ff61"]"#), "{json}");
         assert!(json.contains(r#""env":[["4b",""]]"#), "{json}");
-        for bad in ["0", "zz", "0g"] {
+        for bad in ["0", "zz", "0g", "+f", "-1"] {
             let json = format!(
                 r#"{{"type":"run","profile":null,"command":["{bad}"],"env":[],"pty":false,"quiet":false}}"#
             );

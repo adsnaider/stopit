@@ -301,16 +301,24 @@ pub enum RunError {
 
     /// A server already serves the workspace.
     #[error(
-        "a stopit server already serves {workspace:?} as session {id} (pid {pid}); stop it \
-         first, or use it with `stopit run`"
+        "a stopit server already serves {workspace:?} {which}; stop it first, or use it with \
+         `stopit run`"
     )]
     ServerRunning {
         /// The workspace.
         workspace: PathBuf,
-        /// The other server's session id.
-        id: String,
-        /// The other server's process id.
-        pid: u32,
+        /// Which server, as words: its session and pid, or that it is
+        /// still starting.
+        which: String,
+    },
+
+    /// The per-workspace server lock cannot be taken.
+    #[error("cannot lock {path:?} for the stopit server: {source}")]
+    WorkspaceLock {
+        /// The lock file.
+        path: PathBuf,
+        /// The underlying error.
+        source: io::Error,
     },
 
     /// The server's control socket cannot be set up or used.

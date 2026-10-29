@@ -2912,14 +2912,23 @@ fn attached_runs_at_once_each_get_their_own_stdio() {
         let mut stdin = child.stdin.take().unwrap();
         stdin.write_all(&serde_json::to_vec(ops).unwrap()).unwrap();
     };
-    feed(&mut b, &[write("/tmp/b", "from b"), Op::Argv]);
-    feed(&mut a, &[write("/tmp/a", "from a"), Op::Argv]);
-    for (child, name) in [(a, "a"), (b, "b")] {
-        let out = finish(child);
-        assert_eq!(code(&out), 0, "{name}: {out:?}");
-        let results: Vec<OpResult> = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(ok(&results[0]), &Data::Done, "{name}");
+    // Different operations, so swapped stdio would show.
+    feed(
+        &mut b,
+        &[write("/tmp/b", "from b"), read("/tmp/b"), Op::Cwd],
+    );
+    feed(&mut a, &[write("/tmp/a", "from a"), read("/tmp/a")]);
+    let out_a = finish(a);
+    let out_b = finish(b);
+    for (out, name) in [(&out_a, "a"), (&out_b, "b")] {
+        assert_eq!(code(out), 0, "{name}: {out:?}");
     }
+    let results_a: Vec<OpResult> = serde_json::from_slice(&out_a.stdout).unwrap();
+    let results_b: Vec<OpResult> = serde_json::from_slice(&out_b.stdout).unwrap();
+    assert_eq!(results_a.len(), 2);
+    assert_eq!(contents(&results_a[1]), "from a");
+    assert_eq!(results_b.len(), 3);
+    assert_eq!(contents(&results_b[1]), "from b");
     let results = s.probe(&[], &[read("/tmp/a"), read("/tmp/b")]);
     assert_eq!(contents(&results[0]), "from a");
     assert_eq!(contents(&results[1]), "from b");
@@ -3000,6 +3009,46 @@ fn server_and_workspace_options_must_agree() {
     assert_eq!(code(&out), 125, "{out:?}");
     assert!(
         stderr(&out).contains(&format!("serves {:?}, not {:?}", s.ws(), other)),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_server_that_does_not_answer_is_skipped_with_a_warning() {
+    // A live-looking session for the workspace, whose lock this test holds,
+    // with no socket to connect to.
+    let s = Setup::with_config("");
+    let base = s.runtime().join("stopit");
+    fs::create_dir_all(&base).unwrap();
+    fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+    let id = "0123456789abcdef0123456789abcdef";
+    let dir = base.join(id);
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let lock = File::create(dir.join("lock")).unwrap();
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).unwrap();
+    let record = serde_json::json!({
+        "version": 1,
+        "workspace": s.ws().as_os_str().as_bytes(),
+        "pid": 1,
+    });
+    fs::write(dir.join("server.json"), record.to_string()).unwrap();
+    fs::set_permissions(dir.join("server.json"), fs::Permissions::from_mode(0o600)).unwrap();
+    let ops = [Op::Cwd];
+    let out = output(s.run_probe_command(&[]), &serde_json::to_vec(&ops).unwrap());
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "stopit: warning: the stopit server {id} for this workspace does not answer; \
+             running without it\n"
+        )
+    );
+    // Named, it is an error instead.
+    let out = output(s.run_probe_command(&["--server", id]), b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert!(
+        stderr(&out).contains("cannot reach the stopit server"),
         "{out:?}"
     );
 }

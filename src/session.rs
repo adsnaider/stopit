@@ -154,25 +154,7 @@ impl SessionDir {
     /// Creates the session directory `id` under `runtime_dir`. Fails if it
     /// already exists, so a session never reuses another one's directory.
     fn create_with_id(runtime_dir: &Path, id: String) -> Result<Self, SessionError> {
-        // The runtime directory may legitimately be reached through a link.
-        // It is resolved once, and everything below uses the canonical path,
-        // so what is checked is what is used and `root()` is canonical.
-        let runtime_dir =
-            fs::canonicalize(runtime_dir).map_err(|source| SessionError::Inspect {
-                path: runtime_dir.to_path_buf(),
-                source,
-            })?;
-        check_runtime_dir(&runtime_dir)?;
-
-        let base = runtime_dir.join("stopit");
-        match create_private_dir(&base) {
-            Ok(()) => {}
-            // Left by an earlier session; verified below.
-            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(source) => return Err(SessionError::Create { path: base, source }),
-        }
-        check_private_dir(&base)?;
-
+        let base = runtime_base(runtime_dir)?;
         let root = base.join(&id);
         // Not `create_dir_all`: an existing directory is an error.
         create_private_dir(&root).map_err(|source| SessionError::Create {
@@ -485,6 +467,28 @@ fn read_server_record(root: &Path) -> Option<ServerRecord> {
         .ok()?;
     let record: ServerRecord = serde_json::from_slice(&bytes).ok()?;
     (record.version == 1).then_some(record)
+}
+
+/// `$XDG_RUNTIME_DIR/stopit` for the runtime directory `runtime_dir`,
+/// canonical, created private if missing, and checked.
+pub fn runtime_base(runtime_dir: &Path) -> Result<PathBuf, SessionError> {
+    // The runtime directory may legitimately be reached through a link. It
+    // is resolved once, and everything below uses the canonical path, so
+    // what is checked is what is used and session roots are canonical.
+    let runtime_dir = fs::canonicalize(runtime_dir).map_err(|source| SessionError::Inspect {
+        path: runtime_dir.to_path_buf(),
+        source,
+    })?;
+    check_runtime_dir(&runtime_dir)?;
+    let base = runtime_dir.join("stopit");
+    match create_private_dir(&base) {
+        Ok(()) => {}
+        // Left by an earlier session; verified below.
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(source) => return Err(SessionError::Create { path: base, source }),
+    }
+    check_private_dir(&base)?;
+    Ok(base)
 }
 
 /// Checks the canonical `XDG_RUNTIME_DIR` `runtime_dir`: a directory owned

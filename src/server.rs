@@ -83,7 +83,7 @@ struct Run {
 /// What the server and its workers share.
 #[derive(Default)]
 struct Runs {
-    /// Set once the server stops: no new sandbox starts after it.
+    /// Set once the server stops. No new sandbox starts after it.
     stopping: bool,
     by_number: HashMap<u64, Run>,
 }
@@ -96,14 +96,16 @@ fn lock(runs: &SharedRuns) -> MutexGuard<'_, Runs> {
 
 fn run_server(workspace: Option<&Path>, quiet: bool) -> Result<ExitCode, RunError> {
     catch_signals().map_err(RunError::Signals)?;
-    // The server holds every client's environment: no process of the user
-    // may read its memory through ptrace or /proc.
+    // The server holds every client's environment, so no process of the
+    // user may read its memory through ptrace or /proc.
     // SAFETY: a plain prctl with integer arguments.
     unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
     let cwd = std::env::current_dir().map_err(RunError::Cwd)?;
+    // One server per workspace, decided by a lock rather than by looking,
+    // and before any provider runs.
+    let workspace_dir = discover_workspace(&cwd, workspace)?.dir;
+    let _workspace_lock = lock_workspace(&workspace_dir)?;
     let loaded = LoadedSession::load(&cwd, workspace)?;
-    // One server per workspace, decided by a lock rather than by looking.
-    let _workspace_lock = lock_workspace(&loaded)?;
     for line in loaded.warning_lines() {
         eprintln!("{line}");
     }
@@ -172,25 +174,26 @@ fn run_server(workspace: Option<&Path>, quiet: bool) -> Result<ExitCode, RunErro
         let _ = conn.set_nonblocking(false);
         let run = next_run;
         next_run += 1;
-        let registered = conn.try_clone().ok().and_then(|copy| {
-            let mut runs = lock(&runs);
-            (!runs.stopping && runs.by_number.len() < MAX_CLIENTS).then(|| {
-                runs.by_number.insert(
-                    run,
-                    Run {
-                        conn: copy,
-                        pidfd: None,
-                    },
-                );
-            })
-        });
-        if registered.is_none() {
-            let _ = write_frame(
-                &conn,
-                &ServerMessage::Error {
-                    message: format!("the server already runs {MAX_CLIENTS} sandboxes"),
-                },
-            );
+        let refused = match conn.try_clone() {
+            Err(e) => Some(format!("the server cannot take the connection: {e}")),
+            Ok(copy) => {
+                let mut runs = lock(&runs);
+                if runs.by_number.len() >= MAX_CLIENTS {
+                    Some(format!("the server already runs {MAX_CLIENTS} sandboxes"))
+                } else {
+                    runs.by_number.insert(
+                        run,
+                        Run {
+                            conn: copy,
+                            pidfd: None,
+                        },
+                    );
+                    None
+                }
+            }
+        };
+        if let Some(message) = refused {
+            let _ = write_frame(&conn, &ServerMessage::Error { message });
             continue;
         }
         let worker_loaded = loaded.clone();
@@ -228,20 +231,21 @@ fn run_server(workspace: Option<&Path>, quiet: bool) -> Result<ExitCode, RunErro
     Ok(ExitCode::from(signal_exit_code(ended?)))
 }
 
-/// Takes the lock that makes the server the only one for its workspace:
-/// an exclusive `flock` on `server-<hash>.lock` next to the session
+/// Takes the lock that makes the server the only one for `workspace`. That
+/// is an exclusive `flock` on `server-<hash>.lock` next to the session
 /// directories, held until the server ends.
-fn lock_workspace(loaded: &LoadedSession) -> Result<std::fs::File, RunError> {
+fn lock_workspace(workspace: &Path) -> Result<std::fs::File, RunError> {
     use rustix::fs::{FlockOperation, flock};
     use sha2::{Digest, Sha256};
     use std::os::unix::fs::OpenOptionsExt;
-    let hash = Sha256::digest(loaded.workspace.dir.as_os_str().as_bytes());
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|d| !d.is_empty())
+        .ok_or(RunError::Session(
+            crate::session::SessionError::RuntimeDirUnset,
+        ))?;
+    let base = crate::session::runtime_base(Path::new(&runtime))?;
+    let hash = Sha256::digest(workspace.as_os_str().as_bytes());
     let name: String = hash[..8].iter().map(|b| format!("{b:02x}")).collect();
-    let base = loaded
-        .session
-        .root()
-        .parent()
-        .expect("a session directory has a parent");
     let path = base.join(format!("server-{name}.lock"));
     let file = std::fs::OpenOptions::new()
         .write(true)
@@ -250,21 +254,29 @@ fn lock_workspace(loaded: &LoadedSession) -> Result<std::fs::File, RunError> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&path)
-        .map_err(|source| RunError::Listen {
+        .map_err(|source| RunError::WorkspaceLock {
             path: path.clone(),
             source,
         })?;
-    if flock(&file, FlockOperation::NonBlockingLockExclusive).is_err() {
-        let other = live_servers(base.parent().map(Path::as_os_str))
-            .into_iter()
-            .find(|s| s.record.workspace() == loaded.workspace.dir);
-        return Err(RunError::ServerRunning {
-            workspace: loaded.workspace.dir.clone(),
-            id: other.as_ref().map_or_else(String::new, |s| s.id.clone()),
-            pid: other.map_or(0, |s| s.record.pid),
-        });
+    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(file),
+        Err(rustix::io::Errno::WOULDBLOCK) => {
+            let other = live_servers(Some(runtime.as_os_str()))
+                .into_iter()
+                .find(|s| s.record.workspace() == workspace);
+            Err(RunError::ServerRunning {
+                workspace: workspace.to_owned(),
+                which: match other {
+                    Some(s) => format!("as session {} (pid {})", s.id, s.record.pid),
+                    None => "and is still starting".to_owned(),
+                },
+            })
+        }
+        Err(e) => Err(RunError::WorkspaceLock {
+            path,
+            source: e.into(),
+        }),
     }
-    Ok(file)
 }
 
 /// Fails when `path` does not fit in a Unix socket address.
@@ -547,6 +559,11 @@ pub(crate) fn pick_server(
                 Some(libc::ENOENT | libc::ECONNREFUSED)
             ) =>
         {
+            eprintln!(
+                "stopit: warning: the stopit server {} for this workspace does not answer; \
+                 running without it",
+                server.id
+            );
             Ok(None)
         }
         Err(e) => Err(e),
@@ -603,6 +620,12 @@ pub(crate) fn attach(attached: Attached, invocation: &Invocation) -> Result<u8, 
     } else {
         None
     };
+    if let Some(t) = &mut terminal {
+        catch_winch().map_err(RunError::Signals)?;
+        // Raw before the sandbox starts, so no key typed meanwhile is taken
+        // by the host terminal's line discipline, as for a standalone run.
+        t.enter_raw().map_err(RunError::Pty)?;
+    }
     let own: [BorrowedFd<'static>; 3] = [
         // SAFETY: stdio stays open for the life of the process.
         unsafe { BorrowedFd::borrow_raw(0) },
@@ -616,9 +639,6 @@ pub(crate) fn attach(attached: Attached, invocation: &Invocation) -> Result<u8, 
         _ => own[i],
     });
     let client = RunError::Client;
-    if terminal.is_some() {
-        catch_winch().map_err(RunError::Signals)?;
-    }
     let mask = BlockedSignals::block().map_err(RunError::Signals)?;
     send_stdio(&conn, fds).map_err(client)?;
     write_frame(
@@ -648,9 +668,11 @@ pub(crate) fn attach(attached: Attached, invocation: &Invocation) -> Result<u8, 
             lines,
             clipboard_allow,
         }) => {
-            // Printed while the terminal is still cooked.
+            // With the terminal raw, a line feed alone does not return the
+            // cursor.
+            let end = if terminal.is_some() { "\r\n" } else { "\n" };
             for line in lines {
-                eprintln!("{line}");
+                eprint!("{line}{end}");
             }
             if let Some(t) = &mut terminal {
                 t.set_clipboard(if clipboard_allow {
@@ -658,7 +680,6 @@ pub(crate) fn attach(attached: Attached, invocation: &Invocation) -> Result<u8, 
                 } else {
                     ClipboardPolicy::Block
                 });
-                t.enter_raw().map_err(RunError::Pty)?;
             }
         }
         Some(ServerMessage::Error { message }) => {
@@ -699,4 +720,25 @@ pub(crate) fn attach(attached: Attached, invocation: &Invocation) -> Result<u8, 
     }
     drop(terminal);
     Ok(exit.unwrap_or(EXIT_SUPERVISOR_FAILED))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_paths_must_fit_an_address() {
+        let fits = format!("/{}", "a".repeat(MAX_SOCKET_PATH - 1));
+        assert!(check_socket_path(Path::new(&fits)).is_ok());
+        let long = format!("/{}", "a".repeat(MAX_SOCKET_PATH));
+        let e = check_socket_path(Path::new(&long)).unwrap_err();
+        assert!(
+            matches!(e, RunError::SocketPathTooLong { len: 108, .. }),
+            "{e}"
+        );
+        assert!(
+            e.to_string()
+                .contains("set XDG_RUNTIME_DIR to a shorter path")
+        );
+    }
 }
