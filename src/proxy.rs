@@ -260,6 +260,12 @@ impl Proxy {
         &self.path
     }
 
+    /// How many connections the proxy serves now.
+    #[cfg(test)]
+    fn active(&self) -> usize {
+        self.shared.active.load(Ordering::SeqCst)
+    }
+
     /// The refusals so far, the first few distinct ones as a host and why,
     /// and how many refusals there were in all.
     pub fn denied(&self) -> (Vec<String>, usize) {
@@ -294,6 +300,17 @@ where
     let old = unsafe {
         let mut all: libc::sigset_t = std::mem::zeroed();
         libc::sigfillset(&mut all);
+        // Faults stay deliverable, so a crash in a proxy thread reports
+        // itself rather than killing the process unseen.
+        for fault in [
+            libc::SIGSEGV,
+            libc::SIGBUS,
+            libc::SIGILL,
+            libc::SIGFPE,
+            libc::SIGTRAP,
+        ] {
+            libc::sigdelset(&mut all, fault);
+        }
         let mut old: libc::sigset_t = std::mem::zeroed();
         match libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut old) {
             0 => old,
@@ -402,13 +419,23 @@ fn serve(listener: UnixListener, woken: OwnedFd, shared: Arc<Shared>) {
                     shared: &conn_shared,
                     number,
                 };
-                let _ = handle(conn, &open);
+                let slot = Slot(&conn_shared.active);
+                let _ = handle(conn, slot, &open);
                 lock(&conn_shared.upstreams).remove(&number);
-                conn_shared.active.fetch_sub(1, Ordering::SeqCst);
             });
         if spawned.is_err() {
             shared.active.fetch_sub(1, Ordering::SeqCst);
         }
+    }
+}
+
+/// A connection's place in the count of those served, given back when
+/// dropped.
+struct Slot<'a>(&'a AtomicUsize);
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -514,7 +541,11 @@ fn read_by(conn: &mut UnixStream, buf: &mut [u8], deadline: Instant) -> io::Resu
 /// Serves one client. It reads the request, checks it, connects, checks
 /// the TLS server name, and then relays both ways until either side
 /// closes.
-fn handle(mut client: UnixStream, open: &Open<'_>) -> Result<(), Refusal> {
+///
+/// `slot` comes after `client`, so it is dropped first: once the client
+/// sees its connection close, the place it held is free.
+fn handle(mut client: UnixStream, slot: Slot<'_>, open: &Open<'_>) -> Result<(), Refusal> {
+    let _slot = slot;
     let options = &open.shared.options;
     let deadline = Instant::now() + options.handshake_timeout;
     let mut first = [0u8; 1];
@@ -581,10 +612,8 @@ fn handle(mut client: UnixStream, open: &Open<'_>) -> Result<(), Refusal> {
         // record first. The proxy closes both sides, and the host never
         // gets a byte.
         Ok(First::Hello(_, Some(name))) => {
-            let shown: String = crate::escape::escape_message(&name)
-                .chars()
-                .take(MAX_HOST_SHOWN)
-                .collect();
+            // Escaped where the report is printed.
+            let shown: String = name.chars().take(MAX_HOST_SHOWN).collect();
             return Err(open.deny(&host, Some(&format!("TLS name {shown}"))));
         }
         Ok(First::Hello(_, None)) => {
@@ -626,7 +655,7 @@ fn normalize(host: &str) -> String {
 
 /// Whether `ip` belongs to the host itself or its link. That covers
 /// loopback, unspecified and link-local addresses, and their IPv4-mapped
-/// IPv6 forms. The filter is narrow on purpose: an allowed name that
+/// IPv6 forms. The filter is narrow on purpose, since an allowed name that
 /// resolves to the host's own interface addresses, or to a cloud metadata
 /// address outside link-local, is one the user chose to trust.
 pub fn is_host_local(ip: IpAddr) -> bool {
@@ -847,7 +876,7 @@ const TLS_RECORD_TYPES: std::ops::RangeInclusive<u8> = 0x14..=0x18;
 /// What a client sent first in its tunnel.
 #[derive(Debug, PartialEq, Eq)]
 enum First {
-    /// Bytes that are no TLS record, as read.
+    /// Bytes that are not a TLS record, as read.
     Plain(Vec<u8>),
     /// A complete ClientHello in handshake records, as read, and its
     /// server name if it has exactly one.
@@ -1709,7 +1738,11 @@ mod tests {
         // One client sends its request a byte at a time, too slowly.
         let mut slow = f.connect();
         slow.write_all(b"C").unwrap();
-        std::thread::sleep(Duration::from_millis(100));
+        let start = Instant::now();
+        while f.proxy.active() == 0 {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(10));
+        }
         // The proxy has no room for another meanwhile.
         let mut other = f.connect();
         assert!(response_head(&mut other).starts_with("HTTP/1.1 503"));
@@ -1727,6 +1760,7 @@ mod tests {
         }
         assert!(closed, "the slow client was not dropped");
         assert!(start.elapsed() < Duration::from_secs(3));
+        assert_eq!(f.proxy.active(), 0);
         // And then there is room again.
         let mut conn = tunnel(&f);
         conn.write_all(b"x").unwrap();
@@ -1770,13 +1804,14 @@ mod tests {
             if !["proxy", "proxy connectio", "proxy upload"].contains(&name.trim_end()) {
                 continue;
             }
-            let status = std::fs::read_to_string(path.join("status")).unwrap();
-            let blocked = status
-                .lines()
-                .find_map(|l| l.strip_prefix("SigBlk:"))
-                .unwrap()
-                .trim()
-                .to_owned();
+            // Threads of other tests come and go meanwhile.
+            let Ok(status) = std::fs::read_to_string(path.join("status")) else {
+                continue;
+            };
+            let Some(blocked) = status.lines().find_map(|l| l.strip_prefix("SigBlk:")) else {
+                continue;
+            };
+            let blocked = blocked.trim().to_owned();
             let mask = u64::from_str_radix(&blocked, 16).unwrap();
             for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGWINCH] {
                 assert!(mask & (1 << (signal - 1)) != 0, "{name}: {blocked}");

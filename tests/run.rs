@@ -3665,6 +3665,9 @@ fn proxy_mode_tunnels_through_the_bridge_and_reports_refusals() {
     script += &connect_through("other", "127.0.0.1", "other.test");
     // Allowed, so the proxy tries to resolve it, which fails on the host.
     script += &connect_through("allowed", "127.0.0.1", "allowed.test");
+    // A `kill 0` from the target does not reach the bridge.
+    script += "trap '' TERM; kill -TERM 0; trap - TERM; ";
+    script += &connect_through("after-kill", "127.0.0.1", "other.test");
     if Path::new("/proc/net/if_inet6").exists() {
         script += &connect_through("v6", "::1", "other.test");
     }
@@ -3682,7 +3685,7 @@ fn proxy_mode_tunnels_through_the_bridge_and_reports_refusals() {
     );
     assert!(shown.contains("other HTTP/1.1 403 Forbidden\n"), "{shown}");
     assert!(
-        shown.contains("allowed HTTP/1.1 502 Bad Gateway\n"),
+        shown.contains("allowed HTTP/1.1 502 Bad Gateway\nafter-kill HTTP/1.1 403 Forbidden\n"),
         "{shown}"
     );
     if Path::new("/proc/net/if_inet6").exists() {
@@ -3693,7 +3696,7 @@ fn proxy_mode_tunnels_through_the_bridge_and_reports_refusals() {
     // Two refusals of one host, said once after the run.
     let err = stderr(&out);
     assert!(
-        err.contains("the network proxy refused 2 connections, to other.test;"),
+        err.contains("the network proxy refused 3 connections, to other.test;"),
         "{err}"
     );
     assert!(s.no_session_left());
