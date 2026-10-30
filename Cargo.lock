@@ -360,6 +360,7 @@ dependencies = [
  "clap",
  "globset",
  "libc",
+ "regex-automata",
  "rustix",
  "serde",
  "serde_json",

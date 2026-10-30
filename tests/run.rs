@@ -3797,13 +3797,13 @@ fn harness_config() -> Option<String> {
     Some(format!(
         "{config}[[provider]]\ntype = \"config\"\nname = \"which\"\n\
          [provider.sandbox]\nenv.set = {{ WHICH = \"main\" }}\n\
-         shims.cat = {{ binary = \"cat\", default = {{ decision = \"allow\", profile = \"main\" }} }}\n\
+         shims.cat = {{ cmd = \"cat\", default = {{ decision = \"allow\", profile = \"main\" }} }}\n\
          [profiles.harness]\n\
          [[provider]]\ntype = \"config\"\nname = \"harness\"\nprofile = \"harness\"\n\
          [provider.sandbox]\nenv.set = {{ WHICH = \"harness\" }}\n\
-         shims.sh-main = {{ binary = \"sh\", default = {{ decision = \"allow\", profile = \"main\" }} }}\n\
-         shims.nope = {{ binary = \"sh\", default = {{ decision = \"deny\" }} }}\n\
-         shims.asking = {{ binary = \"sh\", default = {{ decision = \"ask\", profile = \"main\" }} }}\n"
+         shims.sh-main = {{ cmd = \"sh\", default = {{ decision = \"allow\", profile = \"main\" }} }}\n\
+         shims.nope = {{ cmd = \"sh\", default = {{ decision = \"deny\" }} }}\n\
+         shims.asking = {{ cmd = \"sh\", default = {{ decision = \"ask\", profile = \"main\" }} }}\n"
     ))
 }
 
@@ -3854,7 +3854,7 @@ fn shims_calling_shims_stop_four_deep() {
     let s = Setup::with_config(&format!(
         "{config}[[provider]]\ntype = \"config\"\nname = \"deep\"\n\
          [provider.sandbox]\n\
-         shims.deep = {{ binary = \"sh\", default = {{ decision = \"allow\", profile = \"main\" }} }}\n"
+         shims.deep = {{ cmd = \"sh\", default = {{ decision = \"allow\", profile = \"main\" }} }}\n"
     ));
     // Each level calls the shim again, and says how the call ended.
     fs::write(
@@ -4845,8 +4845,8 @@ fn a_tty_shim_gets_its_own_pty_resizes_and_restores_modes() {
     let s = Setup::with_config(&format!(
         "{config}[profiles.tui]\n\
          [[provider]]\ntype = \"config\"\nname = \"tui-shim\"\n[provider.sandbox]\n\
-         shims.tui = {{ binary = \"sh\", tty = true, default = {{ decision = \"allow\", profile = \"tui\" }} }}\n\
-         shims.plain = {{ binary = \"sh\", default = {{ decision = \"allow\", profile = \"main\" }} }}\n\
+         shims.tui = {{ cmd = \"sh\", tty = true, default = {{ decision = \"allow\", profile = \"tui\" }} }}\n\
+         shims.plain = {{ cmd = \"sh\", default = {{ decision = \"allow\", profile = \"main\" }} }}\n\
          [[provider]]\ntype = \"config\"\nname = \"tui-env\"\nprofile = \"tui\"\n[provider.sandbox]\n\
          env.set = {{ PS1 = \"tui$ \" }}\n"
     ));
@@ -4942,7 +4942,7 @@ fn a_tty_shim_asking_approval_survives_a_window_resize() {
     let s = Setup::with_config(&format!(
         "{config}[approval]\ntimeout = \"20s\"\n[profiles.tui]\n\
          [[provider]]\ntype = \"config\"\nname = \"tui-shim\"\n[provider.sandbox]\n\
-         shims.ask-tui = {{ binary = \"sh\", tty = true, default = {{ decision = \"ask\", profile = \"tui\" }} }}\n"
+         shims.ask-tui = {{ cmd = \"sh\", tty = true, default = {{ decision = \"ask\", profile = \"tui\" }} }}\n"
     ));
     let server = Server::start_on_terminal(&s, &server_master, server_slave);
     let command = s.stopit(&[
@@ -4978,7 +4978,7 @@ fn ctrl_z_during_tty_shim_approval_keeps_the_shell_usable() {
     let s = Setup::with_config(&format!(
         "{config}[approval]\ntimeout = \"20s\"\n[profiles.tui]\n\
          [[provider]]\ntype = \"config\"\nname = \"tui-shim\"\n[provider.sandbox]\n\
-         shims.ask-tui = {{ binary = \"sh\", tty = true, default = {{ decision = \"ask\", profile = \"tui\" }} }}\n"
+         shims.ask-tui = {{ cmd = \"sh\", tty = true, default = {{ decision = \"ask\", profile = \"tui\" }} }}\n"
     ));
     let server = Server::start_on_terminal(&s, &server_master, server_slave);
     let command = s.stopit(&["run", "--quiet", "/bin/sh", "-i"]);
@@ -5040,8 +5040,8 @@ fn dev_tty_passed_to_the_broker_never_reaches_the_servers_terminal() {
     let s = Setup::with_config(&format!(
         "{config}[profiles.tui]\n\
          [[provider]]\ntype = \"config\"\nname = \"tui-shim\"\n[provider.sandbox]\n\
-         shims.tui = {{ binary = \"sh\", tty = true, default = {{ decision = \"allow\", profile = \"tui\" }} }}\n\
-         shims.nope = {{ binary = \"sh\", default = {{ decision = \"deny\" }} }}\n"
+         shims.tui = {{ cmd = \"sh\", tty = true, default = {{ decision = \"allow\", profile = \"tui\" }} }}\n\
+         shims.nope = {{ cmd = \"sh\", default = {{ decision = \"deny\" }} }}\n"
     ));
     let server = Server::start_on_terminal(&s, &server_master, server_slave);
     // `/usr/bin/script` allocates a PTY inside the sandbox and makes it the
@@ -5149,7 +5149,7 @@ fn git_runs_through_the_broker_while_main_sees_no_metadata() {
     assert!(!shown.contains("write=0"), "{shown}");
     let err = stderr(&out);
     assert!(
-        err.contains("[stopit: git: the flag -c is refused]"),
+        err.contains("[stopit: git: the shim's rules deny "),
         "{err}"
     );
     // The commit is on the host, and the host's config is untouched.
@@ -5272,7 +5272,7 @@ fn the_vcs_profiles_have_a_home_main_cannot_write() {
     let s = Setup::with_config(&format!(
         "{config}[[provider]]\ntype = \"config\"\nname = \"look\"\n[provider.sandbox]\n\
          fs.rw = [\"~/.config\"]\n\
-         shims.in-vcs = {{ binary = \"sh\", default = {{ decision = \"allow\", profile = \"vcs.local\" }} }}\n"
+         shims.in-vcs = {{ cmd = \"sh\", default = {{ decision = \"allow\", profile = \"vcs.local\" }} }}\n"
     ));
     let host_config = s.root.join("home/.config");
     fs::create_dir_all(host_config.join("jj/repos/abc")).unwrap();
@@ -5311,7 +5311,7 @@ fn vcs_remote_mounts_ssh_agent_and_known_hosts_read_only_while_main_sees_neither
     }
     let s = Setup::with_config(&format!(
         "{config}[[provider]]\ntype = \"config\"\nname = \"look\"\n[provider.sandbox]\n\
-         shims.in-remote = {{ binary = \"sh\", default = {{ decision = \"allow\", profile = \"vcs.remote\" }} }}\n"
+         shims.in-remote = {{ cmd = \"sh\", default = {{ decision = \"allow\", profile = \"vcs.remote\" }} }}\n"
     ));
     let host_ssh = s.root.join("home/.ssh");
     fs::create_dir_all(&host_ssh).unwrap();
@@ -5696,8 +5696,8 @@ fn workspace_mount_host_places_workspace_under_ephemeral_home_and_expands_shim_a
         "[workspace]\nmount = \"host\"\n{config}\
          [[provider]]\ntype = \"config\"\nname = \"home-and-shims\"\n[provider.sandbox]\n\
          system.home = {:?}\n\
-         shims.echo-ws = {{ binary = \"sh\", args = [\"-c\", \"printf '%s|%s\\\\n' \\\"$1\\\" \\\"$2\\\"\", \"sh\", \"{{workspace}}\", \"{{workspace}}/a.txt\"], default = {{ decision = \"allow\", profile = \"main\" }} }}\n\
-         shims.ask-ws = {{ binary = \"sh\", args = [\"-c\", \"printf 'asked:%s\\\\n' \\\"$1\\\"\", \"sh\", \"{{workspace}}/sub\"], default = {{ decision = \"ask\", profile = \"main\" }} }}\n",
+         shims.echo-ws = {{ cmd = [\"sh\", \"-c\", \"printf '%s|%s\\\\n' \\\"$1\\\" \\\"$2\\\"\", \"sh\", \"{{workspace}}\", \"{{workspace}}/a.txt\"], default = {{ decision = \"allow\", profile = \"main\" }} }}\n\
+         shims.ask-ws = {{ cmd = [\"sh\", \"-c\", \"printf 'asked:%s\\\\n' \\\"$1\\\"\", \"sh\", \"{{workspace}}/sub\"], default = {{ decision = \"ask\", profile = \"main\" }} }}\n",
         home.to_str().unwrap()
     ));
 
@@ -5985,8 +5985,8 @@ fn persisting_approvals_updates_stopit_toml_allows_it_and_reloads_live_session()
     let s = Setup::with_config(&format!(
         "{config}[terminal]\nclipboard_write = \"ask\"\n[approval]\ntimeout = \"20s\"\n\
          [[provider]]\ntype = \"config\"\nname = \"ask-echo\"\n[provider.sandbox]\n\
-         shims.myecho = {{ binary = \"echo\", default = {{ decision = \"ask\", profile = \"main\" }}, rules = [\
-           {{ subcommand = [\"hello\"], decision = \"ask\", profile = \"main\" }}\
+         shims.myecho = {{ cmd = \"echo\", default = {{ decision = \"ask\", profile = \"main\" }}, rules = [\
+           {{ prefix = \"hello\", decision = \"ask\", profile = \"main\" }}\
          ] }}\n"
     ));
     let home = s.root.join("home");
@@ -6049,5 +6049,60 @@ fn persisting_approvals_updates_stopit_toml_allows_it_and_reloads_live_session()
     assert_eq!(
         String::from_utf8_lossy(&standalone.stdout),
         "hello again\npersisted-grant\n"
+    );
+}
+
+#[test]
+fn proxy_shims_protect_their_script_and_support_named_inline_and_deny_decisions() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let s = Setup::new();
+    let home = s.root.join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join("secret.txt"), "from-inline-profile\n").unwrap();
+
+    let proxy_path = s.ws().join("my-proxy.sh");
+    fs::write(
+        &proxy_path,
+        "#!/bin/sh\n\
+         case \"$1\" in\n\
+           allow-main)\n\
+             printf '{\"decision\":\"allow\",\"cmd\":[\"echo\",\"proxy-main:%s:%s\",\"'\"$STOPIT_SHIM\"'\",\"'\"$2\"'\"],\"profile\":\"main\"}\\n'\n\
+             ;;\n\
+           allow-inline)\n\
+             printf '{\"decision\":\"allow\",\"cmd\":[\"cat\",\"/home/user/secret.txt\"],\"profile\":{\"inherit\":\"main\",\"fs\":{\"ro\":[\"~/secret.txt\"]}}}\\n'\n\
+             ;;\n\
+           deny-me)\n\
+             printf '{\"decision\":\"deny\",\"reason\":\"custom proxy denial\"}\\n'\n\
+             ;;\n\
+           *)\n\
+             printf '{\"decision\":\"deny\"}\\n'\n\
+             ;;\n\
+         esac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&proxy_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+    s.write_config(&format!(
+        "{config}[[provider]]\ntype = \"config\"\nname = \"proxy-test\"\n[provider.sandbox]\n\
+         shims.pcli = {{ proxy = \"./my-proxy.sh\" }}\n"
+    ));
+
+    let script = "echo tampered >> /workspace/my-proxy.sh 2>/dev/null && echo wrote-proxy || echo proxy-protected; \
+                  cat /home/user/secret.txt 2>/dev/null || echo main-no-secret; \
+                  pcli allow-main arg2; \
+                  pcli allow-inline; \
+                  pcli deny-me; echo deny_rc=$?";
+    let out = output(s.stopit(&["run", "--quiet", "/bin/sh", "-c", script]), b"");
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "proxy-protected\nmain-no-secret\nproxy-main:pcli:arg2\nfrom-inline-profile\ndeny_rc=126\n"
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("[stopit: pcli: custom proxy denial]"),
+        "{err}"
     );
 }

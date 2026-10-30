@@ -711,11 +711,11 @@ mod tests {
             .shims
             .iter()
             .map(|(name, (spec, provider))| {
-                (
-                    name.to_string(),
-                    spec.binary.to_string(),
-                    provider.to_string(),
-                )
+                let target = match &spec.kind {
+                    crate::manifest::ShimKind::Declarative { cmd, .. } => cmd.binary.to_string(),
+                    crate::manifest::ShimKind::Proxy { proxy, .. } => proxy.to_string(),
+                };
+                (name.to_string(), target, provider.to_string())
             })
             .collect()
     }
@@ -1065,7 +1065,7 @@ mod tests {
     }
 
     fn shim(name: &str, binary: &str) -> String {
-        format!("shims.{name} = {{ binary = \"{binary}\", default = {{ decision = \"deny\" }} }}")
+        format!("shims.{name} = {{ cmd = \"{binary}\", default = {{ decision = \"deny\" }} }}")
     }
 
     fn triples(v: &[(&str, &str, &str)]) -> Vec<(String, String, String)> {

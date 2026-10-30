@@ -19,8 +19,8 @@ use crate::config::{
     LayeredProviderEntry, ProfileRef, ProviderEntry, ProviderKind, ProviderName, ProviderOrigin,
     WorkspaceMount,
 };
-use crate::manifest::{Manifest, ManifestError};
-use crate::spec::UntrustedRoot;
+use crate::manifest::{Manifest, ManifestError, ShimKind};
+use crate::spec::{ScriptPathError, UntrustedRoot, has_rewritable_hard_links, resolve_script_path};
 
 pub use base::{
     BASE_PROVIDER_NAME, SUPERVISOR_PROVIDER_NAME, default_base_manifest, layered_session_providers,
@@ -410,11 +410,114 @@ pub fn protected_sources(
     Ok(out)
 }
 
+/// An error blaming `base_dir` if it is non-empty and not an accessible directory.
+pub(super) fn base_dir_error(
+    name: &ProviderName,
+    script: &Path,
+    base_dir: &Path,
+) -> Option<ProviderError> {
+    if base_dir.as_os_str().is_empty() {
+        return None;
+    }
+    let error = match std::fs::metadata(base_dir) {
+        Ok(m) if m.is_dir() => return None,
+        Ok(_) => io::Error::from(io::ErrorKind::NotADirectory),
+        Err(e) => e,
+    };
+    Some(ProviderError::BaseDir {
+        name: name.clone(),
+        script: script.to_owned(),
+        dir: base_dir.to_owned(),
+        error,
+    })
+}
+
+/// Resolves a host executable path (`script` or proxy shim `proxy`), refusing
+/// symlinks inside `ctx.workspace` or `ctx.rw_grants` and, when `protect` is
+/// true, regular files with rewritable hard links.
+pub(super) fn resolve_host_executable(
+    name: &ProviderName,
+    declared: &Path,
+    base_dir: &Path,
+    protect: bool,
+    ctx: &ProviderContext,
+) -> Result<PathBuf, ProviderError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let resolve_error = |error| {
+        base_dir_error(name, declared, base_dir).unwrap_or_else(|| ProviderError::Resolve {
+            name: name.clone(),
+            script: declared.to_owned(),
+            error,
+        })
+    };
+    let path = std::path::absolute(declared).map_err(resolve_error)?;
+    let resolved = match resolve_script_path(&path, &ctx.workspace, &ctx.rw_grants) {
+        Ok(resolved) => resolved,
+        Err(ScriptPathError::Link { link, root }) => {
+            return Err(ProviderError::SourceLink {
+                name: name.clone(),
+                script: declared.to_owned(),
+                link,
+                root: Box::new(root),
+            });
+        }
+        Err(ScriptPathError::Lookup(error)) => return Err(resolve_error(error)),
+    };
+    if protect {
+        let meta = std::fs::symlink_metadata(&resolved).map_err(resolve_error)?;
+        if has_rewritable_hard_links(&resolved, &meta) {
+            return Err(ProviderError::SourceHardLinked {
+                name: name.clone(),
+                script: declared.to_owned(),
+                path: resolved,
+                links: meta.nlink(),
+            });
+        }
+    }
+    Ok(resolved)
+}
+
+/// Resolves every proxy shim in `manifest` (both top-level and contributed
+/// profiles), storing the canonical path on each [`ShimKind::Proxy`] and
+/// returning the canonical paths of those with `protect = true`.
+pub(super) fn resolve_manifest_proxies(
+    name: &ProviderName,
+    base_dir: &Path,
+    manifest: &mut Manifest,
+    ctx: &ProviderContext,
+) -> Result<Vec<PathBuf>, ProviderError> {
+    let mut protected = Vec::new();
+    let shims = manifest.grants.shims.values_mut().chain(
+        manifest
+            .profiles
+            .values_mut()
+            .flat_map(|p| p.grants.shims.values_mut()),
+    );
+    for spec in shims {
+        if let ShimKind::Proxy {
+            proxy,
+            protect,
+            resolved,
+            ..
+        } = &mut spec.kind
+        {
+            let declared = proxy.expand(base_dir, &ctx.home);
+            let canonical = resolve_host_executable(name, &declared, base_dir, *protect, ctx)?;
+            if *protect && !protected.contains(&canonical) {
+                protected.push(canonical.clone());
+            }
+            *resolved = Some(canonical);
+        }
+    }
+    Ok(protected)
+}
+
 /// Builds the provider for a configuration entry.
 ///
 /// `base_dir` is the directory of the configuration file that declared the
-/// entry: a relative script `source` is resolved against it, and it is the
-/// script's current directory. `config` entries ignore it.
+/// entry: a relative script `source` or shim `proxy` is resolved against it,
+/// and it is the script's current directory.
 pub fn from_entry(
     entry: &ProviderEntry,
     base_dir: &Path,
@@ -429,10 +532,11 @@ pub fn from_entry_with_origin(
     origin: ProviderOrigin,
 ) -> Result<Box<dyn Provider>, ProviderError> {
     match &entry.kind {
-        ProviderKind::Config { profile, sandbox } => Ok(Box::new(ConfigProvider::with_origin(
+        ProviderKind::Config { profile, sandbox } => Ok(Box::new(ConfigProvider::with_base_dir(
             entry.name.clone(),
             profile.clone(),
             (**sandbox).clone(),
+            base_dir,
             origin,
         ))),
         ProviderKind::Script {
@@ -672,5 +776,50 @@ mod tests {
         let mut c = ctx("x");
         c.workspace = ws.path().to_owned();
         assert_eq!(p.manifest(&c).unwrap().manifest, Manifest::default());
+    }
+
+    #[test]
+    fn config_provider_resolves_and_protects_proxy_shims() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let proxy_file = root.join("my-proxy.sh");
+        std::fs::write(&proxy_file, "#!/bin/sh\n").unwrap();
+
+        let es = entries(
+            "[[provider]]\ntype = \"config\"\nname = \"cfg\"\n[provider.sandbox]\n\
+             shims.p1 = { proxy = \"./my-proxy.sh\" }\n\
+             shims.p2 = { proxy = \"./my-proxy.sh\", protect = false }\n",
+        );
+        let p = from_entry(&es[0], &root).unwrap();
+        let mut c = ctx("x");
+        c.workspace = root.clone();
+        let out = p.manifest(&c).unwrap();
+        let p1 = out.manifest.grants.shims.get(&"p1".parse().unwrap()).unwrap();
+        assert!(matches!(
+            &p1.kind,
+            ShimKind::Proxy {
+                resolved: Some(path),
+                protect: true,
+                ..
+            } if path == &proxy_file
+        ));
+        assert_eq!(
+            protected_sources(&[p]).unwrap(),
+            [ProtectedSource {
+                provider: "cfg".parse().unwrap(),
+                path: proxy_file.clone(),
+            }]
+        );
+
+        // A proxy shim reached through a symlink inside the workspace is refused.
+        let link = root.join("link-proxy.sh");
+        std::os::unix::fs::symlink(&proxy_file, &link).unwrap();
+        let es_link = entries(
+            "[[provider]]\ntype = \"config\"\nname = \"cfg\"\n[provider.sandbox]\n\
+             shims.p1 = { proxy = \"./link-proxy.sh\" }\n",
+        );
+        let p_link = from_entry(&es_link[0], &root).unwrap();
+        let err = p_link.manifest(&c).unwrap_err();
+        assert!(matches!(err, ProviderError::SourceLink { .. }), "{err:?}");
     }
 }

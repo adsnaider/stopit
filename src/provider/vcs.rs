@@ -752,45 +752,101 @@ fn manifest_from(root: toml::Table) -> Result<Manifest, String> {
     toml::from_str(&root.to_string()).map_err(|e| e.to_string())
 }
 
-/// A shim rule as TOML.
-fn rule(subcommands: &[&str], decision: &str, profile: Option<&str>, deny: &[&str]) -> toml::Value {
+/// Builds a regex pattern matching any non-empty prefix of the long flag name
+/// `name` (without the leading `--`).
+fn long_flag_prefix_pattern(name: &str) -> String {
+    let mut chars = name.chars().rev();
+    let Some(last) = chars.next() else {
+        return String::new();
+    };
+    let mut acc = regex_escape_char(last);
+    for ch in chars {
+        let escaped = regex_escape_char(ch);
+        acc = format!("{escaped}(?:{acc})?");
+    }
+    acc
+}
+
+fn regex_escape_char(ch: char) -> String {
+    match ch {
+        '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' | '\\' => {
+            format!("\\{ch}")
+        }
+        _ => ch.to_string(),
+    }
+}
+
+/// Builds a regex matching any of `flags` (short flags in clusters or with
+/// attached values, and long flags or their prefix abbreviations).
+fn deny_flags_regex(flags: &[&str]) -> String {
+    let mut short = String::new();
+    let mut long = Vec::new();
+    for flag in flags {
+        if let Some(name) = flag.strip_prefix("--") {
+            long.push(long_flag_prefix_pattern(name));
+        } else if let Some(ch) = flag.strip_prefix('-') {
+            short.push_str(ch);
+        }
+    }
+    let long_pat = long.join("|");
+    match (!short.is_empty(), !long_pat.is_empty()) {
+        (true, true) => {
+            format!(r"(?:^| )(?:-[^- =]*[{short}]|--(?:{long_pat})(?: |=|$))")
+        }
+        (true, false) => format!(r"(?:^| )-[^- =]*[{short}]"),
+        (false, true) => format!(r"(?:^| )--(?:{long_pat})(?: |=|$)"),
+        (false, false) => unreachable!("deny_flags_regex called with empty flags"),
+    }
+}
+
+/// A `decision = "deny"` regex rule for `flags`.
+fn deny_flags_rule(flags: &[&str]) -> toml::Value {
     let mut t = toml::Table::new();
-    t.insert(
-        "subcommand".into(),
-        toml::Value::Array(subcommands.iter().map(|s| (*s).into()).collect()),
-    );
-    t.insert("decision".into(), decision.into());
-    if let Some(p) = profile {
-        t.insert("profile".into(), p.into());
-    }
-    if !deny.is_empty() {
-        t.insert(
-            "deny_flags".into(),
-            toml::Value::Array(deny.iter().map(|s| (*s).into()).collect()),
-        );
-    }
+    t.insert("regex".into(), deny_flags_regex(flags).into());
+    t.insert("decision".into(), "deny".into());
     toml::Value::Table(t)
 }
 
-/// The rule for remote commands (`fetch` or `push`), routed to `vcs.remote`
+/// Rules for `subcommands` with `decision` and `profile` (`prefix` rules for
+/// literal subcommands, `regex` rules for `<word> *` wildcards).
+fn rules_for(subcommands: &[&str], decision: &str, profile: Option<&str>) -> Vec<toml::Value> {
+    subcommands
+        .iter()
+        .map(|sub| {
+            let mut t = toml::Table::new();
+            if let Some(prefix) = sub.strip_suffix(" *") {
+                t.insert("regex".into(), format!(r"^{prefix} [^-][^ ]*(?: |$)").into());
+            } else {
+                t.insert("prefix".into(), (*sub).into());
+            }
+            t.insert("decision".into(), decision.into());
+            if let Some(p) = profile {
+                t.insert("profile".into(), p.into());
+            }
+            toml::Value::Table(t)
+        })
+        .collect()
+}
+
+/// Rules for remote commands (`fetch` or `push`), routed to `vcs.remote`
 /// unless `decision` is [`Decision::Deny`].
-fn remote_rule(subcommands: &[&str], decision: Decision, deny: &[&str]) -> toml::Value {
+fn remote_rules(subcommands: &[&str], decision: Decision) -> Vec<toml::Value> {
     let profile = match decision {
         Decision::Allow | Decision::Ask => Some("remote"),
         Decision::Deny => None,
     };
-    rule(subcommands, decision.as_str(), profile, deny)
+    rules_for(subcommands, decision.as_str(), profile)
 }
 
-/// A shim running `binary` with `args` before the caller's, refusing
-/// `deny` anywhere, with `rules`, and asking to run anything else in
-/// `vcs.local`.
-fn shim(binary: &str, args: &[&str], deny: &[&str], rules: Vec<toml::Value>) -> toml::Value {
-    let strings = |items: &[&str]| toml::Value::Array(items.iter().map(|s| (*s).into()).collect());
+/// A declarative shim running `cmd` (`[binary, args...]`), with first-match-wins
+/// `rules` and asking to run anything else in `vcs.local`.
+fn shim(binary: &str, args: &[&str], rules: Vec<toml::Value>) -> toml::Value {
+    let cmd: Vec<toml::Value> = std::iter::once(binary)
+        .chain(args.iter().copied())
+        .map(toml::Value::from)
+        .collect();
     let mut t = toml::Table::new();
-    t.insert("binary".into(), binary.into());
-    t.insert("args".into(), strings(args));
-    t.insert("deny_flags".into(), strings(deny));
+    t.insert("cmd".into(), toml::Value::Array(cmd));
     t.insert(
         "default".into(),
         toml::Value::Table(table([
@@ -809,66 +865,60 @@ fn shim(binary: &str, args: &[&str], deny: &[&str], rules: Vec<toml::Value>) -> 
 /// Reading commands run in `vcs.local` too, since jj snapshots the working
 /// copy first, which writes to `.jj`.
 fn jj_shim(fetch: Decision, push: Decision) -> toml::Value {
-    shim(
-        "jj",
-        &["--no-pager", "-R", "{workspace}"],
+    let mut rules = Vec::new();
+    rules.push(deny_flags_rule(&[
+        "--config",
+        "--config-file",
+        "--config-toml",
+        "-R",
+        "--repository",
+        "--tool",
+        "-i",
+        "--interactive",
+    ]));
+    rules.extend(rules_for(
         &[
-            "--config",
-            "--config-file",
-            "--config-toml",
-            "-R",
-            "--repository",
-            "--tool",
-            "-i",
-            "--interactive",
+            "status",
+            "st",
+            "diff",
+            "log",
+            "show",
+            "evolog",
+            "op log",
+            "file show",
         ],
-        vec![
-            rule(
-                &[
-                    "status",
-                    "st",
-                    "diff",
-                    "log",
-                    "show",
-                    "evolog",
-                    "op log",
-                    "file show",
-                ],
-                "allow",
-                Some("local"),
-                &[],
-            ),
-            rule(
-                &["new", "commit", "ci", "describe", "desc"],
-                "allow",
-                Some("local"),
-                &[
-                    "-A",
-                    "--insert-after",
-                    "--after",
-                    "-B",
-                    "--insert-before",
-                    "--before",
-                ],
-            ),
-            rule(
-                &[
-                    "squash",
-                    "rebase",
-                    "abandon",
-                    "restore",
-                    "undo",
-                    "bookmark *",
-                    "op *",
-                ],
-                "ask",
-                Some("local"),
-                &[],
-            ),
-            remote_rule(&["git fetch", "git clone"], fetch, &[]),
-            remote_rule(&["git push"], push, &[]),
+        "allow",
+        Some("local"),
+    ));
+    rules.extend(rules_for(
+        &[
+            "squash",
+            "rebase",
+            "abandon",
+            "restore",
+            "undo",
+            "bookmark *",
+            "op *",
         ],
-    )
+        "ask",
+        Some("local"),
+    ));
+    rules.extend(remote_rules(&["git fetch", "git clone"], fetch));
+    rules.extend(remote_rules(&["git push"], push));
+    rules.push(deny_flags_rule(&[
+        "-A",
+        "--insert-after",
+        "--after",
+        "-B",
+        "--insert-before",
+        "--before",
+    ]));
+    rules.extend(rules_for(
+        &["new", "commit", "ci", "describe", "desc"],
+        "allow",
+        Some("local"),
+    ));
+    shim("jj", &["--no-pager", "-R", "{workspace}"], rules)
 }
 
 /// The `git` shim of §7.4. It runs `git --no-pager`, and the profiles'
@@ -879,46 +929,40 @@ fn jj_shim(fetch: Decision, push: Decision) -> toml::Value {
 /// `--output` makes `diff`, `log` and their kin write to any path the
 /// profile can write.
 fn git_shim(fetch: Decision, push: Decision) -> toml::Value {
-    shim(
-        "git",
-        &["--no-pager"],
+    let mut rules = Vec::new();
+    rules.push(deny_flags_rule(&[
+        "-c",
+        "--config-env",
+        "--exec-path",
+        "--upload-pack",
+        "--receive-pack",
+        "--exec",
+        "--output",
+        "-C",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+    ]));
+    rules.extend(rules_for(
+        &["status", "diff", "log", "show", "add", "commit"],
+        "allow",
+        Some("local"),
+    ));
+    rules.extend(rules_for(
         &[
-            "-c",
-            "--config-env",
-            "--exec-path",
-            "--upload-pack",
-            "--receive-pack",
-            "--exec",
-            "--output",
-            "-C",
-            "--git-dir",
-            "--work-tree",
-            "--namespace",
+            "reset", "rebase", "checkout", "switch", "branch", "tag", "clean", "stash",
         ],
-        vec![
-            rule(
-                &["status", "diff", "log", "show", "add", "commit"],
-                "allow",
-                Some("local"),
-                &[],
-            ),
-            rule(
-                &[
-                    "reset", "rebase", "checkout", "switch", "branch", "tag", "clean", "stash",
-                ],
-                "ask",
-                Some("local"),
-                &[],
-            ),
-            remote_rule(
-                &["fetch", "pull", "ls-remote", "remote update"],
-                fetch,
-                &[],
-            ),
-            remote_rule(&["clone"], fetch, &["-u", "--template"]),
-            remote_rule(&["push"], push, &[]),
-        ],
-    )
+        "ask",
+        Some("local"),
+    ));
+    rules.extend(remote_rules(
+        &["fetch", "pull", "ls-remote", "remote update"],
+        fetch,
+    ));
+    rules.extend(remote_rules(&["push"], push));
+    rules.push(deny_flags_rule(&["-u", "--template"]));
+    rules.extend(remote_rules(&["clone"], fetch));
+    shim("git", &["--no-pager"], rules)
 }
 
 impl Provider for VcsProvider {
@@ -1124,7 +1168,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["git"]
         );
-        let git = shim(&m, "git");
+        let git = shim(&m, "git").cmd().unwrap();
         assert_eq!(
             git.args.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
             ["--no-pager"]
@@ -1299,7 +1343,7 @@ mod tests {
             patterns(&m.grants.fs.masked),
             ["{workspace}/.git", "{workspace}/.jj"]
         );
-        let jj = shim(&m, "jj");
+        let jj = shim(&m, "jj").cmd().unwrap();
         assert_eq!(
             jj.args.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
             ["--no-pager", "-R", "{workspace}"]
@@ -1605,12 +1649,16 @@ mod tests {
             ("git", "clone --template=/tmp/t https://example.com/r.git"),
             ("git", "log --output=.git/hooks/pre-commit"),
             ("git", "-c core.pager=sh status"),
+            ("git", "status -ck=v"),
             ("git", "-C /elsewhere status"),
+            ("git", "-C/elsewhere status"),
             ("git", "--git-dir=/elsewhere status"),
             ("git", "status --upl=x"),
             ("jj", "--config ui.pager=sh log"),
             ("jj", "-R /elsewhere log"),
+            ("jj", "status -R/elsewhere"),
             ("jj", "new -A @"),
+            ("jj", "new -Amain"),
             ("jj", "diff --tool=sh"),
             ("jj", "commit -i"),
             ("jj", "squash --interactive"),
@@ -1637,7 +1685,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            shim(&m, "jj").args[2].expand(non_utf8_mount),
+            shim(&m, "jj").cmd().unwrap().args[2].expand(non_utf8_mount),
             non_utf8_mount.as_os_str()
         );
 

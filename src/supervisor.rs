@@ -478,7 +478,7 @@ pub fn print_error(message: &str) {
     eprintln!("stopit: error: {}", escape_message(message));
 }
 
-/// The script providers of `config` with `protect = false`, in order.
+/// The `script` providers of `config` with `protect = false`, in order.
 fn unprotected_providers(config: &Config) -> Vec<&ProviderName> {
     config
         .providers
@@ -928,6 +928,7 @@ fn load_policy<S>(
             gf,
             &global_entries,
             &config_dirs.active.path,
+            &home,
             &ws.dir,
             &rw_grants,
         )?,
@@ -2760,6 +2761,7 @@ fn guard_global_config(
     file: &GlobalConfigFile,
     entries: &[ProviderEntry],
     config_dir: &Path,
+    home: &Path,
     workspace: &Path,
     rw_grants: &[UntrustedRoot],
 ) -> Result<Vec<PathBuf>, RunError> {
@@ -2789,21 +2791,51 @@ fn guard_global_config(
     }
     paths.push(resolved);
     for entry in entries {
-        let ProviderKind::Script {
-            source,
-            protect: true,
-            ..
-        } = &entry.kind
-        else {
-            continue;
-        };
-        let declared = config_dir.join(source.as_path());
-        let script = resolve(
-            &declared,
-            &format!("script provider {:?}", entry.name.as_str()),
-        )?;
-        if !paths.contains(&script) {
-            paths.push(script);
+        match &entry.kind {
+            ProviderKind::Script {
+                source,
+                protect: true,
+                ..
+            } => {
+                let declared = config_dir.join(source.as_path());
+                let script = resolve(
+                    &declared,
+                    &format!("script provider {:?}", entry.name.as_str()),
+                )?;
+                if !paths.contains(&script) {
+                    paths.push(script);
+                }
+            }
+            ProviderKind::Config { sandbox, .. } => {
+                let shims = sandbox.grants.shims.iter().chain(
+                    sandbox
+                        .profiles
+                        .values()
+                        .flat_map(|p| p.grants.shims.iter()),
+                );
+                for (shim_name, spec) in shims {
+                    if let crate::manifest::ShimKind::Proxy {
+                        proxy,
+                        protect: true,
+                        ..
+                    } = &spec.kind
+                    {
+                        let declared = proxy.expand(config_dir, home);
+                        let proxy_path = resolve(
+                            &declared,
+                            &format!(
+                                "proxy shim {:?} of provider {:?}",
+                                shim_name.as_str(),
+                                entry.name.as_str()
+                            ),
+                        )?;
+                        if !paths.contains(&proxy_path) {
+                            paths.push(proxy_path);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
     Ok(paths)
@@ -4402,12 +4434,19 @@ mod tests {
         // not, are protected. A script with `protect = false` is not even
         // resolved.
         assert_eq!(
-            guard_global_config(&file, &entries, &dirs.active.path, &ws, &[]).unwrap(),
+            guard_global_config(&file, &entries, &dirs.active.path, &root, &ws, &[]).unwrap(),
             [target.clone(), script.clone()]
         );
         // With `dots` writable, the `current` link could be re-pointed.
-        let e = guard_global_config(&file, &entries, &dirs.active.path, &ws, &[rw_root(&dots)])
-            .unwrap_err();
+        let e = guard_global_config(
+            &file,
+            &entries,
+            &dirs.active.path,
+            &root,
+            &ws,
+            &[rw_root(&dots)],
+        )
+        .unwrap_err();
         let RunError::UntrustedConfig { path, reason } = e else {
             panic!("{e:?}");
         };
@@ -4426,8 +4465,15 @@ mod tests {
         fs::remove_file(&link).unwrap();
         symlink(&target, &link).unwrap();
         let file = read_ok(&dirs);
-        let e = guard_global_config(&file, &entries, &dirs.active.path, &ws, &[rw_root(&dots)])
-            .unwrap_err();
+        let e = guard_global_config(
+            &file,
+            &entries,
+            &dirs.active.path,
+            &root,
+            &ws,
+            &[rw_root(&dots)],
+        )
+        .unwrap_err();
         assert!(
             e.to_string().contains("the way to script provider \"a\""),
             "{e}"
@@ -4437,7 +4483,7 @@ mod tests {
             canonical_path: root.join("elsewhere.toml"),
             ..file
         };
-        let e = guard_global_config(&moved, &[], &dirs.active.path, &ws, &[]).unwrap_err();
+        let e = guard_global_config(&moved, &[], &dirs.active.path, &root, &ws, &[]).unwrap_err();
         assert!(e.to_string().contains("when read, and now to"), "{e}");
     }
 

@@ -44,8 +44,11 @@ use crate::bwrap::{RunExtras, TerminalSession};
 use crate::config::ProfileRef;
 use crate::control::{read_frame_by, recv_fds, write_frame};
 use crate::grant::GrantRequest;
-use crate::manifest::{GRANT_SHIM, ShimName, ShimSpec, SubcommandPattern};
-use crate::policy::Decision;
+use crate::manifest::{
+    ContributedProfile, GRANT_SHIM, Manifest, ProxyProfile, ProxyResponse, ShimKind, ShimName,
+    ShimSpec, SubcommandPattern,
+};
+use crate::policy::{Decision, PathMode};
 use crate::shim::{BrokerMessage, HELLO, PROTOCOL_VERSION, ShimMessage};
 use crate::spec::CompiledSession;
 use crate::supervisor::{
@@ -142,72 +145,49 @@ pub enum Outcome {
     Deny(String),
 }
 
-/// What the rules of `spec` decide for `args`, and the rule that matched,
-/// its subcommand pattern or `default`.
+/// What the declarative rules of `spec` decide for `args`, and the key of the
+/// rule that matched (e.g. `literal:status`, `prefix:git push`, `regex:...`,
+/// or `default`).
 ///
-/// A refused flag anywhere in the arguments denies ([`flag_matches`]): the
-/// shim's own, the matched rule's, and when `default` decides, every
-/// rule's, since a flag before the subcommand sends a listed subcommand
-/// there too. Otherwise the rule whose pattern matches the most of the
-/// words before the first flag wins. A word beats a `*` in its place, and
-/// among patterns alike the strictest decision wins. No match takes the
-/// shim's `default`.
+/// The caller's arguments are joined with single spaces (`args.join(b" ")`)
+/// and evaluated against `rules` in **first-match-wins** order. If no rule
+/// matches, the shim's `default` action decides.
 pub fn decide(spec: &ShimSpec, args: &[Vec<u8>]) -> (Outcome, String) {
-    let words = leading_words(args);
-    // The best match so far, ranked by its words, then its tokens, then
-    // its strictness.
-    let mut best: Option<((usize, usize, u8), &crate::manifest::ShimRule, String)> = None;
-    for rule in &spec.rules {
-        for pattern in &rule.subcommand {
-            if !pattern_matches(pattern, &words) {
-                continue;
-            }
-            let tokens = pattern.tokens().count();
-            let fixed = tokens - usize::from(pattern.tokens().last() == Some("*"));
-            let rank = (fixed, tokens, strictness(rule.decision));
-            if best.as_ref().is_none_or(|(best, _, _)| rank > *best) {
-                best = Some((rank, rule, pattern.as_str().to_owned()));
-            }
-        }
-    }
-    let (decision, profile, rule_flags, name) = match &best {
-        Some((_, rule, name)) => (
-            rule.decision,
-            rule.profile.clone(),
-            rule.deny_flags.iter().collect::<Vec<_>>(),
-            name.clone(),
-        ),
-        None => (
-            spec.default.decision,
-            spec.default.profile.clone(),
-            spec.rules.iter().flat_map(|r| &r.deny_flags).collect(),
-            "default".to_owned(),
-        ),
+    let ShimKind::Declarative { default, rules, .. } = &spec.kind else {
+        return (
+            Outcome::Deny("proxy shim is decided at runtime".to_owned()),
+            "proxy".to_owned(),
+        );
     };
-    for flag in spec.deny_flags.iter().chain(rule_flags) {
-        if let Some(arg) = args.iter().find(|a| flag_matches(flag.as_str(), a)) {
-            return (
-                Outcome::Deny(format!(
-                    "the flag {} is refused",
-                    crate::escape::escape_bytes(arg)
-                )),
-                name,
-            );
-        }
-    }
+    let joined: Vec<u8> = args.join(&b' ');
+    let (decision, profile, key, display_rule) =
+        match rules.iter().find(|r| r.matcher.matches(&joined)) {
+            Some(rule) => (
+                rule.decision,
+                rule.profile.clone(),
+                rule.matcher.key(),
+                Some(rule.matcher.pattern()),
+            ),
+            None => (
+                default.decision,
+                default.profile.clone(),
+                "default".to_owned(),
+                None,
+            ),
+        };
     let outcome = match (decision, profile) {
         (Decision::Allow, Some(p)) => Outcome::Allow(p),
         (Decision::Ask, Some(p)) => Outcome::Ask(p),
-        _ => Outcome::Deny(match name.as_str() {
-            "default" => "the shim's rules deny it".to_owned(),
-            rule => format!("the shim's rules deny `{rule}`"),
+        _ => Outcome::Deny(match display_rule {
+            None => "the shim's rules deny it".to_owned(),
+            Some(pat) => format!("the shim's rules deny `{pat}`"),
         }),
     };
-    (outcome, name)
+    (outcome, key)
 }
 
-/// The arguments up to the first flag. A flag before a word may take a
-/// value that would read as one, so a pattern must match from the start.
+/// The arguments up to the first flag. Used by `stopit-grant` `--scope`
+/// subcommand matching.
 pub(crate) fn leading_words(args: &[Vec<u8>]) -> Vec<&[u8]> {
     args.iter()
         .map(Vec::as_slice)
@@ -223,40 +203,6 @@ pub(crate) fn pattern_matches(pattern: &SubcommandPattern, words: &[&[u8]]) -> b
     let fixed = &tokens[..tokens.len() - usize::from(wildcard)];
     words.len() >= fixed.len() + usize::from(wildcard)
         && fixed.iter().zip(words).all(|(t, w)| t.as_bytes() == *w)
-}
-
-fn strictness(decision: Decision) -> u8 {
-    match decision {
-        Decision::Allow => 0,
-        Decision::Ask => 1,
-        Decision::Deny => 2,
-    }
-}
-
-/// Whether the argument `arg` uses the refused flag `flag`. It does when
-/// it equals the flag, starts with it and `=`, abbreviates a long flag to
-/// three bytes or more as git and others accept (`--upl` for
-/// `--upload-pack`), or, for a one-letter flag such as `-c`, is a cluster
-/// of one-letter flags that holds its letter.
-fn flag_matches(flag: &str, arg: &[u8]) -> bool {
-    let flag = flag.as_bytes();
-    if arg == flag || (arg.starts_with(flag) && arg.get(flag.len()) == Some(&b'=')) {
-        return true;
-    }
-    if flag.starts_with(b"--") && arg.starts_with(b"--") {
-        let name = arg.split(|&b| b == b'=').next().unwrap_or(arg);
-        if name.len() >= 3 && flag.starts_with(name) {
-            return true;
-        }
-    }
-    // `-c` within a cluster such as `-xc`, or with its value attached.
-    flag.len() == 2
-        && flag[0] == b'-'
-        && flag[1] != b'-'
-        && arg.len() > 2
-        && arg[0] == b'-'
-        && arg[1] != b'-'
-        && arg[1..].contains(&flag[1])
 }
 
 /// A broker serving one sandbox. Dropping it stops it, kills the commands
@@ -529,14 +475,28 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
         };
         return run_grant(call, args, cwd_fd, [stdin, stdout, stderr]);
     };
+    let ShimKind::Declarative { cmd, .. } = &spec.kind else {
+        let call = ProxyCall {
+            conn,
+            shared,
+            ctx,
+            number,
+            shim: &name,
+            spec,
+            cwd: &cwd,
+            rel: &rel,
+            foreground,
+        };
+        return run_proxy_shim(call, args, cwd_fd, [stdin, stdout, stderr]);
+    };
     let (outcome, rule) = decide(spec, &args);
-    let shim_args: Vec<OsString> = spec
+    let shim_args: Vec<OsString> = cmd
         .args
         .iter()
         .map(|a| a.expand(&ctx.workspace_mount))
         .collect();
     // What runs, the shim's binary with the arguments.
-    let command_line: String = std::iter::once(spec.binary.as_str().as_bytes())
+    let command_line: String = std::iter::once(cmd.binary.as_str().as_bytes())
         .chain(shim_args.iter().map(|a| a.as_os_str().as_bytes()))
         .chain(args.iter().map(Vec::as_slice))
         .map(crate::escape::shell_quote)
@@ -559,9 +519,11 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
             let request = ApprovalRequest::Command {
                 shim: name.to_string(),
                 rule: match rule.as_str() {
-                    "default" => "default, for calls no rule matches, including any with a flag \
-                                  before the subcommand"
-                        .to_owned(),
+                    "default" => {
+                        "default, for calls no rule matches, including any with a flag before \
+                         the subcommand"
+                            .to_owned()
+                    }
                     rule => rule.to_owned(),
                 },
                 profile: profile.as_str().to_owned(),
@@ -590,7 +552,7 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
             profile
         }
     };
-    let mut command = vec![OsString::from(spec.binary.as_str())];
+    let mut command = vec![OsString::from(cmd.binary.as_str())];
     command.extend(shim_args);
     command.extend(args.into_iter().map(OsString::from_vec));
     start_and_wait(
@@ -605,6 +567,456 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
         &rel,
         spec.tty && foreground,
     )
+}
+
+/// Maximum size of a proxy shim's stdout; more is an error.
+const PROXY_STDOUT_LIMIT: usize = 1024 * 1024;
+
+/// Maximum size of a proxy shim's stderr kept for error messages.
+const PROXY_STDERR_LIMIT: usize = 64 * 1024;
+
+/// Maximum time a proxy shim executable may run on the host before being killed.
+const PROXY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Environment variables passed from the host environment to a proxy shim executable.
+const PROXY_BASE_ENV: [&str; 7] = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TERM"];
+
+struct ProxyCall<'a> {
+    conn: &'a UnixStream,
+    shared: &'a Shared,
+    ctx: &'a Arc<RunContext>,
+    number: u64,
+    shim: &'a ShimName,
+    spec: &'a ShimSpec,
+    cwd: &'a Path,
+    rel: &'a Path,
+    foreground: bool,
+}
+
+fn run_proxy_shim(
+    call: ProxyCall<'_>,
+    args: Vec<Vec<u8>>,
+    cwd_fd: OwnedFd,
+    stdio: [OwnedFd; 3],
+) -> Result<u8, Failure> {
+    let ProxyCall {
+        conn,
+        shared,
+        ctx,
+        number,
+        shim,
+        spec,
+        cwd,
+        rel,
+        foreground,
+    } = call;
+    let name = shim.as_str();
+    let say = |text: &str| say_to(stdio[2].as_fd(), &format!("{name}: {text}"));
+    // Verify the caller's working directory before running the host proxy executable.
+    let (dev, ino) = check_cwd(ctx.loaded.workspace_dir(), rel, cwd_fd.as_fd())?;
+    drop(cwd_fd);
+    let ShimKind::Proxy {
+        resolved: Some(program),
+        ..
+    } = &spec.kind
+    else {
+        return Err(format!("proxy shim {name:?} has no resolved executable path"));
+    };
+    let resp = match exec_proxy_shim(program, &args, shim, cwd, &shared.caller, ctx, &shared.stop) {
+        Ok(resp) => resp,
+        Err(why) => {
+            say(&why);
+            return Ok(EXIT_DENIED);
+        }
+    };
+    if resp.decision == Decision::Deny {
+        let why = resp.reason.as_deref().unwrap_or("denied by proxy");
+        say(why);
+        return Ok(EXIT_DENIED);
+    }
+    let proxy_cmd = resp.cmd.expect("validated by ProxyResponse");
+    let mut command = vec![OsString::from(proxy_cmd.binary.as_str())];
+    command.extend(proxy_cmd.args.iter().map(OsString::from));
+    let command_line: String = command
+        .iter()
+        .map(|a| crate::escape::shell_quote(a.as_os_str().as_bytes()))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    enum ResolvedTarget {
+        Static(Arc<RunContext>, ProfileRef),
+        Inline(Box<InlineProxyCompile>),
+    }
+
+    let (resolved_target, scope_profile_label) = match resp.profile {
+        None => (
+            ResolvedTarget::Static(ctx.clone(), ProfileRef::main()),
+            "main".to_owned(),
+        ),
+        Some(ProxyProfile::Named(p)) => {
+            if let Err(e) = profile_in(&ctx.compiled, Some(p.as_str())) {
+                say(&e.to_string());
+                return Ok(EXIT_DENIED);
+            }
+            let label = p.as_str().to_owned();
+            (ResolvedTarget::Static(ctx.clone(), p), label)
+        }
+        Some(ProxyProfile::Inline(inline)) => {
+            let inline_key = format!("{inline:?}");
+            match compile_inline_proxy_profile(ctx, &shared.caller, *inline) {
+                Ok(compiled_inline) => {
+                    let label = format!("{} ({inline_key})", compiled_inline.target);
+                    (ResolvedTarget::Inline(Box::new(compiled_inline)), label)
+                }
+                Err(why) => {
+                    say(&why);
+                    return Ok(EXIT_DENIED);
+                }
+            }
+        }
+    };
+
+    if resp.decision == Decision::Ask {
+        let Some(approver) = &ctx.approver else {
+            say(
+                "this needs a yes on a stopit server's terminal; run `stopit server` in the \
+                 workspace",
+            );
+            return Ok(EXIT_DENIED);
+        };
+        let rule_desc = match &resp.reason {
+            Some(r) => format!("proxy ({r}): {command_line}"),
+            None => format!("proxy: {command_line}"),
+        };
+        let request = ApprovalRequest::Command {
+            shim: name.to_owned(),
+            rule: rule_desc,
+            profile: scope_profile_label,
+            command: command_line,
+            cwd: crate::escape::escape_bytes(cwd.as_os_str().as_bytes()),
+        };
+        let asker = Asker {
+            run: ctx.run,
+            profile: shared.caller.as_str().to_owned(),
+            command: ctx.command.clone(),
+        };
+        if !approver
+            .decide_with_persist(&asker, &request, None, conn.as_fd())
+            .allows()
+        {
+            say("denied by user");
+            return Ok(EXIT_DENIED);
+        }
+    }
+
+    let (target_ctx, target) = match resolved_target {
+        ResolvedTarget::Static(target_ctx, target) => (target_ctx, target),
+        ResolvedTarget::Inline(compiled_inline) => match compiled_inline.finish(ctx) {
+            Ok(res) => res,
+            Err(why) => {
+                say(&why);
+                return Ok(EXIT_DENIED);
+            }
+        },
+    };
+
+    start_and_wait_checked(
+        conn,
+        shared,
+        number,
+        &target_ctx,
+        &target,
+        &command,
+        stdio,
+        (dev, ino),
+        rel,
+        spec.tty && foreground,
+    )
+}
+
+struct ProxyEnv<'a> {
+    host_env: &'a [(OsString, OsString)],
+    shim: &'a str,
+    workspace: &'a Path,
+    workspace_mount: &'a Path,
+    sandbox_cwd: &'a Path,
+    caller_profile: &'a str,
+    home: &'a Path,
+    session_dir: &'a Path,
+}
+
+fn exec_proxy_shim(
+    program: &Path,
+    args: &[Vec<u8>],
+    shim: &ShimName,
+    sandbox_cwd: &Path,
+    caller_profile: &ProfileRef,
+    ctx: &RunContext,
+    stop: &AtomicBool,
+) -> Result<ProxyResponse, String> {
+    let env = ProxyEnv {
+        host_env: &ctx.host_env,
+        shim: shim.as_str(),
+        workspace: ctx.loaded.workspace_dir(),
+        workspace_mount: &ctx.workspace_mount,
+        sandbox_cwd,
+        caller_profile: caller_profile.as_str(),
+        home: ctx.loaded.host_home(),
+        session_dir: ctx.loaded.session.root(),
+    };
+    run_proxy_process(program, args, &env, stop)
+}
+
+fn run_proxy_process(
+    program: &Path,
+    args: &[Vec<u8>],
+    env: &ProxyEnv<'_>,
+    stop: &AtomicBool,
+) -> Result<ProxyResponse, String> {
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+    use std::process::Command;
+
+    let mut cmd = Command::new(program);
+    cmd.args(args.iter().map(|a| std::ffi::OsStr::from_bytes(a)))
+        .current_dir(env.workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_clear();
+    for (k, v) in env.host_env {
+        if let Some(ks) = k.to_str()
+            && PROXY_BASE_ENV.contains(&ks)
+        {
+            cmd.env(k, v);
+        }
+    }
+    cmd.env("STOPIT_SHIM", env.shim)
+        .env("STOPIT_WORKSPACE", env.workspace)
+        .env("STOPIT_WORKSPACE_MOUNT", env.workspace_mount)
+        .env("STOPIT_CWD", env.sandbox_cwd)
+        .env("STOPIT_CALLER_PROFILE", env.caller_profile)
+        .env("STOPIT_HOME", env.home)
+        .env("STOPIT_SESSION_DIR", env.session_dir);
+    // SAFETY: `setsid` and `sigprocmask` are async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut empty: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut empty);
+            if libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to start proxy {}: {e}", program.display()))?;
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let (done_r, done_w) = crate::proxy::cloexec_pipe()
+        .map_err(|e| format!("failed to read proxy output: {e}"))?;
+
+    let read_capped = |r: &mut dyn Read, limit: usize| -> io::Result<Option<Vec<u8>>> {
+        let mut buf = Vec::new();
+        r.take(limit as u64 + 1).read_to_end(&mut buf)?;
+        Ok((buf.len() <= limit).then_some(buf))
+    };
+
+    std::thread::scope(|s| {
+        let out_handle = s.spawn(move || {
+            let _done = done_w;
+            read_capped(&mut stdout, PROXY_STDOUT_LIMIT)
+        });
+        let err_handle = s.spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr
+                .take(PROXY_STDERR_LIMIT as u64)
+                .read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).trim().to_owned()
+        });
+
+        let deadline = std::time::Instant::now() + PROXY_TIMEOUT;
+        let timed_out = loop {
+            if stop.load(Ordering::SeqCst) {
+                break true;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break true;
+            }
+            let wait_ms = remaining.as_millis().min(100) as libc::c_int;
+            let mut pfd = libc::pollfd {
+                fd: done_r.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: valid pollfd for the duration of the call.
+            let n = unsafe { libc::poll(&mut pfd, 1, wait_ms) };
+            if n > 0 {
+                break false;
+            }
+        };
+
+        if timed_out {
+            let _ = rustix::process::kill_process_group(Pid::from_child(&child), Signal::KILL);
+            let _ = child.wait();
+            return Err("proxy shim timed out".to_owned());
+        }
+
+        let out_res = out_handle.join().expect("stdout reader panicked");
+        if !matches!(out_res, Ok(Some(_))) {
+            let _ = rustix::process::kill_process_group(Pid::from_child(&child), Signal::KILL);
+        }
+        let status = child
+            .wait()
+            .map_err(|e| format!("waiting for proxy failed: {e}"))?;
+        let stderr_text = err_handle.join().expect("stderr reader panicked");
+        let out_bytes = match out_res.map_err(|e| format!("reading proxy stdout failed: {e}"))? {
+            Some(bytes) => bytes,
+            None => {
+                return Err(format!(
+                    "proxy printed more than {PROXY_STDOUT_LIMIT} bytes on stdout"
+                ))
+            }
+        };
+        if !status.success() {
+            return if stderr_text.is_empty() {
+                Err(format!("proxy exited with {status}"))
+            } else {
+                Err(format!("proxy exited with {status}: {stderr_text}"))
+            };
+        }
+        let text = String::from_utf8(out_bytes)
+            .map_err(|e| format!("proxy printed invalid UTF-8 on stdout: {e}"))?;
+        ProxyResponse::from_json_str(&text)
+            .map_err(|e| format!("proxy printed invalid response: {e}"))
+    })
+}
+
+struct InlineProxyCompile {
+    extra: (crate::config::ProviderName, crate::provider::ProviderOutput),
+    generation: u64,
+    compiled: CompiledSession,
+    target: ProfileRef,
+}
+
+impl InlineProxyCompile {
+    fn finish(self, ctx: &Arc<RunContext>) -> Result<(Arc<RunContext>, ProfileRef), String> {
+        let compiled = ctx
+            .loaded
+            .current_grant(&ctx.policy, self.extra, self.generation, self.compiled)
+            .map_err(|e| e.to_string())?;
+        check_inline_proxy_session(&ctx.compiled, &compiled, &self.target)?;
+        let proxy_ctx = Arc::new(RunContext {
+            compiled: Arc::new(compiled),
+            ..(**ctx).clone()
+        });
+        Ok((proxy_ctx, self.target))
+    }
+}
+
+fn check_inline_proxy_session(
+    session: &CompiledSession,
+    compiled: &CompiledSession,
+    target: &ProfileRef,
+) -> Result<Vec<PathBuf>, String> {
+    let compiled_profile = compiled
+        .get(target)
+        .ok_or_else(|| "the inline proxy profile did not compile".to_owned())?;
+    let rw: Vec<PathBuf> = compiled_profile
+        .spec
+        .mounts
+        .iter()
+        .filter(|m| m.mode == PathMode::Rw)
+        .filter_map(|m| match &m.source {
+            crate::resolve::MountSource::Host { path, .. } => Some(
+                compiled_profile
+                    .spec
+                    .canonical_sources
+                    .get(&m.sandbox)
+                    .unwrap_or(path)
+                    .clone(),
+            ),
+            _ => None,
+        })
+        .collect();
+    if !rw.is_empty() {
+        for (name, profile) in session.iter() {
+            let new_rw: Vec<&Path> = rw
+                .iter()
+                .map(PathBuf::as_path)
+                .filter(|w| !profile.spec.untrusted_roots.iter().any(|r| w.starts_with(r)))
+                .collect();
+            if !new_rw.is_empty()
+                && let Some((writable, sandbox, host)) = reached_by_path(&profile.spec, &new_rw)
+            {
+                return Err(format!(
+                    "{} would be writable, and profile {:?} reaches {} below it by path, \
+                     for its mount at {}",
+                    writable.display(),
+                    name.as_str(),
+                    host.display(),
+                    sandbox.display()
+                ));
+            }
+        }
+    }
+    Ok(rw)
+}
+
+fn compile_inline_proxy_profile(
+    ctx: &Arc<RunContext>,
+    caller: &ProfileRef,
+    mut inline: ContributedProfile,
+) -> Result<InlineProxyCompile, String> {
+    if inline
+        .grants
+        .shims
+        .values()
+        .any(|s| matches!(s.kind, ShimKind::Proxy { .. }))
+    {
+        return Err("inline proxy profile may not declare nested proxy shims".to_owned());
+    }
+    inline.grants.sandbox.grant.get_or_insert(false);
+    let is_proxy_ref = |s: &str| s == "proxy" || s == "stopit.proxy";
+    let local_name = if is_proxy_ref(caller.as_str())
+        || matches!(
+            &inline.inherit,
+            crate::config::Inherit::Profile(p) if is_proxy_ref(p.as_str())
+        ) {
+        "proxy-for-proxy"
+    } else {
+        "proxy"
+    };
+    let local: crate::config::ProfileName = local_name.parse().expect("valid profile name");
+    let provider: crate::config::ProviderName = crate::provider::SUPERVISOR_PROVIDER_NAME
+        .parse()
+        .expect("the supervisor's name is a valid provider name");
+    let target = ProfileRef::contributed(&provider, &local);
+    let mut manifest = Manifest::default();
+    manifest.profiles.insert(local, inline);
+    let output = crate::provider::ProviderOutput {
+        profile: ProfileRef::main(),
+        manifest,
+        origin: crate::config::ProviderOrigin::Workspace,
+    };
+    let extra = (provider, output);
+    let (compiled, generation) = ctx
+        .loaded
+        .compile_with(&ctx.policy, extra.clone(), &[])
+        .map_err(|e| e.to_string())?;
+    let rw = check_inline_proxy_session(&ctx.compiled, &compiled, &target)?;
+    let generation = ctx.loaded.admit_grant(&rw, generation);
+    Ok(InlineProxyCompile {
+        extra,
+        generation,
+        compiled,
+        target,
+    })
 }
 
 /// Checks the shim's working directory `cwd_fd` against `rel`, the
@@ -626,6 +1038,33 @@ fn start_and_wait(
 ) -> Result<u8, Failure> {
     let (dev, ino) = check_cwd(ctx.loaded.workspace_dir(), rel, cwd_fd.as_fd())?;
     drop(cwd_fd);
+    start_and_wait_checked(
+        conn,
+        shared,
+        number,
+        ctx,
+        target,
+        command,
+        stdio,
+        (dev, ino),
+        rel,
+        want_tty,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_and_wait_checked(
+    conn: &UnixStream,
+    shared: &Shared,
+    number: u64,
+    ctx: &Arc<RunContext>,
+    target: &ProfileRef,
+    command: &[OsString],
+    stdio: [OwnedFd; 3],
+    (dev, ino): (u64, u64),
+    rel: &Path,
+    want_tty: bool,
+) -> Result<u8, Failure> {
     let in_id = terminal_id(stdio[0].as_fd(), is_readable_mode);
     let out_id = terminal_id(stdio[1].as_fd(), is_writable_mode);
     let (use_pty, queued_signal) = if want_tty && in_id.is_some() && in_id == out_id {
@@ -1529,35 +1968,50 @@ pub(crate) fn start_broker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{Flag, ShimAction, ShimRule, SubcommandPattern};
+    use crate::manifest::{ShimAction, ShimCmd, ShimMatcher, ShimRule};
 
     fn pr(s: &str) -> ProfileRef {
         s.parse().unwrap()
     }
 
-    fn spec(deny: &[&str], rules: Vec<ShimRule>, default: (Decision, Option<&str>)) -> ShimSpec {
+    fn spec(rules: Vec<ShimRule>, default: (Decision, Option<&str>)) -> ShimSpec {
         ShimSpec {
-            binary: "git".parse().unwrap(),
-            args: Vec::new(),
-            deny_flags: deny.iter().map(|f| f.parse::<Flag>().unwrap()).collect(),
             tty: false,
-            default: ShimAction {
-                decision: default.0,
-                profile: default.1.map(pr),
+            kind: ShimKind::Declarative {
+                cmd: ShimCmd {
+                    binary: "git".parse().unwrap(),
+                    args: Vec::new(),
+                },
+                default: ShimAction {
+                    decision: default.0,
+                    profile: default.1.map(pr),
+                },
+                rules,
             },
-            rules,
         }
     }
 
-    fn rule(subs: &[&str], decision: Decision, profile: Option<&str>, deny: &[&str]) -> ShimRule {
+    fn literal_rule(s: &str, decision: Decision, profile: Option<&str>) -> ShimRule {
         ShimRule {
-            subcommand: subs
-                .iter()
-                .map(|s| s.parse::<SubcommandPattern>().unwrap())
-                .collect(),
+            matcher: ShimMatcher::Literal(s.to_owned()),
             decision,
             profile: profile.map(pr),
-            deny_flags: deny.iter().map(|f| f.parse::<Flag>().unwrap()).collect(),
+        }
+    }
+
+    fn prefix_rule(s: &str, decision: Decision, profile: Option<&str>) -> ShimRule {
+        ShimRule {
+            matcher: ShimMatcher::Prefix(s.to_owned()),
+            decision,
+            profile: profile.map(pr),
+        }
+    }
+
+    fn regex_rule(pat: &str, decision: Decision, profile: Option<&str>) -> ShimRule {
+        ShimRule {
+            matcher: ShimMatcher::Regex(pat.parse().unwrap()),
+            decision,
+            profile: profile.map(pr),
         }
     }
 
@@ -1566,174 +2020,60 @@ mod tests {
     }
 
     #[test]
-    fn the_longest_matching_rule_decides_and_ties_go_strict() {
+    fn first_matching_rule_wins_across_literal_prefix_and_regex() {
         let s = spec(
-            &["-c", "--config"],
             vec![
-                rule(&["status", "log"], Decision::Allow, Some("ro"), &[]),
-                rule(&["op *"], Decision::Ask, Some("local"), &[]),
-                rule(&["op log"], Decision::Allow, Some("ro"), &[]),
-                rule(&["push"], Decision::Allow, Some("remote"), &["--force"]),
-                rule(&["push"], Decision::Deny, None, &[]),
+                regex_rule(
+                    r"(?:^| )(?:-c(?:[^ ]|=.*)?|--config(?:=.*)?)(?: |$)",
+                    Decision::Deny,
+                    None,
+                ),
+                literal_rule("", Decision::Allow, Some("ro")),
+                prefix_rule("status", Decision::Allow, Some("ro")),
+                prefix_rule("log", Decision::Allow, Some("ro")),
+                prefix_rule("op log", Decision::Allow, Some("ro")),
+                regex_rule(r"^op [^ ]+(?: .*)?$", Decision::Ask, Some("local")),
+                regex_rule(r"^push(?: .*)? --force(?: |$)", Decision::Deny, None),
+                prefix_rule("push", Decision::Allow, Some("remote")),
             ],
             (Decision::Ask, Some("local")),
         );
         let d = |a: &[&str]| decide(&s, &args(a));
-        assert_eq!(d(&["status"]), (Outcome::Allow(pr("ro")), "status".into()));
-        // Flags after the words are fine; a flag before them, whose value
-        // could read as a word, takes the default.
+        assert_eq!(d(&[]), (Outcome::Allow(pr("ro")), "literal = \"\"".into()));
+        assert_eq!(
+            d(&["status"]),
+            (Outcome::Allow(pr("ro")), "prefix = \"status\"".into())
+        );
         assert_eq!(d(&["log", "-n", "3"]).0, Outcome::Allow(pr("ro")));
         assert_eq!(d(&["--no-pager", "log"]).1, "default");
         assert_eq!(
             d(&["op", "log"]),
-            (Outcome::Allow(pr("ro")), "op log".into())
+            (Outcome::Allow(pr("ro")), "prefix = \"op log\"".into())
         );
         assert_eq!(
             d(&["op", "restore"]),
-            (Outcome::Ask(pr("local")), "op *".into())
+            (
+                Outcome::Ask(pr("local")),
+                "regex = \"^op [^ ]+(?: .*)?$\"".into()
+            )
         );
-        // `op *` needs a word after `op`.
         assert_eq!(d(&["op"]), (Outcome::Ask(pr("local")), "default".into()));
         assert_eq!(d(&["rebase"]).1, "default");
-        // Two rules of one length: the stricter wins.
-        assert!(matches!(d(&["push"]).0, Outcome::Deny(_)));
-        // A word is matched whole.
+        assert!(matches!(d(&["push", "--force"]).0, Outcome::Deny(_)));
+        assert_eq!(
+            d(&["push", "origin", "main"]),
+            (Outcome::Allow(pr("remote")), "prefix = \"push\"".into())
+        );
         assert_eq!(d(&["statuses"]).1, "default");
-    }
-
-    #[test]
-    fn refused_flags_deny_in_every_spelling() {
-        let s = spec(
-            &["-c", "--config", "-C"],
-            vec![
-                rule(&["commit"], Decision::Allow, Some("local"), &["--amend"]),
-                rule(&["show"], Decision::Allow, Some("local"), &[]),
-            ],
-            (Decision::Allow, Some("local")),
-        );
-        for bad in [
-            &["-c", "x=y", "status"][..],
-            &["status", "-cx=y"],
-            &["-xc", "status"],
-            &["--config", "a"],
-            &["--config=a"],
-            &["-C", "/elsewhere", "status"],
-            &["commit", "--amend"],
-            &["commit", "--amend=x"],
-            // `default` decides these, so every rule's flags apply: a flag
-            // before `commit` must not shed its refusals.
-            &["--no-pager", "commit", "--amend"],
-            &["log", "--amend"],
-        ] {
-            assert!(
-                matches!(decide(&s, &args(bad)).0, Outcome::Deny(_)),
-                "{bad:?}"
-            );
-        }
-        for ok in [
-            &["status"][..],
-            &["--configure"],
-            &["commit", "-m", "x"],
-            &["commit", "-am", "x"],
-        ] {
-            assert!(
-                !matches!(decide(&s, &args(ok)).0, Outcome::Deny(_)),
-                "{ok:?}"
-            );
-        }
-        // A rule's own flags do not apply with another rule.
-        assert!(matches!(
-            decide(&s, &args(&["show", "--amend"])).0,
-            Outcome::Allow(_)
-        ));
-    }
-
-    #[test]
-    fn a_flags_value_never_reads_as_a_subcommand() {
-        // Appendix A's git and jj rules, without their refused flags.
-        let git = spec(
-            &[],
-            vec![
-                rule(&["status"], Decision::Allow, Some("local"), &[]),
-                rule(&["reset"], Decision::Ask, Some("local"), &[]),
-            ],
-            (Decision::Ask, Some("local")),
-        );
-        for args_ in [
-            &["-C", "status", "reset"][..],
-            &["--git-dir", "x", "status"],
-        ] {
-            assert_eq!(decide(&git, &args(args_)).1, "default", "{args_:?}");
-        }
-        let jj = spec(
-            &[],
-            vec![
-                rule(&["git fetch"], Decision::Ask, Some("remote"), &[]),
-                rule(&["git push"], Decision::Deny, None, &[]),
-            ],
-            (Decision::Ask, Some("local")),
-        );
-        assert!(matches!(
-            decide(&jj, &args(&["git", "push"])).0,
-            Outcome::Deny(_)
-        ));
-        // `-R fetch` between the words cannot turn a push into a fetch.
-        let (outcome, rule) = decide(&jj, &args(&["git", "-R", "fetch", "push"]));
-        assert_eq!(rule, "default");
-        assert_eq!(outcome, Outcome::Ask(pr("local")));
-    }
-
-    #[test]
-    fn abbreviated_long_flags_are_refused_too() {
-        let s = spec(
-            &["--upload-pack", "--receive-pack", "-c"],
-            vec![rule(
-                &["commit"],
-                Decision::Allow,
-                Some("local"),
-                &["--amend"],
-            )],
-            (Decision::Allow, Some("local")),
-        );
-        for bad in [
-            &["fetch", "--upl=x"][..],
-            &["fetch", "--upload-pa", "x"],
-            &["push", "--rec=x"],
-            &["commit", "--amen"],
-            &["commit", "--ame"],
-            &["status", "-c", "core.pager=x"],
-            // An argument after `--` is still checked; refusing too much
-            // is the safe side.
-            &["commit", "--", "--amend"],
-        ] {
-            assert!(
-                matches!(decide(&s, &args(bad)).0, Outcome::Deny(_)),
-                "{bad:?}"
-            );
-        }
-        // Even one letter after the dashes may abbreviate a flag, but `--`
-        // alone ends the options, and other flags pass.
-        assert!(matches!(
-            decide(&s, &args(&["fetch", "--u"])).0,
-            Outcome::Deny(_)
-        ));
-        for ok in [
-            &["fetch", "--"][..],
-            &["fetch", "--quiet"],
-            &["push", "--all"],
-        ] {
-            assert!(
-                !matches!(decide(&s, &args(ok)).0, Outcome::Deny(_)),
-                "{ok:?}"
-            );
-        }
     }
 
     #[test]
     fn odd_arguments_are_matched_as_bytes() {
         let s = spec(
-            &["--config"],
-            vec![rule(&["status"], Decision::Allow, Some("ro"), &[])],
+            vec![
+                regex_rule(r"(?:^| )--config(?:=.*)?(?: |$)", Decision::Deny, None),
+                prefix_rule("status", Decision::Allow, Some("ro")),
+            ],
             (Decision::Ask, Some("local")),
         );
         assert_eq!(decide(&s, &[]).1, "default");
@@ -1747,8 +2087,69 @@ mod tests {
 
     #[test]
     fn a_denying_default_denies() {
-        let s = spec(&[], vec![], (Decision::Deny, None));
+        let s = spec(vec![], (Decision::Deny, None));
         assert!(matches!(decide(&s, &args(&["x"])).0, Outcome::Deny(_)));
+    }
+
+    #[test]
+    fn run_proxy_process_executes_script_with_clean_env_and_parses_response() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("proxy.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"deny\" ]; then\n\
+               printf '{\"decision\":\"deny\",\"reason\":\"blocked:%s\"}' \"$STOPIT_SHIM\"\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = \"fail\" ]; then\n\
+               echo 'boom' >&2\n\
+               exit 2\n\
+             fi\n\
+             printf '{\"decision\":\"allow\",\"cmd\":[\"echo\",\"%s\",\"%s\",\"%s\"],\"profile\":{\"inherit\":\"main\",\"fs\":{\"ro\":[\"~/extra\"]}}}' \\\n\
+               \"$STOPIT_WORKSPACE_MOUNT\" \"$STOPIT_CWD\" \"$SECRET_LEAK\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let host_env = vec![
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            (OsString::from("SECRET_LEAK"), OsString::from("should-not-leak")),
+        ];
+        let env = ProxyEnv {
+            host_env: &host_env,
+            shim: "mycli",
+            workspace: dir.path(),
+            workspace_mount: Path::new("/workspace"),
+            sandbox_cwd: Path::new("/workspace/sub"),
+            caller_profile: "main",
+            home: Path::new("/home/u"),
+            session_dir: Path::new("/run/u/stopit-1"),
+        };
+        let stop = AtomicBool::new(false);
+
+        let allow_resp = run_proxy_process(&script, &args(&["ok"]), &env, &stop).unwrap();
+        assert_eq!(allow_resp.decision, Decision::Allow);
+        let cmd = allow_resp.cmd.unwrap();
+        assert_eq!(cmd.binary.as_str(), "echo");
+        assert_eq!(
+            cmd.args,
+            vec![
+                "/workspace".to_owned(),
+                "/workspace/sub".to_owned(),
+                "".to_owned(),
+            ]
+        );
+        assert!(matches!(allow_resp.profile, Some(ProxyProfile::Inline(_))));
+
+        let deny_resp = run_proxy_process(&script, &args(&["deny"]), &env, &stop).unwrap();
+        assert_eq!(deny_resp.decision, Decision::Deny);
+        assert_eq!(deny_resp.reason.as_deref(), Some("blocked:mycli"));
+
+        let err = run_proxy_process(&script, &args(&["fail"]), &env, &stop).unwrap_err();
+        assert!(err.contains("boom"), "{err}");
     }
 
     #[test]

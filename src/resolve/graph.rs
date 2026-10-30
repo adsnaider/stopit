@@ -260,8 +260,12 @@ impl ManifestScope<'_> {
     /// `profile`) to its resolved full name.
     fn resolve_shims(&self, grants: &mut Grants, profile: &ProfileRef) -> Result<(), ProfileError> {
         for (shim, spec) in &mut grants.shims {
-            let fields = std::iter::once((ShimField::Default, &mut spec.default.profile)).chain(
-                spec.rules
+            let crate::manifest::ShimKind::Declarative { default, rules, .. } = &mut spec.kind
+            else {
+                continue;
+            };
+            let fields = std::iter::once((ShimField::Default, &mut default.profile)).chain(
+                rules
                     .iter_mut()
                     .enumerate()
                     .map(|(i, rule)| (ShimField::Rule(i), &mut rule.profile)),
@@ -524,8 +528,12 @@ mod tests {
             assert!(seen.insert(p.clone()), "{p} listed twice");
             for c in &node.contributions {
                 for spec in c.grants.shims.values() {
-                    let targets = std::iter::once(&spec.default.profile)
-                        .chain(spec.rules.iter().map(|r| &r.profile));
+                    let crate::manifest::ShimKind::Declarative { default, rules, .. } = &spec.kind
+                    else {
+                        continue;
+                    };
+                    let targets =
+                        std::iter::once(&default.profile).chain(rules.iter().map(|r| &r.profile));
                     for t in targets.flatten() {
                         assert!(g.get(t).is_some(), "shim target {t} missing");
                     }
@@ -570,8 +578,11 @@ mod tests {
             .find(|c| c.provider.as_str() == provider)
             .unwrap_or_else(|| panic!("no contribution of {provider} to {profile}"));
         let spec = &c.grants.shims[&shim.parse::<ShimName>().unwrap()];
-        std::iter::once(&spec.default.profile)
-            .chain(spec.rules.iter().map(|r| &r.profile))
+        let crate::manifest::ShimKind::Declarative { default, rules, .. } = &spec.kind else {
+            panic!("expected declarative shim");
+        };
+        std::iter::once(&default.profile)
+            .chain(rules.iter().map(|r| &r.profile))
             .map(|t| t.as_ref().map(ProfileRef::as_str))
             .collect()
     }
@@ -579,13 +590,13 @@ mod tests {
     /// A vcs-like manifest written with plain references.
     const VCS_PLAIN: &str = r#"
         [shims.jj]
-        binary = "jj"
+        cmd = "jj"
         default = { decision = "ask", profile = "local" }
         rules = [
-          { subcommand = ["status"], decision = "allow", profile = "ro" },
-          { subcommand = ["git push"], decision = "ask", profile = "remote" },
-          { subcommand = ["rm"], decision = "deny" },
-          { subcommand = ["x"], decision = "allow", profile = "main" },
+          { prefix = "status", decision = "allow", profile = "ro" },
+          { prefix = "git push", decision = "ask", profile = "remote" },
+          { prefix = "rm", decision = "deny" },
+          { prefix = "x", decision = "allow", profile = "main" },
         ]
 
         [profiles.ro]
@@ -594,7 +605,7 @@ mod tests {
         [profiles.local]
         fs.rw = ["{workspace}/.git"]
         [profiles.local.shims.jj-remote]
-        binary = "jj"
+        cmd = "jj"
         default = { decision = "ask", profile = "remote" }
 
         [profiles.remote]
@@ -604,13 +615,13 @@ mod tests {
     /// The same manifest, written with full names.
     const VCS_FULL: &str = r#"
         [shims.jj]
-        binary = "jj"
+        cmd = "jj"
         default = { decision = "ask", profile = "vcs.local" }
         rules = [
-          { subcommand = ["status"], decision = "allow", profile = "vcs.ro" },
-          { subcommand = ["git push"], decision = "ask", profile = "vcs.remote" },
-          { subcommand = ["rm"], decision = "deny" },
-          { subcommand = ["x"], decision = "allow", profile = "main" },
+          { prefix = "status", decision = "allow", profile = "vcs.ro" },
+          { prefix = "git push", decision = "ask", profile = "vcs.remote" },
+          { prefix = "rm", decision = "deny" },
+          { prefix = "x", decision = "allow", profile = "main" },
         ]
 
         [profiles.ro]
@@ -619,7 +630,7 @@ mod tests {
         [profiles.local]
         fs.rw = ["{workspace}/.git"]
         [profiles.local.shims.jj-remote]
-        binary = "jj"
+        cmd = "jj"
         default = { decision = "ask", profile = "vcs.remote" }
 
         [profiles.remote]
@@ -718,10 +729,10 @@ mod tests {
                 "vcs",
                 "main",
                 r#"
-                shims.h = { binary = "h", default = { decision = "allow", profile = "harness" } }
+                shims.h = { cmd = "h", default = { decision = "allow", profile = "harness" } }
                 [profiles.local]
                 inherit = "harness"
-                shims.l = { binary = "l", default = { decision = "allow", profile = "harness" } }
+                shims.l = { cmd = "l", default = { decision = "allow", profile = "harness" } }
                 "#,
             )],
         );
@@ -739,7 +750,7 @@ mod tests {
                 "vcs",
                 "main",
                 r#"
-                shims.a = { binary = "a", default = { decision = "allow", profile = "local" } }
+                shims.a = { cmd = "a", default = { decision = "allow", profile = "local" } }
                 [profiles.local]
                 [profiles.child]
                 inherit = "local"
@@ -784,9 +795,9 @@ mod tests {
                     "main",
                     r#"
                     [shims.s]
-                    binary = "s"
+                    cmd = "s"
                     default = { decision = "ask", profile = "later.x" }
-                    rules = [{ subcommand = ["a"], decision = "allow", profile = "later.x" }]
+                    rules = [{ prefix = "a", decision = "allow", profile = "later.x" }]
                     "#,
                 ),
                 out("later", "main", "[profiles.x]"),
@@ -809,7 +820,7 @@ mod tests {
                 out(
                     "other",
                     "main",
-                    r#"shims.s = { binary = "s", default = { decision = "allow", profile = "vcs.ro" } }"#,
+                    r#"shims.s = { cmd = "s", default = { decision = "allow", profile = "vcs.ro" } }"#,
                 ),
             ],
         );
@@ -822,7 +833,7 @@ mod tests {
                 out(
                     "other",
                     "main",
-                    r#"shims.s = { binary = "s", default = { decision = "allow", profile = "ro" } }"#,
+                    r#"shims.s = { cmd = "s", default = { decision = "allow", profile = "ro" } }"#,
                 ),
             ],
         );
@@ -844,7 +855,7 @@ mod tests {
             profile = "harness"
             [provider.sandbox]
             env.pass = ["API_KEY"]
-            shims.s = { binary = "s", default = { decision = "allow", profile = "harness" } }
+            shims.s = { cmd = "s", default = { decision = "allow", profile = "harness" } }
 
             [[provider]]
             type = "config"
@@ -1087,17 +1098,17 @@ mod tests {
         // profile.
         let cases = [
             (
-                r#"shims.s = { binary = "s", default = { decision = "allow", profile = "nope" } }"#,
+                r#"shims.s = { cmd = "s", default = { decision = "allow", profile = "nope" } }"#,
                 r#"shim "s" (default) from provider "vcs", granted to profile "main", targets unknown profile "nope""#,
             ),
             (
                 r#"
                 [shims.s]
-                binary = "s"
+                cmd = "s"
                 default = { decision = "deny" }
                 rules = [
-                  { subcommand = ["a"], decision = "deny" },
-                  { subcommand = ["b"], decision = "ask", profile = "vcs.nope" },
+                  { prefix = "a", decision = "deny" },
+                  { prefix = "b", decision = "ask", profile = "vcs.nope" },
                 ]
                 "#,
                 r#"shim "s" (rule 2) from provider "vcs", granted to profile "main", targets unknown profile "vcs.nope""#,
@@ -1105,7 +1116,7 @@ mod tests {
             (
                 r#"
                 [profiles.p]
-                shims.s = { binary = "s", default = { decision = "ask", profile = "q" } }
+                shims.s = { cmd = "s", default = { decision = "ask", profile = "q" } }
                 "#,
                 r#"shim "s" (default) from provider "vcs", granted to profile "vcs.p", targets unknown profile "q""#,
             ),
@@ -1119,7 +1130,7 @@ mod tests {
             vec![out(
                 "creds",
                 "harness",
-                r#"shims.s = { binary = "s", default = { decision = "allow", profile = "x.y" } }"#,
+                r#"shims.s = { cmd = "s", default = { decision = "allow", profile = "x.y" } }"#,
             )],
         );
         assert_eq!(

@@ -588,7 +588,11 @@ impl Approver {
                         escape_message(&err)
                     ),
                 },
-                _ => "allowed and persisted to .stopit.toml".to_owned(),
+                (Some(_), None) => {
+                    "allowed for this session (this request cannot be persisted to .stopit.toml)"
+                        .to_owned()
+                }
+                (None, _) => "allowed and persisted to .stopit.toml".to_owned(),
             },
             Verdict::DeniedByUser | Verdict::Denied => "denied".to_owned(),
         };

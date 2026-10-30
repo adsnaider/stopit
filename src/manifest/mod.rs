@@ -39,8 +39,9 @@ pub use env::{EnvGrants, EnvName, EnvPattern, EnvValue, SearchPathEntry};
 pub use network::{Domain, NetworkGrants};
 pub use sandbox::{OptInSyscall, SandboxGrants, ShareableNamespace};
 pub use shim::{
-    BinaryName, Flag, GRANT_SHIM, ShimAction, ShimArg, ShimName, ShimRule, ShimSpec,
-    SubcommandPattern,
+    BinaryName, GRANT_SHIM, ProxyCmd, ProxyProfile, ProxyResponse, ProxySource, ShimAction,
+    ShimArg, ShimCmd, ShimKind, ShimMatcher, ShimName, ShimRegex, ShimRule, ShimSpec,
+    SubcommandPattern, validate_literal, validate_prefix,
 };
 pub use system::{DevMode, EtcFile, GroupName, SandboxHome, SystemGrants};
 
@@ -1959,25 +1960,25 @@ mod tests {
         let m = toml_ok(
             r#"
             fs.rw = ["{workspace}"]
-            shims.sh = { binary = "fish", default = { decision = "allow", profile = "main" } }
+            shims.sh = { cmd = "fish", default = { decision = "allow", profile = "main" } }
             [profiles.a]
             inherit = "none"
-            shims.sh = { binary = "bash", default = { decision = "deny" } }
+            shims.sh = { cmd = "bash", default = { decision = "deny" } }
             network.mode = "loopback"
             "#,
         );
         assert_eq!(m.grants.fs.rw, pps(&["{workspace}"]));
         assert_eq!(m.grants.shims.len(), 1);
-        assert_eq!(
-            m.grants.shims[&"sh".parse().unwrap()].binary.as_str(),
-            "fish"
-        );
+        let ShimKind::Declarative { cmd, .. } = &m.grants.shims[&"sh".parse().unwrap()].kind else {
+            panic!("expected declarative shim");
+        };
+        assert_eq!(cmd.binary.as_str(), "fish");
         let a = &m.profiles[&pname("a")];
         assert_eq!(a.inherit, Inherit::None);
-        assert_eq!(
-            a.grants.shims[&"sh".parse().unwrap()].binary.as_str(),
-            "bash"
-        );
+        let ShimKind::Declarative { cmd, .. } = &a.grants.shims[&"sh".parse().unwrap()].kind else {
+            panic!("expected declarative shim");
+        };
+        assert_eq!(cmd.binary.as_str(), "bash");
         assert_eq!(
             a.grants.network.mode,
             Some(crate::policy::NetworkMode::Loopback)

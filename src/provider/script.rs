@@ -76,6 +76,8 @@ pub struct ScriptProvider {
     /// The canonical form of `source`: both the executed and the protected
     /// file. Resolved on first use.
     canonical: OnceLock<PathBuf>,
+    /// Canonical paths of `protect = true` proxy shims returned by this script.
+    protected_proxies: OnceLock<Vec<PathBuf>>,
     base_dir: PathBuf,
     protect: bool,
     config: toml::Table,
@@ -121,6 +123,7 @@ impl ScriptProvider {
             name,
             source: base_dir.join(source.as_path()),
             canonical: OnceLock::new(),
+            protected_proxies: OnceLock::new(),
             base_dir: base_dir.to_owned(),
             protect,
             config,
@@ -417,11 +420,19 @@ impl Provider for ScriptProvider {
     /// directory (DESIGN.md §3.6), is not implemented yet (§11), so such
     /// files need `protected` rules of their own.
     fn protected_paths(&self) -> Result<Vec<PathBuf>, ProviderError> {
-        if self.protect {
-            Ok(vec![self.canonical_source()?.to_owned()])
+        let mut out = if self.protect {
+            vec![self.canonical_source()?.to_owned()]
         } else {
-            Ok(Vec::new())
+            Vec::new()
+        };
+        if let Some(proxies) = self.protected_proxies.get() {
+            for p in proxies {
+                if !out.contains(p) {
+                    out.push(p.clone());
+                }
+            }
         }
+        Ok(out)
     }
 
     /// Runs the script and parses its manifest. The grants apply to `main`.
@@ -439,12 +450,15 @@ impl Provider for ScriptProvider {
             script: self.source.clone(),
             error,
         })?;
-        let manifest =
+        let mut manifest =
             Manifest::from_json_str(&text).map_err(|error| ProviderError::InvalidManifest {
                 name: self.name.clone(),
                 script: self.source.clone(),
                 error,
             })?;
+        let protected =
+            super::resolve_manifest_proxies(&self.name, &self.base_dir, &mut manifest, ctx)?;
+        let _ = self.protected_proxies.set(protected);
         Ok(ProviderOutput {
             profile: ProfileRef::main(),
             manifest,

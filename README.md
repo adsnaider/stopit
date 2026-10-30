@@ -280,8 +280,9 @@ A shim runs a command in a fresh sandbox of another profile. Its rules pick the 
 name = "cargo-shim"
 type = "config"
 [provider.sandbox]
-shims.cargo = { binary = "cargo", deny_flags = ["--config"], default = { decision = "allow", profile = "main" }, rules = [
-  { subcommand = ["publish"], decision = "ask", profile = "publish" },
+shims.cargo = { cmd = "cargo", default = { decision = "allow", profile = "main" }, rules = [
+  { regex = '(?:^| )--config(?:=.*)?(?: |$)', decision = "deny" },
+  { prefix = "publish", decision = "ask", profile = "publish" },
 ] }
 
 [[provider]]
@@ -292,7 +293,7 @@ profile = "publish"
 network = { mode = "proxy", allow_domains = ["crates.io", "index.crates.io", "static.crates.io"] }
 ```
 
-The publish profile still has no registry token, since the default filter drops `CARGO_REGISTRY_TOKEN`. In `args`, standalone `"{workspace}"` and `"{workspace}/..."` arguments expand to the sandbox workspace mount (pass flags and paths as separate arguments, such as `["-R", "{workspace}"]`). Set `tty = true` on a shim for a full-screen TUI or interactive shell so foreground terminal calls get a pseudo-terminal and window-size updates of their own. DESIGN.md section 7.1 describes the rules.
+The publish profile still has no registry token, since the default filter drops `CARGO_REGISTRY_TOKEN`. In `cmd = ["binary", ...args]`, standalone `"{workspace}"` and `"{workspace}/..."` arguments expand to the sandbox workspace mount (pass flags and paths as separate arguments, such as `cmd = ["jj", "-R", "{workspace}"]`). Rules are evaluated in first-match-wins order against the caller's space-joined arguments (`literal`, `prefix`, or `regex`). For full custom argument parsing or dynamic per-invocation profiles, set `proxy = "./my-proxy.sh"` on a shim instead. Set `tty = true` on a shim for a full-screen TUI or interactive shell so foreground terminal calls get a pseudo-terminal and window-size updates of their own. DESIGN.md section 7.1 describes the rules.
 
 ### Mount the project at its host path
 

@@ -4180,7 +4180,7 @@ mod tests {
                 "main",
                 "fs.rw = [\"{workspace}\"]\nfs.ephemeral = [\"~\"]\nsystem.proc = true\n\
                  env.pass = [\"TERM\"]\nenv.set = { EDITOR = \"vi\" }\n\
-                 shims.jj = { binary = \"jj\", default = { decision = \"deny\" } }"
+                 shims.jj = { cmd = \"jj\", default = { decision = \"deny\" } }"
             ),
             prov(
                 "h",

@@ -399,7 +399,7 @@ view = "masked"
   "env":     { "pass": ["TERM"], "deny": ["*_TOKEN"], "set": { "LANG": "C.UTF-8" }, "path_prepend": ["/nix/store/…/bin"] },
   "network": { "mode": "loopback", "allow_domains": [] },
   "sandbox": { "share": [], "allow_syscalls": [], "grant": true },
-  "shims":   { "<name>": { "binary": "…", "deny_flags": [], "default": { "decision": "ask", "profile": "main" }, "rules": [] } },
+  "shims":   { "<name>": { "cmd": ["…"], "default": { "decision": "ask", "profile": "main" }, "rules": [] } },
   "profiles": { "<name>": { "inherit": "main", "fs": {}, "env": {}, "network": {}, "shims": {} } }
 }
 ```
@@ -421,12 +421,10 @@ pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
     /// Static grants, contributed profiles and shims, computed at session start.
     fn manifest(&self, ctx: &ProviderContext) -> Result<Manifest>;
-    /// Optional runtime logic invoked by the broker (e.g. argv parsing, prompt facts).
-    fn handlers(&self) -> Vec<Box<dyn BrokerHandler>> { Vec::new() }
 }
 ```
 
-Built-in providers can implement `handlers` in Rust (the `vcs` provider parses `jj`/`git` global flags, resolves push URLs for prompts, and resolves the on-disk VCS layout, §7.3.1). `config` and `script` providers declare shims with the declarative rule format only; a script-based handler protocol may come later.
+`config`, `script`, and built-in `vcs` providers emit manifests with declarative (`cmd` + `default` + `rules`) or host-proxy (`proxy`) shims (§7.1).
 
 **Provider types:**
 
@@ -682,35 +680,41 @@ When `__init` fails, it prints `stopit __init: ...` to stderr and exits 127 when
 * **Lifecycle:** the broker relays signals (Ctrl+C, harness timeouts killing the shim) to the tool sandbox, kills the tool sandbox if the shim's connection closes, and returns the exit status to the shim.
 * **Terminal (`tty = true`):** by default, `tty` is `false`, so the broker detaches the command into a new session with `bwrap --new-session` and passes the shim's standard descriptors through, preserving shell typeahead for short commands such as `jj` and `git`. When `tty = true` and the shim runs in the foreground of its controlling terminal with a readable stdin and writable stdout on the same concrete terminal endpoint, the broker confirms after policy and approval checks that the shim still holds the foreground and has ignored job-control signals. The broker then opens a fresh pseudo-terminal on the host, puts the caller's terminal into raw mode, and attaches the slave to stdin, stdout, and any stderr sharing that terminal as the target sandbox's controlling terminal. The broker relays between the caller's terminal and the inner master through `OutputFilter` with `ClipboardPolicy::Allow` so the session's outer `OutputFilter` enforces `clipboard_write`, forwards `SIGWINCH` resizes from `stopit __shim`, and resets terminal modes before restoring the caller's `termios` on exit. Multiplexor and master devices such as `/dev/tty` and `/dev/ptmx`, pipelines, redirected stdio, and background or detached calls run in detached mode without touching terminal settings.
 * **Environment:** the broker discards the shim's environment and builds a clean one from the target profile, out of the environment the run started with.
-* **Decisions.** The broker finds the shim among the caller's profile's shims and matches the arguments. A refused flag anywhere in the arguments denies. That covers an argument equal to it, one starting with it and `=`, an abbreviation of a long flag (`--upl` for `--upload-pack`, as git accepts any unambiguous prefix), and, for a one-letter flag such as `-c`, a cluster of one-letter flags that holds its letter. The broker cannot tell a cluster from a flag with its value attached, so `-mchore` is refused where `-c` is, and `-m chore` passes. Otherwise the rule whose pattern matches the most leading arguments wins, counting only the words before the first flag, since a flag before a word may take a value that would read as one. So `git --no-pager push` matches no `push` rule and takes the default, which should be no looser than the strictest rule it stands in for. When the default decides, the refused flags of every rule apply too, so `git --no-pager commit --amend` is refused when the `commit` rule refuses `--amend`. A word beats a `*` in its place, and among patterns alike the strictest decision wins. `ask` goes to the server's prompt (§5.4), which shows the binary with its arguments, the target profile, the working directory, the shim and the rule, and when the default decides, says it covers calls no rule matches, including any with a flag before the subcommand. An answer for the session covers that rule. A standalone run has no one to ask, so `ask` denies there and says to run `stopit server`. A refused command exits with `126` and says why on its stderr, as `[stopit: <shim>: denied by user]` or `[stopit: <shim>: the shim's rules deny ...]`.
-* **Binary resolution:** the broker runs the shim's `binary` as found in the target profile's `PATH`, without `/run/stopit/bin` in any spelling (compared by device and inode).
-* Unlisted subcommands use the shim's `default` (required; conventionally `ask`).
+* **Decisions.** The broker finds the shim among the caller's profile's shims and dispatches by shim kind:
+  * **Declarative shims (`cmd` + `default` + `rules`):** the broker joins the caller's arguments with single ASCII spaces (`args.join(b" ")`) and evaluates `rules` in **first-match-wins** order. Each rule specifies `decision = "allow" | "ask" | "deny"`, `profile = "<profile>"` (required for `allow` and `ask`, forbidden for `deny`), and **exactly one** matcher: `literal = "<string>"` (exact match; `""` matches zero arguments), `prefix = "<string>"` (argument-boundary prefix match: `joined == prefix` or `joined.starts_with("{prefix} ")`), or `regex = "<pattern>"` (compiled at load time via `regex_automata::meta::Regex` with `dot_matches_new_line(true)`, `unicode(false)`, and `utf8(false)`). If no rule matches, the shim's `default` decides.
+  * **Proxy shims (`proxy`):** after verifying the caller's working directory on the host, the broker executes the resolved host proxy executable in its own session (`setsid`, `stdin = /dev/null`) with the caller's arguments (`argv`), a clean base environment (`PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `TERM`), and `STOPIT_SHIM`, `STOPIT_WORKSPACE`, `STOPIT_WORKSPACE_MOUNT`, `STOPIT_CWD`, `STOPIT_CALLER_PROFILE`, `STOPIT_HOME`, and `STOPIT_SESSION_DIR`. The proxy prints a JSON `ProxyResponse` on stdout (`{ "decision": "allow" | "ask" | "deny", "cmd": ["binary", ...], "profile": "vcs.remote" | { "inherit": "...", ... }, "reason": "..." }`). When `profile` is an inline profile object, the broker compiles it dynamically against the session (as `stopit.proxy`) before launching the command. With `protect = true` (the default), the proxy executable is resolved via `resolve_script_path` and automatically protected across every profile in the session.
+  * **Prompts and denials:** `ask` goes to the server's prompt (§5.4), which shows the binary with its arguments, the target profile, the working directory, the shim, and the matched rule. Answering `[s]` remembers the approval for that rule (or, for a proxy shim, that exact command and profile) for the session; answering `[p]` on a declarative shim persists the rule as `decision = "allow"` in `.stopit.toml`. A standalone run has no one to ask, so `ask` denies there and says to run `stopit server`. A refused command exits with `126` and says why on its stderr, as `[stopit: <shim>: denied by user]` or `[stopit: <shim>: the shim's rules deny ...]`.
+* **Binary resolution:** the broker runs the shim's `cmd` binary (or the proxy response's `cmd[0]`) as found in the target profile's `PATH`, without `/run/stopit/bin` in any spelling (compared by device and inode).
+* Unmatched calls on a declarative shim use the shim's `default` (required; conventionally `ask`).
 
 **Shim declaration** (in any manifest):
 
 ```toml
+# Declarative matching shim:
 [provider.sandbox.shims.cargo-publish]
-binary     = "cargo"
-args       = []          # put before the caller's arguments, unchecked by the rules
-deny_flags = ["--config"]
-tty        = false       # give foreground terminal calls a PTY of their own when true
-default    = { decision = "ask", profile = "publish" }
-rules      = [
-  { subcommand = ["publish"], decision = "ask", profile = "publish" },
+cmd     = ["cargo"]      # bare binary string "cargo" or non-empty list ["cargo", ...fixed_args]
+tty     = false          # give foreground terminal calls a PTY of their own when true
+default = { decision = "ask", profile = "publish" }
+rules   = [
+  { regex = '(?:^| )--config(?:=.*)?(?: |$)', decision = "deny" },
+  { prefix = "publish", decision = "ask", profile = "publish" },
 ]
+
+# Proxy shim (host executable):
+[provider.sandbox.shims.custom-git]
+proxy   = "./scripts/git-shim-proxy.py"  # absolute, ~/..., or relative to config dir
+protect = true                           # default true: auto-protect the proxy executable
+tty     = false
 ```
 
-* `binary` and `default` are **required**. `binary` is never inferred from the shim name, and `default` has no implicit value because `ask`/`allow` need a target profile.
-* `args` go between the binary and the caller's arguments. The rules match only the caller's arguments, so `args` may hold a flag the rules refuse (the `jj` shim runs `jj --no-pager -R <workspace>` and refuses `-R` from the caller). Each is non-empty and holds no NUL. Exact `"{workspace}"` and `"{workspace}/…"` (with normalized relative components) expand to the sandbox workspace mount; `{workspace}` elsewhere in an argument (such as `"--config={workspace}/a.toml"`) is rejected so flags and paths are passed as separate arguments, and every other argument is passed literally. The prompt shows the expanded arguments.
+* A shim sets **either** `cmd` + `default` (+ optional `rules`) **or** `proxy` (+ optional `protect`), never both.
+* In `cmd = ["binary", ...args]`, `args` go between `binary` and the caller's arguments. The rules match only the caller's arguments, so `cmd` may hold a flag the rules refuse (the `jj` shim runs `jj --no-pager -R {workspace}` and refuses `-R` from the caller). Each fixed argument is non-empty and holds no NUL. Exact `"{workspace}"` and `"{workspace}/…"` (with normalized relative components) expand to the sandbox workspace mount; `{workspace}` elsewhere in an argument (such as `"--config={workspace}/a.toml"`) is rejected so flags and paths are passed as separate arguments, and every other argument is passed literally. The prompt shows the expanded arguments.
 * A rule or default with `decision = "deny"` must not name a `profile`; `allow` and `ask` must.
 * Shim names `stopit` and `stopit-grant` are reserved.
-* Each entry in a rule's `subcommand` list is one or more tokens separated by single spaces (`[a-z0-9][a-z0-9_-]*`); the last token may be `*` (e.g. `bookmark *`). A lone `*` is rejected (use `default`), and flags are not subcommands.
 
 ### 7.2 Global-flag parsing
 
-So far there are no handlers. The `vcs` shims are declarative like every other shim (§7.1). The words before the first flag pick a rule, and the refused flags below apply anywhere in `argv`, in every spelling §7.1 lists. A global flag before the subcommand sends the call to the default, which asks. The rest of this section is the plan.
-
-Policy is matched after parsing each tool's global options with the tool's own grammar, so that flags anywhere in `argv` are seen. The `vcs` provider's handlers implement this for `jj` (`-R/--repository`, `--at-op`, `--ignore-working-copy`, `--config`, `--config-file`, `--config-toml`) and `git` (`-C`, `-c`, `--git-dir`, `--work-tree`, `--exec-path`, `--config-env`, `--upload-pack`, `--receive-pack`). Config-injection flags are denied outright. Declarative shims (from `config`/`script` providers) match on the first non-flag arguments and `deny_flags`.
+Declarative shims (including the built-in `vcs` provider's `jj` and `git` shims) match the caller's space-joined arguments in first-match-wins order using `literal`, `prefix`, and `regex` rules (§7.1), placing `regex` deny rules for dangerous flags first. When full tool-grammar flag parsing or dynamic target profile construction is needed, a shim can use `proxy = "<path>"` to inspect `argv` on the host and return a `ProxyResponse` with a named or inline profile.
 
 ### 7.3 The `vcs` provider
 
@@ -763,7 +767,7 @@ Pointer files (`.git` gitfiles, `.jj/repo`) live in the agent-writable workspace
 | `vcs.local` | RW | Git config files in every resolved git dir (`config`, `config.worktree`, `info/attributes`; `hooks/` masked as an empty stub), submodule configs/hooks (`modules/*/config`, `modules/*/hooks/`), worktree configs (`worktrees/*/config.worktree`); legacy `.jj/repo/config.toml` if present | RW | None (filtered signing agent if `signing = true`, §7.3.4) |
 | `vcs.remote` | RW | Same as `vcs.local` | RW | Per-command tunnel to the resolved remote + filtered SSH agent (§7.3.3). Only created if `fetch` or `push` is not `"deny"` |
 
-* **Shims** `jj` and `git` (per `tools`) with the default policy (§7.4) and the runtime handlers (flag parsing, remote resolution, push URL/commit resolution for prompts).
+* **Shims** `jj` and `git` (per `tools`) with the default policy (§7.4).
 
 #### 7.3.3 Remote access (`fetch` and `push`)
 
@@ -857,7 +861,7 @@ profile = "harness"
 fs.rw   = ["~/.claude"]
 network = { mode = "proxy", allow_domains = ["api.anthropic.com"] }
 env.set = { SHELL = "/run/stopit/bin/sh-main" }
-shims.sh-main = { binary = "fish", default = { decision = "allow", profile = "main" } }
+shims.sh-main = { cmd = "fish", default = { decision = "allow", profile = "main" } }
 ```
 
 ```
@@ -1149,7 +1153,7 @@ signing = false
 # Plus at least one user provider granting tools (required).
 ```
 
-For reference, the `vcs` provider's manifest is ordinary manifest data plus Rust handlers. For a **plain colocated repository** (all metadata inside `{workspace}`), its grants are equivalent to the following. For worktrees, jj secondary workspaces and subdirectory workspaces, the provider adds the resolved backing-storage and checkout-root paths (§7.3.1) as concrete absolute paths in the same sections. Inside a manifest, contributed profiles use plain names and references (§3.6); from outside they appear as `vcs.ro`, `vcs.local`, `vcs.remote`.
+For reference, the `vcs` provider's manifest is ordinary manifest data. For a **plain colocated repository** (all metadata inside `{workspace}`), its grants are equivalent to the following. For worktrees, jj secondary workspaces and subdirectory workspaces, the provider adds the resolved backing-storage and checkout-root paths (§7.3.1) as concrete absolute paths in the same sections. Inside a manifest, contributed profiles use plain names and references (§3.6); from outside they appear as `vcs.ro`, `vcs.local`, `vcs.remote`.
 
 ```toml
 [provider.sandbox.fs]                      # applied to "main"
@@ -1174,28 +1178,47 @@ inherit = "local"
 network.mode = "proxy"                     # domains derived from the resolved remote at approval time
 
 [provider.sandbox.shims.jj]
-binary = "jj"
-deny_flags = ["--config", "--config-file", "--config-toml"]
+cmd = ["jj", "--no-pager", "-R", "{workspace}"]
 default = { decision = "ask", profile = "local" }
 rules = [
-  { subcommand = ["status", "diff", "log", "show", "evolog", "op log"], decision = "allow", profile = "ro" },
-  { subcommand = ["new", "commit", "describe"], decision = "allow", profile = "local", deny_flags = ["-A", "--insert-after", "-B", "--insert-before"] },
-  { subcommand = ["git fetch", "git clone"], decision = "ask", profile = "remote" },   # from `fetch`
-  { subcommand = ["git push"], decision = "ask", profile = "remote" },                 # from `push`
+  { regex = '(?:^| )(?:-R[^ ]*|--(?:config|config-file|config-toml|repository|tool|interactive)(?:=.*)?|-i)(?: |$)', decision = "deny" },
+  { prefix = "status", decision = "allow", profile = "ro" },
+  { prefix = "diff", decision = "allow", profile = "ro" },
+  { prefix = "log", decision = "allow", profile = "ro" },
+  { prefix = "show", decision = "allow", profile = "ro" },
+  { prefix = "evolog", decision = "allow", profile = "ro" },
+  { prefix = "op log", decision = "allow", profile = "ro" },
+  { prefix = "git fetch", decision = "ask", profile = "remote" },   # from `fetch`
+  { prefix = "git clone", decision = "ask", profile = "remote" },   # from `fetch`
+  { prefix = "git push", decision = "ask", profile = "remote" },    # from `push`
+  { regex = '(?:^| )(?:-[AB][^ ]*|--insert-(?:after|before)(?:=.*)?)(?: |$)', decision = "deny" },
+  { prefix = "new", decision = "allow", profile = "local" },
+  { prefix = "commit", decision = "allow", profile = "local" },
+  { prefix = "describe", decision = "allow", profile = "local" },
 ]
 
 [provider.sandbox.shims.git]
-binary = "git"
-deny_flags = ["-c", "--config-env", "--exec-path", "--upload-pack", "--receive-pack"]
+cmd = ["git", "--no-pager"]
 default = { decision = "ask", profile = "local" }
 rules = [
-  { subcommand = ["status", "diff", "log", "show", "add", "commit"], decision = "allow", profile = "local" },
-  { subcommand = ["fetch", "pull", "ls-remote", "remote update", "clone"], decision = "ask", profile = "remote" },  # from `fetch`
-  { subcommand = ["push"], decision = "ask", profile = "remote" },                                                 # from `push`
+  { regex = '(?:^| )(?:-c[^ ]*|-C[^ ]*|--(?:config-env|exec-path|upload-pack|receive-pack|exec|output|git-dir|work-tree|namespace)(?:=.*)?)(?: |$)', decision = "deny" },
+  { prefix = "status", decision = "allow", profile = "local" },
+  { prefix = "diff", decision = "allow", profile = "local" },
+  { prefix = "log", decision = "allow", profile = "local" },
+  { prefix = "show", decision = "allow", profile = "local" },
+  { prefix = "add", decision = "allow", profile = "local" },
+  { prefix = "commit", decision = "allow", profile = "local" },
+  { prefix = "fetch", decision = "ask", profile = "remote" },          # from `fetch`
+  { prefix = "pull", decision = "ask", profile = "remote" },           # from `fetch`
+  { prefix = "ls-remote", decision = "ask", profile = "remote" },      # from `fetch`
+  { prefix = "remote update", decision = "ask", profile = "remote" },  # from `fetch`
+  { prefix = "push", decision = "ask", profile = "remote" },           # from `push`
+  { regex = '(?:^| )(?:-u[^ ]*|--template(?:=.*)?)(?: |$)', decision = "deny" },
+  { prefix = "clone", decision = "ask", profile = "remote" },          # from `fetch`
 ]
 ```
 
-The declarative form above reproduces the `vcs` provider's *grants*; its runtime handlers (global-flag parsing, remote-name enforcement, the per-command SSH tunnel and filtered agent, push URL/commit resolution for prompts) exist only in the built-in provider.
+The declarative form above reproduces the `vcs` provider's manifest grants and shims.
 
 ---
 

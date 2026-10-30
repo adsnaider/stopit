@@ -15,8 +15,7 @@
 
 use crate::config::{ConfigLayer, ProfileRef, ProviderEntry, ProviderKind};
 use crate::manifest::{
-    Domain, Flag, Manifest, PathPattern, ShimAction, ShimName, ShimRule, ShimSpec,
-    SubcommandPattern,
+    Domain, Manifest, PathPattern, ShimAction, ShimKind, ShimName, ShimRule, ShimSpec,
 };
 use crate::policy::{Decision, NetworkMode};
 use crate::resolve::{approvals_provider_name, is_approvals_provider};
@@ -208,56 +207,39 @@ fn ensure_approvals_manifest<'a>(
     Ok(sandbox)
 }
 
-/// Updates `spec` so `matched_rule` (`"default"` or a subcommand pattern) has
-/// `decision = "allow"` in `target_profile`.
+/// Updates `spec` so `matched_rule` (`"default"` or a [`ShimMatcher::key`])
+/// has `decision = "allow"` in `target_profile`.
 pub fn allow_shim_rule(
     spec: &mut ShimSpec,
     matched_rule: &str,
     target_profile: &ProfileRef,
 ) -> Result<(), String> {
+    let ShimKind::Declarative { default, rules, .. } = &mut spec.kind else {
+        return Err(
+            "proxy shims decide dynamically and cannot be persisted as declarative rules"
+                .to_owned(),
+        );
+    };
     if matched_rule == "default" {
-        spec.default = ShimAction {
+        *default = ShimAction {
             decision: Decision::Allow,
             profile: Some(target_profile.clone()),
         };
         return Ok(());
     }
-    let pat: SubcommandPattern = matched_rule.parse().map_err(|e| format!("{e}"))?;
-    let mut new_rules = Vec::with_capacity(spec.rules.len() + 1);
     let mut matched_any = false;
-    for mut rule in spec.rules.drain(..) {
-        if let Some(pos) = rule.subcommand.iter().position(|p| p == &pat) {
+    for rule in rules.iter_mut() {
+        if rule.matcher.key() == matched_rule {
             matched_any = true;
-            if rule.decision == Decision::Allow && rule.profile.as_ref() == Some(target_profile) {
-                new_rules.push(rule);
-            } else if rule.subcommand.len() == 1 {
-                rule.decision = Decision::Allow;
-                rule.profile = Some(target_profile.clone());
-                new_rules.push(rule);
-            } else {
-                rule.subcommand.remove(pos);
-                let flags: Vec<Flag> = rule.deny_flags.clone();
-                new_rules.push(ShimRule {
-                    subcommand: vec![pat.clone()],
-                    decision: Decision::Allow,
-                    profile: Some(target_profile.clone()),
-                    deny_flags: flags,
-                });
-                new_rules.push(rule);
-            }
-        } else {
-            new_rules.push(rule);
+            rule.decision = Decision::Allow;
+            rule.profile = Some(target_profile.clone());
         }
     }
     if !matched_any {
-        new_rules.push(ShimRule {
-            subcommand: vec![pat],
-            decision: Decision::Allow,
-            profile: Some(target_profile.clone()),
-            deny_flags: Vec::new(),
-        });
+        return Err(format!(
+            "cannot find rule {matched_rule:?} in shim to mark as allowed"
+        ));
     }
-    spec.rules = new_rules;
     Ok(())
 }
 
@@ -460,29 +442,40 @@ fn render_approvals_provider(entry: &ProviderEntry) -> String {
             "\n[provider.sandbox.shims.{}]\n",
             toml_key(shim_name.as_str())
         ));
-        out.push_str(&format!("binary = {}\n", toml_str(spec.binary.as_str())));
-        if !spec.args.is_empty() {
-            out.push_str(&format!(
-                "args = {}\n",
-                toml_str_array(spec.args.iter().map(|a| a.as_str()))
-            ));
-        }
-        if spec.tty {
-            out.push_str("tty = true\n");
-        }
-        if !spec.deny_flags.is_empty() {
-            out.push_str(&format!(
-                "deny_flags = {}\n",
-                toml_str_array(spec.deny_flags.iter().map(Flag::as_str))
-            ));
-        }
-        out.push_str(&format!("default = {}\n", render_action(&spec.default)));
-        if !spec.rules.is_empty() {
-            out.push_str("rules = [\n");
-            for rule in &spec.rules {
-                out.push_str(&format!("  {},\n", render_rule(rule)));
+        match &spec.kind {
+            ShimKind::Declarative {
+                cmd,
+                default,
+                rules,
+            } => {
+                if cmd.args.is_empty() {
+                    out.push_str(&format!("cmd = {}\n", toml_str(cmd.binary.as_str())));
+                } else {
+                    let all_args = std::iter::once(cmd.binary.as_str())
+                        .chain(cmd.args.iter().map(|a| a.as_str()));
+                    out.push_str(&format!("cmd = {}\n", toml_str_array(all_args)));
+                }
+                if spec.tty {
+                    out.push_str("tty = true\n");
+                }
+                out.push_str(&format!("default = {}\n", render_action(default)));
+                if !rules.is_empty() {
+                    out.push_str("rules = [\n");
+                    for rule in rules {
+                        out.push_str(&format!("  {},\n", render_rule(rule)));
+                    }
+                    out.push_str("]\n");
+                }
             }
-            out.push_str("]\n");
+            ShimKind::Proxy { proxy, protect, .. } => {
+                out.push_str(&format!("proxy = {}\n", toml_str(proxy.as_str())));
+                if !*protect {
+                    out.push_str("protect = false\n");
+                }
+                if spec.tty {
+                    out.push_str("tty = true\n");
+                }
+            }
         }
     }
     out
@@ -500,21 +493,17 @@ fn render_action(action: &ShimAction) -> String {
 }
 
 fn render_rule(rule: &ShimRule) -> String {
+    let matcher_part = match &rule.matcher {
+        crate::manifest::ShimMatcher::Literal(s) => format!("literal = {}", toml_str(s)),
+        crate::manifest::ShimMatcher::Prefix(s) => format!("prefix = {}", toml_str(s)),
+        crate::manifest::ShimMatcher::Regex(r) => format!("regex = {}", toml_str(r.as_str())),
+    };
     let mut parts = vec![
-        format!(
-            "subcommand = {}",
-            toml_str_array(rule.subcommand.iter().map(SubcommandPattern::as_str))
-        ),
+        matcher_part,
         format!("decision = {}", toml_str(rule.decision.as_str())),
     ];
     if let Some(profile) = &rule.profile {
         parts.push(format!("profile = {}", toml_str(profile.as_str())));
-    }
-    if !rule.deny_flags.is_empty() {
-        parts.push(format!(
-            "deny_flags = {}",
-            toml_str_array(rule.deny_flags.iter().map(Flag::as_str))
-        ));
     }
     format!("{{ {} }}", parts.join(", "))
 }
@@ -593,17 +582,17 @@ mod tests {
     }
 
     #[test]
-    fn persist_shim_splits_only_the_approved_subcommand_pattern() {
+    fn persist_shim_updates_only_the_approved_rule() {
         let jj_spec: ShimSpec = toml::from_str(
             r#"
-            binary = "jj"
-            args = ["--no-pager", "-R", "{workspace}"]
-            deny_flags = ["-R", "--repository"]
+            cmd = ["jj", "--no-pager", "-R", "{workspace}"]
             default = { decision = "ask", profile = "vcs.local" }
             rules = [
-              { subcommand = ["status", "st", "diff"], decision = "allow", profile = "vcs.local" },
-              { subcommand = ["squash", "rebase", "abandon"], decision = "ask", profile = "vcs.local" },
-              { subcommand = ["git push"], decision = "deny" },
+              { regex = '(^|\s)(-R|--repository)(\s|=|$)', decision = "deny" },
+              { prefix = "status", decision = "allow", profile = "vcs.local" },
+              { prefix = "squash", decision = "ask", profile = "vcs.local" },
+              { prefix = "abandon", decision = "ask", profile = "vcs.local" },
+              { prefix = "git push", decision = "deny" },
             ]
             "#,
         )
@@ -611,7 +600,7 @@ mod tests {
         let target = PersistTarget::Shim {
             caller_profile: ProfileRef::main(),
             shim: "jj".parse().unwrap(),
-            matched_rule: "squash".to_owned(),
+            matched_rule: "prefix = \"squash\"".to_owned(),
             target_profile: "vcs.local".parse().unwrap(),
             spec: jj_spec,
         };

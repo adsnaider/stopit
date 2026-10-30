@@ -98,11 +98,15 @@ pub fn summary_lines(spec: &SandboxSpec, ctx: &SummaryContext<'_>) -> Vec<String
         let names = spec.allow_syscalls.iter().map(|s| s.as_str());
         lines.push(grant("syscalls", &name_list(names)));
     }
-    for (name, (_, provider)) in &spec.shims {
+    for (name, (shim, provider)) in &spec.shims {
+        let protect_note = match shim.kind {
+            crate::manifest::ShimKind::Proxy { protect: false, .. } => ", protect = false",
+            _ => "",
+        };
         lines.push(grant(
             "broker",
             &format!(
-                "{}  (provider \"{}\")",
+                "{}  (provider \"{}\"{protect_note})",
                 escape_str(name.as_str()),
                 escape_str(provider.as_str())
             ),
@@ -606,11 +610,17 @@ mod tests {
         spec.namespaces.shared = [ShareableNamespace::Pid, ShareableNamespace::Net].into();
         spec.allow_syscalls = [OptInSyscall::Ptrace, OptInSyscall::IoUring].into();
         let shim: ShimSpec = toml::from_str(
-            "binary = \"git\"\ndefault = { decision = \"allow\", profile = \"main\" }",
+            "cmd = \"git\"\ndefault = { decision = \"allow\", profile = \"main\" }",
         )
         .unwrap();
+        let proxy_shim: ShimSpec =
+            toml::from_str("proxy = \"./my-proxy.sh\"\nprotect = false").unwrap();
         spec.shims
             .insert("git".parse::<ShimName>().unwrap(), (shim, provider("vcs")));
+        spec.shims.insert(
+            "my-cli".parse::<ShimName>().unwrap(),
+            (proxy_shim, provider("custom")),
+        );
         let off = provider("env");
         let out = summary_lines(&spec, &ctx(Base::None, &[&off]));
         assert_eq!(
@@ -619,6 +629,7 @@ mod tests {
                 "  share    net, pid",
                 "  syscalls ptrace, io_uring",
                 "  broker   git  (provider \"vcs\")",
+                "  broker   my-cli  (provider \"custom\", protect = false)",
                 "  script   provider \"env\" runs unprotected (protect = false)",
             ]
         );
