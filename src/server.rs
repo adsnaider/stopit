@@ -111,13 +111,19 @@ fn run_server(workspace: Option<&Path>, quiet: bool) -> Result<ExitCode, RunErro
     // and before any provider runs.
     let workspace_dir = discover_workspace(&cwd, workspace)?.dir;
     let _workspace_lock = lock_workspace(&workspace_dir)?;
-    let loaded = LoadedSession::load(&cwd, workspace)?;
+    let loaded = Arc::new(LoadedSession::load(&cwd, workspace)?);
     for line in loaded.warning_lines() {
         eprintln!("{line}");
     }
     // From here on, every line goes through the approver, which holds it
     // back while a prompt is up.
-    let approver = Arc::new(Approver::on_stdio(loaded.approval_timeout()));
+    let mut approver = Approver::on_stdio(loaded.approval_timeout());
+    approver.set_persister({
+        let loaded = loaded.clone();
+        move |target| loaded.persist_approval(target)
+    });
+    let approver = Arc::new(approver);
+    let _cbreak = approver.enter_cbreak();
     let control = loaded.session.control_dir()?;
     let socket_path = control.join(CONTROL_SOCKET);
     check_socket_path(&socket_path)?;
@@ -137,12 +143,11 @@ fn run_server(workspace: Option<&Path>, quiet: bool) -> Result<ExitCode, RunErro
         })?;
     if !quiet {
         approver.log(&format!(
-            "stopit: serving {} as session {}; `stopit run` and `stopit shell` there attach to it",
+            "stopit: serving {} as session {}; `stopit run` and `stopit shell` there attach to it (press r to reload)",
             escape_message(&format!("{:?}", loaded.workspace.dir)),
             loaded.session.id()
         ));
     }
-    let loaded = Arc::new(loaded);
     // Blocked from here on in every thread, including the workers spawned
     // below, and only unblocked while the main thread waits.
     let mask = BlockedSignals::block().map_err(RunError::Signals)?;
@@ -153,15 +158,51 @@ fn run_server(workspace: Option<&Path>, quiet: bool) -> Result<ExitCode, RunErro
         if let Some(signal) = take_signal() {
             break Ok(signal);
         }
-        let mut fds = [libc::pollfd {
+        let mut fds = vec![libc::pollfd {
             fd: listener.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         }];
+        let idle_slot = approver.idle_poll_fd().map(|fd| {
+            let slot = fds.len();
+            fds.push(libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            slot
+        });
         match mask.wait(&mut fds) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => break Err(listen_error(e)),
+        }
+        if idle_slot.is_some_and(|slot| fds[slot].revents != 0) {
+            while let Some(key) = approver.read_idle_key() {
+                if matches!(key, b'r' | b'R') {
+                    match loaded.reload() {
+                        Ok((warnings, timeout)) => {
+                            approver.set_timeout(timeout);
+                            approver.clear_quiet();
+                            for line in warnings {
+                                approver.log(&line);
+                            }
+                            if !quiet {
+                                approver.log("stopit: reloaded configuration");
+                            }
+                        }
+                        Err(e) => {
+                            approver.log(&format!(
+                                "stopit: error reloading configuration: {}",
+                                escape_message(&e.to_string())
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if fds[0].revents == 0 {
+            continue;
         }
         let conn = match listener.accept() {
             Ok((conn, _)) => conn,
@@ -380,7 +421,12 @@ fn approve_for_client(conn: &UnixStream, approver: &Approver, runs: &SharedRuns)
     // the session to a client's copy of one would cover the real one.
     let clipboard_write = matches!(request, ApprovalRequest::ClipboardWrite { .. });
     let verdict = match asker {
-        Some(asker) if clipboard_write => approver.decide(&asker, &request, conn.as_fd()),
+        Some(asker) if clipboard_write => approver.decide_with_persist(
+            &asker,
+            &request,
+            Some(&crate::persist::PersistTarget::ClipboardWrite),
+            conn.as_fd(),
+        ),
         Some(_) => {
             approver.log_refusal(
                 run,
@@ -397,7 +443,7 @@ fn approve_for_client(conn: &UnixStream, approver: &Approver, runs: &SharedRuns)
         conn,
         &ServerMessage::Decision {
             allow: verdict.allows(),
-            session: verdict == Verdict::Session,
+            session: matches!(verdict, Verdict::Session | Verdict::Persist),
             quiet: verdict == Verdict::DeniedByUser,
         },
     );

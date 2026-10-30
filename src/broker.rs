@@ -49,7 +49,7 @@ use crate::policy::Decision;
 use crate::shim::{BrokerMessage, HELLO, PROTOCOL_VERSION, ShimMessage};
 use crate::spec::CompiledSession;
 use crate::supervisor::{
-    LoadedSession, RunError, bwrap_exit_code, profile_in, read_nonblocking_status,
+    LoadedSession, RunError, SessionPolicy, bwrap_exit_code, profile_in, read_nonblocking_status,
 };
 
 /// Status of a command the broker refused.
@@ -74,6 +74,10 @@ pub(crate) struct RunContext {
     pub(crate) loaded: Arc<LoadedSession>,
     /// The profiles as compiled for the run.
     pub(crate) compiled: Arc<CompiledSession>,
+    /// The policy snapshot when `compiled` was built.
+    pub(crate) policy: Arc<SessionPolicy>,
+    /// Where the workspace is mounted in this sandbox.
+    pub(crate) workspace_mount: PathBuf,
     /// The environment the run started with, which target profiles filter.
     pub(crate) host_env: Vec<(OsString, OsString)>,
     /// The server's prompter, or `None` for a standalone run.
@@ -99,9 +103,13 @@ impl RunContext {
         run: u64,
         command: &[OsString],
     ) -> Self {
+        let policy = loaded.current_policy();
+        let workspace_mount = policy.workspace_mount().to_path_buf();
         RunContext {
             loaded,
             compiled,
+            policy,
+            workspace_mount,
             host_env,
             approver,
             run,
@@ -454,7 +462,24 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
         return Err("bad shim request: no command".to_owned());
     };
     let _ = conn.set_read_timeout(None);
-    let ctx = &shared.ctx;
+    let base_ctx = &shared.ctx;
+    let (active_policy, active_compiled) = base_ctx.loaded.policy_for_broker(
+        &base_ctx.policy,
+        &base_ctx.compiled,
+        &base_ctx.workspace_mount,
+        &shared.caller,
+    );
+    let ctx_holder;
+    let ctx: &Arc<RunContext> = if active_policy.generation != base_ctx.policy.generation {
+        ctx_holder = Arc::new(RunContext {
+            compiled: active_compiled,
+            policy: active_policy,
+            ..(**base_ctx).clone()
+        });
+        &ctx_holder
+    } else {
+        base_ctx
+    };
     let (_, caller) =
         profile_in(&ctx.compiled, Some(shared.caller.as_str())).map_err(|e| e.to_string())?;
     let grant = shim == GRANT_SHIM && caller.spec.grant;
@@ -486,7 +511,7 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
         return Ok(EXIT_DENIED);
     };
     let cwd = PathBuf::from(OsString::from_vec(cwd));
-    let rel = workspace_relative(&cwd, ctx.loaded.workspace_mount()).ok_or_else(|| {
+    let rel = workspace_relative(&cwd, &ctx.workspace_mount).ok_or_else(|| {
         format!(
             "shims run only from inside the workspace, not from {}",
             crate::escape::escape_bytes(cwd.as_os_str().as_bytes())
@@ -496,6 +521,7 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
         let call = GrantCall {
             conn,
             shared,
+            ctx,
             number,
             caller,
             cwd: &cwd,
@@ -507,7 +533,7 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
     let shim_args: Vec<OsString> = spec
         .args
         .iter()
-        .map(|a| a.expand(ctx.loaded.workspace_mount()))
+        .map(|a| a.expand(&ctx.workspace_mount))
         .collect();
     // What runs, the shim's binary with the arguments.
     let command_line: String = std::iter::once(spec.binary.as_str().as_bytes())
@@ -547,7 +573,17 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
                 profile: shared.caller.as_str().to_owned(),
                 command: ctx.command.clone(),
             };
-            if !approver.decide(&asker, &request, conn.as_fd()).allows() {
+            let persist_target = crate::persist::PersistTarget::Shim {
+                caller_profile: shared.caller.clone(),
+                shim: name.clone(),
+                matched_rule: rule.clone(),
+                target_profile: profile.clone(),
+                spec: spec.clone(),
+            };
+            if !approver
+                .decide_with_persist(&asker, &request, Some(&persist_target), conn.as_fd())
+                .allows()
+            {
                 say(&format!("{name}: denied by user"));
                 return Ok(EXIT_DENIED);
             }
@@ -598,7 +634,7 @@ fn start_and_wait(
         (false, None)
     };
     let start = crate::init::StartDir {
-        path: ctx.loaded.workspace_mount().join(rel),
+        path: ctx.workspace_mount.join(rel),
         dev,
         ino,
     };
@@ -672,12 +708,13 @@ fn confirm_tty(conn: &UnixStream, stop: &AtomicBool) -> Result<(bool, Option<i32
     }
 }
 
-/// A `stopit-grant` call: the shim's connection, the broker, the
-/// connection's number, the caller's profile, and the working directory as
-/// the sandbox sees it and relative to the workspace.
+/// A `stopit-grant` call: the shim's connection, the broker, the active run
+/// context, the connection's number, the caller's profile, and the working
+/// directory as the sandbox sees it and relative to the workspace.
 struct GrantCall<'a> {
     conn: &'a UnixStream,
     shared: &'a Shared,
+    ctx: &'a Arc<RunContext>,
     number: u64,
     caller: &'a crate::spec::CompiledProfile,
     cwd: &'a Path,
@@ -704,12 +741,12 @@ fn run_grant(
     let GrantCall {
         conn,
         shared,
+        ctx,
         number,
         caller,
         cwd,
         rel,
     } = call;
-    let ctx = &shared.ctx;
     let say = |text: &str| say_to(stdio[2].as_fd(), &format!("{GRANT_SHIM}: {text}"));
     let request = match GrantRequest::parse(&args) {
         Ok(request) => request,
@@ -820,14 +857,13 @@ fn run_grant(
         .filter(|(_, rw)| *rw)
         .map(|(p, _)| p.clone())
         .collect();
-    let workspace_mount = ctx.loaded.workspace_mount();
     let check = |compiled: &CompiledSession| {
         let granted = compiled
             .get(&target)
             .ok_or("the temporary profile did not compile")?;
-        check_grant(&ctx.compiled, caller, granted, &paths, workspace_mount)
+        check_grant(&ctx.compiled, caller, granted, &paths, &ctx.workspace_mount)
     };
-    let (compiled, generation) = match ctx.loaded.compile_with(extra.clone(), &rw) {
+    let (compiled, generation) = match ctx.loaded.compile_with(&ctx.policy, extra.clone(), &rw) {
         Ok(compiled) => compiled,
         Err(e) => return refuse(&e.to_string()),
     };
@@ -846,7 +882,17 @@ fn run_grant(
         command: command_line,
         cwd: crate::escape::escape_bytes(cwd.as_os_str().as_bytes()),
     };
-    if !approver.decide(&asker, &ask, conn.as_fd()).allows() {
+    let persist_target = crate::persist::PersistTarget::Grant {
+        caller_profile: shared.caller.clone(),
+        ro: request.ro.iter().cloned().collect(),
+        rw: request.rw.iter().cloned().collect(),
+        net_domains: request.net.iter().cloned().collect(),
+        net_full: request.full,
+    };
+    if !approver
+        .decide_with_persist(&asker, &ask, Some(&persist_target), conn.as_fd())
+        .allows()
+    {
         say("denied by user");
         return Ok(EXIT_DENIED);
     }
@@ -858,7 +904,10 @@ fn run_grant(
         say("refused; the stopit server's terminal says why");
         Ok(EXIT_DENIED)
     };
-    let compiled = match ctx.loaded.current_grant(extra, generation, compiled) {
+    let compiled = match ctx
+        .loaded
+        .current_grant(&ctx.policy, extra, generation, compiled)
+    {
         Ok(compiled) => compiled,
         Err(e) => return refuse(&e.to_string()),
     };

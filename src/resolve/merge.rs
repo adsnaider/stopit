@@ -500,27 +500,60 @@ fn union<'a, T: Clone + Ord + 'a>(
     out
 }
 
+/// Base name of the `config` provider in `.stopit.toml` where `[p]` persists
+/// approved grants and shim rules (DESIGN.md §4.2).
+pub const APPROVALS_PROVIDER_NAME: &str = "approvals";
+
+/// Provider name used in `.stopit.toml` to persist approvals for `profile`:
+/// `"approvals"` for `main`, or `"approvals-<profile>"` (with any `.` replaced
+/// by `-`) for another profile.
+pub fn approvals_provider_name(profile: &ProfileRef) -> ProviderName {
+    let raw = if *profile == ProfileRef::main() {
+        APPROVALS_PROVIDER_NAME.to_owned()
+    } else {
+        format!("{APPROVALS_PROVIDER_NAME}-{}", profile.as_str().replace('.', "-"))
+    };
+    raw.parse()
+        .expect("approvals provider name constructed from a valid ProfileRef is valid")
+}
+
+/// Whether `name` is an approvals provider name (`"approvals"` or
+/// `"approvals-…"`).
+pub fn is_approvals_provider(name: &ProviderName) -> bool {
+    let s = name.as_str();
+    s == APPROVALS_PROVIDER_NAME || s.starts_with("approvals-")
+}
+
 /// `shims` (§3.5): higher [`ProviderOrigin`] replaces lower for the same shim
-/// name within a profile, while the same shim name from two contributions in
-/// the same origin is an error naming both providers; a profile's own shim
-/// replaces an inherited one of the same name.
+/// name within a profile, and within [`ProviderOrigin::Workspace`] a persisted
+/// `approvals` provider ([`is_approvals_provider`]) replaces an earlier
+/// workspace provider's shim; otherwise the same shim name from two
+/// contributions at the same rank is an error naming both providers. A
+/// profile's own shim replaces an inherited one of the same name.
 fn merge_shims(
     profile: &ProfileRef,
     inherited: &BTreeMap<ShimName, (ShimSpec, ProviderName)>,
     own: &[Contribution],
 ) -> Result<BTreeMap<ShimName, (ShimSpec, ProviderName)>, MergeError> {
-    let mut found: BTreeMap<&ShimName, (&ShimSpec, &ProviderName, ProviderOrigin)> =
+    let rank = |c: &Contribution| {
+        (
+            c.origin,
+            c.origin == ProviderOrigin::Workspace && is_approvals_provider(&c.provider),
+        )
+    };
+    let mut found: BTreeMap<&ShimName, (&ShimSpec, &ProviderName, (ProviderOrigin, bool))> =
         BTreeMap::new();
     for c in own {
+        let c_rank = rank(c);
         for (shim, spec) in &c.grants.shims {
             match found.get(shim) {
                 None => {
-                    found.insert(shim, (spec, &c.provider, c.origin));
+                    found.insert(shim, (spec, &c.provider, c_rank));
                 }
-                Some((_, _, first_origin)) if c.origin > *first_origin => {
-                    found.insert(shim, (spec, &c.provider, c.origin));
+                Some((_, _, first_rank)) if c_rank > *first_rank => {
+                    found.insert(shim, (spec, &c.provider, c_rank));
                 }
-                Some((_, _, first_origin)) if c.origin < *first_origin => {}
+                Some((_, _, first_rank)) if c_rank < *first_rank => {}
                 Some((_, first_provider, _)) => {
                     return Err(MergeError::DuplicateShim {
                         profile: profile.clone(),

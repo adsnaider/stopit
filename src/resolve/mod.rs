@@ -16,8 +16,9 @@ pub use graph::{
     Contribution, ProfileError, ProfileGraph, ProfileNode, ShimField, build_profile_graph,
 };
 pub use merge::{
-    EffectiveEnv, EffectiveGrants, EffectiveNetwork, EffectiveSandbox, EffectiveSystem,
-    EnvSetConflict, FsRule, FsRuleKind, MergeError, MergedProfiles, merge_profiles,
+    APPROVALS_PROVIDER_NAME, EffectiveEnv, EffectiveGrants, EffectiveNetwork, EffectiveSandbox,
+    EffectiveSystem, EnvSetConflict, FsRule, FsRuleKind, MergeError, MergedProfiles,
+    approvals_provider_name, is_approvals_provider, merge_profiles,
 };
 pub(crate) use paths::hidden_note;
 pub use paths::{

@@ -74,7 +74,7 @@ use crate::resolve::{PlanWarning, PlanWarningKind};
 use crate::session::{SessionDir, SessionError};
 use crate::spec::{
     CompileError, CompiledProfile, CompiledSession, ScriptPathError, SpecWarning, UntrustedRoot,
-    compile_session, has_rewritable_hard_links, resolve_script_path, static_rw_roots,
+    has_rewritable_hard_links, resolve_script_path, static_rw_roots,
 };
 use crate::state::{
     ConfigDirs, GLOBAL_CONFIG_FILE, StateDirs, StateError, config_dirs_from_host,
@@ -670,7 +670,8 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     for line in loaded.warning_lines() {
         eprintln!("{line}");
     }
-    let (profile_name, profile) = loaded.profile(invocation.profile.as_deref())?;
+    let compiled = loaded.compiled();
+    let (profile_name, profile) = profile_in(&compiled, invocation.profile.as_deref())?;
     // After the warnings, right before the sandbox starts, so it is the
     // last thing above the command's own output.
     if !invocation.quiet {
@@ -683,7 +684,7 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     let proxy = loaded.start_proxy(profile, "run")?;
     let ctx = Arc::new(crate::broker::RunContext::new(
         loaded.clone(),
-        loaded.compiled.clone(),
+        compiled.clone(),
         std::env::vars_os().collect(),
         None,
         0,
@@ -761,35 +762,66 @@ pub(crate) fn profile_in<'a>(
     }
 }
 
-/// A workspace's session, ready to run sandboxes in: its configuration
-/// checked and layered, its providers run, every profile compiled, and the
-/// stopit binary provisioned into the session directory. Dropping it
-/// removes the session directory.
-pub(crate) struct LoadedSession {
-    /// The workspace and its configuration file.
-    pub(crate) workspace: Workspace,
+/// The configuration, provider outputs, and compiled profiles of a
+/// [`LoadedSession`], replaced atomically when `stopit server` reloads its
+/// configuration or persists an approval.
+pub(crate) struct SessionPolicy {
+    /// Incremented each time [`LoadedSession::reload`] or [`LoadedSession::admit_grant`]
+    /// replaces the policy.
+    pub(crate) generation: u64,
     config: Config,
-    home: PathBuf,
-    /// The session compiled when it was loaded.
-    pub(crate) compiled: Arc<CompiledSession>,
+    /// The session compiled when the policy was loaded.
+    compiled: Arc<CompiledSession>,
     /// Warnings found before compiling, without the `stopit: warning:`
     /// prefix.
     load_warnings: Vec<String>,
     /// The compile warnings of [`compiled`](Self::compiled).
     compile_warnings: Vec<String>,
-    /// What [`recompile`](Self::recompile) compiles again: the providers'
-    /// outputs, the protected sources, the state directories and the
-    /// expansion context.
+    /// What [`LoadedSession::recompile`] compiles again: the providers'
+    /// outputs, the protected sources, and the expansion context.
     outputs: Vec<(ProviderName, ProviderOutput)>,
     protected: Vec<ProtectedSource>,
-    state: StateDirs,
     ctx: ExpansionContext,
+}
+
+impl SessionPolicy {
+    pub(crate) fn workspace_mount(&self) -> &Path {
+        self.ctx.workspace_sandbox()
+    }
+
+    fn warning_lines_with(&self, compile_warnings: &[String]) -> Vec<String> {
+        self.load_warnings
+            .iter()
+            .chain(compile_warnings)
+            .map(|w| format!("stopit: warning: {}", escape_message(w)))
+            .collect()
+    }
+
+    fn warning_lines(&self) -> Vec<String> {
+        self.warning_lines_with(&self.compile_warnings)
+    }
+}
+
+/// A workspace's session, ready to run sandboxes in: its configuration
+/// checked and layered, its providers run, every profile compiled, and the
+/// stopit binary provisioned into the session directory. Dropping it
+/// removes the session directory.
+pub(crate) struct LoadedSession {
+    /// The workspace and its initial configuration file.
+    pub(crate) workspace: Workspace,
+    cwd: PathBuf,
+    explicit_dir: Option<PathBuf>,
+    home: PathBuf,
+    policy: std::sync::Mutex<Arc<SessionPolicy>>,
+    state: StateDirs,
     provisioned: Provisioned,
     /// The shim trampoline in the session directory.
     trampoline: PathBuf,
     /// What `stopit-grant` requests asked to mount `rw`, which every later
     /// compile treats as untrusted roots (§7.5).
     granted: std::sync::Mutex<GrantedRw>,
+    /// Serializes `[p] allow and persist` updates to `.stopit.toml` and reloads.
+    persist_lock: std::sync::Mutex<()>,
     /// Dropped last.
     pub(crate) session: SessionDir,
 }
@@ -802,6 +834,174 @@ struct GrantedRw {
     generation: u64,
 }
 
+/// Checks and loads the workspace configuration over the user-global one,
+/// runs the providers, and compiles every profile.
+#[allow(clippy::too_many_arguments)]
+fn load_policy<S>(
+    workspace_dir: &Path,
+    cwd: &Path,
+    explicit_dir: Option<&Path>,
+    granted: &std::collections::BTreeSet<PathBuf>,
+    generation: u64,
+    init_session: impl FnOnce(
+        &crate::config::Limits,
+        &mut Vec<String>,
+    ) -> Result<(S, PathBuf, crate::state::StatePath), RunError>,
+) -> Result<(SessionPolicy, PathBuf, StateDirs, S), RunError> {
+    let ws = Workspace {
+        dir: workspace_dir.to_path_buf(),
+        config: config_in(workspace_dir)?,
+    };
+    let file = ws.read_config()?;
+    // No mount may expose them (§6.2, Reserved host paths), even before
+    // they exist. From the password database, not `HOME`, plus
+    // `STOPIT_STATE_DIR` if set. The store is created now if missing, so
+    // that read-only views of it mask it.
+    let data_dirs = data_dirs_from_host()?;
+    let config_dirs = config_dirs_from_host()?;
+    let store = TrustStore::open(&data_dirs.store.path)?;
+    // Before anything runs or is created: only a configuration the user
+    // allowed, in the exact bytes read, which are the bytes parsed; and
+    // not the default one in place of an allowed one that is gone.
+    let allowed = store.read()?;
+    drop(store);
+    let explicit = explicit_dir.is_some().then_some(&ws.dir);
+    let project_layer = match &file {
+        None => {
+            let links = discovery_links(cwd, explicit_dir, std::env::var_os("PWD"));
+            check_missing(&allowed, &ws.dir, explicit.is_some(), &links)?;
+            None
+        }
+        Some(file) => {
+            check_allowed(&allowed, file, explicit.map(PathBuf::as_path))?;
+            Some(file.parse_layer()?)
+        }
+    };
+    // Read, checked and parsed even when `.stopit.toml` sets
+    // `base = "none"` and the layer goes unused: its target and its
+    // script sources are protected in every session, or a sandbox of
+    // this one could plant what every other workspace runs (§3, The
+    // user-global configuration).
+    let global_file = read_global_config(&config_dirs)?;
+    let global_layer = match &global_file {
+        Some(gf) => Some(gf.parse_layer()?),
+        None => None,
+    };
+    let global_entries = global_layer
+        .as_ref()
+        .map(|layer| layer.providers.clone())
+        .unwrap_or_default();
+    let LayeredConfig {
+        config,
+        providers: layered_entries,
+        replaced,
+    } = ConfigLayer::layer(
+        global_layer.map(|layer| (layer, config_dirs.active.path.as_path())),
+        project_layer.map(|layer| (layer, ws.dir.as_path())),
+    );
+    let mut warnings = Vec::new();
+    if let Some(gf) = &global_file {
+        for name in replaced.iter().filter(|n| is_default_provider_name(n)) {
+            warnings.push(format!(
+                "the [[provider]] named \"{name}\" in {CONFIG_FILE} replaces the one of that \
+                 name in {:?}; give one of them another `name` to keep both",
+                gf.path
+            ));
+        }
+    }
+    let home = host_home(std::env::var_os("HOME"))?;
+    let mount = config.workspace.mount.clone();
+    let ctx = ExpansionContext::new(
+        ws.dir.clone(),
+        mount.clone(),
+        home.clone(),
+        SandboxHome::default(),
+    )?;
+
+    let (carry, session_dir, runtime) = init_session(&config.limits, &mut warnings)?;
+    let providers = layered_session_providers(config.base, &layered_entries)?;
+    // Script paths must not run through links in these (§3.6), nor the
+    // way to the global configuration and its scripts.
+    let rw_grants = static_rw_roots(&static_outputs(&providers), &ctx);
+    let global_guarded = match &global_file {
+        Some(gf) => guard_global_config(
+            gf,
+            &global_entries,
+            &config_dirs.active.path,
+            &ws.dir,
+            &rw_grants,
+        )?,
+        None => Vec::new(),
+    };
+    let pctx = ProviderContext {
+        workspace: ws.dir.clone(),
+        workspace_mount: mount.clone(),
+        home: home.clone(),
+        session_dir,
+        rw_grants,
+    };
+    let outputs = providers
+        .iter()
+        .map(|p| Ok((p.name().clone(), p.manifest(&pctx)?)))
+        .collect::<Result<Vec<_>, ProviderError>>()?;
+    let has_user_tools = outputs.iter().any(|(_, out)| {
+        out.origin != ProviderOrigin::Builtin && manifest_grants_tools(&out.manifest)
+    });
+    // The script providers' sources, and the configuration files
+    // themselves, protected in every profile whatever the base and rules
+    // (§3, §3.6), the latter attributed to the name reserved for
+    // stopit's own rules.
+    let mut protected = protected_sources(&providers)?;
+    let supervisor_name: ProviderName = SUPERVISOR_PROVIDER_NAME
+        .parse()
+        .expect("the supervisor's name is a valid provider name");
+    if let Some(file) = &file {
+        protected.push(ProtectedSource {
+            provider: supervisor_name.clone(),
+            path: file.path.clone(),
+        });
+    }
+    for path in global_guarded {
+        if !protected.iter().any(|p| p.path == path) {
+            protected.push(ProtectedSource {
+                provider: supervisor_name.clone(),
+                path,
+            });
+        }
+    }
+    let global_config_path = config_dirs.active.path.join(GLOBAL_CONFIG_FILE);
+    let state = StateDirs {
+        runtime,
+        data: data_dirs,
+        config: config_dirs,
+    };
+    let compiled = crate::spec::compile_session_granted(
+        &config,
+        outputs.clone(),
+        &protected,
+        &state,
+        &ctx,
+        granted,
+    )?;
+    if config.base == Base::Default && !has_user_tools {
+        return Err(RunError::NoToolsConfigured {
+            global_config: global_config_path,
+        });
+    }
+    let compile_warnings = warning_lines(&compiled, config.base);
+    let policy = SessionPolicy {
+        generation,
+        config,
+        compiled: Arc::new(compiled),
+        load_warnings: warnings,
+        compile_warnings,
+        outputs,
+        protected,
+        ctx,
+    };
+    Ok((policy, home, state, carry))
+}
+
 impl LoadedSession {
     /// Finds the workspace from `cwd` or `explicit` (`--workspace`), checks
     /// and loads its configuration over the user-global one, runs the
@@ -809,150 +1009,32 @@ impl LoadedSession {
     /// session directory.
     pub(crate) fn load(cwd: &Path, explicit_dir: Option<&Path>) -> Result<Self, RunError> {
         let workspace = discover_workspace(cwd, explicit_dir)?;
-        let file = workspace.read_config()?;
-        // No mount may expose them (§6.2, Reserved host paths), even before
-        // they exist. From the password database, not `HOME`, plus
-        // `STOPIT_STATE_DIR` if set. The store is created now if missing, so
-        // that read-only views of it mask it.
-        let data_dirs = data_dirs_from_host()?;
-        let config_dirs = config_dirs_from_host()?;
-        let store = TrustStore::open(&data_dirs.store.path)?;
-        // Before anything runs or is created: only a configuration the user
-        // allowed, in the exact bytes read, which are the bytes parsed; and
-        // not the default one in place of an allowed one that is gone.
-        let allowed = store.read()?;
-        drop(store);
-        let explicit = explicit_dir.is_some().then_some(&workspace.dir);
-        let project_layer = match &file {
-            None => {
-                let links = discovery_links(cwd, explicit_dir, std::env::var_os("PWD"));
-                check_missing(&allowed, &workspace.dir, explicit.is_some(), &links)?;
-                None
-            }
-            Some(file) => {
-                check_allowed(&allowed, file, explicit.map(PathBuf::as_path))?;
-                Some(file.parse_layer()?)
-            }
-        };
-        // Read, checked and parsed even when `.stopit.toml` sets
-        // `base = "none"` and the layer goes unused: its target and its
-        // script sources are protected in every session, or a sandbox of
-        // this one could plant what every other workspace runs (§3, The
-        // user-global configuration).
-        let global_file = read_global_config(&config_dirs)?;
-        let global_layer = match &global_file {
-            Some(gf) => Some(gf.parse_layer()?),
-            None => None,
-        };
-        let global_entries = global_layer
-            .as_ref()
-            .map(|layer| layer.providers.clone())
-            .unwrap_or_default();
-        let LayeredConfig {
-            config,
-            providers: layered_entries,
-            replaced,
-        } = ConfigLayer::layer(
-            global_layer.map(|layer| (layer, config_dirs.active.path.as_path())),
-            project_layer.map(|layer| (layer, workspace.dir.as_path())),
-        );
-        let mut warnings = Vec::new();
-        if let Some(gf) = &global_file {
-            for name in replaced.iter().filter(|n| is_default_provider_name(n)) {
-                warnings.push(format!(
-                    "the [[provider]] named \"{name}\" in {CONFIG_FILE} replaces the one of that \
-                     name in {:?}; give one of them another `name` to keep both",
-                    gf.path
-                ));
-            }
-        }
-        let home = host_home(std::env::var_os("HOME"))?;
-        let mount = config.workspace.mount.clone();
-        let ctx = ExpansionContext::new(
-            workspace.dir.clone(),
-            mount.clone(),
-            home.clone(),
-            SandboxHome::default(),
+        let empty_granted = std::collections::BTreeSet::new();
+        let (policy, home, state, session) = load_policy(
+            &workspace.dir,
+            cwd,
+            explicit_dir,
+            &empty_granted,
+            0,
+            |limits, _| {
+                // With `[limits]`, stopit runs again in a scope of its own before
+                // anything runs or is created (§10).
+                crate::limits::enter_scope(limits)?;
+                // Before the providers, which are told where it is. From here on,
+                // returning removes it.
+                let session = SessionDir::create_from_env()?;
+                let root = session.root().to_path_buf();
+                // stopit's own state, which no mount may expose (§6.2, Reserved host
+                // paths): the parent of every session directory, the data
+                // directories, and the configuration directories. `XDG_RUNTIME_DIR`
+                // is set and absolute, or there would be no session.
+                let runtime = runtime_dir(Path::new(
+                    &std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_default(),
+                ))?;
+                debug_assert_eq!(Some(runtime.path.as_path()), session.root().parent());
+                Ok((session, root, runtime))
+            },
         )?;
-
-        // With `[limits]`, stopit runs again in a scope of its own before
-        // anything runs or is created (§10).
-        crate::limits::enter_scope(&config.limits)?;
-        // Before the providers, which are told where it is. From here on,
-        // returning removes it.
-        let session = SessionDir::create_from_env()?;
-        let providers = layered_session_providers(config.base, &layered_entries)?;
-        // Script paths must not run through links in these (§3.6), nor the
-        // way to the global configuration and its scripts.
-        let rw_grants = static_rw_roots(&static_outputs(&providers), &ctx);
-        let global_guarded = match &global_file {
-            Some(gf) => guard_global_config(
-                gf,
-                &global_entries,
-                &config_dirs.active.path,
-                &workspace.dir,
-                &rw_grants,
-            )?,
-            None => Vec::new(),
-        };
-        let pctx = ProviderContext {
-            workspace: workspace.dir.clone(),
-            workspace_mount: mount.clone(),
-            home: home.clone(),
-            session_dir: session.root().to_path_buf(),
-            rw_grants,
-        };
-        let outputs = providers
-            .iter()
-            .map(|p| Ok((p.name().clone(), p.manifest(&pctx)?)))
-            .collect::<Result<Vec<_>, ProviderError>>()?;
-        let has_user_tools = outputs.iter().any(|(_, out)| {
-            out.origin != ProviderOrigin::Builtin && manifest_grants_tools(&out.manifest)
-        });
-        // The script providers' sources, and the configuration files
-        // themselves, protected in every profile whatever the base and rules
-        // (§3, §3.6), the latter attributed to the name reserved for
-        // stopit's own rules.
-        let mut protected = protected_sources(&providers)?;
-        let supervisor_name: ProviderName = SUPERVISOR_PROVIDER_NAME
-            .parse()
-            .expect("the supervisor's name is a valid provider name");
-        if let Some(file) = &file {
-            protected.push(ProtectedSource {
-                provider: supervisor_name.clone(),
-                path: file.path.clone(),
-            });
-        }
-        for path in global_guarded {
-            if !protected.iter().any(|p| p.path == path) {
-                protected.push(ProtectedSource {
-                    provider: supervisor_name.clone(),
-                    path,
-                });
-            }
-        }
-        // stopit's own state, which no mount may expose (§6.2, Reserved host
-        // paths): the parent of every session directory, the data
-        // directories, and the configuration directories. `XDG_RUNTIME_DIR`
-        // is set and absolute, or there would be no session.
-        let runtime = runtime_dir(Path::new(
-            &std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_default(),
-        ))?;
-        debug_assert_eq!(Some(runtime.path.as_path()), session.root().parent());
-        let global_config_path = config_dirs.active.path.join(GLOBAL_CONFIG_FILE);
-        let state = StateDirs {
-            runtime,
-            data: data_dirs,
-            config: config_dirs,
-        };
-        let compiled = compile_session(&config, outputs.clone(), &protected, &state, &ctx)?;
-        if config.base == Base::Default && !has_user_tools {
-            return Err(RunError::NoToolsConfigured {
-                global_config: global_config_path,
-            });
-        }
-        let compile_warnings = warning_lines(&compiled, config.base);
-        let compiled = Arc::new(compiled);
         let provisioned = provision_self(&session)?;
         let trampoline = crate::shim::write_trampoline(
             &session,
@@ -960,58 +1042,187 @@ impl LoadedSession {
         )?;
         Ok(LoadedSession {
             workspace,
-            config,
+            cwd: cwd.to_path_buf(),
+            explicit_dir: explicit_dir.map(Path::to_path_buf),
             home,
-            compiled,
-            load_warnings: warnings,
-            compile_warnings,
-            outputs,
-            protected,
+            policy: std::sync::Mutex::new(Arc::new(policy)),
             state,
-            ctx,
             provisioned,
             trampoline,
             granted: Default::default(),
+            persist_lock: Default::default(),
             session,
         })
+    }
+
+    fn policy(&self) -> Arc<SessionPolicy> {
+        self.policy.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The session's current policy snapshot.
+    pub(crate) fn current_policy(&self) -> Arc<SessionPolicy> {
+        self.policy()
+    }
+
+    /// The session's current compiled profiles.
+    pub(crate) fn compiled(&self) -> Arc<CompiledSession> {
+        self.policy().compiled.clone()
+    }
+
+    /// Returns the policy and compiled session a broker in an already-running
+    /// sandbox should use for `caller`: the reloaded one if
+    /// [`reload`](Self::reload) or [`admit_grant`](Self::admit_grant) has run
+    /// since `run_policy.generation` with the same workspace mount and
+    /// `caller` exists in the reloaded session, or `(run_policy, run_compiled)`
+    /// otherwise.
+    pub(crate) fn policy_for_broker(
+        &self,
+        run_policy: &Arc<SessionPolicy>,
+        run_compiled: &Arc<CompiledSession>,
+        run_workspace_mount: &Path,
+        caller: &ProfileRef,
+    ) -> (Arc<SessionPolicy>, Arc<CompiledSession>) {
+        let policy = self.policy();
+        if policy.generation != run_policy.generation
+            && policy.ctx.workspace_sandbox() == run_workspace_mount
+            && policy.compiled.get(caller).is_some()
+        {
+            let compiled = policy.compiled.clone();
+            (policy, compiled)
+        } else {
+            (run_policy.clone(), run_compiled.clone())
+        }
+    }
+
+    /// Re-reads `.stopit.toml` and the user-global configuration, re-runs
+    /// providers, and recompiles every profile into the active session.
+    /// If reloading fails, the previous policy remains active.
+    pub(crate) fn reload(&self) -> Result<(Vec<String>, crate::config::ApprovalTimeout), RunError> {
+        let _guard = self.persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.reload_locked()
+    }
+
+    fn reload_locked(&self) -> Result<(Vec<String>, crate::config::ApprovalTimeout), RunError> {
+        let granted = self.granted().paths.clone();
+        let prev = self.policy();
+        let (new_policy, _, _, ()) = load_policy(
+            &self.workspace.dir,
+            &self.cwd,
+            self.explicit_dir.as_deref(),
+            &granted,
+            prev.generation + 1,
+            |limits, warnings| {
+                if *limits != prev.config.limits {
+                    warnings.push(
+                        "changes to [limits] take effect when `stopit server` is restarted"
+                            .to_owned(),
+                    );
+                }
+                Ok((
+                    (),
+                    self.session.root().to_path_buf(),
+                    self.state.runtime.clone(),
+                ))
+            },
+        )?;
+        let warning_lines = new_policy.warning_lines();
+        let timeout = new_policy.config.approval.timeout;
+        *self.policy.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(new_policy);
+        Ok((warning_lines, timeout))
+    }
+
+    /// Persists `target` to `.stopit.toml` in the workspace, records the new
+    /// file hash in [`TrustStore`], and reloads the session policy.
+    ///
+    /// Before writing, verifies that `.stopit.toml` on disk is still in the
+    /// exact state allowed in [`TrustStore`] (or absent and passes
+    /// [`check_missing`]), so unapproved edits on disk are never trusted.
+    pub(crate) fn persist_approval(
+        &self,
+        target: &crate::persist::PersistTarget,
+    ) -> Result<(), String> {
+        let _guard = self.persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let config_path = self.workspace.dir.join(CONFIG_FILE);
+        let found_config = config_in(&self.workspace.dir).map_err(|e| e.to_string())?;
+        let store = TrustStore::open(&self.state.data.store.path).map_err(|e| e.to_string())?;
+        let allowed = store.read().map_err(|e| e.to_string())?;
+        drop(store);
+        let explicit = self.explicit_dir.is_some().then_some(self.workspace.dir.as_path());
+        let (existing_str, expected_dev_ino) = match &found_config {
+            None => {
+                let links = discovery_links(
+                    &self.cwd,
+                    self.explicit_dir.as_deref(),
+                    std::env::var_os("PWD"),
+                );
+                check_missing(&allowed, &self.workspace.dir, explicit.is_some(), &links)
+                    .map_err(|e| e.to_string())?;
+                (String::new(), None)
+            }
+            Some(path) => {
+                let (bytes, dev_ino) = read_trusted_with_id(path).map_err(|e| e.to_string())?;
+                let file = ConfigFile {
+                    path: path.clone(),
+                    bytes,
+                };
+                check_allowed(&allowed, &file, explicit).map_err(|e| e.to_string())?;
+                let text = std::str::from_utf8(&file.bytes)
+                    .map_err(|e| format!("cannot read {config_path:?} as UTF-8: {e}"))?
+                    .to_owned();
+                (text, Some(dev_ino))
+            }
+        };
+        let updated = crate::persist::update_config_toml(&existing_str, target)?;
+        write_trusted_config(&self.workspace.dir, expected_dev_ino, updated.as_bytes())
+            .map_err(|e| e.to_string())?;
+        let store = TrustStore::open(&self.state.data.store.path).map_err(|e| e.to_string())?;
+        store
+            .update(|allowed| allowed.allow(config_path.clone(), updated.as_bytes()))
+            .map_err(|e| e.to_string())?;
+        drop(store);
+        self.reload_locked().map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     fn granted(&self) -> std::sync::MutexGuard<'_, GrantedRw> {
         self.granted.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Compiles with `outputs`, and `granted` as more untrusted roots.
-    fn compile_granted(
+    /// Compiles with `policy` and `outputs`, and `granted` as more untrusted
+    /// roots.
+    fn compile_granted_with(
         &self,
+        policy: &SessionPolicy,
         outputs: Vec<(ProviderName, ProviderOutput)>,
         granted: &std::collections::BTreeSet<PathBuf>,
     ) -> Result<CompiledSession, RunError> {
         Ok(crate::spec::compile_session_granted(
-            &self.config,
+            &policy.config,
             outputs,
-            &self.protected,
+            &policy.protected,
             &self.state,
-            &self.ctx,
+            &policy.ctx,
             granted,
         )?)
     }
 
-    /// Compiles every profile again from the providers' outputs of
-    /// [`load`](Self::load), against the filesystem as it is now, with the
+    /// Compiles every profile again from the providers' outputs of the
+    /// current policy, against the filesystem as it is now, with the
     /// compile warnings. A server does this for every run, so globs, masks
     /// and missing paths are decided when the sandbox starts, as for a
     /// standalone run. Script providers are not run again.
     pub(crate) fn recompile(&self) -> Result<(CompiledSession, Vec<String>), RunError> {
+        let policy = self.policy();
         let granted = self.granted().paths.clone();
-        let compiled = self.compile_granted(self.outputs.clone(), &granted)?;
-        let warnings = warning_lines(&compiled, self.config.base);
+        let compiled = self.compile_granted_with(&policy, policy.outputs.clone(), &granted)?;
+        let warnings = warning_lines(&compiled, policy.config.base);
         Ok((compiled, warnings))
     }
 
-    /// Compiles every profile again, as [`recompile`](Self::recompile)
-    /// does, with `extra` after the providers' outputs: the temporary
-    /// profile of a `stopit-grant` request (§7.5), which every check of
-    /// the compiler then applies to. Warnings are dropped.
+    /// Compiles every profile again in `policy` with `extra` after the
+    /// providers' outputs: the temporary profile of a `stopit-grant` request
+    /// (§7.5), which every check of the compiler then applies to. Warnings
+    /// are dropped.
     ///
     /// `rw`, the request's canonical `rw` paths, count as untrusted roots
     /// here along with those of earlier requests, but join the session's
@@ -1020,6 +1231,7 @@ impl LoadedSession {
     /// generation of the session's paths it saw.
     pub(crate) fn compile_with(
         &self,
+        policy: &SessionPolicy,
         extra: (ProviderName, ProviderOutput),
         rw: &[PathBuf],
     ) -> Result<(CompiledSession, u64), RunError> {
@@ -1028,9 +1240,9 @@ impl LoadedSession {
             (state.paths.clone(), state.generation)
         };
         granted.extend(rw.iter().cloned());
-        let mut outputs = self.outputs.clone();
+        let mut outputs = policy.outputs.clone();
         outputs.push(extra);
-        Ok((self.compile_granted(outputs, &granted)?, generation))
+        Ok((self.compile_granted_with(policy, outputs, &granted)?, generation))
     }
 
     /// Adds `rw`, the `rw` paths of a request that passed its checks, to
@@ -1045,26 +1257,53 @@ impl LoadedSession {
     /// [`compile_with`](Self::compile_with), if another request added
     /// paths since, so the request is compiled again with them.
     pub(crate) fn admit_grant(&self, rw: &[PathBuf], generation: u64) -> u64 {
-        let mut state = self.granted();
-        let unchanged = state.generation == generation;
-        let before = state.paths.len();
-        state.paths.extend(rw.iter().cloned());
-        if state.paths.len() != before {
-            state.generation += 1;
+        let (ret, new_paths) = {
+            let mut state = self.granted();
+            let unchanged = state.generation == generation;
+            let before = state.paths.len();
+            state.paths.extend(rw.iter().cloned());
+            let changed = state.paths.len() != before;
+            if changed {
+                state.generation += 1;
+            }
+            let ret = match unchanged {
+                true => state.generation,
+                false => generation,
+            };
+            (ret, changed.then(|| state.paths.clone()))
+        };
+        if let Some(paths) = new_paths {
+            let prev = self.policy();
+            if let Ok(recompiled) =
+                self.compile_granted_with(&prev, prev.outputs.clone(), &paths)
+            {
+                let mut guard = self.policy.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.generation == prev.generation {
+                    *guard = Arc::new(SessionPolicy {
+                        generation: prev.generation + 1,
+                        config: prev.config.clone(),
+                        compiled: Arc::new(recompiled),
+                        load_warnings: prev.load_warnings.clone(),
+                        compile_warnings: prev.compile_warnings.clone(),
+                        outputs: prev.outputs.clone(),
+                        protected: prev.protected.clone(),
+                        ctx: prev.ctx.clone(),
+                    });
+                }
+            }
         }
-        match unchanged {
-            true => state.generation,
-            false => generation,
-        }
+        ret
     }
 
     /// `compiled`, of a request admitted at `generation`, if no other
     /// request has added `rw` paths since. Otherwise compiles `extra`
-    /// again with them, so a command another grant let write there since
-    /// cannot have moved what this one mounts. The paths stay locked
-    /// meanwhile, which holds up other compiles for one compile's time.
+    /// again with them in `policy`, so a command another grant let write
+    /// there since cannot have moved what this one mounts. The paths stay
+    /// locked meanwhile, which holds up other compiles for one compile's
+    /// time.
     pub(crate) fn current_grant(
         &self,
+        policy: &SessionPolicy,
         extra: (ProviderName, ProviderOutput),
         generation: u64,
         compiled: CompiledSession,
@@ -1073,9 +1312,9 @@ impl LoadedSession {
         if state.generation == generation {
             return Ok(compiled);
         }
-        let mut outputs = self.outputs.clone();
+        let mut outputs = policy.outputs.clone();
         outputs.push(extra);
-        self.compile_granted(outputs, &state.paths)
+        self.compile_granted_with(policy, outputs, &state.paths)
     }
 
     /// The host user's home directory, which `~` in rules names.
@@ -1086,24 +1325,12 @@ impl LoadedSession {
     /// The warnings of loading and of `compile_warnings`, as printed,
     /// `stopit: warning: …` and escaped.
     pub(crate) fn warning_lines_with(&self, compile_warnings: &[String]) -> Vec<String> {
-        self.load_warnings
-            .iter()
-            .chain(compile_warnings)
-            .map(|w| format!("stopit: warning: {}", escape_message(w)))
-            .collect()
+        self.policy().warning_lines_with(compile_warnings)
     }
 
     /// The warnings of loading and compiling, as printed.
     pub(crate) fn warning_lines(&self) -> Vec<String> {
-        self.warning_lines_with(&self.compile_warnings)
-    }
-
-    /// The profile `name` (`main` if `None`) of the session as loaded.
-    pub(crate) fn profile(
-        &self,
-        name: Option<&str>,
-    ) -> Result<(ProfileRef, &CompiledProfile), RunError> {
-        profile_in(&self.compiled, name)
+        self.policy().warning_lines()
     }
 
     /// The startup summary of `profile`, named `name`, as printed
@@ -1113,13 +1340,14 @@ impl LoadedSession {
         name: &ProfileRef,
         profile: &CompiledProfile,
     ) -> Vec<String> {
-        let unprotected = unprotected_providers(&self.config);
+        let policy = self.policy();
+        let unprotected = unprotected_providers(&policy.config);
         let ctx = SummaryContext {
             profile: name.as_str(),
             workspace: &self.workspace.dir,
-            workspace_mount: self.workspace_mount(),
+            workspace_mount: policy.ctx.workspace_sandbox(),
             home: &self.home,
-            base: self.config.base,
+            base: policy.config.base,
             unprotected: &unprotected,
         };
         summary_lines(&profile.spec, &ctx)
@@ -1140,7 +1368,8 @@ impl LoadedSession {
         extras: &crate::bwrap::RunExtras,
     ) -> Result<BwrapCommand, RunError> {
         let env = profile.spec.target_env(host_env);
-        let sandbox_cwd = working_dir(&profile.spec, self.workspace_mount());
+        let mount = self.workspace_mount();
+        let sandbox_cwd = working_dir(&profile.spec, &mount);
         Ok(BwrapCommand::for_init_with(
             &profile.spec,
             &self.session,
@@ -1174,8 +1403,8 @@ impl LoadedSession {
     }
 
     /// Where the sandbox sees the workspace.
-    pub(crate) fn workspace_mount(&self) -> &Path {
-        self.ctx.workspace_sandbox()
+    pub(crate) fn workspace_mount(&self) -> PathBuf {
+        self.policy().ctx.workspace_sandbox().to_path_buf()
     }
 
     /// The network proxy for a sandbox of `profile`, if it is in proxy
@@ -1199,7 +1428,7 @@ impl LoadedSession {
     /// The OSC 52 policy for a standalone run's output filter. `ask` has no
     /// one to ask there, and denies every write.
     pub(crate) fn clipboard(&self) -> ClipboardPolicy {
-        match self.config.terminal.clipboard_write {
+        match self.policy().config.terminal.clipboard_write {
             ClipboardWrite::Allow => ClipboardPolicy::Allow,
             ClipboardWrite::Block => ClipboardPolicy::Block,
             ClipboardWrite::Ask => ClipboardPolicy::Ask,
@@ -1208,12 +1437,12 @@ impl LoadedSession {
 
     /// The session's `terminal.clipboard_write`.
     pub(crate) fn clipboard_write(&self) -> ClipboardWrite {
-        self.config.terminal.clipboard_write
+        self.policy().config.terminal.clipboard_write
     }
 
     /// The session's `approval.timeout`.
     pub(crate) fn approval_timeout(&self) -> crate::config::ApprovalTimeout {
-        self.config.approval.timeout
+        self.policy().config.approval.timeout
     }
 }
 
@@ -2266,6 +2495,37 @@ fn read_trusted(path: &Path) -> Result<Vec<u8>, RunError> {
     Ok(bytes)
 }
 
+/// Reads the configuration file at `path` via [`open_trusted`], checking that
+/// it has only a single hard link, and returns its bytes together with its
+/// `(st_dev, st_ino)` identity so [`write_trusted_config`] can verify the
+/// file was not replaced or hard-linked before writing.
+fn read_trusted_with_id(path: &Path) -> Result<(Vec<u8>, (u64, u64)), RunError> {
+    let fd = open_trusted(path)?;
+    let stat = rustix::fs::fstat(&fd).map_err(|e| RunError::ReadConfig {
+        path: path.to_path_buf(),
+        source: e.into(),
+    })?;
+    if stat.st_nlink != 1 {
+        return Err(RunError::UntrustedConfig {
+            path: path.to_path_buf(),
+            reason: format!(
+                "{path:?} has {} hard links, and a sandbox could rewrite it through another one; \
+                 give it a single name",
+                stat.st_nlink
+            ),
+        });
+    }
+    let id = (stat.st_dev as u64, stat.st_ino as u64);
+    let mut bytes = Vec::new();
+    File::from(fd)
+        .read_to_end(&mut bytes)
+        .map_err(|source| RunError::ReadConfig {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok((bytes, id))
+}
+
 /// Opens the configuration file at `path` for reading if
 /// [`check_config_trust`] allows it, and returns the descriptor it checked:
 /// its directory is opened, then the file in it without following a
@@ -2339,6 +2599,105 @@ fn open_trusted(path: &Path) -> Result<rustix::fd::OwnedFd, RunError> {
     )
     .map_err(untrusted)?;
     Ok(fd)
+}
+
+/// Writes `bytes` to `dir`'s `.stopit.toml` without following symlinks and
+/// after checking [`check_config_trust`], `st_nlink == 1`, and (when
+/// `expected_dev_ino` is `Some`) that `(st_dev, st_ino)` still matches the
+/// file read and verified against [`TrustStore`].
+///
+/// Opens without `O_TRUNC` and with `O_NONBLOCK` first so an untrusted file,
+/// hard-linked file, or FIFO is rejected before any truncation occurs. When
+/// `expected_dev_ino` is `Some`, truncates the verified regular file in place
+/// via `ftruncate` so that any read-only bind mount over `.stopit.toml` in an
+/// already-running sandbox remains attached to the same inode; when `None`,
+/// creates a new file with `O_CREAT | O_EXCL` and mode `0644`.
+fn write_trusted_config(
+    dir: &Path,
+    expected_dev_ino: Option<(u64, u64)>,
+    bytes: &[u8],
+) -> Result<(), RunError> {
+    use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, fstat, ftruncate, openat, openat2};
+    use std::io::Write as _;
+    let path = dir.join(CONFIG_FILE);
+    let io_error = |source: io::Error| RunError::ReadConfig {
+        path: path.clone(),
+        source,
+    };
+    let untrusted = |reason: String| RunError::UntrustedConfig {
+        path: path.clone(),
+        reason,
+    };
+    let dir_fd = match openat2(
+        CWD,
+        dir,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS,
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::LOOP) => {
+            return Err(untrusted(format!(
+                "the way to it, {dir:?}, runs through a symbolic link"
+            )));
+        }
+        Err(e) => return Err(io_error(e.into())),
+    };
+    let (flags, mode) = if expected_dev_ino.is_some() {
+        (
+            OFlags::WRONLY
+                | OFlags::NOFOLLOW
+                | OFlags::NOCTTY
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+    } else {
+        (
+            OFlags::WRONLY
+                | OFlags::CREATE
+                | OFlags::EXCL
+                | OFlags::NOFOLLOW
+                | OFlags::NOCTTY
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )
+    };
+    let fd = match openat(&dir_fd, CONFIG_FILE, flags, mode) {
+        Ok(fd) => fd,
+        Err(Errno::LOOP) => return Err(untrusted("it is a symbolic link".into())),
+        Err(e) => return Err(io_error(e.into())),
+    };
+    let file_stat = fstat(&fd).map_err(|e| io_error(e.into()))?;
+    let dir_stat = fstat(&dir_fd).map_err(|e| io_error(e.into()))?;
+    check_config_trust(
+        Ownership::of(&file_stat),
+        Ownership::of(&dir_stat),
+        rustix::process::getuid().as_raw(),
+    )
+    .map_err(untrusted)?;
+    if file_stat.st_nlink != 1 {
+        return Err(untrusted(format!(
+            "{path:?} has {} hard links, and a sandbox could rewrite it through another one; \
+             give it a single name",
+            file_stat.st_nlink
+        )));
+    }
+    if let Some(expected) = expected_dev_ino
+        && (file_stat.st_dev as u64, file_stat.st_ino as u64) != expected
+    {
+        return Err(untrusted(
+            "it was replaced while persisting the approval".into(),
+        ));
+    }
+    if expected_dev_ino.is_some() {
+        ftruncate(&fd, 0).map_err(|e| io_error(e.into()))?;
+    }
+    let mut file = File::from(fd);
+    file.write_all(bytes).map_err(io_error)?;
+    file.sync_all().map_err(io_error)?;
+    Ok(())
 }
 
 /// Whether a configuration file `file` in the directory `dir` can be trusted
@@ -4135,5 +4494,49 @@ mod tests {
         ] {
             assert!(grants(src), "{src}");
         }
+    }
+
+    #[test]
+    fn write_trusted_config_creates_new_or_updates_in_place_without_following_symlinks() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let (_d, root) = tmp();
+        let cfg = root.join(CONFIG_FILE);
+
+        // Creating a new `.stopit.toml` succeeds when absent.
+        write_trusted_config(&root, None, b"[terminal]\nclipboard_write = \"allow\"\n").unwrap();
+        let meta_before = fs::symlink_metadata(&cfg).unwrap();
+        let id_before = (meta_before.dev(), meta_before.ino());
+
+        // If `expected_dev_ino == None` but a file already exists, `O_EXCL` refuses it.
+        assert!(write_trusted_config(&root, None, b"second\n").is_err());
+
+        // Updating an existing `.stopit.toml` writes in place and preserves its inode.
+        write_trusted_config(&root, Some(id_before), b"# updated\n").unwrap();
+        let meta_after = fs::symlink_metadata(&cfg).unwrap();
+        assert_eq!((meta_after.dev(), meta_after.ino()), id_before);
+        assert_eq!(fs::read(&cfg).unwrap(), b"# updated\n");
+
+        // A mismatched `(dev, ino)` is refused without truncating the file!
+        assert!(
+            write_trusted_config(&root, Some((id_before.0, id_before.1 + 1)), b"bad\n").is_err()
+        );
+        assert_eq!(fs::read(&cfg).unwrap(), b"# updated\n");
+
+        // A hard-linked `.stopit.toml` is refused without truncating the file!
+        let hard = root.join("hard.toml");
+        fs::hard_link(&cfg, &hard).unwrap();
+        assert!(write_trusted_config(&root, Some(id_before), b"bad\n").is_err());
+        assert_eq!(fs::read(&cfg).unwrap(), b"# updated\n");
+        fs::remove_file(&hard).unwrap();
+
+        // Replacing `.stopit.toml` with a symlink is refused by `O_NOFOLLOW`.
+        let other = root.join("other.toml");
+        fs::write(&other, b"original\n").unwrap();
+        fs::remove_file(&cfg).unwrap();
+        symlink(&other, &cfg).unwrap();
+        assert!(write_trusted_config(&root, Some(id_before), b"hijacked\n").is_err());
+        assert!(write_trusted_config(&root, None, b"hijacked\n").is_err());
+        assert_eq!(fs::read(&other).unwrap(), b"original\n");
     }
 }

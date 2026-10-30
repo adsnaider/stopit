@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::ApprovalTimeout;
 use crate::escape::{escape_bytes, escape_message};
-use crate::pty::RawMode;
+use crate::persist::PersistTarget;
+use crate::pty::{CbreakMode, RawMode};
 
 /// How long a prompt ignores keys after it appears.
 const ARMING_DELAY: Duration = Duration::from_millis(300);
@@ -211,6 +212,8 @@ pub enum Verdict {
     Once,
     /// Allowed for the rest of the session, in the request's scope.
     Session,
+    /// Allowed for the session and persisted to `.stopit.toml`.
+    Persist,
     /// Denied by the user, so the scope is quiet for [`QUIET_AFTER_DENY`].
     DeniedByUser,
     /// Denied without the user's answer: no terminal, a timeout, a cancel,
@@ -221,9 +224,12 @@ pub enum Verdict {
 impl Verdict {
     /// Whether the request may proceed.
     pub fn allows(self) -> bool {
-        matches!(self, Verdict::Once | Verdict::Session)
+        matches!(self, Verdict::Once | Verdict::Session | Verdict::Persist)
     }
 }
+
+/// Callback invoked when the user answers `[p] allow and persist`.
+pub type Persister = Box<dyn Fn(&PersistTarget) -> Result<(), String> + Send + Sync>;
 
 /// What the approver remembers.
 #[derive(Default)]
@@ -234,6 +240,8 @@ struct State {
     quiet: HashMap<String, Instant>,
     /// Whether a prompt is on the terminal.
     prompting: bool,
+    /// Whether the server's terminal has hung up (EOF / EIO).
+    terminal_hup: bool,
     /// Log lines held back while a prompt is up, at most [`MAX_HELD`].
     held: Vec<String>,
     /// Log lines dropped while a prompt was up, once `held` was full.
@@ -254,7 +262,11 @@ pub struct Approver {
     /// for keys and written with prompts. `None` when the server's stdin is
     /// not a terminal, and every request is denied.
     terminal: Option<OwnedFd>,
-    timeout: ApprovalTimeout,
+    /// Non-blocking pipe `(read, write)` used to wake the server's main loop
+    /// when a prompt finishes so it can resume polling `terminal` for idle
+    /// keys (`r`).
+    prompt_wake: Option<(OwnedFd, OwnedFd)>,
+    timeout: Mutex<ApprovalTimeout>,
     quiet_after: Duration,
     /// How long a prompt ignores keys after it appears, [`ARMING_DELAY`]
     /// but in tests.
@@ -262,6 +274,9 @@ pub struct Approver {
     /// Whether the server must be in the terminal's foreground to ask.
     /// Only tests, whose terminal is no controlling terminal, turn it off.
     require_foreground: bool,
+    /// Optional callback that writes `[p]` approvals to `.stopit.toml` and
+    /// reloads the server session.
+    persister: Option<Persister>,
     /// Held while a prompt is up, so prompts never overlap.
     prompt: Mutex<()>,
     state: Mutex<State>,
@@ -294,14 +309,103 @@ impl Approver {
         timeout: ApprovalTimeout,
         quiet_after: Duration,
     ) -> Self {
+        let prompt_wake = nonblocking_pipe();
         Approver {
             terminal,
-            timeout,
+            prompt_wake,
+            timeout: Mutex::new(timeout),
             quiet_after,
             arming_delay: ARMING_DELAY,
             require_foreground: true,
+            persister: None,
             prompt: Mutex::new(()),
             state: Mutex::new(State::default()),
+        }
+    }
+
+    /// Configures the callback invoked when the user chooses `[p] allow and
+    /// persist`.
+    pub fn set_persister(
+        &mut self,
+        persister: impl Fn(&PersistTarget) -> Result<(), String> + Send + Sync + 'static,
+    ) {
+        self.persister = Some(Box::new(persister));
+    }
+
+    /// Updates the approval timeout (used when the server reloads its
+    /// configuration).
+    pub fn set_timeout(&self, timeout: ApprovalTimeout) {
+        *self.timeout.lock().unwrap_or_else(|e| e.into_inner()) = timeout;
+    }
+
+    /// Clears any active quiet periods from recent denials (used when the
+    /// user manually reloads the server configuration).
+    pub fn clear_quiet(&self) {
+        self.state().quiet.clear();
+    }
+
+    /// Puts the server's terminal into cbreak mode (`!ICANON & !ECHO`) when
+    /// the server has a terminal and is in its foreground process group, so
+    /// single-key commands (`r`) arrive without waiting for Enter.
+    pub fn enter_cbreak(&self) -> Option<CbreakMode> {
+        let terminal = self.terminal.as_ref()?;
+        if self.require_foreground
+            && rustix::termios::tcgetpgrp(terminal).ok() != Some(rustix::process::getpgrp())
+        {
+            return None;
+        }
+        CbreakMode::enter(terminal.as_fd()).ok()
+    }
+
+    /// Returns the file descriptor the server's main loop should poll alongside
+    /// its control socket: the terminal itself while idle in the foreground, or
+    /// the prompt-end wakeup pipe while a prompt is active on the terminal.
+    pub fn idle_poll_fd(&self) -> Option<RawFd> {
+        let terminal = self.terminal.as_ref()?;
+        {
+            let state = self.state();
+            if state.terminal_hup {
+                return None;
+            }
+            if state.prompting {
+                return self.prompt_wake.as_ref().map(|(r, _)| r.as_raw_fd());
+            }
+        }
+        if self.require_foreground
+            && rustix::termios::tcgetpgrp(terminal).ok() != Some(rustix::process::getpgrp())
+        {
+            return None;
+        }
+        Some(terminal.as_raw_fd())
+    }
+
+    /// Reads one key from the server's terminal when no approval prompt is
+    /// active, draining any prompt-wakeup notifications first.
+    pub fn read_idle_key(&self) -> Option<u8> {
+        if let Some((r, _)) = &self.prompt_wake {
+            drain_pipe(r.as_fd());
+        }
+        let _guard = self.prompt.try_lock().ok()?;
+        {
+            let state = self.state();
+            if state.prompting || state.terminal_hup {
+                return None;
+            }
+        }
+        let terminal = self.terminal.as_ref()?;
+        if self.require_foreground
+            && rustix::termios::tcgetpgrp(terminal).ok() != Some(rustix::process::getpgrp())
+        {
+            return None;
+        }
+        let mut key = [0u8; 1];
+        match rustix::io::read(terminal, &mut key) {
+            Ok(1) => Some(key[0]),
+            Ok(0) | Err(rustix::io::Errno::IO) => {
+                self.state().terminal_hup = true;
+                None
+            }
+            _ => None,
         }
     }
 
@@ -420,6 +524,20 @@ impl Approver {
         request: &ApprovalRequest,
         cancel: BorrowedFd<'_>,
     ) -> Verdict {
+        let default_persist = matches!(request, ApprovalRequest::ClipboardWrite { .. })
+            .then_some(PersistTarget::ClipboardWrite);
+        self.decide_with_persist(asker, request, default_persist.as_ref(), cancel)
+    }
+
+    /// Like [`decide`](Self::decide), with `persist` describing how `[p] allow
+    /// and persist` writes the approval into `.stopit.toml`.
+    pub fn decide_with_persist(
+        &self,
+        asker: &Asker,
+        request: &ApprovalRequest,
+        persist: Option<&PersistTarget>,
+        cancel: BorrowedFd<'_>,
+    ) -> Verdict {
         let scope = request.scope(&asker.profile);
         let quiet = request.quiet_scope(&asker.profile);
         if let Some(verdict) = self.remembered(&scope, &quiet) {
@@ -460,15 +578,25 @@ impl Approver {
             .ask(terminal.as_fd(), asker, &description, cancel)
             .unwrap_or(Verdict::Denied);
         let said = match verdict {
-            Verdict::Once => "allowed once",
-            Verdict::Session => "allowed for this session",
-            Verdict::DeniedByUser | Verdict::Denied => "denied",
+            Verdict::Once => "allowed once".to_owned(),
+            Verdict::Session => "allowed for this session".to_owned(),
+            Verdict::Persist => match (&self.persister, persist) {
+                (Some(persister), Some(target)) => match persister(target) {
+                    Ok(()) => "allowed and persisted to .stopit.toml".to_owned(),
+                    Err(err) => format!(
+                        "allowed for this session (could not persist to .stopit.toml: {})",
+                        escape_message(&err)
+                    ),
+                },
+                _ => "allowed and persisted to .stopit.toml".to_owned(),
+            },
+            Verdict::DeniedByUser | Verdict::Denied => "denied".to_owned(),
         };
         let _ = write_all(terminal.as_fd(), format!("{said}\r\n").as_bytes());
         {
             let mut state = self.state();
             match verdict {
-                Verdict::Session => {
+                Verdict::Session | Verdict::Persist => {
                     state.allowed.insert(scope);
                 }
                 Verdict::DeniedByUser => {
@@ -498,14 +626,17 @@ impl Approver {
         for line in description {
             text.push_str(&format!("  {line}\r\n"));
         }
-        text.push_str("  [y] allow once  [s] allow for this session  [n] deny: ");
+        text.push_str(
+            "  [y] allow once  [s] allow for this session  [p] allow and persist  [n] deny: ",
+        );
         write_all(terminal, text.as_bytes())?;
         // Keys typed before the prompt, and during its first moment, do not
         // count.
         flush_input(terminal);
         std::thread::sleep(self.arming_delay);
         flush_input(terminal);
-        let deadline = match self.timeout {
+        let timeout = *self.timeout.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = match timeout {
             ApprovalTimeout::Off => None,
             ApprovalTimeout::After(after) => Some(Instant::now() + after),
         };
@@ -551,6 +682,7 @@ impl Approver {
                 Ok(1) => match key[0] {
                     b'y' | b'Y' => break Verdict::Once,
                     b's' | b'S' => break Verdict::Session,
+                    b'p' | b'P' => break Verdict::Persist,
                     // Anything else denies, Ctrl-C and Escape included.
                     _ => break Verdict::DeniedByUser,
                 },
@@ -579,6 +711,9 @@ impl Drop for Prompting<'_> {
                 std::mem::take(&mut state.dropped),
             )
         };
+        if let Some((_, w)) = &self.0.prompt_wake {
+            let _ = rustix::io::write(w, &[1u8]);
+        }
         for line in held {
             print_line(&line);
         }
@@ -588,6 +723,24 @@ impl Drop for Prompting<'_> {
             ));
         }
     }
+}
+
+fn nonblocking_pipe() -> Option<(OwnedFd, OwnedFd)> {
+    use std::os::fd::FromRawFd;
+    let mut raw = [0 as libc::c_int; 2];
+    // SAFETY: `raw` holds two integers; on success `pipe2` initializes both
+    // with freshly opened file descriptors owned by this process.
+    unsafe {
+        if libc::pipe2(raw.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) != 0 {
+            return None;
+        }
+        Some((OwnedFd::from_raw_fd(raw[0]), OwnedFd::from_raw_fd(raw[1])))
+    }
+}
+
+fn drain_pipe(fd: BorrowedFd<'_>) {
+    let mut buf = [0u8; 64];
+    while matches!(rustix::io::read(fd, &mut buf), Ok(n) if n > 0) {}
 }
 
 /// Prints `line` to stderr, ignoring errors: `eprintln!` would panic on a
@@ -1188,5 +1341,106 @@ mod tests {
         approver.state().prompting = true;
         approver.log("held");
         assert_eq!(approver.state().held, ["held"]);
+    }
+
+    #[test]
+    fn persist_answer_calls_persister_and_remembers_for_session() {
+        let mut t = on_pty(
+            ApprovalTimeout::After(Duration::from_secs(10)),
+            QUIET_AFTER_DENY,
+        );
+        let persisted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let persisted_clone = persisted.clone();
+        t.approver.set_persister(move |target| {
+            persisted_clone.lock().unwrap().push(target.clone());
+            Ok(())
+        });
+
+        let user = answer(t.master.try_clone().unwrap(), b"p");
+        let target = crate::persist::PersistTarget::ClipboardWrite;
+        assert_eq!(
+            t.approver.decide_with_persist(
+                &asker("main"),
+                &hi(),
+                Some(&target),
+                t.cancel.as_fd(),
+            ),
+            Verdict::Persist
+        );
+        assert!(Verdict::Persist.allows());
+        let shown = user.join().unwrap();
+        assert!(shown.contains("[p] allow and persist"), "{shown:?}");
+        assert!(
+            shown.contains("allowed and persisted to .stopit.toml"),
+            "{shown:?}"
+        );
+        assert_eq!(persisted.lock().unwrap().len(), 1);
+        // Remembered for the session without prompting again.
+        assert_eq!(
+            t.approver.decide_with_persist(
+                &asker("main"),
+                &hi(),
+                Some(&target),
+                t.cancel.as_fd(),
+            ),
+            Verdict::Session
+        );
+    }
+
+    #[test]
+    fn persist_answer_when_persister_fails_allows_for_session_and_reports_error() {
+        let mut t = on_pty(
+            ApprovalTimeout::After(Duration::from_secs(10)),
+            QUIET_AFTER_DENY,
+        );
+        t.approver.set_persister(|_| Err("disk full".into()));
+
+        let user = answer(t.master.try_clone().unwrap(), b"p");
+        let target = crate::persist::PersistTarget::ClipboardWrite;
+        let verdict = t.approver.decide_with_persist(
+            &asker("main"),
+            &hi(),
+            Some(&target),
+            t.cancel.as_fd(),
+        );
+        assert_eq!(verdict, Verdict::Persist);
+        assert!(verdict.allows());
+        let shown = user.join().unwrap();
+        assert!(
+            shown.contains("allowed for this session (could not persist to .stopit.toml: disk full)"),
+            "{shown:?}"
+        );
+        assert_eq!(
+            t.approver
+                .remembered(&hi().scope("main"), &hi().scope("main")),
+            Some(Verdict::Session)
+        );
+    }
+
+    #[test]
+    fn clear_quiet_and_read_idle_key_work() {
+        let t = on_pty(ApprovalTimeout::Off, QUIET_AFTER_DENY);
+        t.approver
+            .set_timeout(ApprovalTimeout::After(Duration::from_secs(5)));
+        t.approver.state().quiet.insert(
+            hi().scope("main"),
+            Instant::now() + Duration::from_secs(60),
+        );
+        t.approver.clear_quiet();
+        assert!(t.approver.state().quiet.is_empty());
+
+        let _cbreak = t.approver.enter_cbreak();
+        assert!(t.approver.idle_poll_fd().is_some());
+        rustix::io::write(&t.master, b"r").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut key = None;
+        while Instant::now() < deadline {
+            if let Some(k) = t.approver.read_idle_key() {
+                key = Some(k);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(key, Some(b'r'));
     }
 }

@@ -20,6 +20,7 @@ pub mod landlock;
 pub mod limits;
 pub mod manifest;
 pub mod net;
+pub mod persist;
 pub mod policy;
 pub mod provider;
 pub mod provision;

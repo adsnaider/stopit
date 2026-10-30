@@ -5865,3 +5865,134 @@ fn workspace_mount_host_at_home_itself_is_refused() {
         "{out_state:?}"
     );
 }
+
+#[test]
+fn server_reloads_configuration_on_r_key_and_keeps_ephemeral_state() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((server_master, server_slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::with_config(&config);
+    let mut server = Server::start_on_terminal(&s, &server_master, server_slave);
+
+    // Run 1 writes to the session's ephemeral `/tmp`.
+    let results = s.probe(&[], &[write("/tmp/shared", "kept across reload")]);
+    assert_eq!(ok(&results[0]), &Data::Done);
+
+    // Edit `.stopit.toml` and `stopit allow` it, then press `r` on the server terminal.
+    s.write_config(&format!(
+        "{config}\
+         [[provider]]\ntype = \"config\"\nname = \"extra\"\n[provider.sandbox]\n\
+         env.set = {{ RELOADED = \"yes\" }}\n"
+    ));
+    (&server_master).write_all(b"r").unwrap();
+    server.wait_for_log("stopit: reloaded configuration");
+
+    let out = output(
+        s.stopit(&[
+            "run",
+            "--quiet",
+            "/bin/sh",
+            "-c",
+            "printf '%s:%s' \"$RELOADED\" \"$(cat /tmp/shared)\"",
+        ]),
+        b"",
+    );
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "yes:kept across reload"
+    );
+
+    // An unallowed change to `.stopit.toml` fails the reload and keeps the active policy.
+    fs::write(s.ws().join(".stopit.toml"), "invalid = true\n").unwrap();
+    server.log.lock().unwrap().clear();
+    (&server_master).write_all(b"r").unwrap();
+    server.wait_for_log("stopit: error reloading configuration:");
+
+    let results = s.probe(&[], &[read("/tmp/shared")]);
+    assert_eq!(contents(&results[0]), "kept across reload");
+
+    assert_eq!(server.stop(), 128 + libc::SIGTERM);
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn persisting_approvals_updates_stopit_toml_allows_it_and_reloads_live_session() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((server_master, server_slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::with_config(&format!(
+        "{config}[terminal]\nclipboard_write = \"ask\"\n[approval]\ntimeout = \"20s\"\n\
+         [[provider]]\ntype = \"config\"\nname = \"ask-echo\"\n[provider.sandbox]\n\
+         shims.myecho = {{ binary = \"echo\", default = {{ decision = \"ask\", profile = \"main\" }}, rules = [\
+           {{ subcommand = [\"hello\"], decision = \"ask\", profile = \"main\" }}\
+         ] }}\n"
+    ));
+    let home = s.root.join("home");
+    fs::write(home.join("extra.txt"), "persisted-grant\n").unwrap();
+
+    let mut server = Server::start_on_terminal(&s, &server_master, server_slave);
+
+    // 1. Answer `p` to a brokered shim command (`myecho hello world`).
+    let shim_cmd = s.stopit(&["run", "--quiet", "/bin/sh", "-c", "myecho hello world"]);
+    let client = command_output_async(shim_cmd);
+    server.wait_for_log("[n] deny: ");
+    answer(
+        &server,
+        &server_master,
+        b"p",
+        "allowed and persisted to .stopit.toml",
+    );
+    let out = client.join().unwrap();
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello world\n");
+
+    // 2. Answer `p` to a `stopit-grant` (`+ro:~/extra.txt`).
+    server.log.lock().unwrap().clear();
+    let grant_cmd = s.stopit(&[
+        "run",
+        "--quiet",
+        "/bin/sh",
+        "-c",
+        "stopit-grant +ro:~/extra.txt -- cat /home/user/extra.txt",
+    ]);
+    let client = command_output_async(grant_cmd);
+    server.wait_for_log("[n] deny: ");
+    answer(
+        &server,
+        &server_master,
+        b"p",
+        "allowed and persisted to .stopit.toml",
+    );
+    let out = client.join().unwrap();
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "persisted-grant\n");
+
+    assert_eq!(server.stop(), 128 + libc::SIGTERM);
+
+    // 3. Because `p` updated `.stopit.toml` and recorded its hash in the trust store,
+    // a standalone run works without running `stopit allow` and already has both
+    // the `myecho hello` rule allowed and `~/extra.txt` mounted read-only!
+    let standalone = output(
+        s.stopit(&[
+            "run",
+            "--standalone",
+            "--quiet",
+            "/bin/sh",
+            "-c",
+            "myecho hello again && cat /home/user/extra.txt",
+        ]),
+        b"",
+    );
+    assert_eq!(code(&standalone), 0, "{standalone:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&standalone.stdout),
+        "hello again\npersisted-grant\n"
+    );
+}

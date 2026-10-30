@@ -19,7 +19,9 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
 use rustix::io::Errno;
 use rustix::pty::{OpenptFlags, grantpt, ioctl_tiocgptpeer, openpt, unlockpt};
-use rustix::termios::{OptionalActions, Termios, tcgetattr, tcgetwinsize, tcsetattr, tcsetwinsize};
+use rustix::termios::{
+    LocalModes, OptionalActions, Termios, tcgetattr, tcgetwinsize, tcsetattr, tcsetwinsize,
+};
 
 use crate::filter::OutputFilter;
 
@@ -138,6 +140,37 @@ impl Drop for RawMode {
         // terminal's reply to a query it sent just before it ended. None of
         // it is meant for the shell. Restoring does not wait for output to
         // drain, which a stalled terminal could make take forever.
+        let _ = rustix::termios::tcflush(&self.fd, rustix::termios::QueueSelector::IFlush);
+        let _ = tcsetattr(&self.fd, OptionalActions::Now, &self.saved);
+    }
+}
+
+/// The server's terminal in cbreak mode (`!ICANON & !ECHO`), so single-key
+/// commands such as `r` arrive without waiting for a newline while signals
+/// from keys (`ISIG`: Ctrl-C, Ctrl-\) and output newline translation (`OPOST`)
+/// stay active. Restored when dropped.
+#[derive(Debug)]
+pub struct CbreakMode {
+    fd: OwnedFd,
+    saved: Termios,
+}
+
+impl CbreakMode {
+    /// Puts the terminal `fd` into cbreak mode (`!ICANON & !ECHO`).
+    pub fn enter(fd: BorrowedFd<'_>) -> io::Result<CbreakMode> {
+        let fd = rustix::io::fcntl_dupfd_cloexec(fd, 3)?;
+        let saved = tcgetattr(&fd)?;
+        let mut cbreak = saved.clone();
+        cbreak
+            .local_modes
+            .remove(LocalModes::ICANON | LocalModes::ECHO);
+        tcsetattr(&fd, OptionalActions::Now, &cbreak)?;
+        Ok(CbreakMode { fd, saved })
+    }
+}
+
+impl Drop for CbreakMode {
+    fn drop(&mut self) {
         let _ = rustix::termios::tcflush(&self.fd, rustix::termios::QueueSelector::IFlush);
         let _ = tcsetattr(&self.fd, OptionalActions::Now, &self.saved);
     }
@@ -772,5 +805,24 @@ mod tests {
             let (_, tty_shared) = own_terminal_fd(tty.as_fd()).unwrap();
             assert!(tty_shared.is_some());
         }
+    }
+
+    #[test]
+    fn cbreak_mode_clears_icanon_and_echo_keeps_isig_and_restores_on_drop() {
+        use rustix::termios::{LocalModes, tcgetattr};
+        let pty = Pty::open(None, None).unwrap();
+        let before = tcgetattr(&pty.slave).unwrap();
+        assert!(before.local_modes.contains(LocalModes::ICANON));
+        assert!(before.local_modes.contains(LocalModes::ECHO));
+        assert!(before.local_modes.contains(LocalModes::ISIG));
+        {
+            let _cbreak = CbreakMode::enter(pty.slave.as_fd()).unwrap();
+            let during = tcgetattr(&pty.slave).unwrap();
+            assert!(!during.local_modes.contains(LocalModes::ICANON));
+            assert!(!during.local_modes.contains(LocalModes::ECHO));
+            assert!(during.local_modes.contains(LocalModes::ISIG));
+        }
+        let after = tcgetattr(&pty.slave).unwrap();
+        assert_eq!(after.local_modes, before.local_modes);
     }
 }
