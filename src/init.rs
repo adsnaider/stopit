@@ -232,7 +232,12 @@ pub struct InitSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartDir {
-    /// Its path in the sandbox.
+    /// Its path in the sandbox, serialized as lowercase hex bytes so non-UTF-8
+    /// Unix paths survive JSON encoding.
+    #[serde(
+        serialize_with = "crate::landlock::serialize_hex_path",
+        deserialize_with = "crate::landlock::deserialize_hex_path"
+    )]
     pub path: std::path::PathBuf,
     /// The device of the directory the broker checked.
     pub dev: u64,
@@ -1527,5 +1532,21 @@ mod tests {
     #[test]
     fn closing_descriptors_from_a_high_number_succeeds() {
         close_fds_from(1 << 20).unwrap();
+    }
+
+    #[test]
+    fn non_utf8_start_dir_round_trips_through_init_spec_json() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut spec = InitSpec::from_sandbox_spec(&SandboxSpec::default());
+        spec.cwd = Some(StartDir {
+            path: std::path::PathBuf::from(OsString::from_vec(b"/home/u/\xff/sub".to_vec())),
+            dev: 17,
+            ino: 42,
+        });
+        let bytes = encode_spec(&spec).unwrap();
+        let decoded = decode_spec(&bytes).unwrap();
+        assert_eq!(decoded, spec);
     }
 }

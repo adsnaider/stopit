@@ -202,7 +202,7 @@ The configuration has a single way of granting resources: **providers**. Only se
 base = "default"
 
 [workspace]
-mount = "/workspace"          # where {workspace} appears inside the sandbox
+mount = "/workspace"          # where {workspace} appears inside the sandbox, or "host"
 
 [limits]
 memory = "8G"
@@ -221,7 +221,7 @@ fs.ro = ["/etc/ssl/certs"]
 network = { mode = "proxy", allow_domains = ["static.crates.io", "index.crates.io"] }
 ```
 
-**Workspace.** The workspace is the host directory the session is about: by default the directory with the nearest `.stopit.toml`, walking up from the current directory (§3), else the current directory, overridable with `stopit run --workspace <dir>`. Its identity is session-wide because the supervisor depends on it (socket and hard-link scans, protected-file shadows, repository resolution, broker cwd checks) and every provider's `{workspace}` paths are relative to it. *Access* to it is still a grant: under `base = "none"` the workspace is defined but not mounted until a provider grants it. The workspace mount point (like `system.home`) is subject to the reserved-path rules in §6.2. Otherwise `{workspace}` rules are resolved and checked like `~` and absolute ones (§3.4, §6.2); the workspace is special in exactly three ways: (1) it is the session's identity, whose path comes from `.stopit.toml` or `--workspace` and which the supervisor relies on, so it must appear in the sandbox only at its mount (§6.2, Workspace exposure); (2) it is always an untrusted root for symlinks, even when no profile of the session grants it `rw` (§3.4, Symlinks); (3) the default base grants it `rw` (§3.2).
+**Workspace.** The workspace is the host directory the session is about: by default the directory with the nearest `.stopit.toml`, walking up from the current directory (§3), else the current directory, overridable with `stopit run --workspace <dir>`. Its identity is session-wide because the supervisor depends on it (socket and hard-link scans, protected-file shadows, repository resolution, broker cwd checks) and every provider's `{workspace}` paths are relative to it. `[workspace] mount` sets where it appears inside the sandbox: a plain absolute path (default `"/workspace"`) or `"host"`, which mounts the workspace at its canonical host directory so tools and saved sessions see the same path inside and outside the sandbox. *Access* to it is still a grant: under `base = "none"` the workspace is defined but not mounted until a provider grants it. The workspace mount point (like `system.home`) is subject to the reserved-path rules in §6.2. Otherwise `{workspace}` rules are resolved and checked like `~` and absolute ones (§3.4, §6.2); the workspace is special in exactly three ways: (1) it is the session's identity, whose path comes from `.stopit.toml` or `--workspace` and which the supervisor relies on, so it must appear in the sandbox only at its mount (§6.2, Workspace exposure); (2) it is always an untrusted root for symlinks, even when no profile of the session grants it `rw` (§3.4, Symlinks); (3) the default base grants it `rw` (§3.2).
 
 ### 3.2 Bases
 
@@ -294,7 +294,7 @@ Semantics:
 * **New files matching a protected glob** (e.g. a new `nix/foo.nix`) are written through directly: every pre-existing file that could reference them is itself protected. See §11 for the auto-import caveat.
 
 Path syntax (in any provider):
-* `{workspace}` is the host workspace directory, mounted at `workspace.mount` (default `/workspace`).
+* `{workspace}` is the host workspace directory, mounted at `workspace.mount` (default `/workspace`, or the canonical host workspace directory when `workspace.mount = "host"`).
 * `~/…` is host `$HOME/…` on the host side and sandbox `HOME` on the sandbox side (`/home/user` unless a provider sets `system.home`; the default base leaves it unset).
 * Absolute paths map to the same path inside the sandbox; `fs.bind` entries remap explicitly.
 * Built-in providers may resolve additional concrete host paths internally (e.g. `vcs` resolves git worktree and jj workspace storage, §7.3). These are not user-facing placeholders.
@@ -701,7 +701,7 @@ rules      = [
 ```
 
 * `binary` and `default` are **required**. `binary` is never inferred from the shim name, and `default` has no implicit value because `ask`/`allow` need a target profile.
-* `args` go between the binary and the caller's arguments. The rules match only the caller's arguments, so `args` may hold a flag the rules refuse (the `jj` shim runs `jj --no-pager -R <workspace>` and refuses `-R` from the caller). Each is non-empty and holds no NUL. The prompt shows them.
+* `args` go between the binary and the caller's arguments. The rules match only the caller's arguments, so `args` may hold a flag the rules refuse (the `jj` shim runs `jj --no-pager -R <workspace>` and refuses `-R` from the caller). Each is non-empty and holds no NUL. Exact `"{workspace}"` and `"{workspace}/…"` (with normalized relative components) expand to the sandbox workspace mount; `{workspace}` elsewhere in an argument (such as `"--config={workspace}/a.toml"`) is rejected so flags and paths are passed as separate arguments, and every other argument is passed literally. The prompt shows the expanded arguments.
 * A rule or default with `decision = "deny"` must not name a `profile`; `allow` and `ask` must.
 * Shim names `stopit` and `stopit-grant` are reserved.
 * Each entry in a rule's `subcommand` list is one or more tokens separated by single spaces (`[a-z0-9][a-z0-9_-]*`); the last token may be `*` (e.g. `bookmark *`). A lone `*` is rejected (use `default`), and flags are not subcommands.

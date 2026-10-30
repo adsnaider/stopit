@@ -49,6 +49,14 @@ pub struct ProviderContext {
     pub rw_grants: Vec<UntrustedRoot>,
 }
 
+impl ProviderContext {
+    /// Where the workspace appears inside the sandbox, resolved against
+    /// [`Self::workspace`].
+    pub fn resolved_workspace_mount(&self) -> &Path {
+        self.workspace_mount.resolve(&self.workspace)
+    }
+}
+
 /// The result of running a provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderOutput {

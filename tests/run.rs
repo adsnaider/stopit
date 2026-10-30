@@ -5607,3 +5607,261 @@ fn limits_without_busctl_fail_before_the_session() {
     // Before any session directory.
     assert!(!s.runtime().join("stopit").exists());
 }
+
+// --- [workspace] mount = "host" and {workspace} in shim args ---
+
+#[test]
+fn workspace_mount_host_places_workspace_under_ephemeral_home_and_expands_shim_args() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    if !sandbox_has("git") {
+        eprintln!("skipping: no git in /usr/bin or /bin");
+        return;
+    }
+    let Some((server_master, server_slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::new();
+    let home = s.root.join("home");
+    let ws = home.join("repos/proj");
+    fs::create_dir_all(&ws).unwrap();
+    for dir in [&home, &home.join("repos"), &ws] {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::write(
+        home.join(".gitconfig"),
+        "[user]\n\tname = Host User\n\temail = host@example.com\n",
+    )
+    .unwrap();
+    host_git(&ws, &["init", "-q", "-b", "main"]);
+    fs::write(ws.join("a.txt"), "hello\n").unwrap();
+
+    s.write_global_config(&format!(
+        "[workspace]\nmount = \"host\"\n{config}\
+         [[provider]]\ntype = \"config\"\nname = \"home-and-shims\"\n[provider.sandbox]\n\
+         system.home = {:?}\n\
+         shims.echo-ws = {{ binary = \"sh\", args = [\"-c\", \"printf '%s|%s\\\\n' \\\"$1\\\" \\\"$2\\\"\", \"sh\", \"{{workspace}}\", \"{{workspace}}/a.txt\"], default = {{ decision = \"allow\", profile = \"main\" }} }}\n\
+         shims.ask-ws = {{ binary = \"sh\", args = [\"-c\", \"printf 'asked:%s\\\\n' \\\"$1\\\"\", \"sh\", \"{{workspace}}/sub\"], default = {{ decision = \"ask\", profile = \"main\" }} }}\n",
+        home.to_str().unwrap()
+    ));
+
+    let ws_arg = ws.to_str().unwrap();
+    let mut server_cmd = s.stopit(&["server", "--workspace", ws_arg]);
+    server_cmd
+        .stdin(server_slave.try_clone().unwrap())
+        .stdout(Stdio::null())
+        .stderr(server_slave.try_clone().unwrap());
+    with_controlling_terminal(&mut server_cmd, &server_slave);
+    let server_child = server_cmd.spawn().unwrap();
+    drop(server_cmd);
+    drop(server_slave);
+    let mut server = Server::collect(server_child, server_master.try_clone().unwrap());
+
+    let run1 = "pwd; \
+                test ! -e /workspace && echo no-slash-ws; \
+                mv ~/repos ~/repos_aside 2>/dev/null && echo mv-ok || echo mv-busy; \
+                echo scratch1 > ~/scratch; \
+                ls -A .git | wc -l; \
+                git add a.txt && git commit -qm host-commit && git log --format=%s; \
+                echo-ws";
+    let out1 = output(
+        s.stopit(&["run", "--workspace", ws_arg, "/bin/sh", "-c", run1]),
+        b"",
+    );
+    assert_eq!(code(&out1), 0, "{out1:?}");
+    let err1 = stderr(&out1);
+    assert!(
+        err1.starts_with("stopit: profile \"main\" (workspace ~/repos/proj rw at ~/repos/proj)\n"),
+        "{err1:?}"
+    );
+    let want1 = format!(
+        "{}\nno-slash-ws\nmv-busy\n0\nhost-commit\n{}|{}/a.txt\n",
+        ws.display(),
+        ws.display(),
+        ws.display()
+    );
+    assert_eq!(String::from_utf8_lossy(&out1.stdout), want1);
+
+    // A second run on the same server reuses ephemeral `~` (where `~/repos`
+    // now exists above the workspace mount) and shows expanded shim arguments
+    // in the approval prompt.
+    let run2_cmd = s.stopit(&[
+        "run",
+        "--quiet",
+        "--workspace",
+        ws_arg,
+        "/bin/sh",
+        "-c",
+        "cat ~/scratch; ask-ws",
+    ]);
+    let client = command_output_async(run2_cmd);
+    server.wait_for_log("[n] deny: ");
+    let prompt_log = server.log();
+    assert!(
+        prompt_log.contains(&format!("{}/sub", ws.display())),
+        "{prompt_log:?}"
+    );
+    assert!(!prompt_log.contains("{workspace}"), "{prompt_log:?}");
+    answer(&server, &server_master, b"y", "allowed once");
+    let out2 = client.join().unwrap();
+    assert_eq!(code(&out2), 0, "{out2:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out2.stdout),
+        format!("scratch1\nasked:{}/sub\n", ws.display())
+    );
+    assert_eq!(server.stop(), 128 + libc::SIGTERM);
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn workspace_mount_host_with_default_home_and_stopit_grant() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((server_master, server_slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::new();
+    let home = s.root.join("home");
+    let ws = home.join("repos/proj");
+    fs::create_dir_all(&ws).unwrap();
+    for dir in [&home, &home.join("repos"), &ws] {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::write(home.join("note.txt"), "granted-note\n").unwrap();
+    fs::write(ws.join("a.txt"), "in-ws\n").unwrap();
+
+    s.write_global_config(&format!("[workspace]\nmount = \"host\"\n{config}"));
+
+    let ws_arg = ws.to_str().unwrap();
+    let mut server_cmd = s.stopit(&["server", "--workspace", ws_arg]);
+    server_cmd
+        .stdin(server_slave.try_clone().unwrap())
+        .stdout(Stdio::null())
+        .stderr(server_slave.try_clone().unwrap());
+    with_controlling_terminal(&mut server_cmd, &server_slave);
+    let server_child = server_cmd.spawn().unwrap();
+    drop(server_cmd);
+    drop(server_slave);
+    let mut server = Server::collect(server_child, server_master.try_clone().unwrap());
+
+    // Grants containing or lying inside the host workspace are refused without prompting.
+    let bad_script = format!(
+        "stopit-grant +ro:{} -- true 2>/dev/null; echo \"contain=$?\"; \
+         stopit-grant +ro:{}/a.txt -- true 2>/dev/null; echo \"inside=$?\"",
+        home.display(),
+        ws.display()
+    );
+    let out_bad = output(
+        s.stopit(&["run", "--workspace", ws_arg, "/bin/sh", "-c", &bad_script]),
+        b"",
+    );
+    assert_eq!(code(&out_bad), 0, "{out_bad:?}");
+    let err_bad = stderr(&out_bad);
+    let want_header = format!(
+        "stopit: profile \"main\" (workspace ~/repos/proj rw at {})\n",
+        ws.display()
+    );
+    assert!(err_bad.starts_with(&want_header), "{err_bad:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out_bad.stdout),
+        "contain=126\ninside=126\n"
+    );
+    assert!(!server.log().contains("[n] deny: "), "{:?}", server.log());
+
+    // A `~` grant outside the workspace lands under default `/home/user` while
+    // `cwd` stays at the host workspace path.
+    let ok_cmd = s.stopit(&[
+        "run",
+        "--quiet",
+        "--workspace",
+        ws_arg,
+        "/bin/sh",
+        "-c",
+        "stopit-grant +ro:~/note.txt -- sh -c 'pwd; cat /home/user/note.txt'",
+    ]);
+    let client = command_output_async(ok_cmd);
+    server.wait_for_log("[n] deny: ");
+    answer(&server, &server_master, b"y", "allowed once");
+    let out_ok = client.join().unwrap();
+    assert_eq!(code(&out_ok), 0, "{out_ok:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out_ok.stdout),
+        format!("{}\ngranted-note\n", ws.display())
+    );
+    assert_eq!(server.stop(), 128 + libc::SIGTERM);
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn workspace_mount_host_at_home_itself_is_refused() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let s = Setup::new();
+    let home = s.root.join("home");
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+    s.write_global_config(&format!(
+        "[workspace]\nmount = \"host\"\n{config}\
+         [[provider]]\ntype = \"config\"\nname = \"same-home\"\n[provider.sandbox]\n\
+         system.home = {:?}\n",
+        home.to_str().unwrap()
+    ));
+    let out = output(
+        s.stopit(&[
+            "run",
+            "--quiet",
+            "--workspace",
+            home.to_str().unwrap(),
+            "/bin/sh",
+            "-c",
+            "true",
+        ]),
+        b"",
+    );
+    assert_eq!(code(&out), 125, "{out:?}");
+    let err = stderr(&out);
+    assert!(err.contains("system.home"), "{err:?}");
+
+    // With default `system.home` (`/home/user`), `--workspace /tmp` is refused
+    // by `check_reserved_paths`, and `--workspace <s.root>` is refused because
+    // the writable workspace would contain stopit's config/state directories.
+    s.write_global_config(&format!("[workspace]\nmount = \"host\"\n{config}"));
+    let out_tmp = output(
+        s.stopit(&[
+            "run",
+            "--quiet",
+            "--workspace",
+            "/tmp",
+            "/bin/sh",
+            "-c",
+            "true",
+        ]),
+        b"",
+    );
+    assert_eq!(code(&out_tmp), 125, "{out_tmp:?}");
+    assert!(
+        stderr(&out_tmp).contains("workspace mount \"/tmp\""),
+        "{out_tmp:?}"
+    );
+
+    fs::set_permissions(&s.root, fs::Permissions::from_mode(0o755)).unwrap();
+    let out_state = output(
+        s.stopit(&[
+            "run",
+            "--quiet",
+            "--workspace",
+            s.root.to_str().unwrap(),
+            "/bin/sh",
+            "-c",
+            "true",
+        ]),
+        b"",
+    );
+    assert_eq!(code(&out_state), 125, "{out_state:?}");
+    assert!(
+        stderr(&out_state).contains("session runtime directory"),
+        "{out_state:?}"
+    );
+}

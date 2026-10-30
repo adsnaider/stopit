@@ -468,11 +468,15 @@ impl VcsProvider {
         // The repository is the one found here, never one git would find
         // by walking up from a directory the caller picked.
         if let Some(git_dir) = layout.git_dirs.first() {
-            set(
-                "GIT_DIR",
-                in_sandbox(git_dir).to_string_lossy().into_owned(),
-            );
-            set("GIT_WORK_TREE", mount.to_string_lossy().into_owned());
+            let git_dir = in_sandbox(git_dir);
+            let git_dir_str = git_dir
+                .to_str()
+                .ok_or_else(|| format!("{git_dir:?}, whose sandbox path is not UTF-8"))?;
+            let mount_str = mount
+                .to_str()
+                .ok_or_else(|| format!("{mount:?}, whose workspace mount is not UTF-8"))?;
+            set("GIT_DIR", git_dir_str.to_owned());
+            set("GIT_WORK_TREE", mount_str.to_owned());
         }
         // No editor or pager, which would hand the caller's terminal a
         // program that runs commands.
@@ -546,12 +550,9 @@ impl VcsProvider {
         profiles.insert("local".into(), Value::Table(local));
         root.insert("profiles".into(), Value::Table(profiles));
         let mut shims = toml::Table::new();
-        let mount_text = mount
-            .to_str()
-            .ok_or_else(|| format!("the workspace mount {mount:?} is not UTF-8"))?;
         for tool in &self.tools {
             let shim = match tool {
-                VcsTool::Jj if jj => jj_shim(mount_text),
+                VcsTool::Jj if jj => jj_shim(),
                 VcsTool::Git if git => git_shim(),
                 _ => continue,
             };
@@ -658,16 +659,16 @@ fn shim(binary: &str, args: &[&str], deny: &[&str], rules: Vec<toml::Value>) -> 
     toml::Value::Table(t)
 }
 
-/// The `jj` shim of §7.4, for the repository at the workspace mount
-/// `mount`. It runs `jj --no-pager -R <mount>`, so jj uses that repository
+/// The `jj` shim of §7.4. It runs `jj --no-pager -R {workspace}`, which the
+/// broker expands to the sandbox workspace mount so jj uses that repository
 /// whatever directory the caller is in. Options that name another
 /// repository, add configuration or run a diff or merge tool are refused.
 /// Reading commands run in `vcs.local` too, since jj snapshots the working
 /// copy first, which writes to `.jj`.
-fn jj_shim(mount: &str) -> toml::Value {
+fn jj_shim() -> toml::Value {
     shim(
         "jj",
-        &["--no-pager", "-R", mount],
+        &["--no-pager", "-R", "{workspace}"],
         &[
             "--config",
             "--config-file",
@@ -805,7 +806,7 @@ impl Provider for VcsProvider {
         };
         let manifest = match self.manifest_for(
             &ctx.workspace,
-            ctx.workspace_mount.as_path(),
+            ctx.resolved_workspace_mount(),
             &layout,
             &identity,
         ) {
@@ -1117,8 +1118,9 @@ mod tests {
         let jj = shim(&m, "jj");
         assert_eq!(
             jj.args.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
-            ["--no-pager", "-R", MOUNT]
+            ["--no-pager", "-R", "{workspace}"]
         );
+        assert_eq!(jj.args[2].expand(Path::new(MOUNT)), MOUNT);
         // A git store inside the jj store is fine too.
         fs::create_dir_all(ws.join(".jj/repo/store/git")).unwrap();
         fs::write(ws.join(".jj/repo/store/git_target"), "git").unwrap();
@@ -1287,5 +1289,29 @@ mod tests {
         ] {
             assert!(matches!(run(name, line), Outcome::Deny(_)), "{name} {line}");
         }
+    }
+
+    #[test]
+    fn non_utf8_workspace_mount_brokers_pure_jj_and_warns_grammatically_for_git() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let non_utf8_mount = Path::new(OsStr::from_bytes(b"/home/u/\xff"));
+        let (_d, jj_ws) = workspace();
+        fs::create_dir_all(jj_ws.join(".jj/repo/store")).unwrap();
+        let m = provider()
+            .manifest_for(&jj_ws, non_utf8_mount, &discover(&jj_ws), &[])
+            .unwrap();
+        assert_eq!(
+            shim(&m, "jj").args[2].expand(non_utf8_mount),
+            non_utf8_mount.as_os_str()
+        );
+
+        let (_d2, git_ws) = workspace();
+        git_init(&git_ws);
+        let err = provider()
+            .manifest_for(&git_ws, non_utf8_mount, &discover(&git_ws), &[])
+            .unwrap_err();
+        assert!(err.contains("whose sandbox path is not UTF-8"), "{err}");
     }
 }

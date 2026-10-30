@@ -338,7 +338,7 @@ pub enum SandboxAnchor {
 
 /// Checks the components after the leading anchor: no empty components (so
 /// no `//` and no trailing `/`), no `.` or `..`, and no braces.
-fn check_components(rest: &str) -> Result<(), &'static str> {
+pub(super) fn check_components(rest: &str) -> Result<(), &'static str> {
     if rest.contains(['{', '}']) {
         return Err("placeholders are only allowed as the leading `{workspace}`");
     }

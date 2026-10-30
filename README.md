@@ -290,7 +290,16 @@ profile = "publish"
 network = { mode = "proxy", allow_domains = ["crates.io", "index.crates.io", "static.crates.io"] }
 ```
 
-The publish profile still has no registry token, since the default filter drops `CARGO_REGISTRY_TOKEN`. Set `tty = true` on a shim for a full-screen TUI or interactive shell so foreground terminal calls get a pseudo-terminal and window-size updates of their own. DESIGN.md section 7.1 describes the rules.
+The publish profile still has no registry token, since the default filter drops `CARGO_REGISTRY_TOKEN`. In `args`, standalone `"{workspace}"` and `"{workspace}/..."` arguments expand to the sandbox workspace mount (pass flags and paths as separate arguments, such as `["-R", "{workspace}"]`). Set `tty = true` on a shim for a full-screen TUI or interactive shell so foreground terminal calls get a pseudo-terminal and window-size updates of their own. DESIGN.md section 7.1 describes the rules.
+
+### Mount the project at its host path
+
+Agents and build caches that record the working directory on the host break if a resumed session sees `/workspace` instead. Set `mount = "host"` in `~/.config/stopit/config.toml` or `.stopit.toml` to mount each project at its canonical host path:
+
+```toml
+[workspace]
+mount = "host"
+```
 
 ### Let a command ask for more
 

@@ -60,7 +60,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use rustix::fs::{
-    CWD, MemfdFlags, Mode, OFlags, ResolveFlags, SealFlags, fcntl_add_seals, memfd_create, openat2,
+    CWD, MemfdFlags, Mode, OFlags, ResolveFlags, SealFlags, fcntl_add_seals, memfd_create, mkdirat,
+    openat2,
 };
 use rustix::io::{Errno, FdFlags, fcntl_dupfd_cloexec, fcntl_setfd};
 use thiserror::Error;
@@ -509,6 +510,7 @@ impl BwrapCommand {
                 untrusted_roots.insert(canon);
             }
         }
+        ensure_ephemeral_parents(spec, session)?;
         let plan = plan_with_caps(
             spec,
             &untrusted_roots,
@@ -1349,6 +1351,120 @@ fn largest_provider(mounts: &[PlannedMount]) -> (Option<ProviderName>, usize) {
         .map_or((None, 0), |(p, n)| (Some(p.clone()), n))
 }
 
+/// Creates missing intermediate directories inside session `ephemeral/`
+/// backing directories for mounts nested below an `ephemeral` mount, refusing
+/// symlinks and non-directories via `openat2(RESOLVE_NO_SYMLINKS)` so every
+/// intermediate parent exists on Run 1 and is self-bound into a mount point by
+/// [`collect_pinned_parents`].
+fn ensure_ephemeral_parents(spec: &SandboxSpec, session: &SessionDir) -> Result<(), BwrapError> {
+    let mut ephemeral_backs: HashMap<&Path, PathBuf> = HashMap::new();
+    for mount in &spec.mounts {
+        if let (MountSource::Ephemeral { key }, PathMode::Ephemeral) = (&mount.source, mount.mode) {
+            let backing = session
+                .ephemeral_dir(key)
+                .map_err(|error| BwrapError::Ephemeral {
+                    sandbox: mount.sandbox.clone(),
+                    error,
+                })?;
+            ephemeral_backs.insert(mount.sandbox.as_path(), backing);
+        }
+    }
+    if ephemeral_backs.is_empty() {
+        return Ok(());
+    }
+    let mount_by_sandbox: HashMap<&Path, &PlannedMount> = spec
+        .mounts
+        .iter()
+        .map(|m| (m.sandbox.as_path(), m))
+        .collect();
+    for mount in &spec.mounts {
+        let anc = mount
+            .sandbox
+            .ancestors()
+            .skip(1)
+            .find_map(|a| mount_by_sandbox.get(a).copied());
+        let Some(anc) = anc else {
+            continue;
+        };
+        let Some(backing) = ephemeral_backs.get(anc.sandbox.as_path()) else {
+            continue;
+        };
+        let rel = mount
+            .sandbox
+            .strip_prefix(&anc.sandbox)
+            .expect("ancestor is a prefix");
+        let Some(parent_rel) = rel.parent() else {
+            continue;
+        };
+        if parent_rel.as_os_str().is_empty() {
+            continue;
+        }
+        let mut dir_fd = openat2(
+            CWD,
+            backing,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS,
+        )
+        .map_err(|err| {
+            if err == Errno::LOOP {
+                BwrapError::EphemeralDestinationLink {
+                    sandbox: mount.sandbox.clone(),
+                    ephemeral: anc.sandbox.clone(),
+                    link: backing.clone(),
+                }
+            } else {
+                BwrapError::EphemeralDestinationInspect {
+                    sandbox: mount.sandbox.clone(),
+                    ephemeral: anc.sandbox.clone(),
+                    path: backing.clone(),
+                    error: io::Error::from(err),
+                }
+            }
+        })?;
+        let mut cur = backing.clone();
+        for comp in parent_rel.components() {
+            cur.push(comp);
+            let name = comp.as_os_str();
+            match mkdirat(&dir_fd, name, Mode::from_raw_mode(0o755)) {
+                Ok(()) | Err(Errno::EXIST) => {}
+                Err(err) => {
+                    return Err(BwrapError::EphemeralDestinationInspect {
+                        sandbox: mount.sandbox.clone(),
+                        ephemeral: anc.sandbox.clone(),
+                        path: cur,
+                        error: io::Error::from(err),
+                    });
+                }
+            }
+            dir_fd = openat2(
+                &dir_fd,
+                name,
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::NO_SYMLINKS | ResolveFlags::BENEATH,
+            )
+            .map_err(|err| {
+                if err == Errno::LOOP {
+                    BwrapError::EphemeralDestinationLink {
+                        sandbox: mount.sandbox.clone(),
+                        ephemeral: anc.sandbox.clone(),
+                        link: cur.clone(),
+                    }
+                } else {
+                    BwrapError::EphemeralDestinationInspect {
+                        sandbox: mount.sandbox.clone(),
+                        ephemeral: anc.sandbox.clone(),
+                        path: cur.clone(),
+                        error: io::Error::from(err),
+                    }
+                }
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// Refuses symlinks or uninspectable entries inside `backing` on the way to a
 /// mount destination `dst` nested below an ephemeral mount `eph_sandbox`.
 fn check_ephemeral_destination(
@@ -1393,9 +1509,8 @@ fn check_ephemeral_destination(
 }
 
 /// Collects existing intermediate directories strictly between an
-/// untrusted-root mount and a `masked`, `protected`, `ro`, or `ephemeral`
-/// descendant mount so `plan` can self-bind each into a mount point before
-/// mounting its children.
+/// untrusted-root (or `ephemeral`) mount and a descendant mount so `plan` can
+/// self-bind each into a mount point before mounting its children.
 fn collect_pinned_parents(
     spec: &SandboxSpec,
     untrusted_roots: &BTreeSet<PathBuf>,
@@ -1426,12 +1541,6 @@ fn collect_pinned_parents(
 
     let mut pinned: BTreeMap<PathBuf, (PathBuf, PathMode)> = BTreeMap::new();
     for mount in &spec.mounts {
-        if !matches!(
-            mount.mode,
-            PathMode::Masked | PathMode::Protected | PathMode::Ro | PathMode::Ephemeral
-        ) {
-            continue;
-        }
         let Some(parent) = mount.sandbox.parent() else {
             continue;
         };
@@ -3101,20 +3210,30 @@ mod tests {
         ]);
         s.untrusted_roots.insert(f.session.ephemeral());
 
-        // Normal missing or directory components inside the ephemeral backing pass.
-        assert!(
-            BwrapCommand::new(
-                &s,
-                &f.session,
-                &f.provisioned,
-                Path::new("/"),
-                &[],
-                TerminalSession::Keep,
-            )
-            .is_ok()
-        );
+        // Missing intermediate components inside the ephemeral backing are
+        // created and self-bound on Run 1.
+        let first = BwrapCommand::new(
+            &s,
+            &f.session,
+            &f.provisioned,
+            Path::new("/"),
+            &[],
+            TerminalSession::Keep,
+        )
+        .unwrap();
+        let first_args: Vec<&str> = first.args().iter().filter_map(|a| a.to_str()).collect();
+        let pos_tmp = first_args.iter().position(|&a| a == "/tmp").unwrap();
+        let pos_sub = first_args.iter().position(|&a| a == "/tmp/sub").unwrap();
+        let pos_leaf = first_args
+            .iter()
+            .position(|&a| a == "/tmp/sub/leaf")
+            .unwrap();
+        assert!(pos_tmp < pos_sub && pos_sub < pos_leaf, "{first_args:?}");
+        assert_eq!(first_args[pos_sub - 2], "--bind-fd", "{first_args:?}");
 
         let backing = f.session.ephemeral().join(key("/tmp").dir_name());
+        assert!(backing.join("sub").is_dir());
+        fs::remove_dir(backing.join("sub")).unwrap();
         std::os::unix::fs::symlink("/etc", backing.join("sub")).unwrap();
         let err = BwrapCommand::new(
             &s,
@@ -3403,5 +3522,55 @@ mod tests {
                 "{err:?}"
             );
         }
+    }
+
+    #[test]
+    fn rw_workspace_nested_inside_ephemeral_home_pins_intermediate_dirs_on_first_run() {
+        let f = Fixture::new();
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path().canonicalize().unwrap().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+
+        let mut s = spec(vec![
+            eph("/home/u", "~"),
+            host(
+                "/home/u/repos/proj",
+                ws.to_str().unwrap(),
+                EntryKind::Dir,
+                Rw,
+            ),
+        ]);
+        s.untrusted_roots.insert(ws);
+        s.untrusted_roots.insert(f.session.ephemeral());
+
+        let cmd = BwrapCommand::new(
+            &s,
+            &f.session,
+            &f.provisioned,
+            Path::new("/home/u/repos/proj"),
+            &[],
+            TerminalSession::Keep,
+        )
+        .unwrap();
+        let backing = f.session.ephemeral().join(key("~").dir_name());
+        assert!(backing.join("repos").is_dir());
+
+        let args: Vec<&str> = cmd.args().iter().filter_map(|a| a.to_str()).collect();
+        let pos_home = args.iter().position(|&a| a == "/home/u").unwrap();
+        let pos_repos = args.iter().position(|&a| a == "/home/u/repos").unwrap();
+        let pos_proj = args
+            .iter()
+            .position(|&a| a != "/home/u/repos/proj" || args[..].is_empty())
+            .and_then(|_| {
+                args.iter()
+                    .enumerate()
+                    .find(|&(i, &a)| {
+                        a == "/home/u/repos/proj" && args.get(i.wrapping_sub(1)) != Some(&"--chdir")
+                    })
+                    .map(|(i, _)| i)
+            })
+            .unwrap();
+        assert!(pos_home < pos_repos && pos_repos < pos_proj, "{args:?}");
+        assert_eq!(args[pos_repos - 2], "--bind-fd", "{args:?}");
     }
 }

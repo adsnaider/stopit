@@ -108,9 +108,10 @@ impl ExpansionContext {
     ) -> Result<Self, ExpandError> {
         check_host_dir("workspace directory", &workspace_host)?;
         check_host_dir("host home directory", &host_home)?;
+        let workspace_sandbox = workspace_mount.resolve(&workspace_host).to_owned();
         Ok(ExpansionContext {
             workspace_host,
-            workspace_sandbox: workspace_mount.as_path().to_owned(),
+            workspace_sandbox,
             host_home,
             sandbox_home: PathBuf::from(sandbox_home.as_str()),
         })
@@ -499,6 +500,24 @@ mod tests {
         assert_eq!(e.sandbox(), Some(p("/sbx/h")));
     }
 
+    #[test]
+    fn host_workspace_mount_maps_workspace_to_its_host_path() {
+        let c = ExpansionContext::new(
+            p("/home/u/repos/stopit"),
+            WorkspaceMount::Host,
+            p("/home/u"),
+            SandboxHome::default(),
+        )
+        .unwrap();
+        assert_eq!(c.workspace_sandbox(), Path::new("/home/u/repos/stopit"));
+        let root = exp(&c, "{workspace}");
+        assert_eq!(root.host(), Some(p("/home/u/repos/stopit")));
+        assert_eq!(root.sandbox(), Some(p("/home/u/repos/stopit")));
+        let sub = exp(&c, "{workspace}/src/lib.rs");
+        assert_eq!(sub.host(), Some(p("/home/u/repos/stopit/src/lib.rs")));
+        assert_eq!(sub.sandbox(), Some(p("/home/u/repos/stopit/src/lib.rs")));
+    }
+
     fn bind(host: &str, sandbox: &str) -> Bind {
         Bind {
             host: host.parse().unwrap(),
@@ -668,7 +687,10 @@ mod tests {
             "/home/user".parse().unwrap(),
         )
         .unwrap();
-        assert_eq!(exp(&c, "{workspace}").sandbox_anchor(), mount.as_path());
+        assert_eq!(
+            exp(&c, "{workspace}").sandbox_anchor(),
+            mount.as_path().unwrap()
+        );
     }
 
     #[test]
@@ -703,5 +725,35 @@ mod tests {
         assert!(msg.contains(".."), "{msg}");
         let msg = new_ctx("/a\0b", "/h").unwrap_err().to_string();
         assert!(msg.contains("NUL"), "{msg}");
+    }
+
+    #[test]
+    fn host_mount_allows_glob_and_brace_characters_in_host_workspace_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        for sub in ["proj [1]", "{dir}", "star*q?"] {
+            let ws = root.join(sub);
+            std::fs::create_dir_all(&ws).unwrap();
+            std::fs::write(ws.join("lib.rs"), "pub fn f() {}\n").unwrap();
+            let c = ExpansionContext::new(
+                ws.clone(),
+                WorkspaceMount::Host,
+                "/home/u".into(),
+                "/home/user".parse().unwrap(),
+            )
+            .unwrap();
+            let lit = exp(&c, "{workspace}");
+            assert!(!lit.has_glob());
+            assert_eq!(lit.host(), Some(ws.clone()));
+            assert_eq!(lit.sandbox(), Some(ws.clone()));
+
+            let globbed = exp(&c, "{workspace}/*.rs");
+            assert!(globbed.has_glob());
+            assert_eq!(globbed.walk_root(), Some(ws.clone()));
+            let resolved = resolve(&globbed).unwrap();
+            assert_eq!(resolved.paths.len(), 1, "{sub}: {resolved:?}");
+            assert_eq!(resolved.paths[0].host, ws.join("lib.rs"));
+            assert_eq!(resolved.paths[0].sandbox, ws.join("lib.rs"));
+        }
     }
 }

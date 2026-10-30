@@ -380,25 +380,44 @@ impl From<MapOnly<RawWorkspaceSettings>> for WorkspaceSettings {
 
 /// Where the workspace is mounted inside the sandbox.
 ///
-/// Guaranteed to be a plain absolute path, validated like the sandbox `HOME`:
-/// not `/`, no NUL bytes, no `~`, placeholders or glob characters, and no
-/// empty (so no `//` or trailing `/`), `.` or `..` components. Whether it
+/// Either `"host"` (mounted at the canonical host workspace directory) or a
+/// plain absolute path (default `"/workspace"`), validated like the sandbox
+/// `HOME`: not `/`, no NUL bytes, no `~`, placeholders or glob characters, and
+/// no empty (so no `//` or trailing `/`), `.` or `..` components. Whether it
 /// collides with other sandbox mounts is checked later, when the sandbox is
 /// compiled.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
-pub struct WorkspaceMount(PathBuf);
+pub enum WorkspaceMount {
+    /// Mounted at a fixed literal path inside the sandbox.
+    Path(PathBuf),
+    /// Mounted at the canonical host workspace directory (`mount = "host"`).
+    Host,
+}
 
 impl WorkspaceMount {
-    /// The validated mount path.
-    pub fn as_path(&self) -> &Path {
-        &self.0
+    /// The fixed mount path when configured as an explicit path, or `None` for
+    /// [`WorkspaceMount::Host`].
+    #[cfg(test)]
+    pub(crate) fn as_path(&self) -> Option<&Path> {
+        match self {
+            WorkspaceMount::Path(path) => Some(path.as_path()),
+            WorkspaceMount::Host => None,
+        }
+    }
+
+    /// Resolves the sandbox mount path against the canonical `host_workspace`.
+    pub fn resolve<'a>(&'a self, host_workspace: &'a Path) -> &'a Path {
+        match self {
+            WorkspaceMount::Path(path) => path.as_path(),
+            WorkspaceMount::Host => host_workspace,
+        }
     }
 }
 
 impl Default for WorkspaceMount {
     fn default() -> Self {
-        WorkspaceMount(PathBuf::from("/workspace"))
+        WorkspaceMount::Path(PathBuf::from("/workspace"))
     }
 }
 
@@ -406,9 +425,17 @@ impl FromStr for WorkspaceMount {
     type Err = ValueError;
 
     fn from_str(s: &str) -> Result<Self, ValueError> {
+        if s == "host" {
+            return Ok(WorkspaceMount::Host);
+        }
+        if !s.contains('\0') && !s.starts_with('/') {
+            return Err(ValueError::new(format!(
+                "invalid workspace mount {s:?}: must be \"host\" or an absolute path (`~` is not allowed here)"
+            )));
+        }
         check_plain_absolute(s)
             .map_err(|why| ValueError::new(format!("invalid workspace mount {s:?}: {why}")))?;
-        Ok(WorkspaceMount(PathBuf::from(s)))
+        Ok(WorkspaceMount::Path(PathBuf::from(s)))
     }
 }
 
@@ -833,6 +860,9 @@ mod tests {
             "/w[x]",
             "/{x}",
             "/{workspace}",
+            "{workspace}",
+            "HOST",
+            "host/sub",
             "~",
             "~/w",
         ] {
@@ -848,11 +878,22 @@ mod tests {
     fn valid_workspace_mounts_are_accepted() {
         for good in ["/workspace", "/a/b", "/a..b", "/.hidden"] {
             let cfg = Config::from_toml_str(&format!("[workspace]\nmount = \"{good}\"")).unwrap();
-            assert_eq!(cfg.workspace.mount.as_path(), Path::new(good));
+            assert_eq!(cfg.workspace.mount.as_path(), Some(Path::new(good)));
+            assert_eq!(
+                cfg.workspace.mount.resolve(Path::new("/host/ws")),
+                Path::new(good)
+            );
         }
+        let host = Config::from_toml_str("[workspace]\nmount = \"host\"").unwrap();
+        assert_eq!(host.workspace.mount, WorkspaceMount::Host);
+        assert_eq!(host.workspace.mount.as_path(), None);
+        assert_eq!(
+            host.workspace.mount.resolve(Path::new("/home/u/proj")),
+            Path::new("/home/u/proj")
+        );
         assert_eq!(
             WorkspaceSettings::default().mount.as_path(),
-            Path::new("/workspace")
+            Some(Path::new("/workspace"))
         );
     }
 
@@ -1124,6 +1165,34 @@ mod tests {
         assert_eq!(layered(None, None).config, expected_defaults());
         // Without a project file, the global layer alone.
         assert_eq!(layered(Some(global), None).config, want);
+        // `mount = "host"` layers in either direction.
+        assert_eq!(
+            layered(Some("[workspace]\nmount = \"host\""), Some(""))
+                .config
+                .workspace
+                .mount,
+            WorkspaceMount::Host
+        );
+        assert_eq!(
+            layered(
+                Some("[workspace]\nmount = \"host\""),
+                Some("[workspace]\nmount = \"/workspace\"")
+            )
+            .config
+            .workspace
+            .mount,
+            "/workspace".parse().unwrap()
+        );
+        assert_eq!(
+            layered(
+                Some("[workspace]\nmount = \"/global\""),
+                Some("[workspace]\nmount = \"host\"")
+            )
+            .config
+            .workspace
+            .mount,
+            WorkspaceMount::Host
+        );
     }
 
     #[test]

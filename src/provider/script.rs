@@ -245,7 +245,7 @@ impl ScriptProvider {
         context.insert("workspace".into(), path("workspace", &ctx.workspace)?);
         context.insert(
             "workspace_mount".into(),
-            path("workspace_mount", ctx.workspace_mount.as_path())?,
+            path("workspace_mount", ctx.resolved_workspace_mount())?,
         );
         context.insert("home".into(), path("home", &ctx.home)?);
         context.insert("session_dir".into(), path("session_dir", &ctx.session_dir)?);
@@ -794,6 +794,18 @@ mod tests {
             serde_json::from_slice(&fs::read(dir.path().join("stdin.json")).unwrap()).unwrap();
         assert_eq!(got["config"], json!({}));
         assert_eq!(got["context"]["name"], "env");
+        let mut host_ctx = ctx();
+        host_ctx.workspace = dir.path().canonicalize().unwrap();
+        host_ctx.workspace_mount = crate::config::WorkspaceMount::Host;
+        let _guard = EXEC_LOCK.read().unwrap_or_else(|e| e.into_inner());
+        p.manifest(&host_ctx).unwrap();
+        drop(_guard);
+        let host_got: Value =
+            serde_json::from_slice(&fs::read(dir.path().join("stdin.json")).unwrap()).unwrap();
+        assert_eq!(
+            host_got["context"]["workspace_mount"],
+            host_ctx.workspace.to_str().unwrap()
+        );
     }
 
     #[test]

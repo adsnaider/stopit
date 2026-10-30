@@ -6,11 +6,14 @@
 //! subcommands against `argv`, merging and resolving profile references
 //! happen later.
 
+use std::ffi::OsString;
 use std::fmt;
+use std::path::Path;
 use std::str::FromStr;
 
 use serde::Deserialize;
 
+use super::check_components;
 use crate::config::ProfileRef;
 use crate::error::ValueError;
 use crate::policy::Decision;
@@ -194,17 +197,34 @@ impl fmt::Display for Flag {
     }
 }
 
-/// An argument a shim puts before the caller's, such as `--no-pager`.
+/// An argument a shim puts before the caller's, such as `--no-pager` or
+/// `"{workspace}"`.
 ///
-/// Non-empty, and containing no NUL.
+/// Non-empty, containing no NUL. Exact `"{workspace}"` and `"{workspace}/…"`
+/// expand to the sandbox workspace mount when the broker runs the shim;
+/// relative components after `"{workspace}/"` must not be empty, `.`, `..`, or
+/// contain further braces. Any other argument (including tool templates such
+/// as `"{commit_id}"` or `"{workspace_id}"`) is passed literally.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 #[serde(try_from = "String")]
 pub struct ShimArg(String);
 
 impl ShimArg {
-    /// The validated argument.
+    /// The validated argument, before placeholder expansion.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Expands `"{workspace}"` and `"{workspace}/…"` against `workspace_mount`,
+    /// leaving every other argument unchanged.
+    pub fn expand(&self, workspace_mount: &Path) -> OsString {
+        if self.0 == "{workspace}" {
+            workspace_mount.as_os_str().to_os_string()
+        } else if let Some(rest) = self.0.strip_prefix("{workspace}/") {
+            workspace_mount.join(rest).into_os_string()
+        } else {
+            OsString::from(&self.0)
+        }
     }
 }
 
@@ -218,6 +238,14 @@ impl FromStr for ShimArg {
         }
         if s.contains('\0') {
             return Err(bad("must not contain NUL bytes"));
+        }
+        if let Some(rest) = s.strip_prefix("{workspace}/") {
+            check_components(rest).map_err(bad)?;
+        } else if s != "{workspace}" && s.contains("{workspace}") {
+            return Err(bad(
+                "{workspace} is only expanded as the whole argument \"{workspace}\" or prefix \
+                 \"{workspace}/...\"; pass the flag and path as separate arguments",
+            ));
         }
         Ok(ShimArg(s.to_owned()))
     }
@@ -986,6 +1014,62 @@ mod tests {
         jv_err(
             r#""shims": {"x": {"binary": "x", "deny_flags": "-c", "default": {"decision": "deny"}}}"#,
         );
+    }
+
+    #[test]
+    fn shim_args_expand_workspace_mount_and_preserve_literals() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let mount = Path::new("/home/u/repos/stopit");
+        for (raw, want) in [
+            ("{workspace}", "/home/u/repos/stopit"),
+            ("{workspace}/Cargo.toml", "/home/u/repos/stopit/Cargo.toml"),
+            ("{workspace}/a/b", "/home/u/repos/stopit/a/b"),
+            ("--no-pager", "--no-pager"),
+            ("{commit_id}", "{commit_id}"),
+            ("{workspace_id}", "{workspace_id}"),
+            ("--template={workspace_id}", "--template={workspace_id}"),
+            ("{{.Names}}", "{{.Names}}"),
+        ] {
+            let arg: ShimArg = raw.parse().unwrap();
+            assert_eq!(arg.as_str(), raw);
+            assert_eq!(arg.expand(mount), OsString::from(want), "{raw}");
+        }
+        let non_utf8_mount = Path::new(OsStr::from_bytes(b"/ws/\xff"));
+        assert_eq!(
+            "{workspace}"
+                .parse::<ShimArg>()
+                .unwrap()
+                .expand(non_utf8_mount),
+            OsStr::from_bytes(b"/ws/\xff")
+        );
+        assert_eq!(
+            "{workspace}/sub"
+                .parse::<ShimArg>()
+                .unwrap()
+                .expand(non_utf8_mount),
+            OsStr::from_bytes(b"/ws/\xff/sub")
+        );
+        for bad in [
+            "",
+            "a\0b",
+            "{workspace}/",
+            "{workspace}//a",
+            "{workspace}/a/",
+            "{workspace}/.",
+            "{workspace}/..",
+            "{workspace}/a/../b",
+            "{workspace}/{x}",
+            "--config={workspace}/deploy.toml",
+            "--work-tree={workspace}",
+            "-R{workspace}",
+            "sub/{workspace}",
+            "{workspace}extra",
+        ] {
+            let msg = bad.parse::<ShimArg>().unwrap_err().to_string();
+            assert!(msg.contains("invalid shim argument"), "{bad:?}: {msg}");
+        }
     }
 
     fn default_toml(inline: &str) -> String {

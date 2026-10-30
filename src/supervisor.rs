@@ -1117,7 +1117,7 @@ impl LoadedSession {
         let ctx = SummaryContext {
             profile: name.as_str(),
             workspace: &self.workspace.dir,
-            workspace_mount: self.config.workspace.mount.as_path(),
+            workspace_mount: self.workspace_mount(),
             home: &self.home,
             base: self.config.base,
             unprotected: &unprotected,
@@ -1140,7 +1140,7 @@ impl LoadedSession {
         extras: &crate::bwrap::RunExtras,
     ) -> Result<BwrapCommand, RunError> {
         let env = profile.spec.target_env(host_env);
-        let sandbox_cwd = working_dir(&profile.spec, self.config.workspace.mount.as_path());
+        let sandbox_cwd = working_dir(&profile.spec, self.workspace_mount());
         Ok(BwrapCommand::for_init_with(
             &profile.spec,
             &self.session,
@@ -1175,7 +1175,7 @@ impl LoadedSession {
 
     /// Where the sandbox sees the workspace.
     pub(crate) fn workspace_mount(&self) -> &Path {
-        self.config.workspace.mount.as_path()
+        self.ctx.workspace_sandbox()
     }
 
     /// The network proxy for a sandbox of `profile`, if it is in proxy

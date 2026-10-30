@@ -71,12 +71,13 @@ pub struct SummaryContext<'a> {
 /// documentation). Escaped, and without the `stopit: ` prefix.
 pub fn summary_lines(spec: &SandboxSpec, ctx: &SummaryContext<'_>) -> Vec<String> {
     let workspace_mode = workspace_mode(spec, ctx.workspace_mount);
+    let sandbox_home = Path::new(spec.system.home.as_str());
     let workspace = path_text(ctx.workspace, ctx.home, None);
     let placed = match workspace_mode {
         Some(mode) => format!(
             "{workspace} {} at {}",
             mode.as_str(),
-            path_text(ctx.workspace_mount, ctx.home, None)
+            path_text(ctx.workspace_mount, ctx.home, Some(sandbox_home))
         ),
         None => format!("{workspace}, not mounted"),
     };
@@ -498,6 +499,27 @@ mod tests {
         let mut spec = SandboxSpec::default();
         spec.mounts = vec![mount("/home/uu/a", "/home/uu/a", PathMode::Ro, "h")];
         assert_eq!(lines(&spec)[1], "  ro       /home/uu/a  (provider \"h\")");
+    }
+
+    #[test]
+    fn workspace_mount_in_header_uses_sandbox_home() {
+        let mut spec = SandboxSpec::default();
+        spec.mask_sockets = true;
+        spec.mounts = vec![mount(WS, WS, PathMode::Rw, "base")];
+        let mut c = ctx(Base::Default, &[]);
+        c.workspace_mount = Path::new(WS);
+        // Default `system.home` is `/home/user`, so `/home/u/proj` inside the
+        // sandbox is not abbreviated with `~`.
+        assert_eq!(
+            summary_lines(&spec, &c),
+            ["profile \"main\" (workspace ~/proj rw at /home/u/proj)"]
+        );
+        // When `system.home` matches host `HOME`, both sides abbreviate with `~`.
+        spec.system.home = HOME.parse().unwrap();
+        assert_eq!(
+            summary_lines(&spec, &c),
+            ["profile \"main\" (workspace ~/proj rw at ~/proj)"]
+        );
     }
 
     #[test]

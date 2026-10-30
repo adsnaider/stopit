@@ -504,9 +504,14 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
         return run_grant(call, args, cwd_fd, [stdin, stdout, stderr]);
     };
     let (outcome, rule) = decide(spec, &args);
+    let shim_args: Vec<OsString> = spec
+        .args
+        .iter()
+        .map(|a| a.expand(ctx.loaded.workspace_mount()))
+        .collect();
     // What runs, the shim's binary with the arguments.
     let command_line: String = std::iter::once(spec.binary.as_str().as_bytes())
-        .chain(spec.args.iter().map(|a| a.as_str().as_bytes()))
+        .chain(shim_args.iter().map(|a| a.as_os_str().as_bytes()))
         .chain(args.iter().map(Vec::as_slice))
         .map(crate::escape::shell_quote)
         .collect::<Vec<_>>()
@@ -550,7 +555,7 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
         }
     };
     let mut command = vec![OsString::from(spec.binary.as_str())];
-    command.extend(spec.args.iter().map(|a| OsString::from(a.as_str())));
+    command.extend(shim_args);
     command.extend(args.into_iter().map(OsString::from_vec));
     start_and_wait(
         conn,

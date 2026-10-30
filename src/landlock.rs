@@ -458,7 +458,10 @@ impl fmt::Debug for LandlockPathBeneathAttr {
     }
 }
 
-fn serialize_hex_path<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+pub(crate) fn serialize_hex_path<S: Serializer>(
+    path: &Path,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let bytes = path.as_os_str().as_bytes();
     let mut hex = String::with_capacity(bytes.len() * 2);
@@ -469,19 +472,19 @@ fn serialize_hex_path<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok
     serializer.serialize_str(&hex)
 }
 
-fn deserialize_hex_path<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PathBuf, D::Error> {
+pub(crate) fn deserialize_hex_path<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<PathBuf, D::Error> {
     let s = String::deserialize(deserializer)?;
     let bytes = unhex(&s).ok_or_else(|| D::Error::custom("path is not lowercase hex"))?;
     if bytes.is_empty() {
-        return Err(D::Error::custom("Landlock rule path must not be empty"));
+        return Err(D::Error::custom("sandbox path must not be empty"));
     }
     if bytes.contains(&0) {
-        return Err(D::Error::custom(
-            "Landlock rule path must not contain a NUL byte",
-        ));
+        return Err(D::Error::custom("sandbox path must not contain a NUL byte"));
     }
     if bytes[0] != b'/' {
-        return Err(D::Error::custom("Landlock rule path must be absolute"));
+        return Err(D::Error::custom("sandbox path must be absolute"));
     }
     Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
 }
