@@ -4,7 +4,7 @@ stopit runs a program, such as an LLM coding agent, a shell or a build, in a Lin
 
 It is a single Rust binary built on [bubblewrap](https://github.com/containers/bubblewrap), Landlock and seccomp. Agents with full-screen terminal interfaces (Claude Code, Gemini CLI, Codex, OpenCode) run in it through a terminal proxy that filters what they may send to your terminal. `git` and `jj` run through a broker that keeps the repository's metadata out of the agent's reach.
 
-> **Status: usable, still young.** These work and are tested against real sandboxes: the sandbox itself, the configuration and its trust checks, the terminal proxy, `stopit server` with its prompts, live configuration reload and saved approvals, the `full` and `proxy` network modes, brokered `git` and `jj` for local work, and resource limits. `stopit-grant` works for network and paths. Fetch and push through the broker, and prompts for writes to protected files, are not built yet. stopit has had no outside security review. [DESIGN.md](DESIGN.md) describes the design, and its section 11 lists the known gaps.
+> **Status: usable, still young.** These work and are tested against real sandboxes: the sandbox itself, the configuration and its trust checks, the terminal proxy, `stopit server` with its prompts, live configuration reload and saved approvals, the `full` and `proxy` network modes, brokered `git` and `jj` (including remote fetch and push via `vcs.remote` and `ssh-agent`), and resource limits. `stopit-grant` works for network and paths. Prompts for writes to protected files are not built yet. stopit has had no outside security review. [DESIGN.md](DESIGN.md) describes the design, and its section 11 lists the known gaps.
 
 ## What the sandbox gets by default
 
@@ -203,7 +203,7 @@ The `vcs` provider, on by default, masks the project's `.git` and `.jj` in the s
 
 - Reading and committing run at once: `git status`, `diff`, `log`, `show`, `add`, `commit`; `jj status`, `diff`, `log`, `show`, `new`, `commit`, `describe`, `op log`.
 - Commands that move or discard work ask you in the server's terminal: `git reset`, `rebase`, `checkout`, `switch`, `branch`, `tag`, `clean`, `stash`; `jj squash`, `rebase`, `abandon`, `restore`, `undo`, `bookmark`, `op`. So does anything not listed, and any call with a flag before the subcommand (`git --no-pager log` asks). Approve only commands you understand, since an approved command can write `.git`.
-- Fetch and push are refused. Run them on the host.
+- Fetch and push (`git fetch`, `pull`, `ls-remote`, `remote update`, `clone`, `push`; `jj git fetch`, `git clone`, `git push`) run in `vcs.remote` according to `fetch` and `push` (both `"ask"` by default), with `network = { mode = "full" }` and read-only binds of the host's `$SSH_AUTH_SOCK` and `~/.ssh/known_hosts`.
 - Options that add configuration, name another repository or run other programs are refused (`git -c`, `-C`, `--git-dir`; `jj --config`, `-R`, `--tool`).
 - git and jj start no editor, pager or signing program, so `git commit` and `jj describe` need `-m`, and commits are not signed.
 - The commands work only from inside the project. A `git` run from `/tmp` gets an error.
@@ -366,7 +366,6 @@ Before the sandbox starts, `stopit run` and `stopit shell` print to stderr what 
 
 ## Current limitations
 
-- Brokered `git` and `jj` cannot fetch or push. Run those on the host.
 - `protected` files are read-only. There is no approval prompt for writes yet.
 - `stopit-grant` cannot grant secrets or an SSH agent yet.
 - The proxy reaches ports 443 and 80 only, so SSH needs `full` mode.

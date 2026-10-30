@@ -5295,6 +5295,61 @@ fn the_vcs_profiles_have_a_home_main_cannot_write() {
     assert!(!stderr(&out).contains("warning"), "{out:?}");
 }
 
+#[test]
+fn vcs_remote_mounts_ssh_agent_and_known_hosts_read_only_while_main_sees_neither() {
+    use std::os::unix::net::UnixListener;
+
+    let Some(config) = shell_config() else {
+        return;
+    };
+    if !sandbox_has("git") {
+        eprintln!("skipping: no git in /usr/bin or /bin");
+        return;
+    }
+    if host_pasta().is_none() {
+        return;
+    }
+    let s = Setup::with_config(&format!(
+        "{config}[[provider]]\ntype = \"config\"\nname = \"look\"\n[provider.sandbox]\n\
+         shims.in-remote = {{ binary = \"sh\", default = {{ decision = \"allow\", profile = \"vcs.remote\" }} }}\n"
+    ));
+    let host_ssh = s.root.join("home/.ssh");
+    fs::create_dir_all(&host_ssh).unwrap();
+    fs::write(
+        host_ssh.join("known_hosts"),
+        "github.com ssh-ed25519 AAAA\n",
+    )
+    .unwrap();
+    fs::write(host_ssh.join("id_ed25519"), "SECRET_KEY\n").unwrap();
+    let sock_path = s.root.join("agent.sock");
+    let _listener = UnixListener::bind(&sock_path).unwrap();
+    host_git(&s.ws(), &["init", "-q", "-b", "main"]);
+    let script = "echo \"main_sock=${SSH_AUTH_SOCK:-unset}\"; \
+                  test ! -e ~/.ssh/known_hosts && echo main_no_kh; \
+                  in-remote -c 'echo \"remote_sock=$SSH_AUTH_SOCK\"; \
+                  test -S \"$SSH_AUTH_SOCK\" && echo is_sock; \
+                  echo \"ssh_cmd=$GIT_SSH_COMMAND\"; \
+                  cat /home/vcs/.ssh/known_hosts; \
+                  (echo x >> /home/vcs/.ssh/known_hosts) 2>/dev/null || echo kh_ro; \
+                  test ! -e /home/vcs/.ssh/id_ed25519 && echo no_privkey'";
+    let mut cmd = s.stopit(&["run", "--quiet", "/bin/sh", "-c", script]);
+    cmd.env("SSH_AUTH_SOCK", &sock_path);
+    let out = output(cmd, b"");
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "main_sock=unset\n\
+         main_no_kh\n\
+         remote_sock=/home/vcs/.ssh/agent.sock\n\
+         is_sock\n\
+         ssh_cmd=ssh -F /dev/null -o IdentityFile=/dev/null -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/home/vcs/.ssh/known_hosts\n\
+         github.com ssh-ed25519 AAAA\n\
+         kh_ro\n\
+         no_privkey\n"
+    );
+    assert!(!stderr(&out).contains("warning"), "{out:?}");
+}
+
 /// Runs `jj args` on the host in `dir`, with no user configuration.
 fn host_jj(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("jj")

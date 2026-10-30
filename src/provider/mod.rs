@@ -28,7 +28,9 @@ pub use base::{
 };
 pub use config::ConfigProvider;
 pub use script::{STDERR_LIMIT, STDOUT_LIMIT, ScriptProvider};
-pub use vcs::{Layout as VcsLayout, VCS_PROVIDER_NAME, VcsProvider, discover as discover_vcs};
+pub use vcs::{
+    Layout as VcsLayout, SshRemote, VCS_PROVIDER_NAME, VcsProvider, discover as discover_vcs,
+};
 
 /// What every provider receives at session start.
 #[derive(Debug, Clone)]

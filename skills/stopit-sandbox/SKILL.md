@@ -79,8 +79,11 @@ are unmasked).
   - Prompt by default (`ask`): history-rewriting or ref-moving commands (`jj
     squash`, `rebase`, `abandon`, `restore`, `undo`, `bookmark *`, `op *`; `git
     reset`, `rebase`, `checkout`, `switch`, `branch`, `tag`, `clean`, `stash`),
-    and any invocation with global flags before the subcommand unless configured
-    in `shims.<name>.args`.
+    remote commands (`jj git fetch`, `git clone`, `git push`; `git fetch`,
+    `pull`, `ls-remote`, `remote update`, `clone`, `push`, which run in
+    `vcs.remote` with network access and the host's `SSH_AUTH_SOCK` and
+    `~/.ssh/known_hosts`), and any invocation with global flags before the
+    subcommand unless configured in `shims.<name>.args`.
 
 ## 4. Requesting Capabilities with `stopit-grant`
 

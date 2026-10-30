@@ -7,17 +7,22 @@
 //!
 //! * to `main`, a mask (or, with `view = "ro"`, a read-only view) of the
 //!   workspace's `.git` and `.jj`;
-//! * the profiles `ro` and `local`, which appear as `vcs.ro` and
-//!   `vcs.local`: the metadata and its backing storage read-only, or
+//! * the profiles `ro`, `local` and (unless both `fetch` and `push` are
+//!   `"deny"`) `remote`, which appear as `vcs.ro`, `vcs.local` and
+//!   `vcs.remote`: the metadata and its backing storage read-only, or
 //!   writable with the git config files and `.jj/repo/config.toml` that
 //!   exist at session start read-only and the hooks directories that exist
-//!   then masked. Both are offline. git gets no system or user
-//!   configuration, no hooks, filesystem monitor, pager or editor, and the
-//!   repository found here rather than one found from the caller's
-//!   directory. jj gets no user configuration, editor or pager;
+//!   then masked. `vcs.ro` and `vcs.local` are offline, while `vcs.remote`
+//!   has `network = { mode = "full" }`, binds the host's `SSH_AUTH_SOCK`
+//!   and `~/.ssh/known_hosts` read-only when present, and sets
+//!   `GIT_SSH_COMMAND` with `-F /dev/null` and `StrictHostKeyChecking=yes`.
+//!   git gets no system or user configuration, no hooks, filesystem monitor,
+//!   pager or editor, and the repository found here rather than one found
+//!   from the caller's directory. jj gets no user configuration, editor or
+//!   pager;
 //! * the shims `jj` and `git` (per `tools`), with the policy of §7.4 written
-//!   as declarative rules. Remote commands are denied for now, so fetch and
-//!   push happen on the host.
+//!   as declarative rules, routing remote fetch and push commands to
+//!   `vcs.remote` according to `fetch` and `push`.
 //!
 //! Layouts it supports: a plain `.git` directory, a `.jj` directory with or
 //! without a colocated `.git`, and a git worktree whose `.git` file names
@@ -25,6 +30,7 @@
 //! layouts get the mask but no VCS profiles, with a warning.
 
 use std::fs;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -64,6 +70,92 @@ const VCS_HOME: &str = "/home/vcs";
 /// no `~` grant of `main` names, so jj's repository configuration
 /// (`jj/repos`) and git's attributes and ignore files there are their own.
 const VCS_XDG_CONFIG: &str = "/home/vcs/.xdg-config";
+
+/// Where the host's `SSH_AUTH_SOCK` is bound read-only in `vcs.remote`.
+const VCS_SSH_AGENT_SOCK: &str = "/home/vcs/.ssh/agent.sock";
+
+/// Where the host's `~/.ssh/known_hosts` is bound read-only in `vcs.remote`.
+const VCS_KNOWN_HOSTS: &str = "/home/vcs/.ssh/known_hosts";
+
+/// Host SSH agent socket and `known_hosts` file for `vcs.remote`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SshRemote {
+    /// Host path of `SSH_AUTH_SOCK`, bound read-only at
+    /// [`VCS_SSH_AGENT_SOCK`] in `vcs.remote`.
+    pub auth_sock: Option<PathBuf>,
+    /// Host path of `~/.ssh/known_hosts`, bound read-only at
+    /// [`VCS_KNOWN_HOSTS`] in `vcs.remote`.
+    pub known_hosts: Option<PathBuf>,
+}
+
+impl SshRemote {
+    /// Discovers the host's `SSH_AUTH_SOCK` and `~/.ssh/known_hosts` for
+    /// `ctx`, refusing symlinks inside the workspace or static `rw` grants
+    /// and paths inside the workspace or stopit's state directories.
+    pub fn discover(ctx: &ProviderContext) -> Self {
+        let sock = std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from);
+        Self::discover_with_sock(ctx, sock.as_deref())
+    }
+
+    /// Like [`Self::discover`], taking the candidate `SSH_AUTH_SOCK` path
+    /// explicitly.
+    pub fn discover_with_sock(ctx: &ProviderContext, ssh_auth_sock: Option<&Path>) -> Self {
+        let Ok(session_dir) = crate::state::resolve_allowing_missing(&ctx.session_dir) else {
+            return SshRemote::default();
+        };
+        let runtime_dir = match ctx.session_dir.parent().filter(|rt| {
+            rt.file_name() == Some(std::ffi::OsStr::new(crate::state::STATE_DIR_NAME))
+        }) {
+            Some(rt) => match crate::state::resolve_allowing_missing(rt) {
+                Ok(resolved) => Some(resolved.path),
+                Err(_) => return SshRemote::default(),
+            },
+            None => None,
+        };
+        let Ok(ctx_data) = crate::state::data_dirs(&ctx.home, None) else {
+            return SshRemote::default();
+        };
+        let Ok(ctx_config) = crate::state::config_dirs(&ctx.home, None) else {
+            return SshRemote::default();
+        };
+        let Ok(host_data) = crate::state::data_dirs_from_host() else {
+            return SshRemote::default();
+        };
+        let Ok(host_config) = crate::state::config_dirs_from_host() else {
+            return SshRemote::default();
+        };
+        let resolve = |candidate: &Path, is_kind: fn(&fs::FileType) -> bool| -> Option<PathBuf> {
+            if !candidate.is_absolute() {
+                return None;
+            }
+            let canon =
+                crate::spec::resolve_script_path(candidate, &ctx.workspace, &ctx.rw_grants).ok()?;
+            let allowed = !canon.starts_with(&ctx.workspace)
+                && !ctx.rw_grants.iter().any(|r| canon.starts_with(&r.path))
+                && !canon.starts_with(&session_dir.path)
+                && runtime_dir.as_ref().is_none_or(|rt| !canon.starts_with(rt))
+                && ctx_data.iter().all(|s| !canon.starts_with(&s.path))
+                && ctx_config.iter().all(|s| !canon.starts_with(&s.path))
+                && host_data.iter().all(|s| !canon.starts_with(&s.path))
+                && host_config.iter().all(|s| !canon.starts_with(&s.path));
+            if !allowed {
+                return None;
+            }
+            let meta = fs::symlink_metadata(&canon).ok()?;
+            if !is_kind(&meta.file_type()) {
+                return None;
+            }
+            rule_path(&ctx.workspace, &canon)?;
+            Some(canon)
+        };
+        let auth_sock = ssh_auth_sock.and_then(|p| resolve(p, FileTypeExt::is_socket));
+        let known_hosts = resolve(&ctx.home.join(".ssh/known_hosts"), fs::FileType::is_file);
+        SshRemote {
+            auth_sock,
+            known_hosts,
+        }
+    }
+}
 
 /// The `vcs` provider.
 #[derive(Debug, Clone)]
@@ -107,14 +199,6 @@ impl VcsProvider {
     /// Warnings for options the provider takes but cannot honour yet.
     fn unsupported_options(&self) -> Vec<String> {
         let mut out = Vec::new();
-        for (option, setting) in [("fetch", self.fetch), ("push", self.push)] {
-            if setting == Decision::Allow {
-                out.push(format!(
-                    "{option} = \"allow\" has no effect yet. Remote commands are refused, so \
-                     run them on the host"
-                ));
-            }
-        }
         if self.signing {
             out.push(
                 "signing = true has no effect yet, and brokered commits are not signed".into(),
@@ -389,14 +473,15 @@ fn rule_path(workspace: &Path, path: &Path) -> Option<String> {
 
 impl VcsProvider {
     /// The manifest for `layout` in `workspace`, which sandboxes see at
-    /// `mount`, with `identity` for git and jj. An error names a path no
-    /// rule can hold.
+    /// `mount`, with `identity` for git and jj and `ssh` for `vcs.remote`.
+    /// An error names a path no rule can hold.
     pub fn manifest_for(
         &self,
         workspace: &Path,
         mount: &Path,
         layout: &Layout,
         identity: &[(String, String)],
+        ssh: &SshRemote,
     ) -> Result<Manifest, String> {
         use toml::Value;
         let path = |p: &Path| {
@@ -502,8 +587,7 @@ impl VcsProvider {
             set(&format!("GIT_CONFIG_VALUE_{i}"), (*value).into());
         }
         let mut profiles = toml::Table::new();
-        // Remote commands are refused by the shims' rules, and the
-        // profiles have no network either, so a call the rules miss
+        // `vcs.ro` and `vcs.local` have no network, so a call the rules miss
         // (`git --no-pager push` takes the default) still reaches no remote
         // over the network.
         let offline = || Value::Table(table([("mode", "none".into())]));
@@ -542,18 +626,74 @@ impl VcsProvider {
         local.insert("network".into(), offline());
         local.insert("system".into(), system());
         local.insert("sandbox".into(), no_grant());
-        local.insert("fs".into(), Value::Table(local_fs));
+        local.insert("fs".into(), Value::Table(local_fs.clone()));
         local.insert(
             "env".into(),
-            Value::Table(table([("set", Value::Table(env))])),
+            Value::Table(table([("set", Value::Table(env.clone()))])),
         );
         profiles.insert("local".into(), Value::Table(local));
+        if self.fetch != Decision::Deny || self.push != Decision::Deny {
+            let mut remote_fs = local_fs;
+            remote_fs.insert(
+                "ephemeral".into(),
+                list(vec![VCS_HOME.to_owned(), format!("{VCS_HOME}/.ssh")]),
+            );
+            let mut binds = Vec::new();
+            let sock_rule = ssh.auth_sock.as_deref().map(&path).transpose()?;
+            if let Some(sock) = &sock_rule {
+                binds.push(Value::Table(table([
+                    ("host", sock.clone().into()),
+                    ("sandbox", VCS_SSH_AGENT_SOCK.into()),
+                    ("mode", "ro".into()),
+                ])));
+            }
+            let kh_rule = ssh.known_hosts.as_deref().map(&path).transpose()?;
+            if let Some(kh) = &kh_rule {
+                binds.push(Value::Table(table([
+                    ("host", kh.clone().into()),
+                    ("sandbox", VCS_KNOWN_HOSTS.into()),
+                    ("mode", "ro".into()),
+                ])));
+            }
+            if !binds.is_empty() {
+                remote_fs.insert("bind".into(), Value::Array(binds));
+            }
+            let mut remote_env = env;
+            if sock_rule.is_some() {
+                remote_env.insert("SSH_AUTH_SOCK".into(), VCS_SSH_AGENT_SOCK.into());
+            }
+            let known_hosts_arg = if kh_rule.is_some() {
+                VCS_KNOWN_HOSTS
+            } else {
+                "/dev/null"
+            };
+            remote_env.insert(
+                "GIT_SSH_COMMAND".into(),
+                format!(
+                    "ssh -F /dev/null -o IdentityFile=/dev/null -o StrictHostKeyChecking=yes -o UserKnownHostsFile={known_hosts_arg}"
+                )
+                .into(),
+            );
+            let mut remote = toml::Table::new();
+            remote.insert(
+                "network".into(),
+                Value::Table(table([("mode", "full".into())])),
+            );
+            remote.insert("system".into(), system());
+            remote.insert("sandbox".into(), no_grant());
+            remote.insert("fs".into(), Value::Table(remote_fs));
+            remote.insert(
+                "env".into(),
+                Value::Table(table([("set", Value::Table(remote_env))])),
+            );
+            profiles.insert("remote".into(), Value::Table(remote));
+        }
         root.insert("profiles".into(), Value::Table(profiles));
         let mut shims = toml::Table::new();
         for tool in &self.tools {
             let shim = match tool {
-                VcsTool::Jj if jj => jj_shim(),
-                VcsTool::Git if git => git_shim(),
+                VcsTool::Jj if jj => jj_shim(self.fetch, self.push),
+                VcsTool::Git if git => git_shim(self.fetch, self.push),
                 _ => continue,
             };
             shims.insert(tool.as_str().into(), shim);
@@ -632,11 +772,14 @@ fn rule(subcommands: &[&str], decision: &str, profile: Option<&str>, deny: &[&st
     toml::Value::Table(t)
 }
 
-/// The rule for remote commands. They are denied until the broker can open
-/// a tunnel to a configured remote (§7.3.3), whatever `fetch` and `push`
-/// say, so the policy never allows more than the provider can enforce.
-fn remote_rule(subcommands: &[&str]) -> toml::Value {
-    rule(subcommands, "deny", None, &[])
+/// The rule for remote commands (`fetch` or `push`), routed to `vcs.remote`
+/// unless `decision` is [`Decision::Deny`].
+fn remote_rule(subcommands: &[&str], decision: Decision, deny: &[&str]) -> toml::Value {
+    let profile = match decision {
+        Decision::Allow | Decision::Ask => Some("remote"),
+        Decision::Deny => None,
+    };
+    rule(subcommands, decision.as_str(), profile, deny)
 }
 
 /// A shim running `binary` with `args` before the caller's, refusing
@@ -665,7 +808,7 @@ fn shim(binary: &str, args: &[&str], deny: &[&str], rules: Vec<toml::Value>) -> 
 /// repository, add configuration or run a diff or merge tool are refused.
 /// Reading commands run in `vcs.local` too, since jj snapshots the working
 /// copy first, which writes to `.jj`.
-fn jj_shim() -> toml::Value {
+fn jj_shim(fetch: Decision, push: Decision) -> toml::Value {
     shim(
         "jj",
         &["--no-pager", "-R", "{workspace}"],
@@ -722,8 +865,8 @@ fn jj_shim() -> toml::Value {
                 Some("local"),
                 &[],
             ),
-            remote_rule(&["git fetch", "git clone"]),
-            remote_rule(&["git push"]),
+            remote_rule(&["git fetch", "git clone"], fetch, &[]),
+            remote_rule(&["git push"], push, &[]),
         ],
     )
 }
@@ -735,7 +878,7 @@ fn jj_shim() -> toml::Value {
 /// `ls-remote`'s other name for `--receive-pack` and `--upload-pack`, and
 /// `--output` makes `diff`, `log` and their kin write to any path the
 /// profile can write.
-fn git_shim() -> toml::Value {
+fn git_shim(fetch: Decision, push: Decision) -> toml::Value {
     shim(
         "git",
         &["--no-pager"],
@@ -767,8 +910,13 @@ fn git_shim() -> toml::Value {
                 Some("local"),
                 &[],
             ),
-            remote_rule(&["fetch", "pull", "ls-remote", "remote update", "clone"]),
-            remote_rule(&["push"]),
+            remote_rule(
+                &["fetch", "pull", "ls-remote", "remote update"],
+                fetch,
+                &[],
+            ),
+            remote_rule(&["clone"], fetch, &["-u", "--template"]),
+            remote_rule(&["push"], push, &[]),
         ],
     )
 }
@@ -804,11 +952,17 @@ impl Provider for VcsProvider {
         } else {
             host_identity()
         };
+        let ssh = if layout.git_dirs.is_empty() && !layout.jj_supported {
+            SshRemote::default()
+        } else {
+            SshRemote::discover(ctx)
+        };
         let manifest = match self.manifest_for(
             &ctx.workspace,
             ctx.resolved_workspace_mount(),
             &layout,
             &identity,
+            &ssh,
         ) {
             Ok(manifest) => manifest,
             // A path no rule can name: the metadata view alone.
@@ -834,7 +988,7 @@ impl Provider for VcsProvider {
 mod tests {
     use super::*;
     use crate::broker::{Outcome, decide};
-    use crate::manifest::{ContributedProfile, PathPattern, ShimName};
+    use crate::manifest::{BindMode, ContributedProfile, PathPattern, ShimName};
 
     const MOUNT: &str = "/workspace";
 
@@ -858,7 +1012,13 @@ mod tests {
 
     fn manifest(ws: &Path, identity: &[(String, String)]) -> Manifest {
         provider()
-            .manifest_for(ws, Path::new(MOUNT), &discover(ws), identity)
+            .manifest_for(
+                ws,
+                Path::new(MOUNT),
+                &discover(ws),
+                identity,
+                &SshRemote::default(),
+            )
             .unwrap()
     }
 
@@ -901,11 +1061,36 @@ mod tests {
         );
         let ro = profile(&m, "ro");
         assert_eq!(patterns(&ro.grants.fs.ro), ["{workspace}/.git"]);
+        let remote = profile(&m, "remote");
+        assert_eq!(patterns(&remote.grants.fs.rw), ["{workspace}/.git"]);
+        assert_eq!(patterns(&remote.grants.fs.ro), ["{workspace}/.git/config"]);
+        assert_eq!(
+            patterns(&remote.grants.fs.masked),
+            ["{workspace}/.git/hooks"]
+        );
+        assert_eq!(
+            remote.grants.network.mode,
+            Some(crate::policy::NetworkMode::Full)
+        );
+        assert_eq!(
+            env(remote, "GIT_SSH_COMMAND"),
+            Some(
+                "ssh -F /dev/null -o IdentityFile=/dev/null -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/dev/null"
+            )
+        );
+        assert_eq!(env(remote, "SSH_AUTH_SOCK"), None);
+        assert_eq!(
+            patterns(&remote.grants.fs.ephemeral),
+            [VCS_HOME, "/home/vcs/.ssh"]
+        );
         for p in [ro, local] {
             assert_eq!(
                 p.grants.network.mode,
                 Some(crate::policy::NetworkMode::None)
             );
+            assert_eq!(patterns(&p.grants.fs.ephemeral), [VCS_HOME]);
+        }
+        for p in [ro, local, remote] {
             assert_eq!(env(p, "GIT_DIR"), Some("/workspace/.git"));
             assert_eq!(env(p, "GIT_WORK_TREE"), Some("/workspace"));
             assert_eq!(env(p, "GIT_CONFIG_GLOBAL"), Some("/dev/null"));
@@ -927,7 +1112,6 @@ mod tests {
             );
             assert_eq!(env(p, "GNUPGHOME"), Some("/home/vcs/.gnupg-unused"));
             assert_eq!(env(p, "XDG_CONFIG_HOME"), Some(VCS_XDG_CONFIG));
-            assert_eq!(patterns(&p.grants.fs.ephemeral), [VCS_HOME]);
             // No `stopit-grant` in a VCS command.
             assert_eq!(p.grants.sandbox.grant, Some(false));
         }
@@ -1206,7 +1390,7 @@ mod tests {
         let layout = discover(&wt);
         assert_eq!(layout.git_dirs.len(), 2, "{:?}", layout.unsupported);
         let e = provider()
-            .manifest_for(&wt, Path::new(MOUNT), &layout, &[])
+            .manifest_for(&wt, Path::new(MOUNT), &layout, &[], &SshRemote::default())
             .unwrap_err();
         assert!(e.contains("no rule can name it"), "{e}");
         let fallback = provider()
@@ -1226,7 +1410,7 @@ mod tests {
             ..provider()
         };
         let m = p
-            .manifest_for(&ws, Path::new(MOUNT), &discover(&ws), &[])
+            .manifest_for(&ws, Path::new(MOUNT), &discover(&ws), &[], &SshRemote::default())
             .unwrap();
         assert_eq!(patterns(&m.grants.fs.ro), ["{workspace}/.git"]);
         assert!(m.grants.fs.masked.is_empty());
@@ -1242,13 +1426,120 @@ mod tests {
         }
         .with_signing(true);
         let warnings = p.unsupported_options();
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
-        assert!(warnings[0].starts_with("fetch = \"allow\""), "{warnings:?}");
-        assert!(warnings[1].starts_with("signing = true"), "{warnings:?}");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("signing = true"), "{warnings:?}");
     }
 
     #[test]
-    fn the_shims_keep_remote_and_unsafe_commands_off() {
+    fn vcs_remote_binds_ssh_agent_and_known_hosts_read_only_and_is_omitted_when_denied() {
+        let (_d, ws) = workspace();
+        git_init(&ws);
+        let ssh = SshRemote {
+            auth_sock: Some(PathBuf::from("/run/user/1000/ssh-agent.sock")),
+            known_hosts: Some(PathBuf::from("/home/user/.ssh/known_hosts")),
+        };
+        let m = provider()
+            .manifest_for(&ws, Path::new(MOUNT), &discover(&ws), &[], &ssh)
+            .unwrap();
+        let remote = profile(&m, "remote");
+        assert_eq!(
+            env(remote, "SSH_AUTH_SOCK"),
+            Some("/home/vcs/.ssh/agent.sock")
+        );
+        assert_eq!(
+            env(remote, "GIT_SSH_COMMAND"),
+            Some(
+                "ssh -F /dev/null -o IdentityFile=/dev/null -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/home/vcs/.ssh/known_hosts"
+            )
+        );
+        assert_eq!(
+            patterns(&remote.grants.fs.ephemeral),
+            ["/home/vcs", "/home/vcs/.ssh"]
+        );
+        let binds: Vec<(&str, &str, BindMode)> = remote
+            .grants
+            .fs
+            .bind
+            .iter()
+            .map(|b| (b.host.as_str(), b.sandbox.as_str(), b.mode))
+            .collect();
+        assert_eq!(
+            binds,
+            vec![
+                (
+                    "/run/user/1000/ssh-agent.sock",
+                    "/home/vcs/.ssh/agent.sock",
+                    BindMode::Ro
+                ),
+                (
+                    "/home/user/.ssh/known_hosts",
+                    "/home/vcs/.ssh/known_hosts",
+                    BindMode::Ro
+                ),
+            ]
+        );
+        // Neither `ro` nor `local` sees `SSH_AUTH_SOCK` or `GIT_SSH_COMMAND`.
+        for name in ["ro", "local"] {
+            let p = profile(&m, name);
+            assert_eq!(env(p, "SSH_AUTH_SOCK"), None);
+            assert_eq!(env(p, "GIT_SSH_COMMAND"), None);
+            assert!(p.grants.fs.bind.is_empty());
+        }
+        // When both `fetch` and `push` are `deny`, `vcs.remote` is not created.
+        let denied = VcsProvider {
+            fetch: Decision::Deny,
+            push: Decision::Deny,
+            ..provider()
+        };
+        let m_denied = denied
+            .manifest_for(&ws, Path::new(MOUNT), &discover(&ws), &[], &ssh)
+            .unwrap();
+        assert!(!m_denied.profiles.contains_key(&"remote".parse().unwrap()));
+    }
+
+    #[test]
+    fn ssh_remote_discover_checks_socket_and_known_hosts_and_refuses_workspace_links() {
+        use std::os::unix::net::UnixListener;
+
+        let (_d, root) = workspace();
+        let ws = root.join("ws");
+        let home = root.join("home");
+        let session = root.join("runtime/stopit/s1");
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        fs::create_dir_all(&session).unwrap();
+
+        let sock_path = root.join("agent.sock");
+        let _listener = UnixListener::bind(&sock_path).unwrap();
+        let kh_path = home.join(".ssh/known_hosts");
+        fs::write(&kh_path, "github.com ssh-ed25519 AAAA\n").unwrap();
+
+        let ctx = ProviderContext {
+            workspace: ws.clone(),
+            workspace_mount: MOUNT.parse().unwrap(),
+            home: home.clone(),
+            session_dir: session.clone(),
+            rw_grants: Vec::new(),
+        };
+        let discovered = SshRemote::discover_with_sock(&ctx, Some(&sock_path));
+        assert_eq!(discovered.auth_sock.as_deref(), Some(sock_path.as_path()));
+        assert_eq!(discovered.known_hosts.as_deref(), Some(kh_path.as_path()));
+
+        // A symlink inside the workspace pointing to the real socket is refused.
+        let ws_link = ws.join("planted.sock");
+        std::os::unix::fs::symlink(&sock_path, &ws_link).unwrap();
+        let via_ws_link = SshRemote::discover_with_sock(&ctx, Some(&ws_link));
+        assert_eq!(via_ws_link.auth_sock, None);
+
+        // A socket inside the stopit runtime directory is refused.
+        let rt_sock = session.join("broker.sock");
+        let _rt_listener = UnixListener::bind(&rt_sock).unwrap();
+        let via_rt = SshRemote::discover_with_sock(&ctx, Some(&rt_sock));
+        assert_eq!(via_rt.auth_sock, None);
+    }
+
+    #[test]
+    fn the_shims_route_remote_commands_to_vcs_remote_and_refuse_unsafe_flags() {
         let (_d, ws) = workspace();
         fs::create_dir_all(ws.join(".jj/repo/store")).unwrap();
         git_init(&ws);
@@ -1258,28 +1549,65 @@ mod tests {
             decide(shim(&m, name), &args).0
         };
         let local = || "local".parse::<ProfileRef>().unwrap();
+        let remote = || "remote".parse::<ProfileRef>().unwrap();
         assert_eq!(run("git", "status"), Outcome::Allow(local()));
         assert_eq!(run("git", "commit -m x"), Outcome::Allow(local()));
         assert_eq!(run("git", "reset --hard"), Outcome::Ask(local()));
         assert_eq!(run("jj", "log -r @"), Outcome::Allow(local()));
         assert_eq!(run("jj", "describe -m x"), Outcome::Allow(local()));
         assert_eq!(run("jj", "abandon"), Outcome::Ask(local()));
-        // Unknown subcommands, and known ones after a flag, ask.
+        // Unknown subcommands, and known ones after a flag, ask in `local` (offline).
         assert_eq!(run("git", "gc"), Outcome::Ask(local()));
         assert_eq!(run("git", "--no-pager push"), Outcome::Ask(local()));
+        // Remote commands default to `ask` in `remote`.
         for (name, line) in [
             ("git", "push origin main"),
             ("git", "fetch"),
             ("git", "pull --rebase"),
             ("git", "remote update"),
+            ("git", "clone https://example.com/r.git"),
+            ("jj", "git push"),
+            ("jj", "git fetch"),
+            ("jj", "git clone https://example.com/r.git"),
+        ] {
+            assert_eq!(run(name, line), Outcome::Ask(remote()), "{name} {line}");
+        }
+        // With `fetch = "allow"` and `push = "deny"`, fetch allows in `remote`
+        // and push is denied.
+        let p = VcsProvider {
+            fetch: Decision::Allow,
+            push: Decision::Deny,
+            ..provider()
+        };
+        let m_custom = p
+            .manifest_for(
+                &ws,
+                Path::new(MOUNT),
+                &discover(&ws),
+                &[],
+                &SshRemote::default(),
+            )
+            .unwrap();
+        let run_custom = |name: &str, line: &str| {
+            let args: Vec<Vec<u8>> = line.split(' ').map(|a| a.as_bytes().to_vec()).collect();
+            decide(shim(&m_custom, name), &args).0
+        };
+        assert_eq!(run_custom("git", "fetch"), Outcome::Allow(remote()));
+        assert_eq!(run_custom("jj", "git fetch"), Outcome::Allow(remote()));
+        assert!(matches!(run_custom("git", "push origin main"), Outcome::Deny(_)));
+        assert!(matches!(run_custom("jj", "git push"), Outcome::Deny(_)));
+        assert_eq!(run("git", "status -u"), Outcome::Allow(local()));
+        assert_eq!(run("git", "add -u"), Outcome::Allow(local()));
+        assert_eq!(run("git", "push -u origin main"), Outcome::Ask(remote()));
+        for (name, line) in [
             ("git", "ls-remote --exec=/bin/sh origin"),
+            ("git", "clone -u /bin/sh https://example.com/r.git"),
+            ("git", "clone --template=/tmp/t https://example.com/r.git"),
             ("git", "log --output=.git/hooks/pre-commit"),
             ("git", "-c core.pager=sh status"),
             ("git", "-C /elsewhere status"),
             ("git", "--git-dir=/elsewhere status"),
             ("git", "status --upl=x"),
-            ("jj", "git push"),
-            ("jj", "git fetch"),
             ("jj", "--config ui.pager=sh log"),
             ("jj", "-R /elsewhere log"),
             ("jj", "new -A @"),
@@ -1300,7 +1628,13 @@ mod tests {
         let (_d, jj_ws) = workspace();
         fs::create_dir_all(jj_ws.join(".jj/repo/store")).unwrap();
         let m = provider()
-            .manifest_for(&jj_ws, non_utf8_mount, &discover(&jj_ws), &[])
+            .manifest_for(
+                &jj_ws,
+                non_utf8_mount,
+                &discover(&jj_ws),
+                &[],
+                &SshRemote::default(),
+            )
             .unwrap();
         assert_eq!(
             shim(&m, "jj").args[2].expand(non_utf8_mount),
@@ -1310,7 +1644,13 @@ mod tests {
         let (_d2, git_ws) = workspace();
         git_init(&git_ws);
         let err = provider()
-            .manifest_for(&git_ws, non_utf8_mount, &discover(&git_ws), &[])
+            .manifest_for(
+                &git_ws,
+                non_utf8_mount,
+                &discover(&git_ws),
+                &[],
+                &SshRemote::default(),
+            )
             .unwrap_err();
         assert!(err.contains("whose sandbox path is not UTF-8"), "{err}");
     }

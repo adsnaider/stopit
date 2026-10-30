@@ -2249,6 +2249,19 @@ fn find_restricted_exposure(
             if shown_at == r.sandbox || overmounted(&m.sandbox, &shown_at) {
                 continue;
             }
+            // `vcs.remote` binds the host's `SSH_AUTH_SOCK` and
+            // `known_hosts` into `/home/vcs/.ssh/` on purpose, even when
+            // `main` masked the same file or socket at its own path.
+            if rel.as_os_str().is_empty()
+                && m.mode == PathMode::Ro
+                && m.provider.as_str() == crate::provider::VCS_PROVIDER_NAME
+                && matches!(
+                    m.sandbox.to_str(),
+                    Some("/home/vcs/.ssh/agent.sock" | "/home/vcs/.ssh/known_hosts")
+                )
+            {
+                continue;
+            }
             // The workspace's identity wins: the workspace mount (the only
             // mount whose source is the workspace) is never covered.
             if p == ws_host {
@@ -9797,5 +9810,94 @@ fs.masked = [\"{workspace}/hidden\"]
             )),
             "{grant_warnings:?}"
         );
+    }
+
+    #[test]
+    fn vcs_remote_compiles_with_known_hosts_inside_masked_ssh_dir() {
+        let f = Fixture::new();
+        f.mkdir("ws/.git/objects");
+        f.mkdir("ws/.git/hooks");
+        f.file("ws/.git/HEAD");
+        f.file("ws/.git/config");
+        f.file("home/.ssh/known_hosts");
+        f.file("home/.ssh/id_ed25519");
+
+        let compiled = f.compile(&prov("mask-ssh", "main", "fs.masked = [\"~/.ssh\"]"));
+        let warnings: Vec<_> = compiled
+            .warnings()
+            .filter(|(_, w)| {
+                !matches!(
+                    w,
+                    SpecWarning::Mount(PlanWarning {
+                        kind: PlanWarningKind::Resolve(ResolveWarning::Missing { .. }),
+                        ..
+                    })
+                )
+            })
+            .collect();
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let main_mounts = mounts(spec(&compiled, "main"));
+        assert!(
+            main_mounts.contains(&row("/home/user/.ssh", Masked, "mask-ssh")),
+            "{main_mounts:?}"
+        );
+        assert!(
+            !main_mounts
+                .iter()
+                .any(|(p, _, _)| p.contains("known_hosts") || p.contains("agent.sock")),
+            "{main_mounts:?}"
+        );
+
+        let remote_spec = spec(&compiled, "vcs.remote");
+        assert_eq!(remote_spec.network, NetworkSpec::Full);
+        assert!(remote_spec.system.etc.contains(&EtcFile::ResolvConf));
+        let remote_mounts = mounts(remote_spec);
+        assert!(
+            remote_mounts.contains(&row("/home/vcs/.ssh", Ephemeral, "vcs")),
+            "{remote_mounts:?}"
+        );
+        assert!(
+            remote_mounts.contains(&row("/home/vcs/.ssh/known_hosts", Ro, "vcs")),
+            "{remote_mounts:?}"
+        );
+        assert!(
+            !remote_mounts
+                .iter()
+                .any(|(p, _, _)| p.contains("id_ed25519")),
+            "{remote_mounts:?}"
+        );
+
+        // Even when `main` masks `~/.ssh/*` or has `fs.ephemeral = ["~/.ssh"]`,
+        // `vcs.remote` keeps its own isolated `/home/vcs/.ssh` ephemeral dir and
+        // its read-only `known_hosts` mount without warnings.
+        for rule in [
+            "fs.masked = [\"~/.ssh/*\"]",
+            "fs.ephemeral = [\"~/.ssh\"]",
+        ] {
+            let c = f.compile(&prov("ssh-rule", "main", rule));
+            let ws: Vec<_> = c
+                .warnings()
+                .filter(|(_, w)| {
+                    !matches!(
+                        w,
+                        SpecWarning::Mount(PlanWarning {
+                            kind: PlanWarningKind::Resolve(ResolveWarning::Missing { .. }),
+                            ..
+                        })
+                    )
+                })
+                .collect();
+            assert!(ws.is_empty(), "{rule}: {ws:?}");
+            let rm = mounts(spec(&c, "vcs.remote"));
+            assert!(
+                rm.contains(&row("/home/vcs/.ssh", Ephemeral, "vcs")),
+                "{rule}: {rm:?}"
+            );
+            assert!(
+                rm.contains(&row("/home/vcs/.ssh/known_hosts", Ro, "vcs")),
+                "{rule}: {rm:?}"
+            );
+        }
     }
 }
