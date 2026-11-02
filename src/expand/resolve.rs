@@ -130,6 +130,27 @@ pub struct ResolveCache {
     symlink_metas: HashMap<PathBuf, Result<EntryKind, io::Error>>,
 }
 
+impl Clone for ResolveCache {
+    fn clone(&self) -> Self {
+        let symlink_metas = self
+            .symlink_metas
+            .iter()
+            .map(|(k, v)| {
+                let cloned = match v {
+                    Ok(kind) => Ok(*kind),
+                    Err(err) => Err(clone_io_error(err)),
+                };
+                (k.clone(), cloned)
+            })
+            .collect();
+        ResolveCache {
+            walks: self.walks.clone(),
+            resolutions: self.resolutions.clone(),
+            symlink_metas,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum CachedWalk {
     RootError(io::Error),

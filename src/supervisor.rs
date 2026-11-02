@@ -1060,7 +1060,10 @@ impl LoadedSession {
     }
 
     fn policy(&self) -> Arc<SessionPolicy> {
-        self.policy.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.policy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The session's current policy snapshot.
@@ -1151,7 +1154,10 @@ impl LoadedSession {
         let store = TrustStore::open(&self.state.data.store.path).map_err(|e| e.to_string())?;
         let allowed = store.read().map_err(|e| e.to_string())?;
         drop(store);
-        let explicit = self.explicit_dir.is_some().then_some(self.workspace.dir.as_path());
+        let explicit = self
+            .explicit_dir
+            .is_some()
+            .then_some(self.workspace.dir.as_path());
         let (existing_str, expected_dev_ino) = match &found_config {
             None => {
                 let links = discovery_links(
@@ -1218,7 +1224,15 @@ impl LoadedSession {
     pub(crate) fn recompile(&self) -> Result<(CompiledSession, Vec<String>), RunError> {
         let policy = self.policy();
         let granted = self.granted().paths.clone();
-        let compiled = self.compile_granted_with(&policy, policy.outputs.clone(), &granted)?;
+        let compiled = crate::spec::compile_session_granted_lazy_with_cache(
+            &policy.config,
+            policy.outputs.clone(),
+            &policy.protected,
+            &self.state,
+            &policy.ctx,
+            &granted,
+            policy.compiled.scan_cache(),
+        )?;
         let warnings = warning_lines(&compiled, policy.config.base);
         Ok((compiled, warnings))
     }
@@ -1244,7 +1258,9 @@ impl LoadedSession {
             (state.paths.clone(), state.generation)
         };
         let all_roots_known = rw.iter().all(|p| policy.compiled.has_untrusted_root(p))
-            && granted.iter().all(|p| policy.compiled.has_untrusted_root(p));
+            && granted
+                .iter()
+                .all(|p| policy.compiled.has_untrusted_root(p));
         if all_roots_known
             && let Some(compiled) = policy.compiled.compile_extra_profile_lazy(
                 &policy.config,
@@ -2695,11 +2711,7 @@ fn write_trusted_config(
     };
     let (flags, mode) = if expected_dev_ino.is_some() {
         (
-            OFlags::WRONLY
-                | OFlags::NOFOLLOW
-                | OFlags::NOCTTY
-                | OFlags::NONBLOCK
-                | OFlags::CLOEXEC,
+            OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::NOCTTY | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::empty(),
         )
     } else {

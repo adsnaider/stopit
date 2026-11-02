@@ -33,7 +33,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -1744,56 +1744,115 @@ enum DirScanOutcome {
     },
 }
 
+#[derive(Debug, Clone)]
+enum DirFault {
+    ReadError(Arc<io::Error>),
+    Unsearchable { names: Vec<OsString> },
+}
+
+#[derive(Debug, Clone, Default)]
+struct RootScanOutcome {
+    sockets: Vec<PathBuf>,
+    faults: Vec<(PathBuf, DirFault)>,
+}
+
+type RootScanKey = (PathBuf, BTreeSet<PathBuf>);
+
 #[derive(Debug, Default)]
 pub(crate) struct SocketScanCache {
-    dirs: Mutex<HashMap<PathBuf, DirScanOutcome>>,
+    roots: Mutex<HashMap<RootScanKey, Arc<RootScanOutcome>>>,
 }
 
 fn scan_one_dir(dir_host: &Path) -> DirScanOutcome {
-    let entries = match fs::read_dir(dir_host) {
-        Ok(entries) => entries,
-        Err(err) if is_missing(err.kind()) => return DirScanOutcome::Missing,
-        Err(error) => return DirScanOutcome::ReadError(Arc::new(error)),
+    use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, RawDir, fstat, openat, statat};
+    use std::ffi::OsStr;
+    use std::mem::MaybeUninit;
+    use std::os::unix::ffi::OsStrExt;
+
+    let fd = match openat(
+        CWD,
+        dir_host,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(err) => {
+            let error = io::Error::from(err);
+            return if is_missing(error.kind()) {
+                DirScanOutcome::Missing
+            } else {
+                DirScanOutcome::ReadError(Arc::new(error))
+            };
+        }
     };
-    let mut probed = false;
+    let likely_searchable = fstat(&fd).is_ok_and(|st| {
+        let mode = st.st_mode & 0o777;
+        (mode & 0o111) == 0o111
+            || ((mode & 0o100) != 0 && st.st_uid == rustix::process::geteuid().as_raw())
+    });
+    let mut probed = likely_searchable;
     let mut unsearchable = false;
     let mut subdirs = Vec::new();
     let mut sockets = Vec::new();
     let mut all_names = Vec::new();
-    for entry in entries {
+    let mut buf = [MaybeUninit::<u8>::uninit(); 8192];
+    let mut raw_dir = RawDir::new(&fd, &mut buf);
+    while let Some(entry) = raw_dir.next() {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(err) if is_missing(err.kind()) => continue,
-            Err(error) => return DirScanOutcome::ReadError(Arc::new(error)),
+            Err(err) => {
+                let error = io::Error::from(err);
+                if is_missing(error.kind()) {
+                    continue;
+                }
+                return DirScanOutcome::ReadError(Arc::new(error));
+            }
         };
-        let name = entry.file_name();
+        let bytes = entry.file_name().to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
         if !probed {
-            let child_host = dir_host.join(&name);
-            match fs::symlink_metadata(&child_host) {
+            match statat(&fd, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(_) => probed = true,
-                Err(err) if is_missing(err.kind()) => continue,
-                Err(_) => {
+                Err(err) => {
+                    let error = io::Error::from(err);
+                    if is_missing(error.kind()) {
+                        continue;
+                    }
                     probed = true;
                     unsearchable = true;
                 }
             }
         }
         if unsearchable {
-            all_names.push(name);
+            all_names.push(OsStr::from_bytes(bytes).to_os_string());
             continue;
         }
-        let ft = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(err) if is_missing(err.kind()) => continue,
-            Err(error) => return DirScanOutcome::ReadError(Arc::new(error)),
-        };
-        if ft.is_symlink() {
-            continue;
-        }
-        if ft.is_dir() {
-            subdirs.push(name);
-        } else if ft.is_socket() {
-            sockets.push(name);
+        match entry.file_type() {
+            FileType::Directory => {
+                subdirs.push(OsStr::from_bytes(bytes).to_os_string());
+            }
+            FileType::Socket => {
+                sockets.push(OsStr::from_bytes(bytes).to_os_string());
+            }
+            FileType::Unknown => match statat(&fd, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(st) => {
+                    let ft = FileType::from_raw_mode(st.st_mode);
+                    if ft == FileType::Directory {
+                        subdirs.push(OsStr::from_bytes(bytes).to_os_string());
+                    } else if ft == FileType::Socket {
+                        sockets.push(OsStr::from_bytes(bytes).to_os_string());
+                    }
+                }
+                Err(err) => {
+                    let error = io::Error::from(err);
+                    if !is_missing(error.kind()) {
+                        return DirScanOutcome::ReadError(Arc::new(error));
+                    }
+                }
+            },
+            _ => {}
         }
     }
     if unsearchable {
@@ -1803,72 +1862,195 @@ fn scan_one_dir(dir_host: &Path) -> DirScanOutcome {
     }
 }
 
-fn populate_socket_scan_cache(
-    roots: &[(PathBuf, PathBuf)],
-    at: &BTreeSet<PathBuf>,
-    cache: &SocketScanCache,
-) {
-    let mut frontier: Vec<(PathBuf, PathBuf)> = roots.to_vec();
-    while !frontier.is_empty() {
-        let uncached: Vec<PathBuf> = {
-            let guard = cache.dirs.lock().unwrap_or_else(|e| e.into_inner());
-            let mut set = BTreeSet::new();
-            for (dir_host, _) in &frontier {
-                if !guard.contains_key(dir_host) {
-                    set.insert(dir_host.clone());
+fn scan_root_tree(root_host: &Path, skip_rel: &BTreeSet<PathBuf>) -> RootScanOutcome {
+    use std::sync::Condvar;
+
+    let mut outcome = RootScanOutcome::default();
+    let initial_subdirs = match scan_one_dir(root_host) {
+        DirScanOutcome::Missing => return outcome,
+        DirScanOutcome::ReadError(err) => {
+            outcome
+                .faults
+                .push((PathBuf::new(), DirFault::ReadError(err)));
+            return outcome;
+        }
+        DirScanOutcome::Unsearchable { names } => {
+            outcome
+                .faults
+                .push((PathBuf::new(), DirFault::Unsearchable { names }));
+            return outcome;
+        }
+        DirScanOutcome::Ok { subdirs, sockets } => {
+            for name in sockets {
+                let rel = PathBuf::from(name);
+                if !skip_rel.contains(&rel) {
+                    outcome.sockets.push(rel);
                 }
             }
-            set.into_iter().collect()
-        };
-        if uncached.len() == 1 {
-            let dir = uncached.into_iter().next().unwrap();
-            let outcome = scan_one_dir(&dir);
-            cache
-                .dirs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(dir, outcome);
-        } else if uncached.len() > 1 {
-            let workers = uncached.len().min(8);
-            let chunk_size = uncached.len().div_ceil(workers);
-            let scanned: Vec<(PathBuf, DirScanOutcome)> = std::thread::scope(|s| {
-                let handles: Vec<_> = uncached
-                    .chunks(chunk_size)
-                    .map(|chunk| {
-                        s.spawn(move || {
-                            chunk
-                                .iter()
-                                .map(|dir| (dir.clone(), scan_one_dir(dir)))
-                                .collect::<Vec<_>>()
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .flat_map(|h| h.join().expect("socket scan worker panicked"))
-                    .collect()
-            });
-            let mut guard = cache.dirs.lock().unwrap_or_else(|e| e.into_inner());
-            for (dir, outcome) in scanned {
-                guard.insert(dir, outcome);
-            }
+            subdirs
+                .into_iter()
+                .map(PathBuf::from)
+                .filter(|rel| !skip_rel.contains(rel))
+                .collect::<Vec<_>>()
         }
-        let mut next_frontier = Vec::new();
-        {
-            let guard = cache.dirs.lock().unwrap_or_else(|e| e.into_inner());
-            for (dir_host, dir_sandbox) in frontier {
-                if let Some(DirScanOutcome::Ok { subdirs, .. }) = guard.get(&dir_host) {
+    };
+    if initial_subdirs.is_empty() {
+        outcome.sockets.sort();
+        return outcome;
+    }
+
+    struct WorkState {
+        stack: Vec<PathBuf>,
+        active: usize,
+        done: bool,
+    }
+
+    let workers = initial_subdirs.len().clamp(1, 8);
+    if workers == 1 {
+        let mut stack = initial_subdirs;
+        while let Some(rel) = stack.pop() {
+            let dir_host = root_host.join(&rel);
+            match scan_one_dir(&dir_host) {
+                DirScanOutcome::Missing => {}
+                DirScanOutcome::ReadError(err) => {
+                    outcome.faults.push((rel, DirFault::ReadError(err)));
+                }
+                DirScanOutcome::Unsearchable { names } => {
+                    outcome.faults.push((rel, DirFault::Unsearchable { names }));
+                }
+                DirScanOutcome::Ok { subdirs, sockets } => {
+                    for name in sockets {
+                        let child_rel = rel.join(name);
+                        if !skip_rel.contains(&child_rel) {
+                            outcome.sockets.push(child_rel);
+                        }
+                    }
                     for name in subdirs {
-                        let child_sandbox = dir_sandbox.join(name);
-                        if !at.contains(&child_sandbox) {
-                            next_frontier.push((dir_host.join(name), child_sandbox));
+                        let child_rel = rel.join(name);
+                        if !skip_rel.contains(&child_rel) {
+                            stack.push(child_rel);
                         }
                     }
                 }
             }
         }
-        frontier = next_frontier;
+        outcome.sockets.sort();
+        outcome.faults.sort_by(|a, b| a.0.cmp(&b.0));
+        return outcome;
     }
+
+    let shared = (
+        Mutex::new(WorkState {
+            stack: initial_subdirs,
+            active: 0,
+            done: false,
+        }),
+        Condvar::new(),
+    );
+    let has_skips = !skip_rel.is_empty();
+    let results: Vec<RootScanOutcome> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                let shared = &shared;
+                s.spawn(move || {
+                    let (lock, cvar) = shared;
+                    let mut local_stack: Vec<PathBuf> = Vec::with_capacity(64);
+                    let mut local = RootScanOutcome::default();
+                    let mut is_active = false;
+                    loop {
+                        if local_stack.is_empty() {
+                            let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+                            if is_active {
+                                state.active -= 1;
+                            }
+                            while state.stack.is_empty() && !state.done {
+                                if state.active == 0 {
+                                    state.done = true;
+                                    cvar.notify_all();
+                                    break;
+                                }
+                                state = cvar.wait(state).unwrap_or_else(|e| e.into_inner());
+                            }
+                            if state.done {
+                                break;
+                            }
+                            let take = (state.stack.len() / workers).clamp(1, 32);
+                            let split_at = state.stack.len() - take;
+                            local_stack.extend(state.stack.drain(split_at..));
+                            state.active += 1;
+                            is_active = true;
+                        }
+                        while let Some(rel) = local_stack.pop() {
+                            let dir_host = root_host.join(&rel);
+                            match scan_one_dir(&dir_host) {
+                                DirScanOutcome::Missing => {}
+                                DirScanOutcome::ReadError(err) => {
+                                    local.faults.push((rel, DirFault::ReadError(err)));
+                                }
+                                DirScanOutcome::Unsearchable { names } => {
+                                    local.faults.push((rel, DirFault::Unsearchable { names }));
+                                }
+                                DirScanOutcome::Ok { subdirs, sockets } => {
+                                    for name in sockets {
+                                        let child_rel = rel.join(name);
+                                        if !has_skips || !skip_rel.contains(&child_rel) {
+                                            local.sockets.push(child_rel);
+                                        }
+                                    }
+                                    for name in subdirs {
+                                        let child_rel = rel.join(name);
+                                        if !has_skips || !skip_rel.contains(&child_rel) {
+                                            local_stack.push(child_rel);
+                                        }
+                                    }
+                                    if local_stack.len() > 24 {
+                                        let mut state =
+                                            lock.lock().unwrap_or_else(|e| e.into_inner());
+                                        if state.stack.len() < workers * 8 {
+                                            let half = local_stack.len() / 2;
+                                            state.stack.extend(local_stack.drain(..half));
+                                            cvar.notify_all();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    local
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("socket scan worker panicked"))
+            .collect()
+    });
+    for part in results {
+        outcome.sockets.extend(part.sockets);
+        outcome.faults.extend(part.faults);
+    }
+    outcome.sockets.sort();
+    outcome.faults.sort_by(|a, b| a.0.cmp(&b.0));
+    outcome
+}
+
+fn get_or_scan_root(
+    root_host: &Path,
+    skip_rel: BTreeSet<PathBuf>,
+    cache: &SocketScanCache,
+) -> Arc<RootScanOutcome> {
+    let key = (root_host.to_owned(), skip_rel);
+    if let Some(cached) = cache
+        .roots
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+    {
+        return Arc::clone(cached);
+    }
+    let scanned = Arc::new(scan_root_tree(&key.0, &key.1));
+    let mut guard = cache.roots.lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(guard.entry(key).or_insert(scanned))
 }
 
 /// Scans every kept `rw` host directory mount for Unix domain sockets
@@ -1894,7 +2076,6 @@ fn mask_rw_sockets_with_cache(
     let mut added: BTreeMap<PathBuf, PlannedMount> = BTreeMap::new();
     let mut replace_rw: BTreeSet<PathBuf> = BTreeSet::new();
 
-    let mut roots = Vec::new();
     for m in &mounts {
         let granted_ro = m.mode == PathMode::Ro && m.provider == stopit;
         if m.mode != PathMode::Rw && !granted_ro {
@@ -1910,34 +2091,34 @@ fn mask_rw_sockets_with_cache(
         if root_kind != EntryKind::Dir {
             continue;
         }
-        roots.push((root_host.to_owned(), m.sandbox.clone()));
-    }
-    populate_socket_scan_cache(&roots, &at, cache);
-    let cache_guard = cache.dirs.lock().unwrap_or_else(|e| e.into_inner());
-
-    for m in &mounts {
-        let granted_ro = m.mode == PathMode::Ro && m.provider == stopit;
-        if m.mode != PathMode::Rw && !granted_ro {
-            continue;
+        let skip_rel: BTreeSet<PathBuf> = at
+            .iter()
+            .filter_map(|p| p.strip_prefix(&m.sandbox).ok())
+            .filter(|rel| !rel.as_os_str().is_empty())
+            .map(Path::to_owned)
+            .collect();
+        let outcome = get_or_scan_root(root_host, skip_rel, cache);
+        for rel in &outcome.sockets {
+            let child_sandbox = m.sandbox.join(rel);
+            let child_host = root_host.join(rel);
+            added
+                .entry(child_sandbox.clone())
+                .or_insert_with(|| PlannedMount {
+                    sandbox: child_sandbox,
+                    source: MountSource::Host {
+                        path: child_host,
+                        kind: EntryKind::Socket,
+                    },
+                    mode: PathMode::Masked,
+                    provider: stopit.clone(),
+                    glob_link: false,
+                });
         }
-        let MountSource::Host { path: host, kind } = &m.source else {
-            continue;
-        };
-        let (root_host, root_kind) = canonical
-            .get(&m.sandbox)
-            .map(|(p, k)| (p.as_path(), *k))
-            .unwrap_or((host.as_path(), *kind));
-        if root_kind != EntryKind::Dir {
-            continue;
-        }
-        let mut stack = vec![(root_host.to_owned(), m.sandbox.clone())];
-        while let Some((dir_host, dir_sandbox)) = stack.pop() {
-            let Some(outcome) = cache_guard.get(&dir_host) else {
-                continue;
-            };
-            match outcome {
-                DirScanOutcome::Missing => continue,
-                DirScanOutcome::ReadError(err) => {
+        for (rel, fault) in &outcome.faults {
+            let dir_host = join_rel(root_host, rel);
+            let dir_sandbox = join_rel(&m.sandbox, rel);
+            match fault {
+                DirFault::ReadError(err) => {
                     mask_unreadable_rw_dir(
                         m,
                         &dir_sandbox,
@@ -1951,7 +2132,7 @@ fn mask_rw_sockets_with_cache(
                         warnings,
                     );
                 }
-                DirScanOutcome::Unsearchable { names } => {
+                DirFault::Unsearchable { names } => {
                     let mut dir_failure = None;
                     for name in names {
                         let child_sandbox = dir_sandbox.join(name);
@@ -1982,37 +2163,6 @@ fn mask_rw_sockets_with_cache(
                             warnings,
                         );
                     }
-                }
-                DirScanOutcome::Ok { subdirs, sockets } => {
-                    for name in sockets {
-                        let child_sandbox = dir_sandbox.join(name);
-                        if at.contains(&child_sandbox) {
-                            continue;
-                        }
-                        let child_host = dir_host.join(name);
-                        added
-                            .entry(child_sandbox.clone())
-                            .or_insert_with(|| PlannedMount {
-                                sandbox: child_sandbox,
-                                source: MountSource::Host {
-                                    path: child_host,
-                                    kind: EntryKind::Socket,
-                                },
-                                mode: PathMode::Masked,
-                                provider: stopit.clone(),
-                                glob_link: false,
-                            });
-                    }
-                    let mut child_dirs: Vec<(PathBuf, PathBuf)> = subdirs
-                        .iter()
-                        .filter_map(|name| {
-                            let child_sandbox = dir_sandbox.join(name);
-                            (!at.contains(&child_sandbox))
-                                .then(|| (dir_host.join(name), child_sandbox))
-                        })
-                        .collect();
-                    child_dirs.sort_by(|a, b| b.1.cmp(&a.1));
-                    stack.extend(child_dirs);
                 }
             }
         }
@@ -3535,6 +3685,7 @@ pub struct CompiledSession {
     order: Vec<ProfileRef>,
     roots: UntrustedRoots,
     scan_cache: Arc<SocketScanCache>,
+    resolve_cache: Arc<ResolveCache>,
 }
 
 impl CompiledSession {
@@ -3598,6 +3749,7 @@ impl CompiledSession {
             order,
             roots,
             scan_cache: Arc::clone(&self.scan_cache),
+            resolve_cache: Arc::clone(&self.resolve_cache),
         }
     }
 
@@ -3648,7 +3800,7 @@ impl CompiledSession {
         let Some(grants) = merged.get(&target) else {
             return Ok(None);
         };
-        let mut resolve_cache = ResolveCache::default();
+        let mut resolve_cache = (*self.resolve_cache).clone();
         let planned = plan_profile(grants, ctx, &mut resolve_cache).map_err(fail(&target))?;
         let mut test_roots = self.roots.clone();
         let before_len = test_roots.roots.len();
@@ -3679,6 +3831,7 @@ impl CompiledSession {
             order: merged.order().to_vec(),
             roots: self.roots.clone(),
             scan_cache: Arc::clone(&self.scan_cache),
+            resolve_cache: Arc::clone(&self.resolve_cache),
         }))
     }
 }
@@ -3863,14 +4016,7 @@ pub(crate) fn compile_session_granted_lazy_with_cache(
     scan_cache: Arc<SocketScanCache>,
 ) -> Result<CompiledSession, CompileError> {
     compile_session_inner(
-        config,
-        outputs,
-        protected,
-        state,
-        ctx,
-        granted,
-        true,
-        scan_cache,
+        config, outputs, protected, state, ctx, granted, true, scan_cache,
     )
 }
 
@@ -3937,6 +4083,7 @@ fn compile_session_inner(
         order: merged.order().to_vec(),
         roots,
         scan_cache,
+        resolve_cache: Arc::new(resolve_cache),
     })
 }
 
@@ -10459,10 +10606,7 @@ fs.masked = [\"{workspace}/hidden\"]
         // Even when `main` masks `~/.ssh/*` or has `fs.ephemeral = ["~/.ssh"]`,
         // `vcs.remote` keeps its own isolated `/home/vcs/.ssh` ephemeral dir and
         // its read-only `known_hosts` mount without warnings.
-        for rule in [
-            "fs.masked = [\"~/.ssh/*\"]",
-            "fs.ephemeral = [\"~/.ssh\"]",
-        ] {
+        for rule in ["fs.masked = [\"~/.ssh/*\"]", "fs.ephemeral = [\"~/.ssh\"]"] {
             let c = f.compile(&prov("ssh-rule", "main", rule));
             let ws: Vec<_> = c
                 .warnings()
@@ -10525,7 +10669,13 @@ fs.masked = [\"{workspace}/hidden\"]
 
         // Before `other` is entered, its rw tree has not been scanned for sockets.
         assert!(
-            !lazy.scan_cache.dirs.lock().unwrap().contains_key(&other_rw),
+            !lazy
+                .scan_cache
+                .roots
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|(root, _)| root == &other_rw),
             "expected lazy socket scan not to scan unused profile's rw tree at compile time"
         );
 
@@ -10538,7 +10688,12 @@ fs.masked = [\"{workspace}/hidden\"]
             assert_eq!(l_warns, e_warns, "{name}");
         }
         assert!(
-            lazy.scan_cache.dirs.lock().unwrap().contains_key(&other_rw),
+            lazy.scan_cache
+                .roots
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|(root, _)| root == &other_rw),
             "expected resolving `other` to populate the socket scan cache for its rw tree"
         );
     }

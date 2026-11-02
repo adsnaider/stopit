@@ -620,7 +620,9 @@ fn run_proxy_shim(
         ..
     } = &spec.kind
     else {
-        return Err(format!("proxy shim {name:?} has no resolved executable path"));
+        return Err(format!(
+            "proxy shim {name:?} has no resolved executable path"
+        ));
     };
     let resp = match exec_proxy_shim(program, &args, shim, cwd, &shared.caller, ctx, &shared.stop) {
         Ok(resp) => resp,
@@ -817,8 +819,8 @@ fn run_proxy_process(
         .map_err(|e| format!("failed to start proxy {}: {e}", program.display()))?;
     let mut stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
-    let (done_r, done_w) = crate::proxy::cloexec_pipe()
-        .map_err(|e| format!("failed to read proxy output: {e}"))?;
+    let (done_r, done_w) =
+        crate::proxy::cloexec_pipe().map_err(|e| format!("failed to read proxy output: {e}"))?;
 
     let read_capped = |r: &mut dyn Read, limit: usize| -> io::Result<Option<Vec<u8>>> {
         let mut buf = Vec::new();
@@ -833,9 +835,7 @@ fn run_proxy_process(
         });
         let err_handle = s.spawn(move || {
             let mut buf = Vec::new();
-            let _ = stderr
-                .take(PROXY_STDERR_LIMIT as u64)
-                .read_to_end(&mut buf);
+            let _ = stderr.take(PROXY_STDERR_LIMIT as u64).read_to_end(&mut buf);
             String::from_utf8_lossy(&buf).trim().to_owned()
         });
 
@@ -880,7 +880,7 @@ fn run_proxy_process(
             None => {
                 return Err(format!(
                     "proxy printed more than {PROXY_STDOUT_LIMIT} bytes on stdout"
-                ))
+                ));
             }
         };
         if !status.success() {
@@ -948,7 +948,13 @@ fn check_inline_proxy_session(
             let new_rw: Vec<&Path> = rw
                 .iter()
                 .map(PathBuf::as_path)
-                .filter(|w| !profile.spec.untrusted_roots.iter().any(|r| w.starts_with(r)))
+                .filter(|w| {
+                    !profile
+                        .spec
+                        .untrusted_roots
+                        .iter()
+                        .any(|r| w.starts_with(r))
+                })
                 .collect();
             if !new_rw.is_empty()
                 && let Some((writable, sandbox, host)) = reached_by_path(&profile.spec, &new_rw)
@@ -1297,17 +1303,24 @@ fn run_grant(
         .filter(|(_, rw)| *rw)
         .map(|(p, _)| p.clone())
         .collect();
-    let check = |compiled: &CompiledSession| {
+    let check = |compiled: &CompiledSession, resolve_sockets: bool| {
         let granted = compiled
             .get(&target)
             .ok_or("the temporary profile did not compile")?;
-        check_grant(&ctx.compiled, caller, granted, &paths, &ctx.workspace_mount)
+        check_grant(
+            &ctx.compiled,
+            caller,
+            granted,
+            &paths,
+            &ctx.workspace_mount,
+            resolve_sockets,
+        )
     };
     let (compiled, generation) = match ctx.loaded.compile_with(&ctx.policy, extra.clone(), &rw) {
         Ok(compiled) => compiled,
         Err(e) => return refuse(&e.to_string()),
     };
-    if let Err(why) = check(&compiled) {
+    if let Err(why) = check(&compiled, false) {
         return refuse(&why);
     }
     let generation =
@@ -1353,7 +1366,7 @@ fn run_grant(
         Ok(compiled) => compiled,
         Err(e) => return refuse(&e.to_string()),
     };
-    if let Err(why) = check(&compiled) {
+    if let Err(why) = check(&compiled, true) {
         return refuse(&why);
     }
     let granted = Arc::new(RunContext {
@@ -1406,6 +1419,7 @@ fn check_grant(
     granted: &crate::spec::CompiledProfile,
     paths: &[(PathBuf, bool)],
     workspace_mount: &Path,
+    resolve_sockets: bool,
 ) -> Result<(), String> {
     use crate::policy::PathMode;
     let rw: Vec<&Path> = paths
@@ -1439,8 +1453,16 @@ fn check_grant(
         }
         return Ok(());
     }
-    let caller_spec = caller.resolved_spec();
-    let granted_spec = granted.resolved_spec();
+    let caller_spec = if resolve_sockets {
+        caller.resolved_spec()
+    } else {
+        &caller.spec
+    };
+    let granted_spec = if resolve_sockets {
+        granted.resolved_spec()
+    } else {
+        &granted.spec
+    };
     let stopit = crate::provider::SUPERVISOR_PROVIDER_NAME;
     // stopit's own rules, the masks over sockets and its state and the
     // protected configuration files, are left out: the compiler applies
@@ -1493,13 +1515,25 @@ fn check_grant(
             ));
         }
     }
-    let before: BTreeSet<String> = caller.all_warnings().map(ToString::to_string).collect();
-    if let Some(new) = granted
-        .all_warnings()
-        .map(ToString::to_string)
-        .find(|w| !before.contains(w))
-    {
-        return Err(format!("a rule would not take as asked: {new}"));
+    if resolve_sockets {
+        let before: BTreeSet<String> = caller.all_warnings().map(ToString::to_string).collect();
+        if let Some(new) = granted
+            .all_warnings()
+            .map(ToString::to_string)
+            .find(|w| !before.contains(w))
+        {
+            return Err(format!("a rule would not take as asked: {new}"));
+        }
+    } else {
+        let before: BTreeSet<String> = caller.warnings.iter().map(ToString::to_string).collect();
+        if let Some(new) = granted
+            .warnings
+            .iter()
+            .map(ToString::to_string)
+            .find(|w| !before.contains(w))
+        {
+            return Err(format!("a rule would not take as asked: {new}"));
+        }
     }
     Ok(())
 }
@@ -2131,7 +2165,10 @@ mod tests {
 
         let host_env = vec![
             (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
-            (OsString::from("SECRET_LEAK"), OsString::from("should-not-leak")),
+            (
+                OsString::from("SECRET_LEAK"),
+                OsString::from("should-not-leak"),
+            ),
         ];
         let env = ProxyEnv {
             host_env: &host_env,
