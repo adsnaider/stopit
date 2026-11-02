@@ -470,7 +470,7 @@ mod tests {
             mount("/nix/store", "/nix/store", PathMode::Ro, "tools"),
             mount(
                 "/home/u/.cargo/registry",
-                "/home/user/.cargo/registry",
+                "/home/stopit/.cargo/registry",
                 PathMode::Rw,
                 "cache",
             ),
@@ -493,7 +493,7 @@ mod tests {
     fn a_home_mount_is_abbreviated_on_both_sides() {
         let mut spec = SandboxSpec::default();
         spec.mounts = vec![
-            mount("/home/u", "/home/user", PathMode::Ro, "h"),
+            mount("/home/u", "/home/stopit", PathMode::Ro, "h"),
             mount("/home/u/a", "/elsewhere/a", PathMode::Ro, "h"),
         ];
         let out = lines(&spec);
@@ -512,7 +512,7 @@ mod tests {
         spec.mounts = vec![mount(WS, WS, PathMode::Rw, "base")];
         let mut c = ctx(Base::Default, &[]);
         c.workspace_mount = Path::new(WS);
-        // Default `system.home` is `/home/user`, so `/home/u/proj` inside the
+        // Default `system.home` is `/home/stopit`, so `/home/u/proj` inside the
         // sandbox is not abbreviated with `~`.
         assert_eq!(
             summary_lines(&spec, &c),

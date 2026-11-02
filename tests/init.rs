@@ -161,11 +161,11 @@ fn environment_computed_from_a_spec_and_a_host_environment_is_what_the_target_ge
             ("EDITOR", "nvim"),
             // The sandbox's identity, not the host's.
             ("HOME", SANDBOX_HOME),
-            ("LOGNAME", "user"),
+            ("LOGNAME", "stopit"),
             ("PATH", "/run/a/bin:/run/b/bin"),
             ("RUST_LOG", "debug"),
             ("TERM", "xterm"),
-            ("USER", "user"),
+            ("USER", "stopit"),
         ])
     );
     let results = init.probe(&env, &[], &[Op::Env]);

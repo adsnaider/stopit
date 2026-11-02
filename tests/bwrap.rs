@@ -408,8 +408,8 @@ fn unmounted_host_paths_are_absent() {
     for result in &results[..10] {
         assert_eq!(errno(result), "ENOENT", "{result:?}");
     }
-    // The empty root holds the mounts' parents only.
-    assert_eq!(ok(&results[10]), &names(&["run", "workspace"]));
+    // The empty root holds the mounts' parents and `/var/run` only.
+    assert_eq!(ok(&results[10]), &names(&["run", "var", "workspace"]));
 }
 
 // --- System mounts ---
@@ -532,11 +532,12 @@ fn default_base_synthesizes_read_only_etc_files() {
     );
     // For this process's ids, the sandbox user's (the line format is
     // checked against the probe's ids below, and golden in `stopit::etc`).
-    let home = "/home/user".parse().unwrap();
+    let home = "/home/stopit".parse().unwrap();
     let expected = EtcFile::ALL.map(|f| {
         etc::contents(
             f,
             SandboxIds::current(),
+            etc::SANDBOX_USER,
             &home,
             &Default::default(),
             Some(etc::SANDBOX_HOSTNAME),
@@ -581,7 +582,7 @@ fn passwd_names_the_sandbox_users_ids() {
     assert_eq!(
         user,
         [
-            "user",
+            "stopit",
             "x",
             &ids.uid.to_string(),
             &ids.gid.to_string(),
@@ -591,7 +592,7 @@ fn passwd_names_the_sandbox_users_ids() {
         ]
     );
     let group = contents(&results[2]).lines().next().unwrap().to_owned();
-    assert_eq!(group, format!("user:x:{}:", ids.gid));
+    assert_eq!(group, format!("stopit:x:{}:", ids.gid));
 }
 
 #[test]
@@ -708,11 +709,11 @@ fn glibc_resolves_the_sandbox_user_through_the_synthesized_files() {
         other => panic!("expected exec output, got {other:?}"),
     };
     if uid != etc::OVERFLOW_ID {
-        assert_eq!(stdout(&results[0]), "user\n");
+        assert_eq!(stdout(&results[0]), "stopit\n");
         assert_eq!(stdout(&results[2]), "nobody\n");
     }
     if gid != etc::OVERFLOW_ID {
-        assert_eq!(stdout(&results[1]), "user\n");
+        assert_eq!(stdout(&results[1]), "stopit\n");
     }
 
     // Without them the name comes from nowhere else.
@@ -884,7 +885,7 @@ fn every_mount_is_nosuid_and_nodev() {
         "/workspace/.git",
         "/workspace/docs",
         "/tmp",
-        "/home/user",
+        "/home/stopit",
         "/proc",
         "/proc/sys",
         "/dev",
@@ -1137,7 +1138,7 @@ fn default_base_end_to_end() {
             read("/workspace/.env"),
             write("/workspace/flake.nix", "x"),
             write("/tmp/scratch", "x"),
-            write("/home/user/.cache", "x"),
+            write("/home/stopit/.cache", "x"),
             stat("/proc/self"),
             stat("/dev/null"),
             stat(f.home()),
@@ -1401,4 +1402,38 @@ fn parent_non_cloexec_descriptor_does_not_leak_into_bwrap() {
     let result = session.run_one(&spec, list("/proc/self/fd"));
     drop(leaked);
     assert_eq!(ok(&result), &names(&["0", "1", "2", "3"]));
+}
+
+#[test]
+fn var_run_symlinks_to_run_in_sandbox() {
+    let f = SpecFixture::new();
+    let spec = f.compile(&config_none(""));
+    let results = f.session().run(
+        &spec,
+        &[stat("/var/run"), list("/var/run/stopit")],
+    );
+    assert_eq!(stat_data(&results[0]).kind, FileKind::Symlink);
+    assert_eq!(ok(&results[1]), &names(&["bin", "lib", "stopit"]));
+}
+
+#[test]
+fn system_user_sets_passwd_group_and_default_home() {
+    let f = SpecFixture::new();
+    let spec = f.compile(&config_none(
+        "system.etc = [\"passwd\", \"group\"]\n\
+         system.user = { username = \"alice\" }\n\
+         fs.ephemeral = [\"~\"]",
+    ));
+    let results = f.session().run(
+        &spec,
+        &[
+            read("/etc/passwd"),
+            read("/etc/group"),
+            write("/home/alice/note", "ok"),
+        ],
+    );
+    assert!(contents(&results[0]).starts_with("alice:x:"));
+    assert!(contents(&results[0]).contains(":/home/alice:/bin/sh\n"));
+    assert!(contents(&results[1]).starts_with("alice:x:"));
+    assert_eq!(ok(&results[2]), &Data::Done);
 }

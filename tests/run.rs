@@ -395,11 +395,11 @@ fn the_environment_is_filtered() {
     assert_eq!(
         ok(&results[0]),
         &env_data(&[
-            ("HOME", "/home/user"),
-            ("LOGNAME", "user"),
+            ("HOME", "/home/stopit"),
+            ("LOGNAME", "stopit"),
             ("PATH", "/run/stopit/bin"),
             ("TERM", "xterm-test"),
-            ("USER", "user"),
+            ("USER", "stopit"),
         ])
     );
 }
@@ -695,13 +695,13 @@ fn an_unused_global_configuration_stays_protected() {
         let results = s.probe(
             &[],
             &[
-                write("/home/user/src/dotfiles/stopit.toml", "pwned"),
-                write("/home/user/src/dotfiles/tools.sh", "pwned"),
+                write("/home/stopit/src/dotfiles/stopit.toml", "pwned"),
+                write("/home/stopit/src/dotfiles/tools.sh", "pwned"),
                 link(
-                    "/home/user/src/dotfiles/stopit.toml",
-                    "/home/user/src/dotfiles/second-name",
+                    "/home/stopit/src/dotfiles/stopit.toml",
+                    "/home/stopit/src/dotfiles/second-name",
                 ),
-                write("/home/user/src/dotfiles/other", "fine"),
+                write("/home/stopit/src/dotfiles/other", "fine"),
             ],
         );
         assert_eq!(errno(&results[0]), "EROFS", "{project}: {results:?}");
@@ -807,14 +807,14 @@ fn a_symlinked_global_configuration_is_protected_at_its_target() {
     let results = s.probe(
         &[],
         &[
-            write("/home/user/src/dotfiles/stopit.toml", "pwned"),
-            remove("/home/user/src/dotfiles/stopit.toml"),
+            write("/home/stopit/src/dotfiles/stopit.toml", "pwned"),
+            remove("/home/stopit/src/dotfiles/stopit.toml"),
             rename(
-                "/home/user/src/dotfiles/stopit.toml",
-                "/home/user/src/dotfiles/old.toml",
+                "/home/stopit/src/dotfiles/stopit.toml",
+                "/home/stopit/src/dotfiles/old.toml",
             ),
-            rename("/home/user/src/dotfiles", "/home/user/src/moved"),
-            write("/home/user/src/dotfiles/other", "fine"),
+            rename("/home/stopit/src/dotfiles", "/home/stopit/src/moved"),
+            write("/home/stopit/src/dotfiles/other", "fine"),
         ],
     );
     assert_eq!(errno(&results[0]), "EROFS", "{results:?}");
@@ -1567,7 +1567,7 @@ fn a_writable_grant_containing_the_data_directory_is_refused_and_nothing_runs() 
         "base = \"none\"\n{}",
         probe_config("fs.rw = [\"~\"]")
     ));
-    let results = s.probe(&[], &[write("/home/user/file", "x")]);
+    let results = s.probe(&[], &[write("/home/stopit/file", "x")]);
     assert!(matches!(ok(&results[0]), Data::Done), "{results:?}");
     assert_eq!(fs::read_to_string(home.join("file")).unwrap(), "x");
     assert!(!home.join(".local").exists());
@@ -4234,7 +4234,7 @@ fn grants_are_refused_before_anyone_is_asked() {
         ("stopit-grant -- true".to_owned(), "nothing to grant"),
         ("stopit-grant +ro:/x".to_owned(), "usage: stopit-grant"),
         (
-            "stopit-grant +ro:/home/user/.cargo -- true".to_owned(),
+            "stopit-grant +ro:/home/stopit/.cargo -- true".to_owned(),
             "is in this sandbox's home, not a host path; write it as ~/.cargo",
         ),
         (
@@ -5247,7 +5247,7 @@ fn extra_group_names_reach_the_group_file() {
             "--quiet",
             "/bin/sh",
             "-c",
-            "grep -v '^user:' /etc/group",
+            "grep -v '^stopit:' /etc/group",
         ]),
         b"",
     );
@@ -5282,7 +5282,7 @@ fn the_vcs_profiles_have_a_home_main_cannot_write() {
     host_git(&s.ws(), &["init", "-q", "-b", "main"]);
     let script = "echo \"main $HOME\"; echo planted > ~/.gitconfig; \
                   in-vcs -c 'echo \"vcs $HOME $(ls -A \"$HOME\" | tr \"\\n\" \" \")\"; \
-                  grep -c \"^user:.*:/home/vcs:\" /etc/passwd; cat ~/.config/tool/x; \
+                  grep -c \"^stopit:.*:/home/vcs:\" /etc/passwd; cat ~/.config/tool/x; \
                   echo \"$XDG_CONFIG_HOME\"'";
     let out = output(s.stopit(&["run", "--quiet", "/bin/sh", "-c", script]), b"");
     assert_eq!(code(&out), 0, "{out:?}");
@@ -5290,7 +5290,7 @@ fn the_vcs_profiles_have_a_home_main_cannot_write() {
     // and git look for their configuration elsewhere.
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "main /home/user\nvcs /home/vcs .config \n1\ntool\n/home/vcs/.xdg-config\n"
+        "main /home/stopit\nvcs /home/vcs .config \n1\ntool\n/home/vcs/.xdg-config\n"
     );
     assert!(!stderr(&out).contains("warning"), "{out:?}");
 }
@@ -5825,7 +5825,7 @@ fn workspace_mount_host_with_default_home_and_stopit_grant() {
     );
     assert!(!server.log().contains("[n] deny: "), "{:?}", server.log());
 
-    // A `~` grant outside the workspace lands under default `/home/user` while
+    // A `~` grant outside the workspace lands under default `/home/stopit` while
     // `cwd` stays at the host workspace path.
     let ok_cmd = s.stopit(&[
         "run",
@@ -5834,7 +5834,7 @@ fn workspace_mount_host_with_default_home_and_stopit_grant() {
         ws_arg,
         "/bin/sh",
         "-c",
-        "stopit-grant +ro:~/note.txt -- sh -c 'pwd; cat /home/user/note.txt'",
+        "stopit-grant +ro:~/note.txt -- sh -c 'pwd; cat /home/stopit/note.txt'",
     ]);
     let client = command_output_async(ok_cmd);
     server.wait_for_log("[n] deny: ");
@@ -5879,7 +5879,7 @@ fn workspace_mount_host_at_home_itself_is_refused() {
     let err = stderr(&out);
     assert!(err.contains("system.home"), "{err:?}");
 
-    // With default `system.home` (`/home/user`), `--workspace /tmp` is refused
+    // With default `system.home` (`/home/stopit`), `--workspace /tmp` is refused
     // by `check_reserved_paths`, and `--workspace <s.root>` is refused because
     // the writable workspace would contain stopit's config/state directories.
     s.write_global_config(&format!("[workspace]\nmount = \"host\"\n{config}"));
@@ -6029,7 +6029,7 @@ fn persisting_approvals_updates_stopit_toml_allows_it_and_reloads_live_session()
         "--quiet",
         "/bin/sh",
         "-c",
-        "stopit-grant +ro:~/extra.txt -- cat /home/user/extra.txt",
+        "stopit-grant +ro:~/extra.txt -- cat /home/stopit/extra.txt",
     ]);
     let client = command_output_async(grant_cmd);
     server.wait_for_log("[n] deny: ");
@@ -6055,7 +6055,7 @@ fn persisting_approvals_updates_stopit_toml_allows_it_and_reloads_live_session()
             "--quiet",
             "/bin/sh",
             "-c",
-            "myecho hello again && cat /home/user/extra.txt",
+            "myecho hello again && cat /home/stopit/extra.txt",
         ]),
         b"",
     );
@@ -6085,7 +6085,7 @@ fn proxy_shims_protect_their_script_and_support_named_inline_and_deny_decisions(
              printf '{\"decision\":\"allow\",\"cmd\":[\"echo\",\"proxy-main:%s:%s\"],\"profile\":\"main\"}\\n' \"$STOPIT_SHIM\" \"$2\"\n\
              ;;\n\
            allow-inline)\n\
-             printf '{\"decision\":\"allow\",\"cmd\":[\"cat\",\"/home/user/secret.txt\"],\"profile\":{\"inherit\":\"main\",\"fs\":{\"ro\":[\"~/secret.txt\"]}}}\\n'\n\
+             printf '{\"decision\":\"allow\",\"cmd\":[\"cat\",\"/home/stopit/secret.txt\"],\"profile\":{\"inherit\":\"main\",\"fs\":{\"ro\":[\"~/secret.txt\"]}}}\\n'\n\
              ;;\n\
            deny-me)\n\
              printf '{\"decision\":\"deny\",\"reason\":\"custom proxy denial\"}\\n'\n\
@@ -6104,7 +6104,7 @@ fn proxy_shims_protect_their_script_and_support_named_inline_and_deny_decisions(
     ));
 
     let script = "echo tampered >> /workspace/my-proxy.sh 2>/dev/null && echo wrote-proxy || echo proxy-protected; \
-                  cat /home/user/secret.txt 2>/dev/null || echo main-no-secret; \
+                  cat /home/stopit/secret.txt 2>/dev/null || echo main-no-secret; \
                   pcli allow-main arg2; \
                   pcli allow-inline; \
                   pcli deny-me; echo deny_rc=$?";

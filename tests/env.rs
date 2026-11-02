@@ -49,13 +49,13 @@ fn default_base_golden() {
         spec.target_env(host()),
         vars(&[
             ("COLORTERM", "truecolor"),
-            ("HOME", "/home/user"),
+            ("HOME", "/home/stopit"),
             ("LANG", "en_US.UTF-8"),
-            ("LOGNAME", "user"),
+            ("LOGNAME", "stopit"),
             // `stopit-grant`'s directory, which the default base gives.
             ("PATH", "/run/stopit/bin"),
             ("TERM", "xterm-256color"),
-            ("USER", "user"),
+            ("USER", "stopit"),
         ])
     );
 }
@@ -84,13 +84,38 @@ env.path_prepend = ["/run/stopit/bin", "/usr/bin"]
             ("CARGO_HOME", "/home/adam/.cargo"),
             ("COLORTERM", "truecolor"),
             ("EDITOR", "vi"),
-            ("HOME", "/home/user"),
+            ("HOME", "/home/stopit"),
             ("LANG", "en_US.UTF-8"),
-            ("LOGNAME", "user"),
+            ("LOGNAME", "stopit"),
             ("PATH", "/run/stopit/bin:/usr/bin"),
             ("RUST_LOG", "debug"),
             ("TERM", "xterm-256color"),
             ("USER", "agent"),
+        ])
+    );
+}
+
+#[test]
+fn system_user_updates_user_logname_and_default_home() {
+    let f = SpecFixture::new();
+    let (spec, _) = f.compile_with_warnings(
+        r#"
+[[provider]]
+type = "config"
+[provider.sandbox]
+system.user = { username = "alice" }
+"#,
+    );
+    assert_eq!(
+        spec.target_env(host()),
+        vars(&[
+            ("COLORTERM", "truecolor"),
+            ("HOME", "/home/alice"),
+            ("LANG", "en_US.UTF-8"),
+            ("LOGNAME", "alice"),
+            ("PATH", "/run/stopit/bin"),
+            ("TERM", "xterm-256color"),
+            ("USER", "alice"),
         ])
     );
 }

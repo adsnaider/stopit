@@ -6,13 +6,14 @@
 //! sandbox user has, never from the host's `/etc`: the sandbox learns
 //! nothing about host accounts, groups, host names or name services.
 //!
-//! * The sandbox user is named [`SANDBOX_USER`] whatever the host user is
-//!   called: the host name is information the sandbox does not need. Its uid
-//!   and gid are the caller's (bwrap's `--unshare-user` maps the caller's
-//!   real ids to themselves), so files the sandbox creates in `rw` mounts
-//!   belong to the user on the host as well. Its shell is [`SANDBOX_SHELL`],
-//!   the conventional default (an empty field means the same), whether or
-//!   not the sandbox has one.
+//! * By default the sandbox user is named [`SANDBOX_USER`] whatever the host
+//!   user is called: the host name is information the sandbox does not need
+//!   unless `system.user` explicitly sets `"host"` or `{ username = "<name>" }`.
+//!   Its uid and gid are the caller's (bwrap's `--unshare-user` maps the
+//!   caller's real ids to themselves), so files the sandbox creates in `rw`
+//!   mounts belong to the user on the host as well. Its shell is
+//!   [`SANDBOX_SHELL`], the conventional default (an empty field means the
+//!   same), whether or not the sandbox has one.
 //! * Inside the user namespace only that uid and gid are mapped; every other
 //!   id, host root included, shows as the overflow id [`OVERFLOW_ID`]. So
 //!   the files also name it (`nobody`, `nogroup`), which `ls -l` and `id`
@@ -41,8 +42,9 @@ use std::collections::BTreeSet;
 
 use crate::manifest::{EtcFile, GroupName, SandboxHome};
 
-/// The name of the sandbox user and of its primary group.
-pub const SANDBOX_USER: &str = "user";
+/// The default name of the sandbox user and of its primary group when
+/// `system.user` is not set.
+pub const SANDBOX_USER: &str = "stopit";
 
 /// The sandbox user's login shell.
 pub const SANDBOX_SHELL: &str = "/bin/sh";
@@ -102,24 +104,65 @@ impl SandboxIds {
     }
 }
 
+/// Looks up the running host user's name from the system password database
+/// (`getpwuid_r(getuid())`), falling back to [`SANDBOX_USER`] if the lookup
+/// fails or returns a name that is not a valid [`crate::manifest::UserName`].
+pub fn host_username() -> String {
+    let uid = rustix::process::getuid().as_raw();
+    let mut cap = 4096usize;
+    while cap <= 65536 {
+        let mut pwd = unsafe { std::mem::zeroed::<libc::passwd>() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let mut buf = vec![0 as libc::c_char; cap];
+        // SAFETY: `pwd`, `buf`, and `result` are valid local buffers for the
+        // duration of `getpwuid_r`.
+        let rc = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut pwd,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE {
+            cap *= 2;
+            continue;
+        }
+        if rc == 0 && !result.is_null() && !pwd.pw_name.is_null() {
+            // SAFETY: `pwd.pw_name` points into `buf`, which `getpwuid_r`
+            // NUL-terminated.
+            let cstr = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) };
+            if let Ok(name) = cstr.to_str()
+                && name.parse::<crate::manifest::UserName>().is_ok()
+            {
+                return name.to_owned();
+            }
+        }
+        break;
+    }
+    SANDBOX_USER.to_owned()
+}
+
 /// The sandbox path of `file`: `/etc/<name>`.
 pub fn sandbox_path(file: EtcFile) -> PathBuf {
     PathBuf::from("/etc").join(file.as_str())
 }
 
-/// The content of `file` for the sandbox user `ids` with the `HOME` `home`
-/// and the extra group names `groups`, in a sandbox whose hostname is
+/// The content of `file` for the sandbox user `user` (`ids`) with the `HOME`
+/// `home` and the extra group names `groups`, in a sandbox whose hostname is
 /// `hostname` (`None` if stopit does not set one).
 pub fn contents(
     file: EtcFile,
     ids: SandboxIds,
+    user: &str,
     home: &SandboxHome,
     groups: &BTreeSet<GroupName>,
     hostname: Option<&str>,
 ) -> String {
     match file {
-        EtcFile::Passwd => passwd(ids, home),
-        EtcFile::Group => group(ids, groups),
+        EtcFile::Passwd => passwd(ids, user, home),
+        EtcFile::Group => group(ids, user, groups),
         EtcFile::Hosts => hosts(hostname),
         EtcFile::NsswitchConf => NSSWITCH_CONF.to_owned(),
         EtcFile::ResolvConf => resolv_conf(),
@@ -144,17 +187,17 @@ pub fn hosts(hostname: Option<&str>) -> String {
     format!("127.0.0.1\t{names}\n::1\t{names}\n")
 }
 
-/// `/etc/passwd`: the sandbox user, then `nobody` unless the user has its
-/// uid.
+/// `/etc/passwd`: the sandbox user `user`, then `nobody` unless the user has
+/// its uid.
 ///
 /// `home` is interpolated as is: [`SandboxHome`] contains no `:` (the field
 /// separator) and no control character (a newline would end the entry).
-pub fn passwd(ids: SandboxIds, home: &SandboxHome) -> String {
+pub fn passwd(ids: SandboxIds, user: &str, home: &SandboxHome) -> String {
     let mut out = String::new();
     let mut entry = |name: &str, uid: u32, gid: u32, home: &str, shell: &str| {
         writeln!(out, "{name}:x:{uid}:{gid}::{home}:{shell}").expect("writing to a String");
     };
-    entry(SANDBOX_USER, ids.uid, ids.gid, home.as_str(), SANDBOX_SHELL);
+    entry(user, ids.uid, ids.gid, home.as_str(), SANDBOX_SHELL);
     if ids.uid != OVERFLOW_ID {
         entry(
             OVERFLOW_USER,
@@ -167,17 +210,22 @@ pub fn passwd(ids: SandboxIds, home: &SandboxHome) -> String {
     out
 }
 
-/// `/etc/group`: the sandbox user's primary group, then, unless that group
-/// has the overflow gid, `nogroup` and each of `extra` (`system.groups`)
+/// `/etc/group`: the sandbox user's primary group `user`, then, unless that
+/// group has the overflow gid, `nogroup` and each of `extra` (`system.groups`)
 /// as other names for it, for programs that look a group up by a name the
 /// file does not otherwise have.
-pub fn group(ids: SandboxIds, extra: &BTreeSet<GroupName>) -> String {
-    let mut out = format!("{SANDBOX_USER}:x:{}:\n", ids.gid);
+pub fn group(ids: SandboxIds, user: &str, extra: &BTreeSet<GroupName>) -> String {
+    let mut out = format!("{user}:x:{}:\n", ids.gid);
     if ids.gid == OVERFLOW_ID {
         return out;
     }
-    writeln!(out, "{OVERFLOW_GROUP}:x:{OVERFLOW_ID}:").expect("writing to a String");
-    for name in extra.iter().filter(|n| n.as_str() != OVERFLOW_GROUP) {
+    if user != OVERFLOW_GROUP {
+        writeln!(out, "{OVERFLOW_GROUP}:x:{OVERFLOW_ID}:").expect("writing to a String");
+    }
+    for name in extra
+        .iter()
+        .filter(|n| n.as_str() != OVERFLOW_GROUP && n.as_str() != user)
+    {
         writeln!(out, "{name}:x:{OVERFLOW_ID}:").expect("writing to a String");
     }
     out
@@ -203,28 +251,31 @@ mod tests {
     #[test]
     fn passwd_golden() {
         assert_eq!(
-            passwd(IDS, &home("/home/user")),
-            "user:x:1000:100::/home/user:/bin/sh\n\
+            passwd(IDS, SANDBOX_USER, &home("/home/stopit")),
+            "stopit:x:1000:100::/home/stopit:/bin/sh\n\
              nobody:x:65534:65534::/nonexistent:/bin/false\n"
         );
         // The configured `HOME`, with a space, verbatim.
         assert_eq!(
-            passwd(IDS, &home("/srv/agent home")).lines().next(),
-            Some("user:x:1000:100::/srv/agent home:/bin/sh")
+            passwd(IDS, "alice", &home("/srv/agent home")).lines().next(),
+            Some("alice:x:1000:100::/srv/agent home:/bin/sh")
         );
     }
 
     #[test]
     fn group_golden() {
-        assert_eq!(group(IDS, &none()), "user:x:100:\nnogroup:x:65534:\n");
-        // Extra names for the overflow gid, sorted, `nogroup` once.
-        let extra: BTreeSet<GroupName> = ["nobody", "nogroup", "audio"]
+        assert_eq!(
+            group(IDS, SANDBOX_USER, &none()),
+            "stopit:x:100:\nnogroup:x:65534:\n"
+        );
+        // Extra names for the overflow gid, sorted, `nogroup` and `user` omitted.
+        let extra: BTreeSet<GroupName> = ["nobody", "nogroup", "audio", "stopit"]
             .iter()
             .map(|n| n.parse().unwrap())
             .collect();
         assert_eq!(
-            group(IDS, &extra),
-            "user:x:100:\nnogroup:x:65534:\naudio:x:65534:\nnobody:x:65534:\n"
+            group(IDS, SANDBOX_USER, &extra),
+            "stopit:x:100:\nnogroup:x:65534:\naudio:x:65534:\nnobody:x:65534:\n"
         );
     }
 
@@ -237,25 +288,26 @@ mod tests {
             gid: OVERFLOW_ID,
         };
         assert_eq!(
-            passwd(ids, &home("/home/user")),
-            "user:x:65534:65534::/home/user:/bin/sh\n"
+            passwd(ids, SANDBOX_USER, &home("/home/stopit")),
+            "stopit:x:65534:65534::/home/stopit:/bin/sh\n"
         );
-        assert_eq!(group(ids, &none()), "user:x:65534:\n");
+        assert_eq!(group(ids, SANDBOX_USER, &none()), "stopit:x:65534:\n");
         // Extra names would alias the user's own group, so they stay out.
         let extra: BTreeSet<GroupName> = ["nobody".parse().unwrap()].into();
-        assert_eq!(group(ids, &extra), "user:x:65534:\n");
+        assert_eq!(group(ids, SANDBOX_USER, &extra), "stopit:x:65534:\n");
         // Only the one that collides is left out.
         let ids = SandboxIds {
             uid: 1000,
             gid: OVERFLOW_ID,
         };
-        assert_eq!(passwd(ids, &home("/h")).lines().count(), 2);
-        assert_eq!(group(ids, &none()), "user:x:65534:\n");
+        assert_eq!(passwd(ids, SANDBOX_USER, &home("/h")).lines().count(), 2);
+        assert_eq!(group(ids, SANDBOX_USER, &none()), "stopit:x:65534:\n");
     }
 
     #[test]
     fn root_is_not_listed() {
-        let text = passwd(IDS, &home("/home/user")) + &group(IDS, &none());
+        let text = passwd(IDS, SANDBOX_USER, &home("/home/stopit"))
+            + &group(IDS, SANDBOX_USER, &none());
         assert!(!text.lines().any(|l| l.starts_with("root:")), "{text}");
         assert!(!text.contains(":0:"), "{text}");
     }
@@ -263,10 +315,10 @@ mod tests {
     #[test]
     fn every_entry_has_the_right_number_of_fields() {
         let ids = SandboxIds { uid: 0, gid: 0 };
-        for line in passwd(ids, &home("/a b/c")).lines() {
+        for line in passwd(ids, SANDBOX_USER, &home("/a b/c")).lines() {
             assert_eq!(line.split(':').count(), 7, "{line}");
         }
-        for line in group(ids, &none()).lines() {
+        for line in group(ids, SANDBOX_USER, &none()).lines() {
             assert_eq!(line.split(':').count(), 4, "{line}");
         }
     }
@@ -301,17 +353,21 @@ mod tests {
 
     #[test]
     fn contents_and_paths_of_every_file() {
-        let h = home("/home/user");
+        let h = home("/home/stopit");
         for hostname in [None, Some(SANDBOX_HOSTNAME)] {
             for file in EtcFile::ALL {
                 let want = match file {
-                    EtcFile::Passwd => passwd(IDS, &h),
-                    EtcFile::Group => group(IDS, &none()),
+                    EtcFile::Passwd => passwd(IDS, SANDBOX_USER, &h),
+                    EtcFile::Group => group(IDS, SANDBOX_USER, &none()),
                     EtcFile::Hosts => hosts(hostname),
                     EtcFile::NsswitchConf => NSSWITCH_CONF.to_owned(),
                     EtcFile::ResolvConf => resolv_conf(),
                 };
-                assert_eq!(contents(file, IDS, &h, &none(), hostname), want, "{file}");
+                assert_eq!(
+                    contents(file, IDS, SANDBOX_USER, &h, &none(), hostname),
+                    want,
+                    "{file}"
+                );
                 assert!(want.ends_with('\n'), "{file}");
             }
         }
@@ -333,5 +389,6 @@ mod tests {
         let ids = SandboxIds::current();
         assert_eq!(ids.uid, rustix::process::getuid().as_raw());
         assert_eq!(ids.gid, rustix::process::getgid().as_raw());
+        assert!(!host_username().is_empty());
     }
 }

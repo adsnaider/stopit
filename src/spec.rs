@@ -45,7 +45,7 @@ use crate::error::is_missing;
 use crate::expand::{EntryKind, ExpansionContext, ResolveCache, expand_bind, expand_pattern};
 use crate::manifest::{
     BindMode, DevMode, Domain, EtcFile, Grants, GroupName, OptInSyscall, SandboxHome,
-    ShareableNamespace, ShimName, ShimSpec,
+    SandboxUser, ShareableNamespace, ShimName, ShimSpec,
 };
 use crate::policy::{NetworkMode, PathMode};
 use crate::provider::{ProtectedSource, ProviderOutput, SUPERVISOR_PROVIDER_NAME};
@@ -95,7 +95,7 @@ pub struct SandboxSpec {
 }
 
 /// System mounts and synthesized files (§6.2 steps 3 and 4).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemSpec {
     /// Mount a masked-subset `/proc`.
     pub proc: bool,
@@ -103,13 +103,29 @@ pub struct SystemSpec {
     pub dev: Option<DevMode>,
     /// The `/etc` files to synthesize.
     pub etc: BTreeSet<EtcFile>,
-    /// The sandbox `HOME`: the profile's `system.home`, or `/home/user` when
+    /// The sandbox `HOME`: the profile's `system.home`, or `/home/<user>` when
     /// no provider sets one. It is where `~` rules are mounted; nothing is
     /// mounted there unless a rule grants it.
     pub home: SandboxHome,
+    /// The sandbox username (`system.user`, or [`crate::etc::SANDBOX_USER`]
+    /// when no provider sets one).
+    pub user: String,
     /// More names for the overflow gid in the synthesized `/etc/group`
     /// (`system.groups`).
     pub groups: BTreeSet<GroupName>,
+}
+
+impl Default for SystemSpec {
+    fn default() -> Self {
+        SystemSpec {
+            proc: false,
+            dev: None,
+            etc: BTreeSet::new(),
+            home: SandboxHome::default(),
+            user: crate::etc::SANDBOX_USER.to_owned(),
+            groups: BTreeSet::new(),
+        }
+    }
 }
 
 /// Which namespaces are shared with the host (§6.2 step 1).
@@ -3539,6 +3555,7 @@ fn compile_profile(
 /// A profile whose mounts are planned but not yet checked against the
 /// session's untrusted roots.
 struct PlannedProfile {
+    user: String,
     home: SandboxHome,
     plan: MountPlan,
 }
@@ -3551,11 +3568,21 @@ fn plan_profile(
     ctx: &ExpansionContext,
     cache: &mut ResolveCache,
 ) -> Result<PlannedProfile, SpecError> {
-    let home = grants.system.home.clone().unwrap_or_default();
+    let user = grants
+        .system
+        .user
+        .as_ref()
+        .map(SandboxUser::resolve)
+        .unwrap_or_else(|| crate::etc::SANDBOX_USER.to_owned());
+    let home = grants
+        .system
+        .home
+        .clone()
+        .unwrap_or_else(|| SandboxHome::for_user(&user));
     check_reserved_paths(ctx.workspace_sandbox(), Path::new(home.as_str()))?;
     let plan = plan_mounts_with_cache(&grants.fs, &ctx.with_sandbox_home(&home), cache)?;
     check_mount_destinations(&plan.mounts, synthesizes_resolv_conf(grants))?;
-    Ok(PlannedProfile { home, plan })
+    Ok(PlannedProfile { user, home, plan })
 }
 
 /// Whether a profile with `grants` gets the synthesized
@@ -3592,16 +3619,21 @@ fn finish_profile_inner(
     defer_socket_scan: bool,
     scan_cache: &Arc<SocketScanCache>,
 ) -> Result<CompiledProfile, SpecError> {
-    let PlannedProfile { home, plan } = planned;
+    let PlannedProfile { user, home, plan } = planned;
+    let profile_ctx = ctx.with_sandbox_home(&home);
     let mut warnings: Vec<SpecWarning> = plan.warnings.into_iter().map(Into::into).collect();
-    let mounts =
-        check_destination_links(plan.mounts, ctx.workspace_sandbox(), roots, &mut warnings)?;
+    let mounts = check_destination_links(
+        plan.mounts,
+        profile_ctx.workspace_sandbox(),
+        roots,
+        &mut warnings,
+    )?;
     let (mounts, canonical_sources, lazy_socket_scan) = check_host_sources(
         mounts,
         grants.mask_sockets,
         defer_socket_scan,
         scan_cache,
-        ctx,
+        &profile_ctx,
         roots,
         protected,
         state,
@@ -3629,6 +3661,7 @@ fn finish_profile_inner(
             dev: grants.system.dev,
             etc,
             home,
+            user,
             groups: grants.system.groups.clone(),
         },
         namespaces: Namespaces {
@@ -4111,7 +4144,7 @@ mod tests {
 
     /// A temporary workspace and host home, with an expansion context
     /// mapping them to the workspace mount (`/workspace` by default) and
-    /// `/home/user`.
+    /// `/home/stopit`.
     struct Fixture {
         _dir: TempDir,
         root: PathBuf,
@@ -4142,7 +4175,7 @@ mod tests {
                 root.join(ws_rel),
                 ws_mount.parse().unwrap(),
                 root.join("home"),
-                "/home/user".parse().unwrap(),
+                SandboxHome::default(),
             )
             .unwrap();
             fs::create_dir_all(root.join("run/stopit")).unwrap();
@@ -4361,7 +4394,7 @@ mod tests {
         assert_eq!(spec.system.dev, None);
         assert!(spec.system.etc.is_empty());
         // Nothing is mounted there, but `~` still has a sandbox location.
-        assert_eq!(spec.system.home.as_str(), "/home/user");
+        assert_eq!(spec.system.home.as_str(), "/home/stopit");
         assert_eq!(spec.network, NetworkSpec::None);
         assert_eq!(spec.network.mode(), NetworkMode::None);
         assert_eq!(spec.network.allow_domains(), None);
@@ -4383,7 +4416,7 @@ mod tests {
             [
                 row("/tmp", Ephemeral, "base"),
                 row("/workspace", Rw, "base"),
-                row("/home/user", Ephemeral, "base"),
+                row("/home/stopit", Ephemeral, "base"),
             ]
         );
         assert_eq!(
@@ -4402,7 +4435,7 @@ mod tests {
             strs(&spec.system.etc),
             ["passwd", "group", "hosts", "nsswitch.conf"]
         );
-        assert_eq!(spec.system.home.as_str(), "/home/user");
+        assert_eq!(spec.system.home.as_str(), "/home/stopit");
         assert_eq!(spec.network, NetworkSpec::Loopback);
         assert_eq!(strs(&spec.env.pass), ["TERM", "LANG", "COLORTERM"]);
         assert_eq!(
@@ -4520,7 +4553,7 @@ mod tests {
         let f = Fixture::new();
         // The default base does not set `system.home`; the spec defaults it.
         let s = f.compile("");
-        assert_eq!(spec(&s, "main").system.home.as_str(), "/home/user");
+        assert_eq!(spec(&s, "main").system.home.as_str(), "/home/stopit");
 
         // So a user provider can move `main`'s HOME without a conflict, and
         // the base's ephemeral `~` follows it.
@@ -4590,7 +4623,7 @@ mod tests {
             [
                 row("/tmp", Ephemeral, "base"),
                 row("/workspace", Rw, "base"),
-                row("/home/user", Ephemeral, "base"),
+                row("/home/stopit", Ephemeral, "base"),
                 row("/workspace/.bazelrc", Protected, "base"),
                 row("/workspace/.claude", Protected, "base"),
                 row("/workspace/.cursor", Protected, "base"),
@@ -4934,7 +4967,7 @@ mod tests {
             mounts(main),
             [
                 row("/workspace", Rw, "m"),
-                row("/home/user", Ephemeral, "m")
+                row("/home/stopit", Ephemeral, "m")
             ]
         );
         assert!(main.system.proc);
@@ -4980,9 +5013,70 @@ mod tests {
         assert_eq!(mounts(bare), [row("/nix/store", Ro, "b")]);
         assert!(!bare.system.proc);
         assert_eq!(bare.system.dev, Some(DevMode::Minimal));
-        assert_eq!(bare.system.home.as_str(), "/home/user");
+        assert_eq!(bare.system.home.as_str(), "/home/stopit");
         assert_eq!(bare.env, EffectiveEnv::default());
         assert!(bare.shims.is_empty());
+    }
+
+    #[test]
+    fn system_user_sets_user_and_default_home_unless_home_is_explicit() {
+        let f = Fixture::new();
+        f.mkdir("home/.config");
+        let s = f.compile(&format!(
+            "base = \"none\"\n\
+             [profiles.explicit_home]\n\
+             [profiles.child_user]\n\
+             {}{}{}",
+            prov(
+                "m",
+                "main",
+                "system.user = { username = \"alice\" }\nfs.ro = [\"~/.config\"]"
+            ),
+            prov("e", "explicit_home", "system.home = \"/srv/custom\""),
+            prov("c", "child_user", "system.user = { username = \"bob\" }"),
+        ));
+        let main = spec(&s, "main");
+        assert_eq!(main.system.user, "alice");
+        assert_eq!(main.system.home.as_str(), "/home/alice");
+        assert_eq!(mounts(main), [row("/home/alice/.config", Ro, "m")]);
+
+        // An explicit `system.home` overrides `/home/<user>` while keeping
+        // `system.user`.
+        let explicit = spec(&s, "explicit_home");
+        assert_eq!(explicit.system.user, "alice");
+        assert_eq!(explicit.system.home.as_str(), "/srv/custom");
+        assert_eq!(mounts(explicit), [row("/srv/custom/.config", Ro, "m")]);
+
+        // A child profile overriding `system.user` moves the derived `HOME` too.
+        let child = spec(&s, "child_user");
+        assert_eq!(child.system.user, "bob");
+        assert_eq!(child.system.home.as_str(), "/home/bob");
+        assert_eq!(mounts(child), [row("/home/bob/.config", Ro, "m")]);
+
+        // `workspace.mount` colliding with the derived `/home/<user>` is
+        // rejected by the reserved-path check.
+        let f_ws = Fixture::with_workspace("ws", "/home/alice");
+        let e = f_ws.compile_err(&format!(
+            "base = \"none\"\n{}",
+            prov("m", "main", "system.user = { username = \"alice\" }")
+        ));
+        assert!(
+            matches!(
+                &e,
+                CompileError::Profile {
+                    error,
+                    ..
+                } if matches!(
+                    **error,
+                    SpecError::ReservedPath {
+                        which: PathRole::Home,
+                        ref path,
+                        reason: ReservedReason::SameAsWorkspace,
+                    } if path == Path::new("/home/alice")
+                )
+            ),
+            "{e:?}"
+        );
     }
 
     #[test]
@@ -5052,14 +5146,14 @@ mod tests {
         let inside = |r: &str| InsideReserved(p(r));
 
         for (w, h) in [
-            ("/workspace", "/home/user"),
-            ("/home/user/proj", "/home/user"),
-            ("/tmp/ws", "/home/user"),
+            ("/workspace", "/home/stopit"),
+            ("/home/stopit/proj", "/home/stopit"),
+            ("/tmp/ws", "/home/stopit"),
             ("/workspace", "/tmp/home"),
-            ("/procfs", "/home/user"),
+            ("/procfs", "/home/stopit"),
             ("/workspace", "/etcetera"),
-            ("/srv/run/stopit", "/home/user"),
-            ("/run/other", "/home/user"),
+            ("/srv/run/stopit", "/home/stopit"),
+            ("/run/other", "/home/stopit"),
             ("/workspace", "/workspace2"),
             ("/tmp/h/ws", "/tmp/h"),
         ] {
@@ -5068,73 +5162,73 @@ mod tests {
 
         // (workspace, home, which, path, reason)
         let rejected = [
-            ("/", "/home/user", PathRole::Workspace, "/", covers("/proc")),
+            ("/", "/home/stopit", PathRole::Workspace, "/", covers("/proc")),
             (
                 "/proc",
-                "/home/user",
+                "/home/stopit",
                 PathRole::Workspace,
                 "/proc",
                 covers("/proc"),
             ),
             (
                 "/proc/x",
-                "/home/user",
+                "/home/stopit",
                 PathRole::Workspace,
                 "/proc/x",
                 inside("/proc"),
             ),
             (
                 "/dev/shm",
-                "/home/user",
+                "/home/stopit",
                 PathRole::Workspace,
                 "/dev/shm",
                 inside("/dev"),
             ),
             (
                 "/dev",
-                "/home/user",
+                "/home/stopit",
                 PathRole::Workspace,
                 "/dev",
                 covers("/dev"),
             ),
             (
                 "/etc",
-                "/home/user",
+                "/home/stopit",
                 PathRole::Workspace,
                 "/etc",
                 covers("/etc"),
             ),
             (
                 "/etc/foo",
-                "/home/user",
+                "/home/stopit",
                 PathRole::Workspace,
                 "/etc/foo",
                 inside("/etc"),
             ),
             (
                 "/tmp",
-                "/home/user",
+                "/home/stopit",
                 PathRole::Workspace,
                 "/tmp",
                 covers("/tmp"),
             ),
             (
                 "/run",
-                "/home/user",
+                "/home/stopit",
                 PathRole::Workspace,
                 "/run",
                 covers("/run/stopit"),
             ),
             (
                 "/run/stopit",
-                "/home/user",
+                "/home/stopit",
                 PathRole::Workspace,
                 "/run/stopit",
                 covers("/run/stopit"),
             ),
             (
                 "/run/stopit/x",
-                "/home/user",
+                "/home/stopit",
                 PathRole::Workspace,
                 "/run/stopit/x",
                 inside("/run/stopit"),
@@ -5205,7 +5299,7 @@ mod tests {
             e.to_string(),
             r#"sandbox home (system.home) "/etc/x" is inside the reserved path "/etc""#
         );
-        let e = check_reserved_paths(Path::new("/run"), Path::new("/home/user")).unwrap_err();
+        let e = check_reserved_paths(Path::new("/run"), Path::new("/home/stopit")).unwrap_err();
         assert_eq!(
             e.to_string(),
             r#"workspace mount "/run" is or contains the reserved path "/run/stopit""#
@@ -5414,7 +5508,7 @@ mod tests {
                     mode,
                     projects.clone(),
                     projects.clone(),
-                    PathBuf::from("/home/user/Projects")
+                    PathBuf::from("/home/stopit/Projects")
                 ),
                 "{body}"
             );
@@ -5470,7 +5564,7 @@ mod tests {
                 Ro,
                 sub.clone(),
                 sub,
-                PathBuf::from("/home/user/Projects/stopit/sub")
+                PathBuf::from("/home/stopit/Projects/stopit/sub")
             )
         );
     }
@@ -5490,7 +5584,7 @@ mod tests {
                     Ro,
                     f.root.join("home").join(link),
                     target,
-                    PathBuf::from("/home/user").join(link)
+                    PathBuf::from("/home/stopit").join(link)
                 )
             );
         }
@@ -5598,7 +5692,7 @@ mod tests {
                 x.clone(),
                 x.clone(),
                 ssh.clone(),
-                PathBuf::from("/home/user/proj/x")
+                PathBuf::from("/home/stopit/proj/x")
             )
         );
         assert_eq!(
@@ -5608,7 +5702,7 @@ mod tests {
                 f.ws().join("d/id_ed25519"),
                 f.ws().join("d"),
                 ssh.join("id_ed25519"),
-                PathBuf::from("/home/user/proj/d/id_ed25519")
+                PathBuf::from("/home/stopit/proj/d/id_ed25519")
             )
         );
         // An `rw` rule is dropped with a warning instead: dropping a grant
@@ -5625,7 +5719,7 @@ mod tests {
         assert_eq!(
             get(&s, "main").warnings[0].to_string(),
             format!(
-                "provider \"p\": rw mount of {:?} at \"/home/user/proj/d/id_ed25519\" runs \
+                "provider \"p\": rw mount of {:?} at \"/home/stopit/proj/d/id_ed25519\" runs \
                  through the symlink {:?} inside the host workspace {:?} (resolving to {:?}); a \
                  sandbox can write there, so links inside it are never followed, and the rw \
                  mount is skipped",
@@ -5653,7 +5747,7 @@ mod tests {
             e.to_string(),
             format!(
                 "cannot compile profile \"main\": provider \"p\": ro mount of {x:?} at \
-                 \"/home/user/proj/x\" runs through the symlink {x:?} inside the host workspace \
+                 \"/home/stopit/proj/x\" runs through the symlink {x:?} inside the host workspace \
                  {:?} (resolving to {ssh:?}); a sandbox can write there, so links inside it are \
                  never followed, whatever the rule's anchor or the links leading there: remove \
                  the link or change the rule",
@@ -5694,7 +5788,7 @@ mod tests {
                 home.join("current/config"),
                 config.clone(),
                 ssh.clone(),
-                PathBuf::from("/home/user/current/config")
+                PathBuf::from("/home/stopit/current/config")
             )
         );
         // A glob below an entering link: the walk follows its root link and
@@ -5767,7 +5861,7 @@ mod tests {
                 Ro,
                 home.join("current/config"),
                 f.ws().join("config"),
-                PathBuf::from("/home/user/current/config")
+                PathBuf::from("/home/stopit/current/config")
             )
         );
         // Links outside the workspace on the way out of it are followed.
@@ -5782,9 +5876,9 @@ mod tests {
     #[test]
     fn entering_links_to_the_aligned_path_are_accepted() {
         // The workspace lives at `~/real/proj` but is mounted at
-        // `/home/user/proj`, and `~/proj -> real/proj`: `~/proj/...` rules
+        // `/home/stopit/proj`, and `~/proj -> real/proj`: `~/proj/...` rules
         // land on the aligned path through a link outside the workspace.
-        let f = Fixture::with_workspace("home/real/proj", "/home/user/proj");
+        let f = Fixture::with_workspace("home/real/proj", "/home/stopit/proj");
         let home = f.root.join("home");
         f.mkdir("home/real/proj/x");
         f.mkdir("home/.ssh");
@@ -5999,7 +6093,7 @@ mod tests {
         // With the workspace mounted at its `~` path, a `~` rule inside it
         // lies inside the workspace mount, so the destination check refuses
         // the link first (a restrictive rule) or drops the mount (`rw`).
-        let f = Fixture::with_workspace("home/proj", "/home/user/proj");
+        let f = Fixture::with_workspace("home/proj", "/home/stopit/proj");
         f.mkdir("home/.ssh");
         symlink("../.ssh", f.ws().join("x")).unwrap();
         let ws = "fs.rw = [\"{workspace}\"]\n";
@@ -6009,12 +6103,12 @@ mod tests {
             (&dl.link, &dl.ancestor, dl.root.kind),
             (
                 &f.ws().join("x"),
-                &PathBuf::from("/home/user/proj"),
+                &PathBuf::from("/home/stopit/proj"),
                 UntrustedKind::Workspace
             )
         );
         let s = compile_body(&f, "fs.rw = [\"{workspace}\", \"~/proj/x\"]").unwrap();
-        assert_eq!(mounts(spec(&s, "main")), [row("/home/user/proj", Rw, "p")]);
+        assert_eq!(mounts(spec(&s, "main")), [row("/home/stopit/proj", Rw, "p")]);
         assert_eq!(destination_warnings(&s, "main")[0].link, f.ws().join("x"));
         // Without the workspace mount nothing is underneath (bwrap's root
         // tmpfs), and the host-source check refuses the link: an error for
@@ -6039,7 +6133,7 @@ mod tests {
             e.to_string(),
             format!(
                 "cannot compile profile \"main\": provider \"p\": ro mount of {:?} at \
-                 \"/home/user/Projects\" exposes the host workspace {:?} outside the workspace \
+                 \"/home/stopit/Projects\" exposes the host workspace {:?} outside the workspace \
                  mount; the workspace must appear only at its mount, where its restrictions, \
                  pinned parents and the supervisor's checks apply; grant narrower paths that \
                  leave the workspace out, mask this one, or reach these files through the \
@@ -6053,7 +6147,7 @@ mod tests {
             e.to_string(),
             format!(
                 "cannot compile profile \"main\": provider \"p\": ro mount of {:?} (resolving to \
-                 {:?}) at \"/home/user/ws-link\" exposes the host workspace {:?} outside the \
+                 {:?}) at \"/home/stopit/ws-link\" exposes the host workspace {:?} outside the \
                  workspace mount; the workspace must appear only at its mount, where its \
                  restrictions, pinned parents and the supervisor's checks apply; grant narrower \
                  paths that leave the workspace out, mask this one, or reach these files through \
@@ -6102,7 +6196,7 @@ mod tests {
         // The workspace is `~/proj`, mounted at the matching path under HOME,
         // so `~/proj/...` rules land exactly where the workspace mount shows
         // the same files.
-        let f = Fixture::with_workspace("home/proj", "/home/user/proj");
+        let f = Fixture::with_workspace("home/proj", "/home/stopit/proj");
         f.mkdir("home/proj/x");
         for body in [
             "fs.ro = [\"~/proj/x\"]",
@@ -6115,7 +6209,7 @@ mod tests {
         }
         // But not `~` itself, which contains the workspace.
         let e = compile_body(&f, "fs.ro = [\"~\"]").unwrap_err();
-        assert_eq!(exposure(&f, e).3, PathBuf::from("/home/user"));
+        assert_eq!(exposure(&f, e).3, PathBuf::from("/home/stopit"));
     }
 
     /// Each `SourceUnresolved` warning of `profile` as `(mode, host, sandbox,
@@ -6157,7 +6251,7 @@ mod tests {
                 [(
                     mode,
                     dangling.clone(),
-                    PathBuf::from("/home/user/dangling"),
+                    PathBuf::from("/home/stopit/dangling"),
                     io::ErrorKind::NotFound,
                     None
                 )],
@@ -6170,7 +6264,7 @@ mod tests {
                 get(&s, "main").warnings[0].to_string(),
                 format!(
                     "provider \"p\": cannot resolve the host source {dangling:?} of the {mode} \
-                     mount at \"/home/user/dangling\": {}, so the mount is skipped",
+                     mount at \"/home/stopit/dangling\": {}, so the mount is skipped",
                     u.error
                 ),
                 "{mode}"
@@ -6181,14 +6275,14 @@ mod tests {
                 &f,
                 &format!(
                     "fs.{mode} = [\"~/dangling\"]\n\
-                     fs.bind = [{{ host = \"~/cfg\", sandbox = \"/home/user/dangling/cfg\", \
+                     fs.bind = [{{ host = \"~/cfg\", sandbox = \"/home/stopit/dangling/cfg\", \
                      mode = \"ro\" }}]"
                 ),
             )
             .unwrap();
             assert_eq!(
                 mounts(spec(&s, "main")),
-                [row("/home/user/dangling/cfg", Ro, "p")],
+                [row("/home/stopit/dangling/cfg", Ro, "p")],
                 "{mode}"
             );
         }
@@ -6214,7 +6308,7 @@ mod tests {
             [(
                 Rw,
                 looping.clone(),
-                PathBuf::from("/home/user/loop"),
+                PathBuf::from("/home/stopit/loop"),
                 eloop,
                 None
             )]
@@ -6230,7 +6324,7 @@ mod tests {
                     provider: "p".parse().unwrap(),
                     mode,
                     host: looping.clone(),
-                    sandbox: PathBuf::from("/home/user/loop"),
+                    sandbox: PathBuf::from("/home/stopit/loop"),
                     kind: eloop,
                 },
                 "{mode}"
@@ -6375,7 +6469,7 @@ mod tests {
         assert_eq!(
             spec(&s, "main").mounts,
             [PlannedMount {
-                sandbox: "/home/user/docs".into(),
+                sandbox: "/home/stopit/docs".into(),
                 source: MountSource::Host {
                     path: docs.clone(),
                     kind: EntryKind::Dir
@@ -6402,7 +6496,7 @@ mod tests {
                     w.to_string(),
                     format!(
                         "provider \"p\": cannot resolve the host source {docs:?} of the masked \
-                         mount at \"/home/user/docs\": {}; the mask is kept, but whether the \
+                         mount at \"/home/stopit/docs\": {}; the mask is kept, but whether the \
                          content it covers is visible at another sandbox path is not checked",
                         u.error
                     )
@@ -6736,7 +6830,7 @@ mod tests {
             }
         );
         // An absolute rule alike (it lands at the host path, outside the
-        // grant's mount at `/home/user/.cache/tool`).
+        // grant's mount at `/home/stopit/.cache/tool`).
         let abs = format!("fs.ro = [{:?}]", tool.join("cfg").to_str().unwrap());
         let e = compile_body(&f, &format!("fs.rw = [\"~/.cache/tool\"]\n{abs}")).unwrap_err();
         let lf = untrusted_link(e, "main");
@@ -6757,10 +6851,10 @@ mod tests {
                 DestinationLink {
                     provider: "p".parse().unwrap(),
                     mode: if sandbox == "cfg" { Ro } else { Protected },
-                    sandbox: Path::new("/home/user/.cache/tool").join(sandbox),
+                    sandbox: Path::new("/home/stopit/.cache/tool").join(sandbox),
                     host: tool.join(sandbox),
                     link: tool.join("cfg"),
-                    ancestor: PathBuf::from("/home/user/.cache/tool"),
+                    ancestor: PathBuf::from("/home/stopit/.cache/tool"),
                     ancestor_mode: Rw,
                     ancestor_source: tool.clone(),
                     root: rw_root(tool.clone(), "p", Some("main"), tool.clone()),
@@ -6787,7 +6881,7 @@ mod tests {
         let s = compile_body(&f, "fs.ro = [\"~/.cache/tool/cfg\"]").unwrap();
         assert_eq!(
             mounts(spec(&s, "main")),
-            [row("/home/user/.cache/tool/cfg", Ro, "p")]
+            [row("/home/stopit/.cache/tool/cfg", Ro, "p")]
         );
     }
 
@@ -6842,7 +6936,7 @@ mod tests {
         assert_eq!(
             SpecError::UntrustedLinkFollowed(Box::new(lf)).to_string(),
             format!(
-                "provider \"r\": ro mount of {:?} at \"/home/user/.cache/tool/cfg\" runs through \
+                "provider \"r\": ro mount of {:?} at \"/home/stopit/.cache/tool/cfg\" runs through \
                  the symlink {:?} inside {tool:?}, granted rw as {tool:?} by provider \"w\" in \
                  profile \"main\" (resolving to {:?}); a sandbox can write there, so links inside \
                  it are never followed, whatever the rule's anchor or the links leading there: \
@@ -6983,7 +7077,7 @@ mod tests {
             mounts(spec(&s, "main")),
             [
                 row("/workspace", Rw, "p"),
-                row("/home/user/.cache", Rw, "p")
+                row("/home/stopit/.cache", Rw, "p")
             ]
         );
         let dl = destination_warnings(&s, "main");
@@ -7004,7 +7098,7 @@ mod tests {
         let s = compile_body(&f, &bind("rw")).unwrap();
         assert_eq!(
             mounts(spec(&s, "main")),
-            [row("/home/user/.cache", Rw, "p")]
+            [row("/home/stopit/.cache", Rw, "p")]
         );
         let lf = source_warnings(&s, "main");
         assert_eq!(lf.len(), 1);
@@ -7102,7 +7196,7 @@ mod tests {
         f.file("home/cfg");
         for (name, mode) in [("ro", Ro), ("protected", Protected)] {
             let body = format!(
-                "{grant}fs.bind = [{{ host = \"~/cfg\", sandbox = \"/home/user/.cache/tool/cfg\", \
+                "{grant}fs.bind = [{{ host = \"~/cfg\", sandbox = \"/home/stopit/.cache/tool/cfg\", \
                  mode = \"{name}\" }}]"
             );
             let e = compile_body(&f, &body).unwrap_err();
@@ -7112,10 +7206,10 @@ mod tests {
                     mode,
                     ..dest_link(
                         Ro,
-                        "/home/user/.cache/tool/cfg",
+                        "/home/stopit/.cache/tool/cfg",
                         tool.join("cfg"),
                         tool.join("cfg"),
-                        "/home/user/.cache/tool",
+                        "/home/stopit/.cache/tool",
                         tool.clone(),
                         root.clone()
                     )
@@ -7133,10 +7227,10 @@ mod tests {
             destination_link(e, "main"),
             dest_link(
                 Ro,
-                "/home/user/.cache/tool/d/cfg",
+                "/home/stopit/.cache/tool/d/cfg",
                 tool.join("d/cfg"),
                 tool.join("d"),
-                "/home/user/.cache/tool",
+                "/home/stopit/.cache/tool",
                 tool.clone(),
                 root.clone()
             )
@@ -7146,8 +7240,8 @@ mod tests {
             e.to_string(),
             format!(
                 "cannot compile profile \"main\": provider \"p\": the ro mount at \
-                 \"/home/user/.cache/tool/d/cfg\" lies inside the rw mount at \
-                 \"/home/user/.cache/tool\" of {tool:?}, where reaching it means following the \
+                 \"/home/stopit/.cache/tool/d/cfg\" lies inside the rw mount at \
+                 \"/home/stopit/.cache/tool\" of {tool:?}, where reaching it means following the \
                  symlink {:?} (on the way to {:?}) inside {tool:?}, granted rw as {tool:?} by \
                  provider \"p\" in profile \"main\"; a sandbox can write there and bwrap follows \
                  links when mounting, so the mount would land elsewhere, and a ro mount is never \
@@ -7160,16 +7254,16 @@ mod tests {
         let s = compile_body(&f, "fs.rw = [\"~/.cache/tool\", \"~/.cache/tool/cfg\"]").unwrap();
         assert_eq!(
             mounts(spec(&s, "main")),
-            [row("/home/user/.cache/tool", Rw, "p")]
+            [row("/home/stopit/.cache/tool", Rw, "p")]
         );
         assert_eq!(
             destination_warnings(&s, "main"),
             [dest_link(
                 Rw,
-                "/home/user/.cache/tool/cfg",
+                "/home/stopit/.cache/tool/cfg",
                 tool.join("cfg"),
                 tool.join("cfg"),
-                "/home/user/.cache/tool",
+                "/home/stopit/.cache/tool",
                 tool.clone(),
                 root.clone()
             )]
@@ -7182,7 +7276,7 @@ mod tests {
             &f,
             &format!(
                 "{grant}fs.masked = [\"~/.cache/tool/real\"]\n\
-                 fs.bind = [{{ host = \"~/cfg\", sandbox = \"/home/user/.cache/tool/new/cfg\", \
+                 fs.bind = [{{ host = \"~/cfg\", sandbox = \"/home/stopit/.cache/tool/new/cfg\", \
                  mode = \"ro\" }}]"
             ),
         )
@@ -7190,9 +7284,9 @@ mod tests {
         assert_eq!(
             mounts(spec(&s, "main")),
             [
-                row("/home/user/.cache/tool", Rw, "p"),
-                row("/home/user/.cache/tool/real", Masked, "p"),
-                row("/home/user/.cache/tool/new/cfg", Ro, "p"),
+                row("/home/stopit/.cache/tool", Rw, "p"),
+                row("/home/stopit/.cache/tool/real", Masked, "p"),
+                row("/home/stopit/.cache/tool/new/cfg", Ro, "p"),
             ]
         );
     }
@@ -7208,21 +7302,21 @@ mod tests {
         symlink(f.root.join("store/foo"), f.root.join("home/.config/foo")).unwrap();
         for (rule, sandbox, mode) in [
             (
-                "fs.bind = [{ host = \"~/cfg\", sandbox = \"/home/user/.config/foo/config\", \
+                "fs.bind = [{ host = \"~/cfg\", sandbox = \"/home/stopit/.config/foo/config\", \
                  mode = \"protected\" }]",
-                "/home/user/.config/foo/config",
+                "/home/stopit/.config/foo/config",
                 Protected,
             ),
             (
                 "fs.masked = [\"~/.config/foo\"]",
-                "/home/user/.config/foo",
+                "/home/stopit/.config/foo",
                 Masked,
             ),
         ] {
             let s = compile_body(&f, &format!("fs.ro = [\"~/.config\"]\n{rule}")).unwrap();
             assert_eq!(
                 mounts(spec(&s, "main")),
-                [row("/home/user/.config", Ro, "p"), row(sandbox, mode, "p")],
+                [row("/home/stopit/.config", Ro, "p"), row(sandbox, mode, "p")],
                 "{rule}"
             );
         }
@@ -7252,10 +7346,10 @@ mod tests {
             DestinationLink {
                 provider: "p".parse().unwrap(),
                 mode: Masked,
-                sandbox: "/home/user/.cache/tool/cfg".into(),
+                sandbox: "/home/stopit/.cache/tool/cfg".into(),
                 host: tool.join("cfg"),
                 link: tool.join("cfg"),
-                ancestor: "/home/user".into(),
+                ancestor: "/home/stopit".into(),
                 ancestor_mode: Ro,
                 ancestor_source: home.clone(),
                 root: rw_root(tool.clone(), "w", Some("agent"), tool),
@@ -7611,7 +7705,7 @@ mod tests {
             SpecError::MaskTargetUninspectable {
                 provider: "p".parse().unwrap(),
                 host: f.root.join("home/sub/l"),
-                sandbox: "/home/user/sub/l".into(),
+                sandbox: "/home/stopit/sub/l".into(),
                 kind: io::ErrorKind::PermissionDenied,
             }
         );
@@ -7766,7 +7860,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             mounts(spec(&s, "main")),
-            [row("/home/user/.cache/tool", Rw, "p")]
+            [row("/home/stopit/.cache/tool", Rw, "p")]
         );
         assert_eq!(
             glob_links(&s, "main"),
@@ -7774,7 +7868,7 @@ mod tests {
                 "p".into(),
                 Masked,
                 tool.join("cfg"),
-                PathBuf::from("/home/user/.cache/tool/cfg")
+                PathBuf::from("/home/stopit/.cache/tool/cfg")
             )]
         );
         let s = f
@@ -7795,7 +7889,7 @@ mod tests {
         assert!(get(&s, "main").warnings.is_empty());
         assert_eq!(
             mounts(spec(&s, "main")),
-            [row("/home/user/.config/foo", Ro, "p")]
+            [row("/home/stopit/.config/foo", Ro, "p")]
         );
     }
 
@@ -7973,7 +8067,7 @@ mod tests {
             [
                 row("/opt/cfg", Ro, "p"),
                 row("/opt/cfg/tool/token", Masked, "p"),
-                row("/home/user/.config/tool/token", Masked, "p"),
+                row("/home/stopit/.config/tool/token", Masked, "p"),
             ]
         );
         assert_eq!(
@@ -7993,7 +8087,7 @@ mod tests {
                 restricted_provider: "p".parse().unwrap(),
                 restricted_mode: Masked,
                 restricted_host: token.clone(),
-                restricted_sandbox: "/home/user/.config/tool/token".into(),
+                restricted_sandbox: "/home/stopit/.config/tool/token".into(),
                 covered: Masked,
             }
         );
@@ -8002,7 +8096,7 @@ mod tests {
             format!(
                 "provider \"p\": ro mount of {cfg:?} at \"/opt/cfg\" shows {token:?} at \
                  \"/opt/cfg/tool/token\", where the masked mount of it by provider \"p\" at \
-                 \"/home/user/.config/tool/token\" does not apply, so it would be visible there; \
+                 \"/home/stopit/.config/tool/token\" does not apply, so it would be visible there; \
                  stopit masks it at \"/opt/cfg/tool/token\" this session; to fix the \
                  configuration, narrow this grant to leave it out, add a rule for {token:?} if \
                  this mount shows it at its own host path, or cover \"/opt/cfg/tool/token\" with \
@@ -8021,7 +8115,7 @@ mod tests {
             [
                 row("/opt/cfg", Ro, "b"),
                 row("/opt/cfg/tool/token", Masked, "m"),
-                row("/home/user/.config/tool/token", Masked, "m"),
+                row("/home/stopit/.config/tool/token", Masked, "m"),
             ]
         );
         // At its aligned path, the mask covers what the grant shows there.
@@ -8044,19 +8138,19 @@ mod tests {
         let x = exposed(&f, &body);
         assert_eq!(
             (x.resolved, x.shown_at),
-            (cfg.clone(), PathBuf::from("/home/user/cfg-link/tool/token"))
+            (cfg.clone(), PathBuf::from("/home/stopit/cfg-link/tool/token"))
         );
         let s = compile_body(&f, &body).unwrap();
         assert_eq!(
             mounts(spec(&s, "main")),
             [
-                row("/home/user/cfg-link", Ro, "p"),
-                row("/home/user/.config/tool/token", Masked, "p"),
-                row("/home/user/cfg-link/tool/token", Masked, "p"),
+                row("/home/stopit/cfg-link", Ro, "p"),
+                row("/home/stopit/.config/tool/token", Masked, "p"),
+                row("/home/stopit/cfg-link/tool/token", Masked, "p"),
             ]
         );
         assert_eq!(
-            source_at(&s, "/home/user/cfg-link/tool/token"),
+            source_at(&s, "/home/stopit/cfg-link/tool/token"),
             host(&token, EntryKind::File)
         );
         // A source strictly inside a masked directory is a more specific
@@ -8077,7 +8171,7 @@ mod tests {
             mounts(spec(&s, "main")),
             [
                 row("/opt/token", Ro, "p"),
-                row("/home/user/.config/tool", Masked, "p"),
+                row("/home/stopit/.config/tool", Masked, "p"),
             ]
         );
         assert_eq!(source_at(&s, "/opt/token"), host(&token, EntryKind::File));
@@ -8097,7 +8191,7 @@ mod tests {
             mounts(spec(&s, "main")),
             [
                 row("/opt/token", Masked, "p"),
-                row("/home/user/.config/tool/token", Masked, "p"),
+                row("/home/stopit/.config/tool/token", Masked, "p"),
             ]
         );
         assert_eq!(source_at(&s, "/opt/token"), host(&token, EntryKind::File));
@@ -8125,7 +8219,7 @@ mod tests {
             mounts(spec(&s, "main")),
             [
                 row("/workspace", Rw, "p"),
-                row("/home/user/Projects", Masked, "p"),
+                row("/home/stopit/Projects", Masked, "p"),
             ]
         );
     }
@@ -8144,14 +8238,14 @@ mod tests {
             ("\"~/Projects/stopit\"", vec![]),
             (
                 "\"~/Projects/*\"",
-                vec![row("/home/user/Projects/other", Masked, "p")],
+                vec![row("/home/stopit/Projects/other", Masked, "p")],
             ),
         ] {
             let body = format!("fs.rw = [\"{{workspace}}\"]\nfs.masked = [{rule}]");
             let s = compile_body(&f, &body).unwrap();
             let mut want = vec![row("/workspace", Rw, "p")];
             want.extend(extra);
-            want.push(row("/home/user/Projects/stopit", Masked, "p"));
+            want.push(row("/home/stopit/Projects/stopit", Masked, "p"));
             assert_eq!(mounts(spec(&s, "main")), want, "{rule}");
             assert_eq!(
                 source_at(&s, "/workspace"),
@@ -8166,7 +8260,7 @@ mod tests {
                             restricted_provider: "p".parse().unwrap(),
                             restricted_mode: Masked,
                             restricted_host: ws.clone(),
-                            restricted_sandbox: "/home/user/Projects/stopit".into(),
+                            restricted_sandbox: "/home/stopit/Projects/stopit".into(),
                             workspace: ws.clone(),
                             workspace_mount: "/workspace".into(),
                         }
@@ -8175,7 +8269,7 @@ mod tests {
                         w.to_string(),
                         format!(
                             "provider \"p\": the masked rule for {ws:?} at \
-                             \"/home/user/Projects/stopit\" matches the host workspace itself, so \
+                             \"/home/stopit/Projects/stopit\" matches the host workspace itself, so \
                              it does not apply to the workspace mount at \"/workspace\" this \
                              session: the workspace stays mounted there (restricted content \
                              inside it is still covered); exclude the workspace from the rule, \
@@ -8199,8 +8293,8 @@ mod tests {
             [
                 row("/workspace", Rw, "p"),
                 row("/workspace/.env", Masked, "p"),
-                row("/home/user/Projects/stopit", Masked, "p"),
-                row("/home/user/Projects/stopit/.env", Masked, "p"),
+                row("/home/stopit/Projects/stopit", Masked, "p"),
+                row("/home/stopit/Projects/stopit/.env", Masked, "p"),
             ]
         );
         let warnings = &get(&s, "main").warnings;
@@ -8234,8 +8328,8 @@ mod tests {
             [
                 row("/workspace", Rw, "p"),
                 row("/workspace/.env", Masked, "p"),
-                row("/home/user/Projects", Masked, "p"),
-                row("/home/user/Projects/stopit/.env", Masked, "p"),
+                row("/home/stopit/Projects", Masked, "p"),
+                row("/home/stopit/Projects/stopit/.env", Masked, "p"),
             ]
         );
         assert_eq!(
@@ -8270,8 +8364,8 @@ mod tests {
         assert_eq!(
             mounts(spec(&s, "main")),
             [
-                row("/home/user/.ssh", Masked, "p"),
-                row("/home/user/.toolrc", Ro, "p"),
+                row("/home/stopit/.ssh", Masked, "p"),
+                row("/home/stopit/.toolrc", Ro, "p"),
             ]
         );
         match get(&s, "main").warnings.as_slice() {
@@ -8283,21 +8377,21 @@ mod tests {
                         mode: Ro,
                         host: toolrc.clone(),
                         resolved: key.clone(),
-                        sandbox: "/home/user/.toolrc".into(),
+                        sandbox: "/home/stopit/.toolrc".into(),
                         restricted_provider: "p".parse().unwrap(),
                         restricted_mode: Masked,
                         restricted_host: ssh.clone(),
-                        restricted_sandbox: "/home/user/.ssh".into(),
+                        restricted_sandbox: "/home/stopit/.ssh".into(),
                     }
                 );
                 assert_eq!(
                     w.to_string(),
                     format!(
                         "provider \"p\": ro mount of {toolrc:?} (resolving to {key:?}) at \
-                         \"/home/user/.toolrc\" reaches, through a host symlink, into {ssh:?}, \
-                         which the masked mount by provider \"p\" at \"/home/user/.ssh\" \
+                         \"/home/stopit/.toolrc\" reaches, through a host symlink, into {ssh:?}, \
+                         which the masked mount by provider \"p\" at \"/home/stopit/.ssh\" \
                          restricts; as a narrower grant of part of it, it is mounted as \
-                         configured, so that content is visible at \"/home/user/.toolrc\"; if \
+                         configured, so that content is visible at \"/home/stopit/.toolrc\"; if \
                          that is not intended, remove this grant or the link"
                     )
                 );
@@ -8353,7 +8447,7 @@ mod tests {
             mounts(spec(&s, "main")),
             [
                 row("/opt/cfg", Ro, "p"),
-                row("/home/user/.toolrc", Masked, "p"),
+                row("/home/stopit/.toolrc", Masked, "p"),
                 row("/opt/cfg/tool/rc", Masked, "p"),
             ]
         );
@@ -8393,7 +8487,7 @@ mod tests {
             [
                 row("/opt/cfg", Ro, "p"),
                 row("/opt/cfg/tool", Masked, "p"),
-                row("/home/user/.config/tool", Masked, "p"),
+                row("/home/stopit/.config/tool", Masked, "p"),
                 row("/opt/cfg/tool/other", Ro, "p"),
             ]
         );
@@ -8414,8 +8508,8 @@ mod tests {
             [
                 row("/opt/cfg", Ro, "p"),
                 row("/opt/cfg/tool", Masked, "p"),
-                row("/home/user/.config/tool", Masked, "p"),
-                row("/home/user/.config/tool/token", Masked, "p"),
+                row("/home/stopit/.config/tool", Masked, "p"),
+                row("/home/stopit/.config/tool/token", Masked, "p"),
             ]
         );
         let xs = exposures(
@@ -8448,7 +8542,7 @@ mod tests {
             [
                 row("/opt/cfg", Ro, "p"),
                 row("/opt/cfg/tool/token", Masked, "p"),
-                row("/home/user/.config/tool/token", Masked, "p"),
+                row("/home/stopit/.config/tool/token", Masked, "p"),
             ]
         );
         assert_eq!(mounts(spec(&s, "agent")), [row("/opt/cfg", Ro, "q")]);
@@ -8485,7 +8579,7 @@ mod tests {
                 Ro,
                 target.clone(),
                 target.clone(),
-                PathBuf::from("/home/user/.config/foo"),
+                PathBuf::from("/home/stopit/.config/foo"),
                 Masked
             )
         );
@@ -8498,7 +8592,7 @@ mod tests {
         let want = sorted(vec![
             row(&at(&store), Ro, "p"),
             row(&at(&target), Masked, "p"),
-            row("/home/user/.config/foo", Masked, "p"),
+            row("/home/stopit/.config/foo", Masked, "p"),
         ]);
         assert_eq!(mounts(spec(&s, "main")), want);
         assert_eq!(source_at(&s, &at(&target)), host(&target, EntryKind::Dir));
@@ -8514,8 +8608,8 @@ mod tests {
             sorted(vec![
                 row(&at(&store), Ro, "p"),
                 row(&at(&target), Masked, "p"),
-                row("/home/user/.config/bar", Masked, "p"),
-                row("/home/user/.config/foo", Masked, "p"),
+                row("/home/stopit/.config/bar", Masked, "p"),
+                row("/home/stopit/.config/foo", Masked, "p"),
             ])
         );
         let xs = exposures(&f, &two);
@@ -8524,8 +8618,8 @@ mod tests {
                 .map(|x| (x.shown_at.clone(), x.restricted_sandbox.clone()))
                 .collect::<Vec<_>>(),
             [
-                (target.clone(), PathBuf::from("/home/user/.config/bar")),
-                (target.clone(), PathBuf::from("/home/user/.config/foo")),
+                (target.clone(), PathBuf::from("/home/stopit/.config/bar")),
+                (target.clone(), PathBuf::from("/home/stopit/.config/foo")),
             ]
         );
         // A mask and a protected mount of the same content, shown writable
@@ -8543,8 +8637,8 @@ mod tests {
             sorted(vec![
                 row(&at(&store), Rw, "p"),
                 row(&at(&target), Masked, "p"),
-                row("/home/user/.config/bar", Masked, "p"),
-                row("/home/user/.config/foo", Masked, "p"),
+                row("/home/stopit/.config/bar", Masked, "p"),
+                row("/home/stopit/.config/foo", Masked, "p"),
             ])
         );
         let mut xs: Vec<_> = exposures(&f, &mixed)
@@ -8555,7 +8649,7 @@ mod tests {
         let mut want = vec![
             (Protected, target.clone(), Masked),
             (Masked, target.clone(), Masked),
-            (Masked, PathBuf::from("/home/user/.config/bar"), Masked),
+            (Masked, PathBuf::from("/home/stopit/.config/bar"), Masked),
         ];
         want.sort();
         assert_eq!(xs, want);
@@ -8595,7 +8689,7 @@ mod tests {
                 mounts(spec(&s, "main")),
                 [
                     row("/src", want, "p"),
-                    row("/home/user/proj2/flake.nix", Protected, "p"),
+                    row("/home/stopit/proj2/flake.nix", Protected, "p"),
                 ]
             );
         }
@@ -8632,7 +8726,7 @@ mod tests {
             [
                 row("/src", Rw, "p"),
                 row("/src/flake.nix", Protected, "p"),
-                row("/home/user/proj2/flake.nix", Protected, "p"),
+                row("/home/stopit/proj2/flake.nix", Protected, "p"),
             ]
         );
         assert_eq!(
@@ -8650,7 +8744,7 @@ mod tests {
             mounts(spec(&s, "main")),
             [
                 row("/sub", Rw, "p"),
-                row("/home/user/proj2", Protected, "p"),
+                row("/home/stopit/proj2", Protected, "p"),
             ]
         );
         // An `rw` grant of the protected directory itself, elsewhere, is
@@ -8662,7 +8756,7 @@ mod tests {
             mounts(spec(&s, "main")),
             [
                 row("/src", Protected, "p"),
-                row("/home/user/proj2", Protected, "p"),
+                row("/home/stopit/proj2", Protected, "p"),
             ]
         );
         assert_eq!(source_at(&s, "/src"), host(&proj, EntryKind::Dir));
@@ -8685,8 +8779,8 @@ mod tests {
             [
                 row("/src", Protected, "p"),
                 row("/src/secret", Masked, "p"),
-                row("/home/user/proj2", Protected, "p"),
-                row("/home/user/proj2/secret", Masked, "p"),
+                row("/home/stopit/proj2", Protected, "p"),
+                row("/home/stopit/proj2/secret", Masked, "p"),
             ]
         );
         assert_eq!(
@@ -8758,16 +8852,16 @@ mod tests {
         let s = compile_body(
             &f,
             "fs.rw = [\"~/.cache\"]\nfs.masked = [\"~/.cache/tool\"]\n\
-             fs.bind = [{ host = \"~/.ssh/id_ed25519\", sandbox = \"/home/user/.cache/tool/cfg\", \
+             fs.bind = [{ host = \"~/.ssh/id_ed25519\", sandbox = \"/home/stopit/.cache/tool/cfg\", \
              mode = \"ro\" }]",
         )
         .unwrap();
         assert_eq!(
             mounts(spec(&s, "main")),
             [
-                row("/home/user/.cache", Rw, "p"),
-                row("/home/user/.cache/tool", Masked, "p"),
-                row("/home/user/.cache/tool/cfg", Ro, "p"),
+                row("/home/stopit/.cache", Rw, "p"),
+                row("/home/stopit/.cache/tool", Masked, "p"),
+                row("/home/stopit/.cache/tool/cfg", Ro, "p"),
             ]
         );
     }
@@ -8858,9 +8952,9 @@ mod tests {
         let body = |mode: &str| {
             format!(
                 "fs.rw = [\"~/.cache\"]\nfs.bind = [\n\
-                 {{ host = \"~/.cache/tool\", sandbox = \"/home/user/.cache/sub\", \
+                 {{ host = \"~/.cache/tool\", sandbox = \"/home/stopit/.cache/sub\", \
                  mode = \"rw\" }},\n\
-                 {{ host = \"~/cfg\", sandbox = \"/home/user/.cache/sub/cfg\", \
+                 {{ host = \"~/cfg\", sandbox = \"/home/stopit/.cache/sub/cfg\", \
                  mode = \"{mode}\" }},\n]"
             )
         };
@@ -8876,9 +8970,9 @@ mod tests {
             ),
             (
                 Ro,
-                Path::new("/home/user/.cache/sub/cfg"),
+                Path::new("/home/stopit/.cache/sub/cfg"),
                 &cache.join("sub/cfg"),
-                Path::new("/home/user/.cache"),
+                Path::new("/home/stopit/.cache"),
                 &cache_root
             )
         );
@@ -8886,16 +8980,16 @@ mod tests {
         let s = compile_body(&f, &body("rw")).unwrap();
         assert_eq!(
             mounts(spec(&s, "main")),
-            [row("/home/user/.cache", Rw, "p")]
+            [row("/home/stopit/.cache", Rw, "p")]
         );
         assert!(
             matches!(
                 get(&s, "main").warnings.as_slice(),
                 [SpecWarning::SourceLink(lf), SpecWarning::DestinationLink(dl)]
                     if lf.link == cache.join("tool")
-                        && lf.sandbox == Path::new("/home/user/.cache/sub")
+                        && lf.sandbox == Path::new("/home/stopit/.cache/sub")
                         && dl.link == cache.join("sub/cfg")
-                        && dl.ancestor == Path::new("/home/user/.cache")
+                        && dl.ancestor == Path::new("/home/stopit/.cache")
             ),
             "{:?}",
             get(&s, "main").warnings
@@ -8927,9 +9021,9 @@ mod tests {
             ),
             (
                 Ro,
-                Path::new("/home/user/.cache/tool/sub"),
+                Path::new("/home/stopit/.cache/tool/sub"),
                 &cache.join("tool"),
-                Path::new("/home/user/.cache")
+                Path::new("/home/stopit/.cache")
             )
         );
         let s = compile_body(
@@ -8940,24 +9034,24 @@ mod tests {
         .unwrap();
         assert_eq!(
             mounts(spec(&s, "main")),
-            [row("/home/user/.cache", Rw, "p")]
+            [row("/home/stopit/.cache", Rw, "p")]
         );
         let dropped: Vec<_> = destination_warnings(&s, "main")
             .into_iter()
             .map(|d| (d.sandbox, d.link, d.ancestor))
             .collect();
         let tool = cache.join("tool");
-        let at = PathBuf::from("/home/user/.cache");
+        let at = PathBuf::from("/home/stopit/.cache");
         assert_eq!(
             dropped,
             [
-                ("/home/user/.cache/tool".into(), tool.clone(), at.clone()),
+                ("/home/stopit/.cache/tool".into(), tool.clone(), at.clone()),
                 (
-                    "/home/user/.cache/tool/sub".into(),
+                    "/home/stopit/.cache/tool/sub".into(),
                     tool.clone(),
                     at.clone()
                 ),
-                ("/home/user/.cache/tool/sub/key".into(), tool, at),
+                ("/home/stopit/.cache/tool/sub/key".into(), tool, at),
             ]
         );
     }
@@ -8976,7 +9070,7 @@ mod tests {
         let bind = |mode: &str| {
             format!(
                 "fs.rw = [\"~/.cache\"]\nfs.bind = [{{ host = \"~/x\", \
-                 sandbox = \"/home/user/.cache/locked/sub/x\", mode = \"{mode}\" }}]"
+                 sandbox = \"/home/stopit/.cache/locked/sub/x\", mode = \"{mode}\" }}]"
             )
         };
         // An ephemeral rule's destination is checked alike (it has no host
@@ -8990,11 +9084,11 @@ mod tests {
         // A restrictive mount is never skipped: the directory that cannot
         // be searched is masked, and the mount is kept on top of the mask.
         for (s, mode, dest) in [
-            (masked, Ro, "/home/user/.cache/locked/sub/x"),
+            (masked, Ro, "/home/stopit/.cache/locked/sub/x"),
             (
                 masked_ephemeral,
                 Ephemeral,
-                "/home/user/.cache/locked/sub/tmp",
+                "/home/stopit/.cache/locked/sub/tmp",
             ),
         ] {
             let s = s.unwrap();
@@ -9002,8 +9096,8 @@ mod tests {
             assert_eq!(
                 mounts(spec),
                 [
-                    row("/home/user/.cache", Rw, "p"),
-                    row("/home/user/.cache/locked", Masked, "p"),
+                    row("/home/stopit/.cache", Rw, "p"),
+                    row("/home/stopit/.cache/locked", Masked, "p"),
                     row(dest, mode, "p"),
                 ],
                 "{mode}"
@@ -9035,7 +9129,7 @@ mod tests {
                     Path::new(dest),
                     &locked.join("sub"),
                     io::ErrorKind::PermissionDenied,
-                    Path::new("/home/user/.cache/locked"),
+                    Path::new("/home/stopit/.cache/locked"),
                     &locked,
                 ),
                 "{mode}"
@@ -9045,7 +9139,7 @@ mod tests {
                 format!(
                     "provider \"p\": cannot check the destination \"{dest}\" of the {mode} mount \
                      for symlinks: inspecting {:?} failed: {}; a {mode} mount is never skipped, \
-                     so the directory {locked:?} is masked at \"/home/user/.cache/locked\", \
+                     so the directory {locked:?} is masked at \"/home/stopit/.cache/locked\", \
                      hiding everything in it, and the mount is kept on top",
                     locked.join("sub"),
                     dm.error,
@@ -9056,7 +9150,7 @@ mod tests {
         let s = warned.unwrap();
         assert_eq!(
             mounts(spec(&s, "main")),
-            [row("/home/user/.cache", Rw, "p")]
+            [row("/home/stopit/.cache", Rw, "p")]
         );
         assert!(
             matches!(
@@ -9093,9 +9187,9 @@ mod tests {
         assert_eq!(
             mounts(spec(&s, "main")),
             [
-                row("/home/user/.cache", Masked, "p"),
-                row("/home/user/.cache/eph", Ephemeral, "p"),
-                row("/home/user/.cache/sub/tmp", Ephemeral, "p"),
+                row("/home/stopit/.cache", Masked, "p"),
+                row("/home/stopit/.cache/eph", Ephemeral, "p"),
+                row("/home/stopit/.cache/sub/tmp", Ephemeral, "p"),
             ]
         );
         // The first mount below it meets the directory; the next one lies
@@ -9109,9 +9203,9 @@ mod tests {
                 assert_eq!(
                     (dm.sandbox.as_path(), &dm.path, dm.masked.as_path()),
                     (
-                        Path::new("/home/user/.cache/eph"),
+                        Path::new("/home/stopit/.cache/eph"),
                         &cache.join("eph"),
-                        Path::new("/home/user/.cache")
+                        Path::new("/home/stopit/.cache")
                     )
                 );
                 assert_eq!(
@@ -9119,7 +9213,7 @@ mod tests {
                     GrantHidden {
                         provider: "p".parse().unwrap(),
                         mode: Rw,
-                        sandbox: "/home/user/.cache".into(),
+                        sandbox: "/home/stopit/.cache".into(),
                         dir: cache.clone(),
                         workspace: false,
                     }
@@ -9128,7 +9222,7 @@ mod tests {
                     w.to_string(),
                     format!(
                         "provider \"p\": this rw grant is hidden this session: its mount at \
-                         \"/home/user/.cache\" is replaced by an empty masked directory, because \
+                         \"/home/stopit/.cache\" is replaced by an empty masked directory, because \
                          {cache:?} cannot be inspected (a sandbox may have removed its \
                          permissions); restore them (e.g. `chmod u+rwx {}`) to get it back",
                         cache.display()
@@ -9380,20 +9474,20 @@ mod tests {
             [
                 row("/opt/bin", Rw, "u"),
                 row("/opt/home", Rw, "u"),
-                row("/home/user/bin", Rw, "u"),
+                row("/home/stopit/bin", Rw, "u"),
                 protected_row("/opt/bin/env.sh"),
-                protected_row("/home/user/bin/env.sh"),
+                protected_row("/home/stopit/bin/env.sh"),
                 protected_row("/opt/home/bin/env.sh"),
             ]
         );
         // Read-only, or not shown at all: nothing to add.
         assert_eq!(
             mounts(spec(&s, "ro_view")),
-            [row("/home/user/bin", Ro, "r")]
+            [row("/home/stopit/bin", Ro, "r")]
         );
         assert_eq!(
             mounts(spec(&s, "hidden")),
-            [row("/home/user/other", Rw, "h")]
+            [row("/home/stopit/other", Rw, "h")]
         );
     }
 
@@ -9447,7 +9541,7 @@ mod tests {
             mounts(&main.spec),
             [
                 row("/opt/home", Rw, "u"),
-                row("/home/user/cfg", Masked, "u"),
+                row("/home/stopit/cfg", Masked, "u"),
                 row("/opt/home/cfg", Masked, "u"),
             ]
         );
@@ -9688,11 +9782,11 @@ mod tests {
         f.mkdir("home/.local/share");
         let home = f.root.join("home");
         for (body, host, sandbox) in [
-            ("fs.rw = [\"~\"]", home.clone(), "/home/user"),
+            ("fs.rw = [\"~\"]", home.clone(), "/home/stopit"),
             (
                 "fs.rw = [\"~/.local/share\"]",
                 home.join(".local/share"),
-                "/home/user/.local/share",
+                "/home/stopit/.local/share",
             ),
             (
                 "fs.bind = [{ host = \"~/.local\", sandbox = \"/opt/local\", mode = \"rw\" }]",
@@ -9723,7 +9817,7 @@ mod tests {
             e.to_string(),
             format!(
                 "cannot compile profile \"main\": provider \"u\": rw mount of {home:?} at \
-                 \"/home/user\" contains stopit's data directory {:?}, which holds stopit's \
+                 \"/home/stopit\" contains stopit's data directory {:?}, which holds stopit's \
                  persistent state, such as which configurations you allowed; a sandbox could \
                  write it there, create it, or replace a directory or link on the way to it, so \
                  no writable mount may contain it or the way to it: grant narrower rw paths that \
@@ -9849,7 +9943,7 @@ mod tests {
         }
         f.mkdir("home/.local/share/stopit");
         for (body, source, sandbox) in [
-            ("fs.ro = [\"~\"]", home.clone(), PathBuf::from("/home/user")),
+            ("fs.ro = [\"~\"]", home.clone(), PathBuf::from("/home/stopit")),
             (
                 "fs.bind = [{ host = \"~/.local\", sandbox = \"/opt/local\", mode = \"ro\" }]",
                 home.join(".local"),
@@ -9899,16 +9993,16 @@ mod tests {
         assert_eq!(
             mounts(&main.spec),
             [
-                row("/home/user", Ro, "u"),
+                row("/home/stopit", Ro, "u"),
                 row(f.root.join("var").to_str().unwrap(), Ro, "u"),
                 row(state.to_str().unwrap(), Masked, "stopit"),
-                row("/home/user/.local/share/stopit", Masked, "stopit"),
+                row("/home/stopit/.local/share/stopit", Masked, "stopit"),
             ]
         );
         let [SpecWarning::StateDirMasked(w)] = main.warnings.as_slice() else {
             panic!("{:?}", main.warnings);
         };
-        let masked_at = PathBuf::from("/home/user/.local/share/stopit");
+        let masked_at = PathBuf::from("/home/stopit/.local/share/stopit");
         assert_eq!(
             **w,
             StateDirMasked {
@@ -9916,7 +10010,7 @@ mod tests {
                 mode: Ro,
                 host: home.clone(),
                 resolved: home.clone(),
-                sandbox: "/home/user".into(),
+                sandbox: "/home/stopit".into(),
                 dir: StateDir::Data,
                 reserved: default.clone(),
                 masked_at: masked_at.clone(),
@@ -10289,8 +10383,8 @@ mod tests {
         assert_eq!(
             mounts(&main.spec),
             [
-                row("/home/user", Ro, "u"),
-                row("/home/user/.config/stopit", Masked, "stopit"),
+                row("/home/stopit", Ro, "u"),
+                row("/home/stopit/.config/stopit", Masked, "stopit"),
             ]
         );
 
@@ -10308,7 +10402,7 @@ mod tests {
         };
         assert_eq!(w.dir, StateDir::Config);
         assert_eq!(w.reserved, home.join(".config/stopit"));
-        assert_eq!(w.masked_at, PathBuf::from("/home/user/.config/stopit"));
+        assert_eq!(w.masked_at, PathBuf::from("/home/stopit/.config/stopit"));
 
         let mut f_link = Fixture::new();
         f_link.mkdir("home/.config");
@@ -10340,7 +10434,7 @@ mod tests {
         assert_eq!(
             mounts(&main.spec),
             [
-                row("/home/user", Ro, "u"),
+                row("/home/stopit", Ro, "u"),
                 row(store.to_str().unwrap(), Ro, "u"),
                 row(store.join("xyz-stopit").to_str().unwrap(), Masked, "stopit"),
             ]
@@ -10407,15 +10501,15 @@ fs.masked = [\"{workspace}/hidden\"]
                 row("/workspace/explicit.sock", Ro, "u"),
                 row("/workspace/hidden", Masked, "u"),
                 row("/workspace/root.sock", Masked, "stopit"),
-                row("/home/user/cache", Rw, "u"),
+                row("/home/stopit/cache", Rw, "u"),
                 row("/workspace/nested/deep.sock", Masked, "stopit"),
-                row("/home/user/cache/daemon.sock", Masked, "stopit"),
+                row("/home/stopit/cache/daemon.sock", Masked, "stopit"),
             ]
         );
         for sock_path in [
             "/workspace/root.sock",
             "/workspace/nested/deep.sock",
-            "/home/user/cache/daemon.sock",
+            "/home/stopit/cache/daemon.sock",
         ] {
             let m = sp
                 .mounts
@@ -10458,7 +10552,7 @@ fs.masked = [\"{workspace}/hidden\"]
                 row("/workspace", Rw, "u"),
                 row("/workspace/explicit.sock", Ro, "u"),
                 row("/workspace/hidden", Masked, "u"),
-                row("/home/user/cache", Rw, "u"),
+                row("/home/stopit/cache", Rw, "u"),
             ]
         );
     }
@@ -10526,14 +10620,14 @@ fs.masked = [\"{workspace}/hidden\"]
         let sp_grant = spec(&compiled_grant, "main");
         assert_eq!(
             mounts(sp_grant),
-            [row("/home/user/exec_only", Masked, "stopit")]
+            [row("/home/stopit/exec_only", Masked, "stopit")]
         );
         let grant_warnings = &compiled_grant.get(&ProfileRef::main()).unwrap().warnings;
         assert!(
             grant_warnings.iter().any(|w| matches!(
                 w,
                 SpecWarning::SocketScanMasked(s)
-                    if s.masked == Path::new("/home/user/exec_only")
+                    if s.masked == Path::new("/home/stopit/exec_only")
             )),
             "{grant_warnings:?}"
         );
@@ -10541,7 +10635,7 @@ fs.masked = [\"{workspace}/hidden\"]
             grant_warnings.iter().any(|w| matches!(
                 w,
                 SpecWarning::GrantHidden(g)
-                    if g.sandbox == Path::new("/home/user/exec_only") && !g.workspace
+                    if g.sandbox == Path::new("/home/stopit/exec_only") && !g.workspace
             )),
             "{grant_warnings:?}"
         );
@@ -10574,7 +10668,7 @@ fs.masked = [\"{workspace}/hidden\"]
 
         let main_mounts = mounts(spec(&compiled, "main"));
         assert!(
-            main_mounts.contains(&row("/home/user/.ssh", Masked, "mask-ssh")),
+            main_mounts.contains(&row("/home/stopit/.ssh", Masked, "mask-ssh")),
             "{main_mounts:?}"
         );
         assert!(

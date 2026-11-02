@@ -409,7 +409,7 @@ impl Sandbox {
 pub const WORKSPACE_MOUNT: &str = "/workspace";
 
 /// The sandbox `HOME` every [`SpecFixture`] uses.
-pub const SANDBOX_HOME: &str = "/home/user";
+pub const SANDBOX_HOME: &str = "/home/stopit";
 
 /// A temporary host layout to compile real [`SandboxSpec`]s against, through
 /// the public pipeline (`stopit::spec::compile_session`): a workspace

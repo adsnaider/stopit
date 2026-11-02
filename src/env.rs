@@ -26,9 +26,11 @@ impl EffectiveEnv {
     ///
     /// * stopit sets the sandbox's identity: `HOME` is `home`, and `USER`
     ///   and `LOGNAME` are the user of the synthesized `/etc/passwd`
-    ///   ([`SANDBOX_USER`]). These are never taken from the host, whatever
+    ///   ([`SANDBOX_USER`] by default, or the resolved `system.user` in
+    ///   [`SandboxSpec::env`]). These are never taken from the host, whatever
     ///   `pass` says, so these variables never reveal the host home path or
-    ///   user name. `set` may override them.
+    ///   user name unless `system.user = "host"` is configured. `set` may
+    ///   override them.
     /// * A host variable is passed only if its name matches a `pass` pattern
     ///   and no `deny` pattern: `deny` always wins. Matching is by name,
     ///   byte for byte, so non-UTF-8 names and values are matched and passed
@@ -69,6 +71,18 @@ impl EffectiveEnv {
         host: impl IntoIterator<Item = (OsString, OsString)>,
         defaults: &[(&str, String)],
     ) -> Vec<(OsString, OsString)> {
+        self.apply_for_user(SANDBOX_USER, home, host, defaults)
+    }
+
+    /// [`apply_with`](Self::apply_with), using `user` as the `USER` and
+    /// `LOGNAME` identity variables.
+    pub fn apply_for_user(
+        &self,
+        user: &str,
+        home: &SandboxHome,
+        host: impl IntoIterator<Item = (OsString, OsString)>,
+        defaults: &[(&str, String)],
+    ) -> Vec<(OsString, OsString)> {
         let mut env: BTreeMap<OsString, OsString> = BTreeMap::new();
         for (name, value) in host {
             let key = name.as_bytes();
@@ -89,8 +103,8 @@ impl EffectiveEnv {
             env.entry(name).or_insert(value);
         }
         env.insert(HOME.into(), home.as_str().into());
-        env.insert(USER.into(), SANDBOX_USER.into());
-        env.insert(LOGNAME.into(), SANDBOX_USER.into());
+        env.insert(USER.into(), user.into());
+        env.insert(LOGNAME.into(), user.into());
         for (name, value) in defaults {
             env.insert(name.into(), value.into());
         }
@@ -120,7 +134,12 @@ impl SandboxSpec {
         } else {
             Vec::new()
         };
-        let mut env = self.env.apply_with(&self.system.home, host, &defaults);
+        let mut env = self.env.apply_for_user(
+            &self.system.user,
+            &self.system.home,
+            host,
+            &defaults,
+        );
         // The profile's shims come first in `PATH`, once.
         if !self.installed_shims().is_empty() {
             let bin = OsString::from(crate::shim::SANDBOX_BIN);
@@ -194,9 +213,9 @@ mod tests {
     /// sorted by name.
     fn with_identity(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
         let mut all: BTreeMap<&str, &str> = BTreeMap::from([
-            ("HOME", "/home/user"),
-            ("USER", "user"),
-            ("LOGNAME", "user"),
+            ("HOME", "/home/stopit"),
+            ("USER", "stopit"),
+            ("LOGNAME", "stopit"),
         ]);
         all.extend(pairs.iter().copied());
         all.into_iter().map(|(k, v)| (k.into(), v.into())).collect()
@@ -208,12 +227,12 @@ mod tests {
         assert_eq!(
             out,
             vars(&[
-                ("HOME", "/home/user"),
+                ("HOME", "/home/stopit"),
                 ("LOGNAME", SANDBOX_USER),
                 ("USER", SANDBOX_USER)
             ])
         );
-        assert_eq!(SANDBOX_USER, "user");
+        assert_eq!(SANDBOX_USER, "stopit");
         // Also with a policy that passes and sets other things.
         let env = policy(&["A"], &[], &[("B", "2")], &["/bin"]);
         let out = run(&env, vars(&[("A", "1")]));
@@ -453,7 +472,7 @@ mod tests {
         let out = run(&env, vars(&[("B", "x=y"), ("PATH", "/h")]));
         assert_eq!(
             crate::init::encode_env(out.iter().map(|(k, v)| (k, v))).unwrap(),
-            b"A=\0B=x=y\0HOME=/home/user\0LOGNAME=user\0PATH=/bin\0USER=user\0"
+            b"A=\0B=x=y\0HOME=/home/stopit\0LOGNAME=stopit\0PATH=/bin\0USER=stopit\0"
         );
     }
 

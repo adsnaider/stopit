@@ -1206,8 +1206,15 @@ fn plan_with_caps(
     // unaffected: bwrap creates `/etc` and the mount points in its root
     // tmpfs, in whichever order.
     for &file in &spec.system.etc {
-        let data =
-            etc::contents(file, ids, &spec.system.home, &spec.system.groups, hostname).into_bytes();
+        let data = etc::contents(
+            file,
+            ids,
+            &spec.system.user,
+            &spec.system.home,
+            &spec.system.groups,
+            hostname,
+        )
+        .into_bytes();
         plan.data_file(ETC_FILE_PERMS, data, &etc::sandbox_path(file))?;
     }
     // TODO(§6.2 step 4): the sandbox-`HOME` stubs (`.gitconfig`, …), which
@@ -1280,10 +1287,18 @@ fn plan_with_caps(
         plan.push([OsStr::new("--remount-ro"), dir.as_os_str()])?;
     }
 
-    // Step 6: the runtime directory, after every other mount so none can
-    // hide it (the reserved paths forbid mounts there anyway). Only the
-    // provisioned pieces: the session directory also holds `ephemeral/`
-    // and, later, sockets.
+    // Step 6: `/var/run -> /run` compatibility symlink (unless a mount covers
+    // `/var` or `/var/run`), followed by the runtime directory, after every
+    // other mount so none can hide it (the reserved paths forbid mounts there
+    // anyway). Only the provisioned pieces: the session directory also holds
+    // `ephemeral/` and, later, sockets.
+    let has_var_or_var_run = spec
+        .mounts
+        .iter()
+        .any(|m| m.sandbox == Path::new("/var") || m.sandbox.starts_with("/var/run"));
+    if !has_var_or_var_run {
+        plan.push(["--symlink", "/run", "/var/run"])?;
+    }
     let base = Path::new(SANDBOX_RUNTIME_DIR);
     for (host, name) in [
         (&runtime.exe, "stopit"),
@@ -1830,7 +1845,10 @@ mod tests {
 
     const ENV: [&str; 3] = ["--clearenv", "--chdir", "/"];
 
-    const RUNTIME: [&str; 9] = [
+    const RUNTIME: [&str; 12] = [
+        "--symlink",
+        "/run",
+        "/var/run",
         "--ro-bind",
         "/s/stopit",
         "/run/stopit/stopit",
@@ -2225,9 +2243,9 @@ mod tests {
         assert_eq!(
             data,
             [
-                "user:x:1000:100::/home/agent:/bin/sh\n\
+                "stopit:x:1000:100::/home/agent:/bin/sh\n\
                  nobody:x:65534:65534::/nonexistent:/bin/false\n",
-                "user:x:100:\nnogroup:x:65534:\n",
+                "stopit:x:100:\nnogroup:x:65534:\n",
                 etc::hosts(Some(etc::SANDBOX_HOSTNAME)).as_str(),
                 etc::NSSWITCH_CONF,
                 "nameserver 169.254.1.1\n",
@@ -2237,7 +2255,7 @@ mod tests {
 
     #[test]
     fn each_subset_of_etc_files_gives_exactly_those_files() {
-        let home: crate::manifest::SandboxHome = "/home/user".parse().unwrap();
+        let home: crate::manifest::SandboxHome = "/home/stopit".parse().unwrap();
         for bits in 0..1u32 << EtcFile::ALL.len() {
             let wanted: BTreeSet<EtcFile> = EtcFile::ALL
                 .into_iter()
@@ -2271,6 +2289,7 @@ mod tests {
                         etc::contents(
                             f,
                             IDS,
+                            &spec.system.user,
                             &home,
                             &Default::default(),
                             Some(etc::SANDBOX_HOSTNAME),
@@ -2325,8 +2344,27 @@ mod tests {
             &mut |_, _| unreachable!(),
         )
         .unwrap();
-        assert!(plan.data[0].starts_with(b"user:x:4242:77::/home/user:/bin/sh\n"));
-        assert!(plan.data[1].starts_with(b"user:x:77:\n"));
+        assert!(plan.data[0].starts_with(b"stopit:x:4242:77::/home/stopit:/bin/sh\n"));
+        assert!(plan.data[1].starts_with(b"stopit:x:77:\n"));
+    }
+
+    #[test]
+    fn var_run_symlink_is_skipped_when_var_or_var_run_is_mounted() {
+        for dst in ["/var", "/var/run", "/var/run/dbus"] {
+            let s = spec(vec![host(dst, "/h", EntryKind::Dir, Ro)]);
+            let args = golden(&s);
+            assert!(
+                !args.windows(3).any(|w| w == ["--symlink", "/run", "/var/run"]),
+                "{dst}: {args:?}"
+            );
+        }
+        // A mount elsewhere under `/var` still gets `/var/run -> /run`.
+        let s = spec(vec![host("/var/tmp", "/h", EntryKind::Dir, Ro)]);
+        let args = golden(&s);
+        assert!(
+            args.windows(3).any(|w| w == ["--symlink", "/run", "/var/run"]),
+            "{args:?}"
+        );
     }
 
     #[test]
@@ -2758,7 +2796,7 @@ mod tests {
         assert_eq!(named[0].1, "/etc/passwd");
         assert_eq!(
             read_fd(named[0].0),
-            etc::passwd(ids, &spec.system.home).into_bytes()
+            etc::passwd(ids, &spec.system.user, &spec.system.home).into_bytes()
         );
         assert_eq!(named[1].1, "/etc/nsswitch.conf");
         assert_eq!(read_fd(named[1].0), etc::NSSWITCH_CONF.as_bytes());

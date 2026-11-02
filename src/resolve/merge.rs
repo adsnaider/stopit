@@ -22,8 +22,8 @@ use super::graph::{Contribution, ProfileGraph};
 use crate::config::{ProfileRef, ProviderName, ProviderOrigin};
 use crate::manifest::{
     Bind, DevMode, Domain, EnvName, EnvPattern, EnvValue, EtcFile, FsGrants, GroupName,
-    OptInSyscall, PathPattern, SandboxHome, SearchPathEntry, ShareableNamespace, ShimName,
-    ShimSpec,
+    OptInSyscall, PathPattern, SandboxHome, SandboxUser, SearchPathEntry, ShareableNamespace,
+    ShimName, ShimSpec,
 };
 use crate::policy::{NetworkMode, PathMode};
 
@@ -69,6 +69,8 @@ pub struct EffectiveSystem {
     pub etc: BTreeSet<EtcFile>,
     /// The sandbox `HOME`, if any provider set one.
     pub home: Option<SandboxHome>,
+    /// The sandbox username, if any provider set one.
+    pub user: Option<SandboxUser>,
     /// More names for the overflow gid in `/etc/group`.
     pub groups: BTreeSet<GroupName>,
 }
@@ -203,6 +205,11 @@ pub enum MergeError {
         second: SandboxHome,
     },
 
+    /// Two providers set different `system.user` values for one profile.
+    /// Boxed to keep `MergeError` small.
+    #[error(transparent)]
+    UserConflict(Box<UserConflict>),
+
     /// Two providers set different values for one variable in one profile.
     /// Boxed to keep `MergeError` small.
     #[error(transparent)]
@@ -226,6 +233,30 @@ pub enum MergeError {
         /// The provider that granted it again.
         second_provider: ProviderName,
     },
+}
+
+/// Two providers set different `system.user` values for one profile (see
+/// [`MergeError::UserConflict`]).
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "profile {:?}: conflicting system.user values {} (provider {:?}) and {} (provider {:?})",
+    .profile.as_str(),
+    .first,
+    .first_provider.as_str(),
+    .second,
+    .second_provider.as_str()
+)]
+pub struct UserConflict {
+    /// The profile.
+    pub profile: ProfileRef,
+    /// The provider that set the first value.
+    pub first_provider: ProviderName,
+    /// The first value.
+    pub first: SandboxUser,
+    /// The provider that set the conflicting value.
+    pub second_provider: ProviderName,
+    /// The conflicting value.
+    pub second: SandboxUser,
 }
 
 /// Two providers set different `env.set` values for one variable in one
@@ -293,6 +324,7 @@ fn merge_profile(
             dev: merge_dev(inherited.system.dev, own),
             etc: merge_etc(&inherited.system.etc, own),
             home: merge_home(profile, inherited.system.home.as_ref(), own)?,
+            user: merge_user(profile, inherited.system.user.as_ref(), own)?,
             groups: union(
                 &inherited.system.groups,
                 own.iter().map(|c| &c.grants.system.groups),
@@ -392,6 +424,40 @@ fn merge_home(
         }
     }
     Ok(found.map(|(home, _, _)| home).or(inherited).cloned())
+}
+
+/// `system.user`: higher [`ProviderOrigin`] overrides lower within a profile,
+/// while conflicting values within the same origin are an error and identical
+/// values pass; a profile's own value overrides the inherited one.
+fn merge_user(
+    profile: &ProfileRef,
+    inherited: Option<&SandboxUser>,
+    own: &[Contribution],
+) -> Result<Option<SandboxUser>, MergeError> {
+    let mut found: Option<(&SandboxUser, &ProviderName, ProviderOrigin)> = None;
+    for c in own {
+        let Some(user) = &c.grants.system.user else {
+            continue;
+        };
+        match found {
+            None => found = Some((user, &c.provider, c.origin)),
+            Some((_, _, first_origin)) if c.origin > first_origin => {
+                found = Some((user, &c.provider, c.origin));
+            }
+            Some((_, _, first_origin)) if c.origin < first_origin => {}
+            Some((first, _, _)) if first == user => {}
+            Some((first, first_provider, _)) => {
+                return Err(MergeError::UserConflict(Box::new(UserConflict {
+                    profile: profile.clone(),
+                    first_provider: first_provider.clone(),
+                    first: first.clone(),
+                    second_provider: c.provider.clone(),
+                    second: user.clone(),
+                })));
+            }
+        }
+    }
+    Ok(found.map(|(user, _, _)| user).or(inherited).cloned())
 }
 
 /// `env.pass` / `env.deny` (§3.5): union with the inherited patterns,
@@ -873,6 +939,34 @@ mod tests {
         assert_eq!(home(&m, "child"), Some("/home/agent"));
         assert_eq!(home(&m, "unset"), Some("/home/user"));
         assert_eq!(home(&merged("[profiles.p]"), "p"), None);
+    }
+
+    #[test]
+    fn user_conflicts_within_and_own_overrides_inherited() {
+        let m = merged(&format!(
+            "[profiles.child]\n[profiles.unset]\n{}{}{}{}",
+            prov("a", "main", "system.user = \"host\""),
+            prov("b", "main", "system.user = \"host\""),
+            prov("c", "child", ""),
+            prov("d", "child", "system.user = { username = \"alice\" }"),
+        ));
+        assert_eq!(eff(&m, "main").system.user, Some(SandboxUser::Host));
+        assert_eq!(
+            eff(&m, "child").system.user,
+            Some(SandboxUser::Custom("alice".parse().unwrap()))
+        );
+        assert_eq!(eff(&m, "unset").system.user, Some(SandboxUser::Host));
+        assert_eq!(eff(&merged("[profiles.p]"), "p").system.user, None);
+
+        let e = merge_err(&format!(
+            "{}{}",
+            prov("a", "main", "system.user = \"host\""),
+            prov("b", "main", "system.user = { username = \"alice\" }"),
+        ));
+        assert_eq!(
+            e.to_string(),
+            r#"profile "main": conflicting system.user values "host" (provider "a") and { username = "alice" } (provider "b")"#
+        );
     }
 
     #[test]

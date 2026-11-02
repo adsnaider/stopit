@@ -5,6 +5,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::Deserialize;
+use serde::de::{self, Deserializer, MapAccess, Visitor};
 
 use super::check_plain_absolute;
 use crate::error::ValueError;
@@ -24,6 +25,8 @@ pub struct SystemGrants {
     pub dev: Option<DevMode>,
     /// Synthesized `/etc` files.
     pub etc: Vec<EtcFile>,
+    /// The sandbox user (`"host"` or `{ username = "<name>" }`).
+    pub user: Option<SandboxUser>,
     /// The sandbox `HOME`.
     pub home: Option<SandboxHome>,
     /// More names for the overflow gid in the synthesized `/etc/group`.
@@ -36,6 +39,7 @@ struct RawSystemGrants {
     proc: Option<bool>,
     dev: Option<DevMode>,
     etc: Vec<EtcFile>,
+    user: Option<SandboxUser>,
     home: Option<SandboxHome>,
     groups: Vec<GroupName>,
 }
@@ -46,9 +50,147 @@ impl From<MapOnly<RawSystemGrants>> for SystemGrants {
             proc: raw.proc,
             dev: raw.dev,
             etc: raw.etc,
+            user: raw.user,
             home: raw.home,
             groups: raw.groups,
         }
+    }
+}
+
+/// A validated sandbox username (`system.user.username = "<name>"`).
+///
+/// 1 to 32 bytes from `[a-z0-9_-]`, starting with a lowercase ASCII letter or
+/// `_`, and none of `root`, `nobody`, or `nogroup`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(try_from = "String")]
+pub struct UserName(String);
+
+impl UserName {
+    /// The validated username.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for UserName {
+    type Err = ValueError;
+
+    fn from_str(s: &str) -> Result<Self, ValueError> {
+        let bad = |why: &str| ValueError::new(format!("invalid username {s:?}: {why}"));
+        if s.is_empty() || s.len() > 32 {
+            return Err(bad("must be 1 to 32 bytes long"));
+        }
+        if !s.starts_with(|c: char| c.is_ascii_lowercase() || c == '_') {
+            return Err(bad("must start with a lowercase letter or `_`"));
+        }
+        if !s
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        {
+            return Err(bad(
+                "may only contain lowercase letters, digits, `_` and `-`",
+            ));
+        }
+        if s == "root" {
+            return Err(bad("`root` is reserved"));
+        }
+        if s == crate::etc::OVERFLOW_USER {
+            return Err(bad("`nobody` is reserved for the overflow uid"));
+        }
+        if s == crate::etc::OVERFLOW_GROUP {
+            return Err(bad("`nogroup` is reserved for the overflow gid"));
+        }
+        Ok(UserName(s.to_owned()))
+    }
+}
+
+impl TryFrom<String> for UserName {
+    type Error = ValueError;
+
+    fn try_from(s: String) -> Result<Self, ValueError> {
+        s.parse()
+    }
+}
+
+impl fmt::Display for UserName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// How the sandbox user is named in `/etc/passwd`, `/etc/group`, `USER` and
+/// `LOGNAME` (`system.user`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SandboxUser {
+    /// Use the running host user (`system.user = "host"`).
+    Host,
+    /// Use a custom fake user (`system.user = { username = "<name>" }`).
+    Custom(UserName),
+}
+
+impl SandboxUser {
+    /// Resolves the effective username for this sandbox user setting.
+    pub fn resolve(&self) -> String {
+        match self {
+            SandboxUser::Host => crate::etc::host_username(),
+            SandboxUser::Custom(name) => name.as_str().to_owned(),
+        }
+    }
+}
+
+impl fmt::Display for SandboxUser {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SandboxUser::Host => f.write_str("\"host\""),
+            SandboxUser::Custom(name) => write!(f, "{{ username = {:?} }}", name.as_str()),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCustomUser {
+    username: UserName,
+}
+
+impl<'de> Deserialize<'de> for SandboxUser {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct SandboxUserVisitor;
+
+        impl<'de> Visitor<'de> for SandboxUserVisitor {
+            type Value = SandboxUser;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("\"host\" or a table { username = \"<name>\" }")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if v == "host" {
+                    Ok(SandboxUser::Host)
+                } else {
+                    Err(E::custom(format!(
+                        "invalid system.user {v:?}: expected \"host\" or {{ username = \"<name>\" }}"
+                    )))
+                }
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let raw =
+                    RawCustomUser::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(SandboxUser::Custom(raw.username))
+            }
+        }
+
+        deserializer.deserialize_any(SandboxUserVisitor)
     }
 }
 
@@ -56,8 +198,9 @@ impl From<MapOnly<RawSystemGrants>> for SystemGrants {
 /// another name for the overflow gid.
 ///
 /// 1 to 32 bytes from `[a-z0-9_-]`, starting with a letter or `_`, as
-/// `groupadd` accepts by default. `user` is refused, since it names the
-/// sandbox user's own group.
+/// `groupadd` accepts by default, and not `root`. If a group name matches the
+/// sandbox user's primary group (`system.user`), [`crate::etc::group`] omits
+/// the duplicate entry.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 #[serde(try_from = "String")]
 pub struct GroupName(String);
@@ -88,8 +231,8 @@ impl FromStr for GroupName {
                 "may only contain lowercase letters, digits, `_` and `-`",
             ));
         }
-        if s == crate::etc::SANDBOX_USER {
-            return Err(bad("names the sandbox user's own group"));
+        if s == "root" {
+            return Err(bad("`root` is reserved"));
         }
         Ok(GroupName(s.to_owned()))
     }
@@ -196,6 +339,14 @@ impl fmt::Display for EtcFile {
 pub struct SandboxHome(String);
 
 impl SandboxHome {
+    /// `/home/<user>` for a validated sandbox username, falling back to
+    /// `/home/stopit` if `user` does not form a valid [`SandboxHome`].
+    pub fn for_user(user: &str) -> Self {
+        format!("/home/{user}")
+            .parse()
+            .unwrap_or_else(|_| SandboxHome(format!("/home/{}", crate::etc::SANDBOX_USER)))
+    }
+
     /// The validated path text.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -203,10 +354,10 @@ impl SandboxHome {
 }
 
 impl Default for SandboxHome {
-    /// `/home/user`, the sandbox `HOME` when no provider sets one (DESIGN.md
-    /// §3.4).
+    /// `/home/stopit`, the sandbox `HOME` when no provider sets `system.home`
+    /// or `system.user` (DESIGN.md §3.4).
     fn default() -> Self {
-        SandboxHome("/home/user".to_owned())
+        Self::for_user(crate::etc::SANDBOX_USER)
     }
 }
 
@@ -273,8 +424,9 @@ mod tests {
     }
 
     #[test]
-    fn default_sandbox_home_is_home_user() {
-        assert_eq!(SandboxHome::default(), home("/home/user"));
+    fn default_sandbox_home_is_home_stopit() {
+        assert_eq!(SandboxHome::default(), home("/home/stopit"));
+        assert_eq!(SandboxHome::for_user("alice"), home("/home/alice"));
     }
 
     #[test]
@@ -284,11 +436,66 @@ mod tests {
         assert_eq!(want.dev, None);
         assert!(want.etc.is_empty());
         assert_eq!(want.home, None);
+        assert_eq!(want.user, None);
         assert_eq!(Manifest::default().grants.system, want);
         assert_eq!(toml_ok("").grants.system, want);
         assert_eq!(toml_ok("[system]").grants.system, want);
         assert_eq!(jv_ok("").grants.system, want);
         assert_eq!(jv_ok(r#""system": {}"#).grants.system, want);
+    }
+
+    #[test]
+    fn sandbox_user_parses_host_and_custom_username() {
+        assert_eq!(
+            toml_ok("system.user = \"host\"").grants.system.user,
+            Some(SandboxUser::Host)
+        );
+        assert_eq!(
+            jv_ok(r#""system": { "user": "host" }"#).grants.system.user,
+            Some(SandboxUser::Host)
+        );
+        let custom = SandboxUser::Custom("alice_1-b".parse().unwrap());
+        assert_eq!(
+            toml_ok("system.user = { username = \"alice_1-b\" }")
+                .grants
+                .system
+                .user,
+            Some(custom.clone())
+        );
+        assert_eq!(
+            toml_ok("[system.user]\nusername = \"alice_1-b\"")
+                .grants
+                .system
+                .user,
+            Some(custom.clone())
+        );
+        assert_eq!(
+            jv_ok(r#""system": { "user": { "username": "alice_1-b" } }"#)
+                .grants
+                .system
+                .user,
+            Some(custom)
+        );
+        for bad in ["alice", "stopit", "root", ""] {
+            let msg = toml_err(&format!("system.user = {bad:?}"));
+            assert!(msg.contains("host"), "{bad:?}: {msg}");
+        }
+        for bad_name in [
+            "",
+            "root",
+            "nobody",
+            "nogroup",
+            "Alice",
+            "1abc",
+            "-a",
+            "a:b",
+            "a\nb",
+            &"a".repeat(33),
+        ] {
+            toml_err(&format!("system.user = {{ username = {bad_name:?} }}"));
+        }
+        toml_err("system.user = { username = \"alice\", extra = 1 }");
+        toml_err("system.user = 123");
     }
 
     #[test]
@@ -310,13 +517,13 @@ mod tests {
         assert!(longest.parse::<GroupName>().is_ok());
         for bad in [
             "",
+            "root",
             "Nobody",
             "1abc",
             "-a",
             "a b",
             "a:b",
             "a\nb",
-            "user",
             "é",
             &"a".repeat(33),
         ] {
@@ -333,16 +540,17 @@ mod tests {
             dev: Some(DevMode::Minimal),
             etc: ETC_FILES.to_vec(),
             home: Some(home("/home/user")),
+            user: Some(SandboxUser::Host),
             groups: Vec::new(),
         };
         let toml = r#"
-            system = { proc = true, dev = "minimal", etc = ["passwd", "group", "hosts", "nsswitch.conf"], home = "/home/user" }
+            system = { proc = true, dev = "minimal", etc = ["passwd", "group", "hosts", "nsswitch.conf"], home = "/home/user", user = "host" }
         "#;
         assert_eq!(toml_ok(toml).grants.system, want);
-        let json = r#""system": { "proc": true, "dev": "minimal", "etc": ["passwd", "group", "hosts", "nsswitch.conf"], "home": "/home/user" }"#;
+        let json = r#""system": { "proc": true, "dev": "minimal", "etc": ["passwd", "group", "hosts", "nsswitch.conf"], "home": "/home/user", "user": "host" }"#;
         assert_eq!(jv_ok(json).grants.system, want);
         // As a standalone table too.
-        let toml = "[system]\nproc = true\ndev = \"minimal\"\netc = [\"passwd\", \"group\", \"hosts\", \"nsswitch.conf\"]\nhome = \"/home/user\"";
+        let toml = "[system]\nproc = true\ndev = \"minimal\"\netc = [\"passwd\", \"group\", \"hosts\", \"nsswitch.conf\"]\nhome = \"/home/user\"\nuser = \"host\"";
         assert_eq!(toml_ok(toml).grants.system, want);
     }
 
