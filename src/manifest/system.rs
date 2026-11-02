@@ -2,6 +2,7 @@
 //! (DESIGN.md §3.6, §6.2).
 
 use std::fmt;
+use std::path::Path;
 use std::str::FromStr;
 
 use serde::Deserialize;
@@ -23,6 +24,8 @@ pub struct SystemGrants {
     pub proc: Option<bool>,
     /// Mount a `/dev`.
     pub dev: Option<DevMode>,
+    /// Host device nodes under `/dev` to pass through via `--dev-bind-try`.
+    pub devices: Vec<DevicePath>,
     /// Synthesized `/etc` files.
     pub etc: Vec<EtcFile>,
     /// The sandbox user (`"host"` or `{ username = "<name>" }`).
@@ -38,6 +41,7 @@ pub struct SystemGrants {
 struct RawSystemGrants {
     proc: Option<bool>,
     dev: Option<DevMode>,
+    devices: Vec<DevicePath>,
     etc: Vec<EtcFile>,
     user: Option<SandboxUser>,
     home: Option<SandboxHome>,
@@ -49,11 +53,88 @@ impl From<MapOnly<RawSystemGrants>> for SystemGrants {
         SystemGrants {
             proc: raw.proc,
             dev: raw.dev,
+            devices: raw.devices,
             etc: raw.etc,
             user: raw.user,
             home: raw.home,
             groups: raw.groups,
         }
+    }
+}
+
+/// Device nodes that `bwrap --dev /dev` synthesizes or mounts itself, which
+/// `system.devices` must not shadow.
+const RESERVED_DEVICES: &[&str] = &[
+    "/dev/null",
+    "/dev/zero",
+    "/dev/full",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/tty",
+    "/dev/console",
+    "/dev/pts",
+    "/dev/ptmx",
+    "/dev/shm",
+    "/dev/fd",
+    "/dev/stdin",
+    "/dev/stdout",
+    "/dev/stderr",
+    "/dev/core",
+];
+
+/// A validated host device path under `/dev` (`system.devices = ["/dev/kvm"]`).
+///
+/// Must be a plain absolute path strictly under `/dev` (not `/dev` itself),
+/// without globs, placeholders, `.` or `..`, and must not collide with any
+/// standard node synthesized by `bwrap --dev /dev`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(try_from = "String")]
+pub struct DevicePath(String);
+
+impl DevicePath {
+    /// The validated device path text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The validated device path as a [`Path`].
+    pub fn as_path(&self) -> &Path {
+        Path::new(&self.0)
+    }
+}
+
+impl FromStr for DevicePath {
+    type Err = ValueError;
+
+    fn from_str(s: &str) -> Result<Self, ValueError> {
+        let invalid = |why: &str| ValueError::new(format!("invalid device path {s:?}: {why}"));
+        check_plain_absolute(s).map_err(invalid)?;
+        let path = Path::new(s);
+        if !path.starts_with("/dev") || path == Path::new("/dev") {
+            return Err(invalid("must be a path strictly under /dev"));
+        }
+        for &reserved in RESERVED_DEVICES {
+            if path.starts_with(reserved) {
+                return Err(invalid(&format!(
+                    "collides with standard /dev node {reserved:?}"
+                )));
+            }
+        }
+        Ok(DevicePath(s.to_owned()))
+    }
+}
+
+impl TryFrom<String> for DevicePath {
+    type Error = ValueError;
+
+    fn try_from(s: String) -> Result<Self, ValueError> {
+        s.parse()
+    }
+}
+
+impl fmt::Display for DevicePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -534,23 +615,85 @@ mod tests {
     }
 
     #[test]
+    fn device_paths_accept_valid_dev_nodes_and_reject_reserved_or_non_dev() {
+        let m = toml_ok(
+            "system.devices = [\"/dev/kvm\", \"/dev/vhost-vsock\", \"/dev/ttyUSB0\", \"/dev/bus/usb/001/002\"]",
+        );
+        assert_eq!(
+            m.grants
+                .system
+                .devices
+                .iter()
+                .map(DevicePath::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "/dev/kvm",
+                "/dev/vhost-vsock",
+                "/dev/ttyUSB0",
+                "/dev/bus/usb/001/002"
+            ]
+        );
+        let j = jv_ok(r#""system": { "devices": ["/dev/kvm"] }"#);
+        assert_eq!(j.grants.system.devices[0].as_path(), Path::new("/dev/kvm"));
+        for bad in [
+            "",
+            "/",
+            "/dev",
+            "/dev/",
+            "/devices/kvm",
+            "/etc/passwd",
+            "dev/kvm",
+            "~/dev/kvm",
+            "{workspace}/dev/kvm",
+            "/dev/*",
+            "/dev/kvm?",
+            "/dev/[a]",
+            "/dev/./kvm",
+            "/dev/../etc/passwd",
+            "/dev//kvm",
+            "/dev/null",
+            "/dev/zero",
+            "/dev/full",
+            "/dev/random",
+            "/dev/urandom",
+            "/dev/tty",
+            "/dev/console",
+            "/dev/pts",
+            "/dev/pts/0",
+            "/dev/ptmx",
+            "/dev/shm",
+            "/dev/shm/x",
+            "/dev/fd",
+            "/dev/fd/0",
+            "/dev/stdin",
+            "/dev/stdout",
+            "/dev/stderr",
+            "/dev/core",
+        ] {
+            assert!(bad.parse::<DevicePath>().is_err(), "{bad:?}");
+            toml_err(&format!("system.devices = [{bad:?}]"));
+        }
+    }
+
+    #[test]
     fn full_system_table_parses_from_toml_and_json() {
         let want = SystemGrants {
             proc: Some(true),
             dev: Some(DevMode::Minimal),
+            devices: vec!["/dev/kvm".parse().unwrap()],
             etc: ETC_FILES.to_vec(),
             home: Some(home("/home/user")),
             user: Some(SandboxUser::Host),
             groups: Vec::new(),
         };
         let toml = r#"
-            system = { proc = true, dev = "minimal", etc = ["passwd", "group", "hosts", "nsswitch.conf"], home = "/home/user", user = "host" }
+            system = { proc = true, dev = "minimal", devices = ["/dev/kvm"], etc = ["passwd", "group", "hosts", "nsswitch.conf"], home = "/home/user", user = "host" }
         "#;
         assert_eq!(toml_ok(toml).grants.system, want);
-        let json = r#""system": { "proc": true, "dev": "minimal", "etc": ["passwd", "group", "hosts", "nsswitch.conf"], "home": "/home/user", "user": "host" }"#;
+        let json = r#""system": { "proc": true, "dev": "minimal", "devices": ["/dev/kvm"], "etc": ["passwd", "group", "hosts", "nsswitch.conf"], "home": "/home/user", "user": "host" }"#;
         assert_eq!(jv_ok(json).grants.system, want);
         // As a standalone table too.
-        let toml = "[system]\nproc = true\ndev = \"minimal\"\netc = [\"passwd\", \"group\", \"hosts\", \"nsswitch.conf\"]\nhome = \"/home/user\"\nuser = \"host\"";
+        let toml = "[system]\nproc = true\ndev = \"minimal\"\ndevices = [\"/dev/kvm\"]\netc = [\"passwd\", \"group\", \"hosts\", \"nsswitch.conf\"]\nhome = \"/home/user\"\nuser = \"host\"";
         assert_eq!(toml_ok(toml).grants.system, want);
     }
 

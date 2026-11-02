@@ -21,9 +21,9 @@ use thiserror::Error;
 use super::graph::{Contribution, ProfileGraph};
 use crate::config::{ProfileRef, ProviderName, ProviderOrigin};
 use crate::manifest::{
-    Bind, DevMode, Domain, EnvName, EnvPattern, EnvValue, EtcFile, FsGrants, GroupName,
-    OptInSyscall, PathPattern, SandboxHome, SandboxUser, SearchPathEntry, ShareableNamespace,
-    ShimName, ShimSpec,
+    Bind, DevMode, DevicePath, Domain, EnvName, EnvPattern, EnvValue, EtcFile, FsGrants,
+    GroupName, OptInSyscall, PathPattern, SandboxHome, SandboxUser, SearchPathEntry,
+    ShareableNamespace, ShimName, ShimSpec,
 };
 use crate::policy::{NetworkMode, PathMode};
 
@@ -65,6 +65,8 @@ pub struct EffectiveSystem {
     pub proc: bool,
     /// Which `/dev` to mount, if any.
     pub dev: Option<DevMode>,
+    /// Host device nodes under `/dev` to pass through via `--dev-bind-try`.
+    pub devices: BTreeSet<DevicePath>,
     /// Synthesized `/etc` files.
     pub etc: BTreeSet<EtcFile>,
     /// The sandbox `HOME`, if any provider set one.
@@ -322,6 +324,10 @@ fn merge_profile(
         system: EffectiveSystem {
             proc: merge_proc(inherited.system.proc, own),
             dev: merge_dev(inherited.system.dev, own),
+            devices: union(
+                &inherited.system.devices,
+                own.iter().map(|c| &c.grants.system.devices),
+            ),
             etc: merge_etc(&inherited.system.etc, own),
             home: merge_home(profile, inherited.system.home.as_ref(), own)?,
             user: merge_user(profile, inherited.system.user.as_ref(), own)?,
@@ -923,6 +929,26 @@ mod tests {
             ["passwd", "group", "hosts", "nsswitch.conf"]
         );
         assert_eq!(strs(&eff(&m, "bare").system.etc), ["hosts"]);
+    }
+
+    #[test]
+    fn devices_is_a_union() {
+        let m = merged(&format!(
+            "[profiles.child]\n[profiles.bare]\ninherit = \"none\"\n{}{}{}{}",
+            prov("a", "main", "system.devices = [\"/dev/vhost-vsock\", \"/dev/kvm\"]"),
+            prov("b", "main", "system.devices = [\"/dev/kvm\", \"/dev/dri\"]"),
+            prov("c", "child", "system.devices = [\"/dev/bus/usb\"]"),
+            prov("d", "bare", "system.devices = [\"/dev/kvm\"]"),
+        ));
+        assert_eq!(
+            strs(&eff(&m, "main").system.devices),
+            ["/dev/dri", "/dev/kvm", "/dev/vhost-vsock"]
+        );
+        assert_eq!(
+            strs(&eff(&m, "child").system.devices),
+            ["/dev/bus/usb", "/dev/dri", "/dev/kvm", "/dev/vhost-vsock"]
+        );
+        assert_eq!(strs(&eff(&m, "bare").system.devices), ["/dev/kvm"]);
     }
 
     #[test]

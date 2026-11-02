@@ -43,7 +43,9 @@ pub use shim::{
     ShimArg, ShimCmd, ShimKind, ShimMatcher, ShimName, ShimRegex, ShimRule, ShimSpec,
     SubcommandPattern, validate_literal, validate_prefix,
 };
-pub use system::{DevMode, EtcFile, GroupName, SandboxHome, SandboxUser, SystemGrants, UserName};
+pub use system::{
+    DevMode, DevicePath, EtcFile, GroupName, SandboxHome, SandboxUser, SystemGrants, UserName,
+};
 
 /// Error produced while loading a manifest document from JSON.
 #[derive(Debug, Error)]

@@ -44,7 +44,7 @@ use crate::config::{Config, ProfileRef, ProviderName};
 use crate::error::is_missing;
 use crate::expand::{EntryKind, ExpansionContext, ResolveCache, expand_bind, expand_pattern};
 use crate::manifest::{
-    BindMode, DevMode, Domain, EtcFile, Grants, GroupName, OptInSyscall, SandboxHome,
+    BindMode, DevMode, DevicePath, Domain, EtcFile, Grants, GroupName, OptInSyscall, SandboxHome,
     SandboxUser, ShareableNamespace, ShimName, ShimSpec,
 };
 use crate::policy::{NetworkMode, PathMode};
@@ -101,6 +101,8 @@ pub struct SystemSpec {
     pub proc: bool,
     /// Which `/dev` to mount, if any.
     pub dev: Option<DevMode>,
+    /// Host device nodes under `/dev` to pass through via `--dev-bind-try`.
+    pub devices: BTreeSet<DevicePath>,
     /// The `/etc` files to synthesize.
     pub etc: BTreeSet<EtcFile>,
     /// The sandbox `HOME`: the profile's `system.home`, or `/home/<user>` when
@@ -120,6 +122,7 @@ impl Default for SystemSpec {
         SystemSpec {
             proc: false,
             dev: None,
+            devices: BTreeSet::new(),
             etc: BTreeSet::new(),
             home: SandboxHome::default(),
             user: crate::etc::SANDBOX_USER.to_owned(),
@@ -3659,6 +3662,7 @@ fn finish_profile_inner(
         system: SystemSpec {
             proc: grants.system.proc,
             dev: grants.system.dev,
+            devices: grants.system.devices.clone(),
             etc,
             home,
             user,

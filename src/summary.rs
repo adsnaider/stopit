@@ -20,9 +20,10 @@
 //! outside the workspace, or inside it with a mode wider than the workspace
 //! mount's (`rw` over `protected` over `ro`: an `rw` `{workspace}/out` under
 //! an `ro` workspace); sockets left unmasked in `rw` grants; the network
-//! beyond loopback, shared namespaces, re-enabled syscalls, brokered shims,
-//! script providers with `protect = false`, and environment `pass` patterns
-//! and `set` names beyond the default base's. Masked and ephemeral mounts,
+//! beyond loopback, passed-through host devices, shared namespaces,
+//! re-enabled syscalls, brokered shims, script providers with
+//! `protect = false`, and environment `pass` patterns and `set` names beyond
+//! the default base's. Masked and ephemeral mounts,
 //! mounts inside the workspace no wider than its own, and stopit's own rules
 //! show nothing of the host, or nothing new, and are left out. Environment
 //! values are never printed, only names.
@@ -90,6 +91,10 @@ pub fn summary_lines(spec: &SandboxSpec, ctx: &SummaryContext<'_>) -> Vec<String
         lines.push(grant("sockets", "not masked in rw grants"));
     }
     network_line(&spec.network, &mut lines);
+    if !spec.system.devices.is_empty() {
+        let names = spec.system.devices.iter().map(|d| d.as_str());
+        lines.push(grant("devices", &name_list(names)));
+    }
     if !spec.namespaces.shared.is_empty() {
         let names = spec.namespaces.shared.iter().map(|ns| ns.as_str());
         lines.push(grant("share", &name_list(names)));
@@ -607,6 +612,9 @@ mod tests {
     #[test]
     fn namespaces_syscalls_shims_and_unprotected_providers_are_listed() {
         let mut spec = SandboxSpec::default();
+        spec.system.devices = ["/dev/kvm".parse().unwrap(), "/dev/vhost-vsock".parse().unwrap()]
+            .into_iter()
+            .collect();
         spec.namespaces.shared = [ShareableNamespace::Pid, ShareableNamespace::Net].into();
         spec.allow_syscalls = [OptInSyscall::Ptrace, OptInSyscall::IoUring].into();
         let shim: ShimSpec = toml::from_str(
@@ -626,6 +634,7 @@ mod tests {
         assert_eq!(
             out[1..],
             [
+                "  devices  /dev/kvm, /dev/vhost-vsock",
                 "  share    net, pid",
                 "  syscalls ptrace, io_uring",
                 "  broker   git  (provider \"vcs\")",

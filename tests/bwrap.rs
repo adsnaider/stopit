@@ -496,6 +496,37 @@ fn dev_is_minimal() {
     assert_eq!(errno(&results[4]), "ENOENT");
 }
 
+#[test]
+fn system_devices_passes_through_existing_and_skips_missing() {
+    let f = SpecFixture::new();
+    let existing = fs::read_dir("/dev")
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.to_str()
+                .is_some_and(|s| s.parse::<stopit::manifest::DevicePath>().is_ok())
+                && fs::metadata(p).is_ok()
+        })
+        .expect("at least one non-reserved /dev entry exists on the host");
+    let existing_str = existing.to_str().unwrap();
+    let spec = f.compile(&config_none(&format!(
+        "system.dev = \"minimal\"\n\
+         system.devices = [{existing_str:?}, \"/dev/nonexistent-stopit-device\"]"
+    )));
+    let results = f.session().run(
+        &spec,
+        &[
+            stat("/dev/null"),
+            stat(existing_str),
+            stat("/dev/nonexistent-stopit-device"),
+        ],
+    );
+    assert_eq!(stat_data(&results[0]).kind, FileKind::Other);
+    assert!(results[1].is_ok(), "{:?}", results[1]);
+    assert_eq!(errno(&results[2]), "ENOENT");
+}
+
 // --- Synthesized `/etc` files ---
 
 /// The ids of this process, which the sandbox user has.

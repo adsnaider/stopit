@@ -1199,6 +1199,10 @@ fn plan_with_caps(
         Some(DevMode::Minimal) => plan.push(["--dev", "/dev"])?,
         None => {}
     }
+    for dev in &spec.system.devices {
+        let p = dev.as_path().as_os_str();
+        plan.push([OsStr::new("--dev-bind-try"), p, p])?;
+    }
 
     // Step 4: synthesized `/etc` files, before the filesystem mounts. No
     // mount may equal or contain one (§6.2, Reserved paths), so none can
@@ -2183,6 +2187,22 @@ mod tests {
         let mut spec = SandboxSpec::default();
         spec.system.dev = Some(DevMode::Minimal);
         assert_eq!(golden(&spec), around(&["--dev", "/dev"]));
+        spec.system.devices = ["/dev/kvm".parse().unwrap(), "/dev/vhost-vsock".parse().unwrap()]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            golden(&spec),
+            around(&[
+                "--dev",
+                "/dev",
+                "--dev-bind-try",
+                "/dev/kvm",
+                "/dev/kvm",
+                "--dev-bind-try",
+                "/dev/vhost-vsock",
+                "/dev/vhost-vsock",
+            ])
+        );
         // Neither: no /proc, no /dev.
         let args = golden(&SandboxSpec::default());
         assert!(!args.iter().any(|a| a == "/proc" || a == "/dev"));
