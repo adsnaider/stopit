@@ -296,10 +296,12 @@ impl ConfigLayer {
         let mut layered_providers = Vec::new();
         let mut config_providers = Vec::new();
         let mut replaced = Vec::new();
+        let mut replaced_kinds: HashMap<ProviderName, ProviderKind> = HashMap::new();
         if let Some(dir) = g_dir {
             for entry in g_layer.providers {
                 if project_names.contains_key(entry.name.as_str()) {
-                    replaced.push(entry.name);
+                    replaced.push(entry.name.clone());
+                    replaced_kinds.insert(entry.name, entry.kind);
                 } else {
                     config_providers.push(entry.clone());
                     layered_providers.push(LayeredProviderEntry {
@@ -311,7 +313,13 @@ impl ConfigLayer {
             }
         }
         if let Some(dir) = p_dir {
-            for entry in p_layer.providers {
+            for mut entry in p_layer.providers {
+                if !entry.enabled
+                    && matches!(entry.kind, ProviderKind::Config { .. })
+                    && let Some(kind @ ProviderKind::Vcs { .. }) = replaced_kinds.get(&entry.name)
+                {
+                    entry.kind = kind.clone();
+                }
                 config_providers.push(entry.clone());
                 layered_providers.push(LayeredProviderEntry {
                     origin: ProviderOrigin::Workspace,

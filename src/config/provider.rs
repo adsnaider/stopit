@@ -212,6 +212,8 @@ impl ProviderKind {
 pub struct ProviderEntry {
     /// Effective name: the `name` key, or the type when absent.
     pub name: ProviderName,
+    /// Whether this provider is enabled; defaults to `true`.
+    pub enabled: bool,
     /// The type and its options.
     pub kind: ProviderKind,
 }
@@ -223,6 +225,7 @@ struct RawProviderEntry {
     #[serde(rename = "type")]
     kind: Option<String>,
     name: Option<ProviderName>,
+    enabled: Option<bool>,
     // config
     profile: Option<ProfileRef>,
     sandbox: Option<Manifest>,
@@ -242,10 +245,21 @@ impl TryFrom<MapOnly<RawProviderEntry>> for ProviderEntry {
     type Error = ValueError;
 
     fn try_from(MapOnly(raw): MapOnly<RawProviderEntry>) -> Result<Self, ValueError> {
-        let Some(ty) = raw.kind.as_deref() else {
-            return Err(ValueError::new(format!(
-                "provider entry is missing the required key `type` (one of {TYPES:?})"
-            )));
+        let enabled = raw.enabled.unwrap_or(true);
+        let ty = match raw.kind.as_deref() {
+            Some(ty) => ty,
+            None if !enabled && raw.name.is_some() => {
+                if raw.name.as_ref().is_some_and(|n| n.as_str() == "vcs") {
+                    "vcs"
+                } else {
+                    "config"
+                }
+            }
+            None => {
+                return Err(ValueError::new(format!(
+                    "provider entry is missing the required key `type` (one of {TYPES:?})"
+                )));
+            }
         };
 
         if !TYPES.contains(&ty) {
@@ -286,11 +300,15 @@ impl TryFrom<MapOnly<RawProviderEntry>> for ProviderEntry {
                 sandbox: Box::new(raw.sandbox.unwrap_or_default()),
             },
             "script" => ProviderKind::Script {
-                source: raw.source.ok_or_else(|| {
-                    ValueError::new(
-                        "provider type \"script\" requires the key `source` (path to the executable)",
-                    )
-                })?,
+                source: match raw.source {
+                    Some(source) => source,
+                    None if !enabled => ScriptSource(PathBuf::new()),
+                    None => {
+                        return Err(ValueError::new(
+                            "provider type \"script\" requires the key `source` (path to the executable)",
+                        ));
+                    }
+                },
                 protect: raw.protect.unwrap_or(true),
                 config: raw.config.unwrap_or_default(),
             },
@@ -323,7 +341,11 @@ impl TryFrom<MapOnly<RawProviderEntry>> for ProviderEntry {
                 }
             }
         };
-        Ok(ProviderEntry { name, kind })
+        Ok(ProviderEntry {
+            name,
+            enabled,
+            kind,
+        })
     }
 }
 
@@ -557,6 +579,7 @@ mod tests {
     fn config_defaults() {
         let e = one("[[provider]]\ntype = \"config\"");
         assert_eq!(e.name, name("config"));
+        assert!(e.enabled);
         assert_eq!(
             e.kind,
             ProviderKind::Config {
@@ -565,6 +588,22 @@ mod tests {
             }
         );
         assert_eq!(e.kind.type_name(), "config");
+    }
+
+    #[test]
+    fn disabled_provider_entry_parses() {
+        let e = one("[[provider]]\ntype = \"vcs\"\nenabled = false");
+        assert_eq!(e.name, name("vcs"));
+        assert!(!e.enabled);
+        assert_eq!(e.kind.type_name(), "vcs");
+
+        let e = one("[[provider]]\nname = \"corp\"\nenabled = false");
+        assert_eq!(e.name, name("corp"));
+        assert!(!e.enabled);
+
+        let e = one("[[provider]]\ntype = \"script\"\nname = \"corp\"\nenabled = false");
+        assert_eq!(e.name, name("corp"));
+        assert!(!e.enabled);
     }
 
     #[test]

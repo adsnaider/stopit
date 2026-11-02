@@ -483,7 +483,7 @@ fn unprotected_providers(config: &Config) -> Vec<&ProviderName> {
     config
         .providers
         .iter()
-        .filter(|e| matches!(e.kind, ProviderKind::Script { protect: false, .. }))
+        .filter(|e| e.enabled && matches!(e.kind, ProviderKind::Script { protect: false, .. }))
         .map(|e| &e.name)
         .collect()
 }
@@ -2852,12 +2852,15 @@ fn guard_global_config(
     }
     paths.push(resolved);
     for entry in entries {
+        if !entry.enabled {
+            continue;
+        }
         match &entry.kind {
             ProviderKind::Script {
                 source,
                 protect: true,
                 ..
-            } => {
+            } if !source.as_path().as_os_str().is_empty() => {
                 let declared = config_dir.join(source.as_path());
                 let script = resolve(
                     &declared,
@@ -4484,7 +4487,9 @@ mod tests {
         let entries = ConfigLayer::from_toml_str(&format!(
             "[[provider]]\ntype = \"script\"\nname = \"a\"\nsource = {:?}\n\
              [[provider]]\ntype = \"script\"\nname = \"off\"\nsource = \"/nonexistent\"\n\
-             protect = false\n",
+             protect = false\n\
+             [[provider]]\ntype = \"script\"\nname = \"disabled\"\nsource = \"/nonexistent\"\n\
+             enabled = false\n",
             dots.join("current/tools.sh")
         ))
         .unwrap()
@@ -4546,6 +4551,19 @@ mod tests {
         };
         let e = guard_global_config(&moved, &[], &dirs.active.path, &root, &ws, &[]).unwrap_err();
         assert!(e.to_string().contains("when read, and now to"), "{e}");
+
+        // Disabled script providers with `protect = false` are not listed as
+        // running unprotected in the startup summary.
+        let cfg = Config::from_toml_str(
+            "[[provider]]\ntype = \"script\"\nname = \"active\"\nsource = \"a.sh\"\nprotect = false\n\
+             [[provider]]\ntype = \"script\"\nname = \"disabled\"\nsource = \"b.sh\"\nprotect = false\nenabled = false\n",
+        )
+        .unwrap();
+        let names: Vec<&str> = unprotected_providers(&cfg)
+            .into_iter()
+            .map(|n| n.as_str())
+            .collect();
+        assert_eq!(names, ["active"]);
     }
 
     #[test]

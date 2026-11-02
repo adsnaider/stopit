@@ -175,6 +175,7 @@ fn ensure_approvals_manifest<'a>(
         None => {
             layer.providers.push(ProviderEntry {
                 name: name.clone(),
+                enabled: true,
                 kind: ProviderKind::Config {
                     profile: caller_profile.clone(),
                     sandbox: Box::new(Manifest::default()),
@@ -475,6 +476,9 @@ fn render_approvals_provider(entry: &ProviderEntry) -> String {
                 if spec.tty {
                     out.push_str("tty = true\n");
                 }
+            }
+            ShimKind::Disabled => {
+                out.push_str("enabled = false\n");
             }
         }
     }

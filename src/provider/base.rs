@@ -101,6 +101,9 @@ pub fn layered_session_providers(
         }
     }
     for entry in entries {
+        if !entry.entry.enabled {
+            continue;
+        }
         providers.push(from_layered_entry(entry)?);
     }
     Ok(providers)
@@ -264,6 +267,32 @@ mod tests {
     fn a_vcs_provider_of_the_users_replaces_the_default_one() {
         let c = cfg("[[provider]]\ntype = \"vcs\"\nname = \"mine\"\nview = \"ro\"");
         assert_eq!(names(&c), ["base", "mine"]);
+        // Disabling the `vcs` provider suppresses the built-in one too.
+        let c = cfg("[[provider]]\ntype = \"vcs\"\nenabled = false");
+        assert_eq!(names(&c), ["base"]);
+        let c = cfg("[[provider]]\nname = \"vcs\"\nenabled = false");
+        assert_eq!(names(&c), ["base"]);
+        // A disabled user provider is omitted.
+        let c = cfg(
+            "[[provider]]\ntype = \"config\"\nname = \"keep\"\n\
+             [[provider]]\ntype = \"config\"\nname = \"drop\"\nenabled = false",
+        );
+        assert_eq!(names(&c), ["base", "vcs", "keep"]);
+        // Disabling a custom-named global `vcs` provider by name in `.stopit.toml`
+        // keeps the built-in `vcs` provider suppressed.
+        let g = crate::config::ConfigLayer::from_toml_str(
+            "[[provider]]\ntype = \"vcs\"\nname = \"repo-vcs\"",
+        )
+        .unwrap();
+        let p = crate::config::ConfigLayer::from_toml_str(
+            "[[provider]]\nname = \"repo-vcs\"\nenabled = false",
+        )
+        .unwrap();
+        let layered = crate::config::ConfigLayer::layer(
+            Some((g, Path::new("/g"))),
+            Some((p, Path::new("/p"))),
+        );
+        assert_eq!(names(&layered.config), ["base"]);
         // Another type may not take the default one's name.
         let c = cfg("[[provider]]\ntype = \"config\"\nname = \"vcs\"");
         let Err(e) = session_providers(&c, Path::new("/cfg")) else {

@@ -716,6 +716,9 @@ impl fmt::Display for ProxySource {
 /// The mode-specific definition of a [`ShimSpec`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShimKind {
+    /// A tombstone (`shims.<name> = false` or `{ enabled = false }`) that
+    /// removes an inherited or lower-origin shim of the same name during merge.
+    Disabled,
     /// A declarative shim with `cmd`, `default`, and first-match-wins `rules`.
     Declarative {
         /// The underlying binary and any fixed arguments prepended before the
@@ -742,13 +745,13 @@ pub enum ShimKind {
 
 /// One shim declaration (DESIGN.md §7.1).
 ///
-/// Deserializes from a table or object only, never from a sequence.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "MapOnly<RawShimSpec>")]
+/// Deserializes from a table or object, or `false` to tombstone/remove a shim.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShimSpec {
     /// Whether foreground terminal calls run on a pseudo-terminal of their own.
     pub tty: bool,
-    /// Declarative matching rules or proxy executable configuration.
+    /// Declarative matching rules, proxy executable configuration, or disabled
+    /// tombstone.
     pub kind: ShimKind,
 }
 
@@ -757,7 +760,7 @@ impl ShimSpec {
     pub fn cmd(&self) -> Option<&ShimCmd> {
         match &self.kind {
             ShimKind::Declarative { cmd, .. } => Some(cmd),
-            ShimKind::Proxy { .. } => None,
+            ShimKind::Proxy { .. } | ShimKind::Disabled => None,
         }
     }
 }
@@ -765,6 +768,8 @@ impl ShimSpec {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawShimSpec {
+    #[serde(default)]
+    enabled: Option<bool>,
     #[serde(default)]
     cmd: Option<ShimCmd>,
     #[serde(default)]
@@ -783,6 +788,17 @@ impl TryFrom<MapOnly<RawShimSpec>> for ShimSpec {
     type Error = ValueError;
 
     fn try_from(MapOnly(raw): MapOnly<RawShimSpec>) -> Result<Self, ValueError> {
+        if raw.enabled == Some(false) {
+            if raw.cmd.is_some() && raw.proxy.is_some() {
+                return Err(ValueError::new(
+                    "invalid shim: `cmd` and `proxy` are mutually exclusive",
+                ));
+            }
+            return Ok(ShimSpec {
+                tty: false,
+                kind: ShimKind::Disabled,
+            });
+        }
         match (raw.cmd, raw.proxy) {
             (Some(_), Some(_)) => Err(ValueError::new(
                 "invalid shim: `cmd` and `proxy` are mutually exclusive",
@@ -831,6 +847,41 @@ impl TryFrom<MapOnly<RawShimSpec>> for ShimSpec {
                 })
             }
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for ShimSpec {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ShimSpecVisitor;
+
+        impl<'de> Visitor<'de> for ShimSpecVisitor {
+            type Value = ShimSpec;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a map or `false`")
+            }
+
+            fn visit_bool<E: de::Error>(self, v: bool) -> Result<ShimSpec, E> {
+                if !v {
+                    Ok(ShimSpec {
+                        tty: false,
+                        kind: ShimKind::Disabled,
+                    })
+                } else {
+                    Err(E::custom(
+                        "invalid shim: boolean `true` is not a shim definition; use `false` to disable a shim or a table with `cmd` or `proxy`",
+                    ))
+                }
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, map: A) -> Result<ShimSpec, A::Error> {
+                let raw =
+                    RawShimSpec::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                ShimSpec::try_from(MapOnly(raw)).map_err(de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_any(ShimSpecVisitor)
     }
 }
 
@@ -1153,6 +1204,28 @@ mod tests {
         assert!(toml_ok("[shims]").grants.shims.is_empty());
         assert!(jv_ok("").grants.shims.is_empty());
         assert!(jv_ok(r#""shims": {}"#).grants.shims.is_empty());
+    }
+
+    #[test]
+    fn disabled_shim_parses_from_false_or_enabled_false() {
+        let want = ShimSpec {
+            tty: false,
+            kind: ShimKind::Disabled,
+        };
+        let m = toml_ok(
+            r#"
+            [shims]
+            git = false
+            jj = { enabled = false }
+            "#,
+        );
+        assert_eq!(m.grants.shims[&sn("git")], want);
+        assert_eq!(m.grants.shims[&sn("jj")], want);
+        let j = jv_ok(r#""shims": { "git": false, "jj": { "enabled": false } }"#);
+        assert_eq!(j.grants.shims[&sn("git")], want);
+        assert_eq!(j.grants.shims[&sn("jj")], want);
+        toml_err("[shims]\ngit = true");
+        jv_err(r#""shims": { "git": true }"#);
     }
 
     #[test]

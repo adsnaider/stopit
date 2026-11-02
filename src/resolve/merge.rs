@@ -599,9 +599,12 @@ pub fn is_approvals_provider(name: &ProviderName) -> bool {
 /// `shims` (§3.5): higher [`ProviderOrigin`] replaces lower for the same shim
 /// name within a profile, and within [`ProviderOrigin::Workspace`] a persisted
 /// `approvals` provider ([`is_approvals_provider`]) replaces an earlier
-/// workspace provider's shim; otherwise the same shim name from two
-/// contributions at the same rank is an error naming both providers. A
-/// profile's own shim replaces an inherited one of the same name.
+/// workspace provider's shim; a tombstone (`shims.<name> = false` /
+/// [`crate::manifest::ShimKind::Disabled`]) removes an inherited or
+/// lower/same-rank shim of the same name. Otherwise the same shim name from
+/// two contributions at the same rank is an error naming both providers. A
+/// profile's own shim replaces (or removes, if disabled) an inherited one of
+/// the same name.
 fn merge_shims(
     profile: &ProfileRef,
     inherited: &BTreeMap<ShimName, (ShimSpec, ProviderName)>,
@@ -618,6 +621,7 @@ fn merge_shims(
     for c in own {
         let c_rank = rank(c);
         for (shim, spec) in &c.grants.shims {
+            let is_disabled = matches!(spec.kind, crate::manifest::ShimKind::Disabled);
             match found.get(shim) {
                 None => {
                     found.insert(shim, (spec, &c.provider, c_rank));
@@ -626,6 +630,11 @@ fn merge_shims(
                     found.insert(shim, (spec, &c.provider, c_rank));
                 }
                 Some((_, _, first_rank)) if c_rank < *first_rank => {}
+                Some((first_spec, _, _))
+                    if matches!(first_spec.kind, crate::manifest::ShimKind::Disabled) => {}
+                Some(_) if is_disabled => {
+                    found.insert(shim, (spec, &c.provider, c_rank));
+                }
                 Some((_, first_provider, _)) => {
                     return Err(MergeError::DuplicateShim {
                         profile: profile.clone(),
@@ -638,11 +647,13 @@ fn merge_shims(
         }
     }
     let mut out = inherited.clone();
-    out.extend(
-        found
-            .into_iter()
-            .map(|(shim, (spec, provider, _))| (shim.clone(), (spec.clone(), provider.clone()))),
-    );
+    for (shim, (spec, provider, _)) in found {
+        if matches!(spec.kind, crate::manifest::ShimKind::Disabled) {
+            out.remove(shim);
+        } else {
+            out.insert(shim.clone(), (spec.clone(), provider.clone()));
+        }
+    }
     Ok(out)
 }
 
@@ -786,6 +797,7 @@ mod tests {
                 let target = match &spec.kind {
                     crate::manifest::ShimKind::Declarative { cmd, .. } => cmd.binary.to_string(),
                     crate::manifest::ShimKind::Proxy { proxy, .. } => proxy.to_string(),
+                    crate::manifest::ShimKind::Disabled => unreachable!("removed during merge"),
                 };
                 (name.to_string(), target, provider.to_string())
             })
@@ -1229,6 +1241,19 @@ mod tests {
         let (spec, provider) = &eff(&m, "main").shims[&"jj".parse().unwrap()];
         assert_eq!(spec, &own[&"jj".parse().unwrap()]);
         assert_eq!(provider, &pn("a"));
+    }
+
+    #[test]
+    fn disabled_shim_tombstone_removes_inherited_and_lower_or_same_rank_shims() {
+        let m = merged(&format!(
+            "[profiles.child]\n{}{}{}{}",
+            prov("a", "main", &format!("{}\n{}", shim("jj", "jj"), shim("git", "git"))),
+            prov("b", "main", "shims.git = false"),
+            prov("c", "child", "shims.jj = { enabled = false }"),
+            prov("d", "child", &shim("gh", "gh")),
+        ));
+        assert_eq!(shims(&m, "main"), triples(&[("jj", "jj", "a")]));
+        assert_eq!(shims(&m, "child"), triples(&[("gh", "gh", "d")]));
     }
 
     #[test]
