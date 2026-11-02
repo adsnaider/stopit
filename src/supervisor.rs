@@ -672,6 +672,9 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     }
     let compiled = loaded.compiled();
     let (profile_name, profile) = profile_in(&compiled, invocation.profile.as_deref())?;
+    for line in loaded.profile_warning_lines(profile) {
+        eprintln!("{line}");
+    }
     // After the warnings, right before the sandbox starts, so it is the
     // last thing above the command's own output.
     if !invocation.quiet {
@@ -976,7 +979,7 @@ fn load_policy<S>(
         data: data_dirs,
         config: config_dirs,
     };
-    let compiled = crate::spec::compile_session_granted(
+    let compiled = crate::spec::compile_session_granted_lazy(
         &config,
         outputs.clone(),
         &protected,
@@ -1197,7 +1200,7 @@ impl LoadedSession {
         outputs: Vec<(ProviderName, ProviderOutput)>,
         granted: &std::collections::BTreeSet<PathBuf>,
     ) -> Result<CompiledSession, RunError> {
-        Ok(crate::spec::compile_session_granted(
+        Ok(crate::spec::compile_session_granted_lazy(
             &policy.config,
             outputs,
             &policy.protected,
@@ -1240,10 +1243,33 @@ impl LoadedSession {
             let state = self.granted();
             (state.paths.clone(), state.generation)
         };
+        let all_roots_known = rw.iter().all(|p| policy.compiled.has_untrusted_root(p))
+            && granted.iter().all(|p| policy.compiled.has_untrusted_root(p));
+        if all_roots_known
+            && let Some(compiled) = policy.compiled.compile_extra_profile_lazy(
+                &policy.config,
+                &policy.outputs,
+                extra.clone(),
+                &policy.protected,
+                &self.state,
+                &policy.ctx,
+            )?
+        {
+            return Ok((compiled, generation));
+        }
         granted.extend(rw.iter().cloned());
         let mut outputs = policy.outputs.clone();
         outputs.push(extra);
-        Ok((self.compile_granted_with(policy, outputs, &granted)?, generation))
+        let compiled = crate::spec::compile_session_granted_lazy_with_cache(
+            &policy.config,
+            outputs,
+            &policy.protected,
+            &self.state,
+            &policy.ctx,
+            &granted,
+            policy.compiled.scan_cache(),
+        )?;
+        Ok((compiled, generation))
     }
 
     /// Adds `rw`, the `rw` paths of a request that passed its checks, to
@@ -1257,7 +1283,12 @@ impl LoadedSession {
     /// the new one, or `generation`, from
     /// [`compile_with`](Self::compile_with), if another request added
     /// paths since, so the request is compiled again with them.
-    pub(crate) fn admit_grant(&self, rw: &[PathBuf], generation: u64) -> u64 {
+    pub(crate) fn admit_grant(
+        &self,
+        rw: &[PathBuf],
+        generation: u64,
+        precompiled: Option<(&SessionPolicy, &CompiledSession, &ProfileRef)>,
+    ) -> u64 {
         let (ret, new_paths) = {
             let mut state = self.granted();
             let unchanged = state.generation == generation;
@@ -1271,13 +1302,19 @@ impl LoadedSession {
                 true => state.generation,
                 false => generation,
             };
-            (ret, changed.then(|| state.paths.clone()))
+            (ret, changed.then(|| (unchanged, state.paths.clone())))
         };
-        if let Some(paths) = new_paths {
+        if let Some((unchanged_granted, paths)) = new_paths {
             let prev = self.policy();
-            if let Ok(recompiled) =
-                self.compile_granted_with(&prev, prev.outputs.clone(), &paths)
+            let recompiled = if unchanged_granted
+                && let Some((compiled_policy, compiled, extra_target)) = precompiled
+                && compiled_policy.generation == prev.generation
             {
+                Ok(compiled.without_profile(extra_target))
+            } else {
+                self.compile_granted_with(&prev, prev.outputs.clone(), &paths)
+            };
+            if let Ok(recompiled) = recompiled {
                 let mut guard = self.policy.lock().unwrap_or_else(|e| e.into_inner());
                 if guard.generation == prev.generation {
                     *guard = Arc::new(SessionPolicy {
@@ -1334,6 +1371,17 @@ impl LoadedSession {
         self.policy().warning_lines()
     }
 
+    /// Any warnings produced by resolving `profile`'s deferred socket scan,
+    /// formatted as `stopit: warning: …` and escaped.
+    pub(crate) fn profile_warning_lines(&self, profile: &CompiledProfile) -> Vec<String> {
+        let policy = self.policy();
+        distinct_messages(profile.socket_scan_warnings(), policy.config.base)
+            .into_iter()
+            .filter(|w| !policy.compile_warnings.contains(w))
+            .map(|w| format!("stopit: warning: {}", escape_message(&w)))
+            .collect()
+    }
+
     /// The startup summary of `profile`, named `name`, as printed
     /// (`stopit: …`, escaped).
     pub(crate) fn summary_lines(
@@ -1351,7 +1399,7 @@ impl LoadedSession {
             base: policy.config.base,
             unprotected: &unprotected,
         };
-        summary_lines(&profile.spec, &ctx)
+        summary_lines(profile.resolved_spec(), &ctx)
             .iter()
             .map(|line| format!("stopit: {}", escape_message(line)))
             .collect()
@@ -1368,11 +1416,12 @@ impl LoadedSession {
         terminal: TerminalSession,
         extras: &crate::bwrap::RunExtras,
     ) -> Result<BwrapCommand, RunError> {
-        let env = profile.spec.target_env(host_env);
+        let spec = profile.resolved_spec();
+        let env = spec.target_env(host_env);
         let mount = self.workspace_mount();
-        let sandbox_cwd = working_dir(&profile.spec, &mount);
+        let sandbox_cwd = working_dir(spec, &mount);
         Ok(BwrapCommand::for_init_with(
-            &profile.spec,
+            spec,
             &self.session,
             &self.provisioned,
             &sandbox_cwd,

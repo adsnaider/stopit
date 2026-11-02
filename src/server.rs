@@ -528,6 +528,7 @@ fn run_for_client(
     let compiled = Arc::new(compiled);
     let (profile_name, profile) = profile_in(&compiled, profile.as_deref())?;
     let mut lines = loaded.warning_lines_with(&compile_warnings);
+    lines.extend(loaded.profile_warning_lines(profile));
     if !client_quiet {
         lines.extend(loaded.summary_lines(&profile_name, profile));
     }

@@ -6082,7 +6082,7 @@ fn proxy_shims_protect_their_script_and_support_named_inline_and_deny_decisions(
         "#!/bin/sh\n\
          case \"$1\" in\n\
            allow-main)\n\
-             printf '{\"decision\":\"allow\",\"cmd\":[\"echo\",\"proxy-main:%s:%s\",\"'\"$STOPIT_SHIM\"'\",\"'\"$2\"'\"],\"profile\":\"main\"}\\n'\n\
+             printf '{\"decision\":\"allow\",\"cmd\":[\"echo\",\"proxy-main:%s:%s\"],\"profile\":\"main\"}\\n' \"$STOPIT_SHIM\" \"$2\"\n\
              ;;\n\
            allow-inline)\n\
              printf '{\"decision\":\"allow\",\"cmd\":[\"cat\",\"/home/user/secret.txt\"],\"profile\":{\"inherit\":\"main\",\"fs\":{\"ro\":[\"~/secret.txt\"]}}}\\n'\n\

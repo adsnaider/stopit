@@ -12,7 +12,9 @@
 
 mod resolve;
 
-pub use resolve::{EntryKind, Resolution, ResolveWarning, ResolvedPath, resolve};
+pub use resolve::{
+    EntryKind, Resolution, ResolveCache, ResolveWarning, ResolvedPath, resolve, resolve_with_cache,
+};
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -160,7 +162,7 @@ fn join(anchor: &Path, rest: &Path) -> PathBuf {
 ///
 /// The fields are private so that `rest` cannot be replaced by an absolute
 /// path, which `Path::join` would treat as discarding the anchor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ExpandedPattern {
     anchor: PatternAnchor,
     host_anchor: PathBuf,

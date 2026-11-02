@@ -927,15 +927,14 @@ fn check_inline_proxy_session(
     let compiled_profile = compiled
         .get(target)
         .ok_or_else(|| "the inline proxy profile did not compile".to_owned())?;
-    let rw: Vec<PathBuf> = compiled_profile
-        .spec
+    let compiled_spec = compiled_profile.resolved_spec();
+    let rw: Vec<PathBuf> = compiled_spec
         .mounts
         .iter()
         .filter(|m| m.mode == PathMode::Rw)
         .filter_map(|m| match &m.source {
             crate::resolve::MountSource::Host { path, .. } => Some(
-                compiled_profile
-                    .spec
+                compiled_spec
                     .canonical_sources
                     .get(&m.sandbox)
                     .unwrap_or(path)
@@ -1010,7 +1009,9 @@ fn compile_inline_proxy_profile(
         .compile_with(&ctx.policy, extra.clone(), &[])
         .map_err(|e| e.to_string())?;
     let rw = check_inline_proxy_session(&ctx.compiled, &compiled, &target)?;
-    let generation = ctx.loaded.admit_grant(&rw, generation);
+    let generation =
+        ctx.loaded
+            .admit_grant(&rw, generation, Some((&ctx.policy, &compiled, &target)));
     Ok(InlineProxyCompile {
         extra,
         generation,
@@ -1309,7 +1310,9 @@ fn run_grant(
     if let Err(why) = check(&compiled) {
         return refuse(&why);
     }
-    let generation = ctx.loaded.admit_grant(&rw, generation);
+    let generation =
+        ctx.loaded
+            .admit_grant(&rw, generation, Some((&ctx.policy, &compiled, &target)));
     // Not refused unseen: the user sees it.
     approver.release_refusal(ctx.run);
     let network = mode.map(|_| &compiled.get(&target).expect("checked above").spec.network);
@@ -1424,6 +1427,20 @@ fn check_grant(
             }
         }
     }
+    if paths.is_empty() {
+        let before: BTreeSet<String> = caller.warnings.iter().map(ToString::to_string).collect();
+        if let Some(new) = granted
+            .warnings
+            .iter()
+            .map(ToString::to_string)
+            .find(|w| !before.contains(w))
+        {
+            return Err(format!("a rule would not take as asked: {new}"));
+        }
+        return Ok(());
+    }
+    let caller_spec = caller.resolved_spec();
+    let granted_spec = granted.resolved_spec();
     let stopit = crate::provider::SUPERVISOR_PROVIDER_NAME;
     // stopit's own rules, the masks over sockets and its state and the
     // protected configuration files, are left out: the compiler applies
@@ -1433,7 +1450,7 @@ fn check_grant(
             return None;
         }
         let inside_rw = || {
-            caller.spec.mounts.iter().any(|r| {
+            caller_spec.mounts.iter().any(|r| {
                 r.mode == PathMode::Rw
                     && c.sandbox != r.sandbox
                     && c.sandbox.starts_with(&r.sandbox)
@@ -1451,7 +1468,7 @@ fn check_grant(
             c.sandbox.display()
         ))
     };
-    for m in &granted.spec.mounts {
+    for m in &granted_spec.mounts {
         let from_grant =
             m.provider.as_str() == stopit && matches!(m.mode, PathMode::Ro | PathMode::Rw);
         if !from_grant {
@@ -1464,8 +1481,7 @@ fn check_grant(
                 workspace_mount.display()
             ));
         }
-        let lifted = caller
-            .spec
+        let lifted = caller_spec
             .mounts
             .iter()
             .filter(|c| m.sandbox.starts_with(&c.sandbox))
@@ -1477,10 +1493,9 @@ fn check_grant(
             ));
         }
     }
-    let before: BTreeSet<String> = caller.warnings.iter().map(ToString::to_string).collect();
+    let before: BTreeSet<String> = caller.all_warnings().map(ToString::to_string).collect();
     if let Some(new) = granted
-        .warnings
-        .iter()
+        .all_warnings()
         .map(ToString::to_string)
         .find(|w| !before.contains(w))
     {

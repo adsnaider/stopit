@@ -14,10 +14,12 @@
 //! consults `.gitignore` or other ignore files: secrets such as `.env` are
 //! typically gitignored and must still be found.
 
+use std::collections::HashMap;
 use std::fs::FileType;
 use std::io;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use thiserror::Error;
 use walkdir::WalkDir;
@@ -70,6 +72,13 @@ pub struct ResolvedPath {
     pub kind: EntryKind,
 }
 
+fn clone_io_error(error: &io::Error) -> io::Error {
+    match error.raw_os_error() {
+        Some(code) => io::Error::from_raw_os_error(code),
+        None => io::Error::new(error.kind(), error.to_string()),
+    }
+}
+
 /// A non-fatal problem found while resolving a pattern.
 #[derive(Debug, Error)]
 pub enum ResolveWarning {
@@ -92,13 +101,125 @@ pub enum ResolveWarning {
     },
 }
 
+impl Clone for ResolveWarning {
+    fn clone(&self) -> Self {
+        match self {
+            ResolveWarning::Missing { path } => ResolveWarning::Missing { path: path.clone() },
+            ResolveWarning::Io { path, error } => ResolveWarning::Io {
+                path: path.clone(),
+                error: clone_io_error(error),
+            },
+        }
+    }
+}
+
 /// The outcome of [`resolve`].
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Resolution {
     /// The matching paths, sorted by host path and deduplicated.
     pub paths: Vec<ResolvedPath>,
     /// Non-fatal problems, in the order they were found.
     pub warnings: Vec<ResolveWarning>,
+}
+
+/// Per-compile cache of glob directory walks and pattern resolutions.
+#[derive(Debug, Default)]
+pub struct ResolveCache {
+    walks: HashMap<(PathBuf, Option<usize>), Arc<CachedWalk>>,
+    resolutions: HashMap<ExpandedPattern, Resolution>,
+    symlink_metas: HashMap<PathBuf, Result<EntryKind, io::Error>>,
+}
+
+#[derive(Debug)]
+enum CachedWalk {
+    RootError(io::Error),
+    Steps(Vec<WalkStep>),
+}
+
+#[derive(Debug)]
+enum WalkStep {
+    Entry {
+        host: PathBuf,
+        relative: PathBuf,
+        kind: EntryKind,
+    },
+    Error {
+        path: PathBuf,
+        error: io::Error,
+    },
+}
+
+impl ResolveCache {
+    /// Caches `path.symlink_metadata()` across rules and profiles within a
+    /// single compile pass.
+    pub(crate) fn symlink_metadata(&mut self, path: &Path) -> Result<EntryKind, io::Error> {
+        if let Some(res) = self.symlink_metas.get(path) {
+            return match res {
+                Ok(kind) => Ok(*kind),
+                Err(err) => Err(clone_io_error(err)),
+            };
+        }
+        let res = path
+            .symlink_metadata()
+            .map(|meta| EntryKind::from_file_type(meta.file_type()));
+        let stored = match &res {
+            Ok(kind) => Ok(*kind),
+            Err(err) => Err(clone_io_error(err)),
+        };
+        self.symlink_metas.insert(path.to_owned(), stored);
+        res
+    }
+
+    fn walk(&mut self, root: &Path, max_depth: Option<usize>) -> Arc<CachedWalk> {
+        let key = (root.to_owned(), max_depth);
+        if let Some(cached) = self.walks.get(&key) {
+            return cached.clone();
+        }
+        let built = match root.metadata() {
+            Err(error) => CachedWalk::RootError(error),
+            Ok(_) => {
+                let mut walk = WalkDir::new(root)
+                    .follow_links(false)
+                    // The root is on the way to every match, like the components before
+                    // it, so a link there is followed; links below it never are.
+                    .follow_root_links(true)
+                    .min_depth(1);
+                if let Some(d) = max_depth {
+                    walk = walk.max_depth(d);
+                }
+                let mut steps = Vec::new();
+                for entry in walk {
+                    match entry {
+                        Ok(entry) => {
+                            let relative = entry
+                                .path()
+                                .strip_prefix(root)
+                                .expect("walkdir yields paths below its root")
+                                .to_owned();
+                            let kind = EntryKind::from_file_type(entry.file_type());
+                            let host = entry.into_path();
+                            steps.push(WalkStep::Entry {
+                                host,
+                                relative,
+                                kind,
+                            });
+                        }
+                        Err(err) => {
+                            let path = err.path().unwrap_or(root).to_owned();
+                            steps.push(WalkStep::Error {
+                                path,
+                                error: err.into(),
+                            });
+                        }
+                    }
+                }
+                CachedWalk::Steps(steps)
+            }
+        };
+        let arc = Arc::new(built);
+        self.walks.insert(key, arc.clone());
+        arc
+    }
 }
 
 impl Resolution {
@@ -116,13 +237,11 @@ impl Resolution {
         });
     }
 
-    /// Records an error from the glob walk below `root`, classified like
-    /// [`warn_io`](Self::warn_io): an entry that vanished during the walk
-    /// (or whose directory was replaced by a non-directory) is `Missing`,
-    /// anything else (e.g. an unreadable directory) is `Io`.
-    fn warn_walk(&mut self, root: &Path, err: walkdir::Error) {
-        let path = err.path().unwrap_or(root).to_owned();
-        self.warn_io(path.clone(), path, err.into());
+    #[cfg(test)]
+    fn warn_walk(&mut self, walk_root: &Path, err: walkdir::Error) {
+        let failing = err.path().unwrap_or(walk_root).to_owned();
+        let error: io::Error = err.into();
+        self.warn_io(failing.clone(), failing, error);
     }
 
     fn finish(mut self) -> Self {
@@ -157,22 +276,37 @@ impl Resolution {
 /// A validated [`PathPattern`](crate::manifest::PathPattern) never has one,
 /// so this is defensive.
 pub fn resolve(pattern: &ExpandedPattern) -> Result<Resolution, ExpandError> {
-    let res = if pattern.has_glob() {
-        resolve_glob(pattern)?
-    } else {
-        resolve_literal(pattern)
-    };
-    Ok(res.finish())
+    let mut cache = ResolveCache::default();
+    resolve_with_cache(pattern, &mut cache)
 }
 
-fn resolve_literal(pattern: &ExpandedPattern) -> Resolution {
+/// Resolves `pattern` against the host filesystem, reusing walks and
+/// pattern resolutions stored in `cache`.
+pub fn resolve_with_cache(
+    pattern: &ExpandedPattern,
+    cache: &mut ResolveCache,
+) -> Result<Resolution, ExpandError> {
+    if let Some(cached) = cache.resolutions.get(pattern) {
+        return Ok(cached.clone());
+    }
+    let res = if pattern.has_glob() {
+        resolve_glob_with_cache(pattern, cache)?
+    } else {
+        resolve_literal_with_cache(pattern, cache)
+    };
+    let finished = res.finish();
+    cache.resolutions.insert(pattern.clone(), finished.clone());
+    Ok(finished)
+}
+
+fn resolve_literal_with_cache(pattern: &ExpandedPattern, cache: &mut ResolveCache) -> Resolution {
     let mut res = Resolution::default();
     let rel = pattern.rest();
     let host = join(pattern.host_anchor(), rel);
-    match host.symlink_metadata() {
-        Ok(meta) => res.paths.push(ResolvedPath {
+    match cache.symlink_metadata(&host) {
+        Ok(kind) => res.paths.push(ResolvedPath {
             sandbox: join(pattern.sandbox_anchor(), rel),
-            kind: EntryKind::from_file_type(meta.file_type()),
+            kind,
             host,
         }),
         Err(error) => res.warn_io(join(pattern.host_anchor(), pattern.rest()), host, error),
@@ -180,7 +314,10 @@ fn resolve_literal(pattern: &ExpandedPattern) -> Resolution {
     res
 }
 
-fn resolve_glob(pattern: &ExpandedPattern) -> Result<Resolution, ExpandError> {
+fn resolve_glob_with_cache(
+    pattern: &ExpandedPattern,
+    cache: &mut ResolveCache,
+) -> Result<Resolution, ExpandError> {
     // `rest` comes from a validated UTF-8 pattern, so this is lossless.
     let rest = pattern.rest().to_string_lossy();
     let components: Vec<&str> = rest.split('/').collect();
@@ -201,40 +338,39 @@ fn resolve_glob(pattern: &ExpandedPattern) -> Result<Resolution, ExpandError> {
     let root = join(pattern.host_anchor(), &prefix);
     debug_assert_eq!(pattern.walk_root().as_ref(), Some(&root));
     let sandbox_root = join(pattern.sandbox_anchor(), &prefix);
-    if let Err(error) = root.metadata() {
-        res.warn_io(join(pattern.host_anchor(), &prefix), root, error);
-        return Ok(res);
-    }
-
-    let mut walk = WalkDir::new(&root)
-        .follow_links(false)
-        // The root is on the way to every match, like the components before
-        // it, so a link there is followed; links below it never are.
-        .follow_root_links(true)
-        .min_depth(1);
-    if !remainder.contains("**") {
-        // Without `**` every match has exactly this many components. This is
-        // only an optimisation: matching alone is correct.
-        walk = walk.max_depth(components.len() - split);
-    }
-    for entry in walk {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(err) => {
-                res.warn_walk(&root, err);
-                continue;
+    // Without `**` every match has exactly this many components. This is
+    // only an optimisation: matching alone is correct.
+    let max_depth = (!remainder.contains("**")).then_some(components.len() - split);
+    let walk = cache.walk(&root, max_depth);
+    match walk.as_ref() {
+        CachedWalk::RootError(error) => {
+            res.warn_io(
+                join(pattern.host_anchor(), &prefix),
+                root,
+                clone_io_error(error),
+            );
+        }
+        CachedWalk::Steps(steps) => {
+            for step in steps {
+                match step {
+                    WalkStep::Error { path, error } => {
+                        res.warn_io(path.clone(), path.clone(), clone_io_error(error));
+                    }
+                    WalkStep::Entry {
+                        host,
+                        relative,
+                        kind,
+                    } => {
+                        if matcher.is_match(relative) {
+                            res.paths.push(ResolvedPath {
+                                host: host.clone(),
+                                sandbox: sandbox_root.join(relative),
+                                kind: *kind,
+                            });
+                        }
+                    }
+                }
             }
-        };
-        let relative = entry
-            .path()
-            .strip_prefix(&root)
-            .expect("walkdir yields paths below its root");
-        if matcher.is_match(relative) {
-            res.paths.push(ResolvedPath {
-                host: entry.path().to_owned(),
-                sandbox: sandbox_root.join(relative),
-                kind: EntryKind::from_file_type(entry.file_type()),
-            });
         }
     }
     Ok(res)

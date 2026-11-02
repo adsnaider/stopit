@@ -23,5 +23,5 @@ pub use merge::{
 pub(crate) use paths::hidden_note;
 pub use paths::{
     EphemeralKey, MountConflict, MountPlan, MountSource, PathPlanError, PlanWarning,
-    PlanWarningKind, PlannedMount, WalkRootLink, plan_mounts,
+    PlanWarningKind, PlannedMount, WalkRootLink, plan_mounts, plan_mounts_with_cache,
 };

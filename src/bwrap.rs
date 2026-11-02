@@ -501,13 +501,12 @@ impl BwrapCommand {
             if mount.mode == PathMode::Rw
                 && let MountSource::Host { path, .. } = &mount.source
             {
-                let canon = spec
-                    .canonical_sources
-                    .get(&mount.sandbox)
-                    .cloned()
-                    .or_else(|| fs::canonicalize(path).ok())
-                    .unwrap_or_else(|| path.clone());
-                untrusted_roots.insert(canon);
+                if let Some(canon) = spec.canonical_sources.get(&mount.sandbox) {
+                    untrusted_roots.insert(canon.clone());
+                } else if !untrusted_roots.contains(path) {
+                    let canon = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+                    untrusted_roots.insert(canon);
+                }
             }
         }
         ensure_ephemeral_parents(spec, session)?;
@@ -520,7 +519,7 @@ impl BwrapCommand {
             argv_after_prefix,
             terminal,
             retain_init_caps,
-            &|path| path.symlink_metadata().is_ok(),
+            &host_proc_has,
             &|path| Some(fs::symlink_metadata(path)),
             &mut |sandbox, key| {
                 session
@@ -1054,6 +1053,21 @@ fn checked(arg: &OsStr) -> Result<OsString, BwrapError> {
         });
     }
     Ok(arg.to_os_string())
+}
+
+/// Checks whether a `/proc` optional mask path exists on the host, caching the
+/// result for [`PROC_OPTIONAL_MASKS`] across the lifetime of the process.
+fn host_proc_has(path: &Path) -> bool {
+    static PRESENT: std::sync::OnceLock<[bool; PROC_OPTIONAL_MASKS.len()]> =
+        std::sync::OnceLock::new();
+    let present = PRESENT.get_or_init(|| {
+        PROC_OPTIONAL_MASKS.map(|p| Path::new(p).symlink_metadata().is_ok())
+    });
+    if let Some(idx) = PROC_OPTIONAL_MASKS.iter().position(|p| Path::new(p) == path) {
+        present[idx]
+    } else {
+        path.symlink_metadata().is_ok()
+    }
 }
 
 /// Generates the invocation for `spec`, whose user has the ids `ids` inside

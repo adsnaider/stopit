@@ -27,7 +27,7 @@
 //! is checked against stopit's own state directories (§6.2, "Reserved host
 //! paths").
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
@@ -35,23 +35,24 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rustix::io::Errno;
 use thiserror::Error;
 
 use crate::config::{Config, ProfileRef, ProviderName};
 use crate::error::is_missing;
-use crate::expand::{EntryKind, ExpansionContext, expand_bind, expand_pattern};
+use crate::expand::{EntryKind, ExpansionContext, ResolveCache, expand_bind, expand_pattern};
 use crate::manifest::{
-    BindMode, DevMode, Domain, EtcFile, GroupName, OptInSyscall, SandboxHome, ShareableNamespace,
-    ShimName, ShimSpec,
+    BindMode, DevMode, Domain, EtcFile, Grants, GroupName, OptInSyscall, SandboxHome,
+    ShareableNamespace, ShimName, ShimSpec,
 };
 use crate::policy::{NetworkMode, PathMode};
 use crate::provider::{ProtectedSource, ProviderOutput, SUPERVISOR_PROVIDER_NAME};
 use crate::resolve::{
     EffectiveEnv, EffectiveGrants, EffectiveNetwork, MergeError, MountPlan, MountSource,
     PathPlanError, PlanWarning, PlannedMount, ProfileError, build_profile_graph, hidden_note,
-    merge_profiles, plan_mounts,
+    merge_profiles, plan_mounts_with_cache,
 };
 use crate::state::{StateDir, StateDirs};
 
@@ -347,14 +348,143 @@ pub enum SpecWarning {
     },
 }
 
-/// A compiled profile: its spec and the warnings found building it.
+fn clone_io_error(error: &io::Error) -> io::Error {
+    if let Some(code) = error.raw_os_error() {
+        io::Error::from_raw_os_error(code)
+    } else {
+        io::Error::new(error.kind(), error.to_string())
+    }
+}
+
+impl Clone for SpecWarning {
+    fn clone(&self) -> Self {
+        match self {
+            SpecWarning::Mount(w) => SpecWarning::Mount(w.clone()),
+            SpecWarning::DestinationLink(w) => SpecWarning::DestinationLink(w.clone()),
+            SpecWarning::DestinationUnchecked {
+                provider,
+                sandbox,
+                path,
+                error,
+            } => SpecWarning::DestinationUnchecked {
+                provider: provider.clone(),
+                sandbox: sandbox.clone(),
+                path: path.clone(),
+                error: clone_io_error(error),
+            },
+            SpecWarning::DestinationMasked(w) => SpecWarning::DestinationMasked(w.clone()),
+            SpecWarning::GrantHidden(w) => SpecWarning::GrantHidden(w.clone()),
+            SpecWarning::SocketScanMasked(w) => SpecWarning::SocketScanMasked(w.clone()),
+            SpecWarning::SourceUnresolved(w) => SpecWarning::SourceUnresolved(w.clone()),
+            SpecWarning::SourceUnderMask(w, p) => {
+                SpecWarning::SourceUnderMask(w.clone(), p.clone())
+            }
+            SpecWarning::MaskSourceUnresolved(w) => SpecWarning::MaskSourceUnresolved(w.clone()),
+            SpecWarning::SourceLink(w) => SpecWarning::SourceLink(w.clone()),
+            SpecWarning::GlobLink(w) => SpecWarning::GlobLink(w.clone()),
+            SpecWarning::RestrictedContentExposed(w) => {
+                SpecWarning::RestrictedContentExposed(w.clone())
+            }
+            SpecWarning::WorkspaceRestricted(w) => SpecWarning::WorkspaceRestricted(w.clone()),
+            SpecWarning::LinkedIntoRestricted(w) => SpecWarning::LinkedIntoRestricted(w.clone()),
+            SpecWarning::InsideProtectedSource(w) => SpecWarning::InsideProtectedSource(w.clone()),
+            SpecWarning::StateDirMasked(w) => SpecWarning::StateDirMasked(w.clone()),
+            SpecWarning::DomainsIgnored { mode, domains } => SpecWarning::DomainsIgnored {
+                mode: *mode,
+                domains: domains.clone(),
+            },
+        }
+    }
+}
+
 #[derive(Debug)]
+struct LazySocketScan {
+    canonical_entries: BTreeMap<PathBuf, (PathBuf, EntryKind)>,
+    ws_sandbox: PathBuf,
+    scan_cache: Arc<SocketScanCache>,
+    resolved: OnceLock<(SandboxSpec, Vec<SpecWarning>)>,
+}
+
+impl Clone for LazySocketScan {
+    fn clone(&self) -> Self {
+        let resolved = OnceLock::new();
+        if let Some(val) = self.resolved.get() {
+            let _ = resolved.set(val.clone());
+        }
+        LazySocketScan {
+            canonical_entries: self.canonical_entries.clone(),
+            ws_sandbox: self.ws_sandbox.clone(),
+            scan_cache: Arc::clone(&self.scan_cache),
+            resolved,
+        }
+    }
+}
+
+impl LazySocketScan {
+    fn resolve(&self, base_spec: &SandboxSpec) -> &(SandboxSpec, Vec<SpecWarning>) {
+        self.resolved.get_or_init(|| {
+            let mut warnings = Vec::new();
+            let mounts = mask_rw_sockets_with_cache(
+                base_spec.mounts.clone(),
+                &self.canonical_entries,
+                &self.ws_sandbox,
+                &mut warnings,
+                &self.scan_cache,
+            );
+            let mut canonical_sources = BTreeMap::new();
+            for m in &mounts {
+                if m.mode == PathMode::Masked {
+                    continue;
+                }
+                if let MountSource::Host { path, .. } = &m.source
+                    && let Some((resolved, _)) = self.canonical_entries.get(&m.sandbox)
+                    && resolved != path
+                {
+                    canonical_sources.insert(m.sandbox.clone(), resolved.clone());
+                }
+            }
+            let mut spec = base_spec.clone();
+            spec.mounts = mounts;
+            spec.canonical_sources = canonical_sources;
+            (spec, warnings)
+        })
+    }
+}
+
+/// A compiled profile: its spec and the warnings found building it.
+#[derive(Debug, Clone)]
 pub struct CompiledProfile {
     /// The sandbox description.
     pub spec: SandboxSpec,
     /// Non-fatal problems: mount-planning warnings first (in the plan's
     /// order), then spec-level ones.
     pub warnings: Vec<SpecWarning>,
+    lazy_socket_scan: Option<LazySocketScan>,
+}
+
+impl CompiledProfile {
+    /// Returns the profile's [`SandboxSpec`] with any deferred `mask_rw_sockets`
+    /// scan resolved and cached.
+    pub fn resolved_spec(&self) -> &SandboxSpec {
+        match &self.lazy_socket_scan {
+            Some(lazy) => &lazy.resolve(&self.spec).0,
+            None => &self.spec,
+        }
+    }
+
+    /// Returns any warnings produced by deferred `mask_rw_sockets` scanning.
+    pub fn socket_scan_warnings(&self) -> &[SpecWarning] {
+        match &self.lazy_socket_scan {
+            Some(lazy) => &lazy.resolve(&self.spec).1,
+            None => &[],
+        }
+    }
+
+    /// Returns all compile warnings of the profile, including any from deferred
+    /// `mask_rw_sockets` scanning.
+    pub fn all_warnings(&self) -> impl Iterator<Item = &SpecWarning> {
+        self.warnings.iter().chain(self.socket_scan_warnings())
+    }
 }
 
 /// Error compiling one profile.
@@ -530,6 +660,20 @@ pub struct DestinationMasked {
     pub masked_host: PathBuf,
 }
 
+impl Clone for DestinationMasked {
+    fn clone(&self) -> Self {
+        DestinationMasked {
+            provider: self.provider.clone(),
+            mode: self.mode,
+            sandbox: self.sandbox.clone(),
+            path: self.path.clone(),
+            error: clone_io_error(&self.error),
+            masked: self.masked.clone(),
+            masked_host: self.masked_host.clone(),
+        }
+    }
+}
+
 /// A mount replaced by a mask over a directory that cannot be searched or read.
 /// See [`SpecWarning::GrantHidden`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -576,6 +720,19 @@ pub struct SocketScanMasked {
     pub masked_host: PathBuf,
 }
 
+impl Clone for SocketScanMasked {
+    fn clone(&self) -> Self {
+        SocketScanMasked {
+            provider: self.provider.clone(),
+            mount_sandbox: self.mount_sandbox.clone(),
+            path: self.path.clone(),
+            error: clone_io_error(&self.error),
+            masked: self.masked.clone(),
+            masked_host: self.masked_host.clone(),
+        }
+    }
+}
+
 /// A mount's host source cannot be resolved to a canonical path (see
 /// [`SpecWarning::SourceUnresolved`], [`SpecWarning::SourceUnderMask`] and
 /// [`SpecWarning::MaskSourceUnresolved`]).
@@ -602,6 +759,19 @@ pub struct SourceUnresolved {
     /// What went wrong resolving it.
     #[source]
     pub error: io::Error,
+}
+
+impl Clone for SourceUnresolved {
+    fn clone(&self) -> Self {
+        SourceUnresolved {
+            provider: self.provider.clone(),
+            mode: self.mode,
+            host: self.host.clone(),
+            sandbox: self.sandbox.clone(),
+            link: self.link.clone(),
+            error: clone_io_error(&self.error),
+        }
+    }
 }
 
 /// A mount's host source runs through a symlink inside an untrusted root, a
@@ -1348,16 +1518,25 @@ fn check_mount_destinations(
 ///
 /// `ctx`'s host workspace is canonical by contract, and is one of `roots`.
 /// Paths are compared by component.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn check_host_sources(
     mounts: Vec<PlannedMount>,
     mask_sockets: bool,
+    defer_socket_scan: bool,
+    scan_cache: &Arc<SocketScanCache>,
     ctx: &ExpansionContext,
     roots: &UntrustedRoots,
     protected: &[SourceToProtect<'_>],
     state: &StateDirs,
     warnings: &mut Vec<SpecWarning>,
-) -> Result<(Vec<PlannedMount>, BTreeMap<PathBuf, PathBuf>), SpecError> {
+) -> Result<
+    (
+        Vec<PlannedMount>,
+        BTreeMap<PathBuf, PathBuf>,
+        Option<LazySocketScan>,
+    ),
+    SpecError,
+> {
     let ws_host = ctx.workspace_host();
     let ws_sandbox = ctx.workspace_sandbox();
     // The sandbox paths of the masked directories, none of which is dropped
@@ -1515,15 +1694,27 @@ fn check_host_sources(
     let mounts = protect_sources(mounts, &rw_sources, protected, state, warnings);
     let workspace = (ws_host, ctx.workspace_sandbox());
     let mounts = check_state_dirs(mounts, &canonical, workspace, state, warnings)?;
-    let mounts = if mask_sockets {
-        mask_rw_sockets(
+    let (mounts, lazy_socket_scan) = match (mask_sockets, defer_socket_scan) {
+        (true, true) => (
             mounts,
-            &canonical_entries,
-            ctx.workspace_sandbox(),
-            warnings,
-        )
-    } else {
-        mounts
+            Some(LazySocketScan {
+                canonical_entries: canonical_entries.clone(),
+                ws_sandbox: ctx.workspace_sandbox().to_owned(),
+                scan_cache: Arc::clone(scan_cache),
+                resolved: OnceLock::new(),
+            }),
+        ),
+        (true, false) => (
+            mask_rw_sockets_with_cache(
+                mounts,
+                &canonical_entries,
+                ctx.workspace_sandbox(),
+                warnings,
+                scan_cache,
+            ),
+            None,
+        ),
+        (false, _) => (mounts, None),
     };
     let mut canonical_sources = BTreeMap::new();
     for m in &mounts {
@@ -1537,7 +1728,147 @@ fn check_host_sources(
             canonical_sources.insert(m.sandbox.clone(), resolved.clone());
         }
     }
-    Ok((mounts, canonical_sources))
+    Ok((mounts, canonical_sources, lazy_socket_scan))
+}
+
+#[derive(Debug, Clone)]
+enum DirScanOutcome {
+    Missing,
+    ReadError(Arc<io::Error>),
+    Unsearchable {
+        names: Vec<OsString>,
+    },
+    Ok {
+        subdirs: Vec<OsString>,
+        sockets: Vec<OsString>,
+    },
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SocketScanCache {
+    dirs: Mutex<HashMap<PathBuf, DirScanOutcome>>,
+}
+
+fn scan_one_dir(dir_host: &Path) -> DirScanOutcome {
+    let entries = match fs::read_dir(dir_host) {
+        Ok(entries) => entries,
+        Err(err) if is_missing(err.kind()) => return DirScanOutcome::Missing,
+        Err(error) => return DirScanOutcome::ReadError(Arc::new(error)),
+    };
+    let mut probed = false;
+    let mut unsearchable = false;
+    let mut subdirs = Vec::new();
+    let mut sockets = Vec::new();
+    let mut all_names = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) if is_missing(err.kind()) => continue,
+            Err(error) => return DirScanOutcome::ReadError(Arc::new(error)),
+        };
+        let name = entry.file_name();
+        if !probed {
+            let child_host = dir_host.join(&name);
+            match fs::symlink_metadata(&child_host) {
+                Ok(_) => probed = true,
+                Err(err) if is_missing(err.kind()) => continue,
+                Err(_) => {
+                    probed = true;
+                    unsearchable = true;
+                }
+            }
+        }
+        if unsearchable {
+            all_names.push(name);
+            continue;
+        }
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(err) if is_missing(err.kind()) => continue,
+            Err(error) => return DirScanOutcome::ReadError(Arc::new(error)),
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            subdirs.push(name);
+        } else if ft.is_socket() {
+            sockets.push(name);
+        }
+    }
+    if unsearchable {
+        DirScanOutcome::Unsearchable { names: all_names }
+    } else {
+        DirScanOutcome::Ok { subdirs, sockets }
+    }
+}
+
+fn populate_socket_scan_cache(
+    roots: &[(PathBuf, PathBuf)],
+    at: &BTreeSet<PathBuf>,
+    cache: &SocketScanCache,
+) {
+    let mut frontier: Vec<(PathBuf, PathBuf)> = roots.to_vec();
+    while !frontier.is_empty() {
+        let uncached: Vec<PathBuf> = {
+            let guard = cache.dirs.lock().unwrap_or_else(|e| e.into_inner());
+            let mut set = BTreeSet::new();
+            for (dir_host, _) in &frontier {
+                if !guard.contains_key(dir_host) {
+                    set.insert(dir_host.clone());
+                }
+            }
+            set.into_iter().collect()
+        };
+        if uncached.len() == 1 {
+            let dir = uncached.into_iter().next().unwrap();
+            let outcome = scan_one_dir(&dir);
+            cache
+                .dirs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(dir, outcome);
+        } else if uncached.len() > 1 {
+            let workers = uncached.len().min(8);
+            let chunk_size = uncached.len().div_ceil(workers);
+            let scanned: Vec<(PathBuf, DirScanOutcome)> = std::thread::scope(|s| {
+                let handles: Vec<_> = uncached
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        s.spawn(move || {
+                            chunk
+                                .iter()
+                                .map(|dir| (dir.clone(), scan_one_dir(dir)))
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().expect("socket scan worker panicked"))
+                    .collect()
+            });
+            let mut guard = cache.dirs.lock().unwrap_or_else(|e| e.into_inner());
+            for (dir, outcome) in scanned {
+                guard.insert(dir, outcome);
+            }
+        }
+        let mut next_frontier = Vec::new();
+        {
+            let guard = cache.dirs.lock().unwrap_or_else(|e| e.into_inner());
+            for (dir_host, dir_sandbox) in frontier {
+                if let Some(DirScanOutcome::Ok { subdirs, .. }) = guard.get(&dir_host) {
+                    for name in subdirs {
+                        let child_sandbox = dir_sandbox.join(name);
+                        if !at.contains(&child_sandbox) {
+                            next_frontier.push((dir_host.join(name), child_sandbox));
+                        }
+                    }
+                }
+            }
+        }
+        frontier = next_frontier;
+    }
 }
 
 /// Scans every kept `rw` host directory mount for Unix domain sockets
@@ -1549,11 +1880,12 @@ fn check_host_sources(
 /// unreadable or unsearchable directories inside a scanned mount as directories
 /// with [`SpecWarning::SocketScanMasked`] so the sandbox cannot uncover sockets
 /// hidden inside them.
-fn mask_rw_sockets(
+fn mask_rw_sockets_with_cache(
     mut mounts: Vec<PlannedMount>,
     canonical: &BTreeMap<PathBuf, (PathBuf, EntryKind)>,
     ws_sandbox: &Path,
     warnings: &mut Vec<SpecWarning>,
+    cache: &SocketScanCache,
 ) -> Vec<PlannedMount> {
     let stopit: ProviderName = SUPERVISOR_PROVIDER_NAME
         .parse()
@@ -1561,6 +1893,27 @@ fn mask_rw_sockets(
     let at: BTreeSet<PathBuf> = mounts.iter().map(|m| m.sandbox.clone()).collect();
     let mut added: BTreeMap<PathBuf, PlannedMount> = BTreeMap::new();
     let mut replace_rw: BTreeSet<PathBuf> = BTreeSet::new();
+
+    let mut roots = Vec::new();
+    for m in &mounts {
+        let granted_ro = m.mode == PathMode::Ro && m.provider == stopit;
+        if m.mode != PathMode::Rw && !granted_ro {
+            continue;
+        }
+        let MountSource::Host { path: host, kind } = &m.source else {
+            continue;
+        };
+        let (root_host, root_kind) = canonical
+            .get(&m.sandbox)
+            .map(|(p, k)| (p.as_path(), *k))
+            .unwrap_or((host.as_path(), *kind));
+        if root_kind != EntryKind::Dir {
+            continue;
+        }
+        roots.push((root_host.to_owned(), m.sandbox.clone()));
+    }
+    populate_socket_scan_cache(&roots, &at, cache);
+    let cache_guard = cache.dirs.lock().unwrap_or_else(|e| e.into_inner());
 
     for m in &mounts {
         let granted_ro = m.mode == PathMode::Ro && m.provider == stopit;
@@ -1579,92 +1932,89 @@ fn mask_rw_sockets(
         }
         let mut stack = vec![(root_host.to_owned(), m.sandbox.clone())];
         while let Some((dir_host, dir_sandbox)) = stack.pop() {
-            let entries = match fs::read_dir(&dir_host) {
-                Ok(entries) => entries,
-                Err(err) if is_missing(err.kind()) => continue,
-                Err(error) => {
+            let Some(outcome) = cache_guard.get(&dir_host) else {
+                continue;
+            };
+            match outcome {
+                DirScanOutcome::Missing => continue,
+                DirScanOutcome::ReadError(err) => {
                     mask_unreadable_rw_dir(
                         m,
                         &dir_sandbox,
                         &dir_host,
                         dir_host.clone(),
-                        error,
+                        clone_io_error(err),
                         ws_sandbox,
                         &stopit,
                         &mut added,
                         &mut replace_rw,
                         warnings,
                     );
-                    continue;
                 }
-            };
-            let mut dir_failure = None;
-            let mut subdirs = Vec::new();
-            let mut sockets = Vec::new();
-            for entry in entries {
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(err) if is_missing(err.kind()) => continue,
-                    Err(error) => {
-                        dir_failure = Some((dir_host.clone(), error));
-                        break;
+                DirScanOutcome::Unsearchable { names } => {
+                    let mut dir_failure = None;
+                    for name in names {
+                        let child_sandbox = dir_sandbox.join(name);
+                        if at.contains(&child_sandbox) {
+                            continue;
+                        }
+                        let child_host = dir_host.join(name);
+                        match fs::symlink_metadata(&child_host) {
+                            Ok(_) => {}
+                            Err(err) if is_missing(err.kind()) => continue,
+                            Err(error) => {
+                                dir_failure = Some((child_host, error));
+                                break;
+                            }
+                        }
                     }
-                };
-                let name = entry.file_name();
-                let child_sandbox = dir_sandbox.join(&name);
-                if at.contains(&child_sandbox) {
-                    continue;
-                }
-                let child_host = dir_host.join(&name);
-                let meta = match fs::symlink_metadata(&child_host) {
-                    Ok(meta) => meta,
-                    Err(err) if is_missing(err.kind()) => continue,
-                    Err(error) => {
-                        dir_failure = Some((child_host, error));
-                        break;
+                    if let Some((failed_path, error)) = dir_failure {
+                        mask_unreadable_rw_dir(
+                            m,
+                            &dir_sandbox,
+                            &dir_host,
+                            failed_path,
+                            error,
+                            ws_sandbox,
+                            &stopit,
+                            &mut added,
+                            &mut replace_rw,
+                            warnings,
+                        );
                     }
-                };
-                let ft = meta.file_type();
-                if ft.is_symlink() {
-                    continue;
                 }
-                if ft.is_dir() {
-                    subdirs.push((child_host, child_sandbox));
-                } else if ft.is_socket() {
-                    sockets.push((child_host, child_sandbox));
+                DirScanOutcome::Ok { subdirs, sockets } => {
+                    for name in sockets {
+                        let child_sandbox = dir_sandbox.join(name);
+                        if at.contains(&child_sandbox) {
+                            continue;
+                        }
+                        let child_host = dir_host.join(name);
+                        added
+                            .entry(child_sandbox.clone())
+                            .or_insert_with(|| PlannedMount {
+                                sandbox: child_sandbox,
+                                source: MountSource::Host {
+                                    path: child_host,
+                                    kind: EntryKind::Socket,
+                                },
+                                mode: PathMode::Masked,
+                                provider: stopit.clone(),
+                                glob_link: false,
+                            });
+                    }
+                    let mut child_dirs: Vec<(PathBuf, PathBuf)> = subdirs
+                        .iter()
+                        .filter_map(|name| {
+                            let child_sandbox = dir_sandbox.join(name);
+                            (!at.contains(&child_sandbox))
+                                .then(|| (dir_host.join(name), child_sandbox))
+                        })
+                        .collect();
+                    child_dirs.sort_by(|a, b| b.1.cmp(&a.1));
+                    stack.extend(child_dirs);
                 }
             }
-            if let Some((failed_path, error)) = dir_failure {
-                mask_unreadable_rw_dir(
-                    m,
-                    &dir_sandbox,
-                    &dir_host,
-                    failed_path,
-                    error,
-                    ws_sandbox,
-                    &stopit,
-                    &mut added,
-                    &mut replace_rw,
-                    warnings,
-                );
-                continue;
-            }
-            for (child_host, child_sandbox) in sockets {
-                added
-                    .entry(child_sandbox.clone())
-                    .or_insert_with(|| PlannedMount {
-                        sandbox: child_sandbox,
-                        source: MountSource::Host {
-                            path: child_host,
-                            kind: EntryKind::Socket,
-                        },
-                        mode: PathMode::Masked,
-                        provider: stopit.clone(),
-                        glob_link: false,
-                    });
-            }
-            subdirs.sort_by(|a, b| b.1.cmp(&a.1));
-            stack.extend(subdirs);
         }
     }
 
@@ -3018,10 +3368,22 @@ fn compile_profile(
     ctx: &ExpansionContext,
     state: &StateDirs,
 ) -> Result<CompiledProfile, SpecError> {
-    let planned = plan_profile(grants, ctx)?;
+    let mut resolve_cache = ResolveCache::default();
+    let planned = plan_profile(grants, ctx, &mut resolve_cache)?;
     let mut roots = UntrustedRoots::new(ctx.workspace_host());
     roots.add_rw_mounts(None, &planned.plan.mounts);
-    finish_profile(planned, grants, parent, ctx, &roots, &[], state)
+    let scan_cache = Arc::new(SocketScanCache::default());
+    finish_profile_inner(
+        planned,
+        grants,
+        parent,
+        ctx,
+        &roots,
+        &[],
+        state,
+        false,
+        &scan_cache,
+    )
 }
 
 /// A profile whose mounts are planned but not yet checked against the
@@ -3037,10 +3399,11 @@ struct PlannedProfile {
 fn plan_profile(
     grants: &EffectiveGrants,
     ctx: &ExpansionContext,
+    cache: &mut ResolveCache,
 ) -> Result<PlannedProfile, SpecError> {
     let home = grants.system.home.clone().unwrap_or_default();
     check_reserved_paths(ctx.workspace_sandbox(), Path::new(home.as_str()))?;
-    let plan = plan_mounts(&grants.fs, &ctx.with_sandbox_home(&home))?;
+    let plan = plan_mounts_with_cache(&grants.fs, &ctx.with_sandbox_home(&home), cache)?;
     check_mount_destinations(&plan.mounts, synthesizes_resolv_conf(grants))?;
     Ok(PlannedProfile { home, plan })
 }
@@ -3067,7 +3430,8 @@ fn synthesizes_resolv_conf(grants: &EffectiveGrants) -> bool {
 /// mount's source is not checked, and it exposes nothing. A restrictive mount
 /// that fails both checks (a `~` rule below an `rw` grant of its parent,
 /// through a planted link) is reported by the destination check.
-fn finish_profile(
+#[allow(clippy::too_many_arguments)]
+fn finish_profile_inner(
     planned: PlannedProfile,
     grants: &EffectiveGrants,
     parent: Option<&EffectiveGrants>,
@@ -3075,14 +3439,18 @@ fn finish_profile(
     roots: &UntrustedRoots,
     protected: &[SourceToProtect<'_>],
     state: &StateDirs,
+    defer_socket_scan: bool,
+    scan_cache: &Arc<SocketScanCache>,
 ) -> Result<CompiledProfile, SpecError> {
     let PlannedProfile { home, plan } = planned;
     let mut warnings: Vec<SpecWarning> = plan.warnings.into_iter().map(Into::into).collect();
     let mounts =
         check_destination_links(plan.mounts, ctx.workspace_sandbox(), roots, &mut warnings)?;
-    let (mounts, canonical_sources) = check_host_sources(
+    let (mounts, canonical_sources, lazy_socket_scan) = check_host_sources(
         mounts,
         grants.mask_sockets,
+        defer_socket_scan,
+        scan_cache,
         ctx,
         roots,
         protected,
@@ -3122,7 +3490,11 @@ fn finish_profile(
         shims: grants.shims.clone(),
         grant: grants.sandbox.grant,
     };
-    Ok(CompiledProfile { spec, warnings })
+    Ok(CompiledProfile {
+        spec,
+        warnings,
+        lazy_socket_scan,
+    })
 }
 
 /// The network spec for `network`, dropping `allow_domains` outside proxy
@@ -3155,12 +3527,14 @@ fn network_spec(
 }
 
 /// Every profile of a session, compiled.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompiledSession {
     profiles: BTreeMap<ProfileRef, CompiledProfile>,
     /// Every profile exactly once, parents before children (the profile
     /// graph's order).
     order: Vec<ProfileRef>,
+    roots: UntrustedRoots,
+    scan_cache: Arc<SocketScanCache>,
 }
 
 impl CompiledSession {
@@ -3195,6 +3569,117 @@ impl CompiledSession {
     /// Always false: `main` always exists.
     pub fn is_empty(&self) -> bool {
         self.profiles.is_empty()
+    }
+
+    /// Whether `path` is already one of the session's canonical untrusted roots.
+    pub(crate) fn has_untrusted_root(&self, path: &Path) -> bool {
+        self.roots.roots.iter().any(|r| r.path == path)
+    }
+
+    /// Returns a clone of this session with `profile` removed.
+    pub(crate) fn without_profile(&self, profile: &ProfileRef) -> CompiledSession {
+        let mut profiles = self.profiles.clone();
+        profiles.remove(profile);
+        let order = self
+            .order
+            .iter()
+            .filter(|p| *p != profile)
+            .cloned()
+            .collect();
+        let mut roots = self.roots.clone();
+        for root in &mut roots.roots {
+            if matches!(&root.kind, UntrustedKind::RwGrant { profile: Some(p), .. } if p == profile)
+            {
+                root.kind = UntrustedKind::Granted;
+            }
+        }
+        CompiledSession {
+            profiles,
+            order,
+            roots,
+            scan_cache: Arc::clone(&self.scan_cache),
+        }
+    }
+
+    pub(crate) fn scan_cache(&self) -> Arc<SocketScanCache> {
+        Arc::clone(&self.scan_cache)
+    }
+
+    /// Fast path for compiling a single contributed leaf profile (`stopit.grant`
+    /// or `stopit.proxy`) when `UntrustedRoots` is unchanged: plans and finishes
+    /// only the leaf profile and clones all other profiles from `self`.
+    /// Returns `Ok(None)` if `extra` is not a single new contributed profile or
+    /// if its mounts introduce a new `rw` untrusted root.
+    pub(crate) fn compile_extra_profile_lazy(
+        &self,
+        config: &Config,
+        base_outputs: &[(ProviderName, ProviderOutput)],
+        extra: (ProviderName, ProviderOutput),
+        protected: &[ProtectedSource],
+        state: &StateDirs,
+        ctx: &ExpansionContext,
+    ) -> Result<Option<CompiledSession>, CompileError> {
+        if extra.1.manifest.grants != Grants::default() || extra.1.manifest.profiles.len() != 1 {
+            return Ok(None);
+        }
+        let local_name = extra
+            .1
+            .manifest
+            .profiles
+            .keys()
+            .next()
+            .expect("checked len == 1");
+        let target = ProfileRef::contributed(&extra.0, local_name);
+        if self.profiles.contains_key(&target) {
+            return Ok(None);
+        }
+        let mut outputs = base_outputs.to_vec();
+        outputs.push(extra);
+        let graph = build_profile_graph(config, outputs)?;
+        let merged = merge_profiles(&graph)?;
+        let protected = check_protected_sources(protected)?;
+        let fail = |profile: &ProfileRef| {
+            let profile = profile.clone();
+            move |error| CompileError::Profile {
+                profile,
+                error: Box::new(error),
+            }
+        };
+        let Some(grants) = merged.get(&target) else {
+            return Ok(None);
+        };
+        let mut resolve_cache = ResolveCache::default();
+        let planned = plan_profile(grants, ctx, &mut resolve_cache).map_err(fail(&target))?;
+        let mut test_roots = self.roots.clone();
+        let before_len = test_roots.roots.len();
+        test_roots.add_rw_mounts(Some(&target), &planned.plan.mounts);
+        if test_roots.roots.len() != before_len {
+            return Ok(None);
+        }
+        let parent = graph
+            .get(&target)
+            .and_then(|node| node.parent.as_ref())
+            .map(|p| merged.get(p).expect("every parent is a merged profile"));
+        let compiled_target = finish_profile_inner(
+            planned,
+            grants,
+            parent,
+            ctx,
+            &self.roots,
+            &protected,
+            state,
+            true,
+            &self.scan_cache,
+        )
+        .map_err(fail(&target))?;
+        let mut profiles = self.profiles.clone();
+        profiles.insert(target, compiled_target);
+        Ok(Some(CompiledSession {
+            profiles,
+            order: merged.order().to_vec(),
+            roots: self.roots.clone(),
+            scan_cache: Arc::clone(&self.scan_cache),
+        }))
     }
 }
 
@@ -3252,6 +3737,38 @@ pub enum CompileError {
     },
 }
 
+fn check_protected_sources(
+    protected: &[ProtectedSource],
+) -> Result<Vec<SourceToProtect<'_>>, CompileError> {
+    let protected = protected
+        .iter()
+        .map(|p| match p.path.symlink_metadata() {
+            Ok(meta) if has_rewritable_hard_links(&p.path, &meta) => {
+                Err(CompileError::ProtectedSourceHardLinked {
+                    provider: p.provider.clone(),
+                    path: p.path.clone(),
+                    links: meta.nlink(),
+                })
+            }
+            Ok(meta) => Ok(SourceToProtect {
+                provider: &p.provider,
+                path: &p.path,
+                kind: EntryKind::from_file_type(meta.file_type()),
+            }),
+            Err(e) => Err(CompileError::ProtectedSource {
+                provider: p.provider.clone(),
+                path: p.path.clone(),
+                kind: e.kind(),
+            }),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    debug_assert!(
+        protected.iter().all(|p| p.kind != EntryKind::Symlink),
+        "protected sources are canonical"
+    );
+    Ok(protected)
+}
+
 /// Runs the whole pipeline for a session: builds the profile graph from
 /// `config` and the providers' `outputs` (in merge order, each with its
 /// provider's effective name; see [`build_profile_graph`]), merges every
@@ -3300,34 +3817,77 @@ pub fn compile_session_granted(
     ctx: &ExpansionContext,
     granted: &BTreeSet<PathBuf>,
 ) -> Result<CompiledSession, CompileError> {
+    compile_session_inner(
+        config,
+        outputs,
+        protected,
+        state,
+        ctx,
+        granted,
+        false,
+        Arc::new(SocketScanCache::default()),
+    )
+}
+
+/// [`compile_session_granted`] with `mask_rw_sockets` deferred per profile
+/// until [`CompiledProfile::resolved_spec`] or
+/// [`CompiledProfile::socket_scan_warnings`] is called.
+pub fn compile_session_granted_lazy(
+    config: &Config,
+    outputs: Vec<(ProviderName, ProviderOutput)>,
+    protected: &[ProtectedSource],
+    state: &StateDirs,
+    ctx: &ExpansionContext,
+    granted: &BTreeSet<PathBuf>,
+) -> Result<CompiledSession, CompileError> {
+    compile_session_inner(
+        config,
+        outputs,
+        protected,
+        state,
+        ctx,
+        granted,
+        true,
+        Arc::new(SocketScanCache::default()),
+    )
+}
+
+/// [`compile_session_granted_lazy`] reusing an existing [`SocketScanCache`].
+pub(crate) fn compile_session_granted_lazy_with_cache(
+    config: &Config,
+    outputs: Vec<(ProviderName, ProviderOutput)>,
+    protected: &[ProtectedSource],
+    state: &StateDirs,
+    ctx: &ExpansionContext,
+    granted: &BTreeSet<PathBuf>,
+    scan_cache: Arc<SocketScanCache>,
+) -> Result<CompiledSession, CompileError> {
+    compile_session_inner(
+        config,
+        outputs,
+        protected,
+        state,
+        ctx,
+        granted,
+        true,
+        scan_cache,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_session_inner(
+    config: &Config,
+    outputs: Vec<(ProviderName, ProviderOutput)>,
+    protected: &[ProtectedSource],
+    state: &StateDirs,
+    ctx: &ExpansionContext,
+    granted: &BTreeSet<PathBuf>,
+    defer_socket_scan: bool,
+    scan_cache: Arc<SocketScanCache>,
+) -> Result<CompiledSession, CompileError> {
     let graph = build_profile_graph(config, outputs)?;
     let merged = merge_profiles(&graph)?;
-    let protected = protected
-        .iter()
-        .map(|p| match p.path.symlink_metadata() {
-            Ok(meta) if has_rewritable_hard_links(&p.path, &meta) => {
-                Err(CompileError::ProtectedSourceHardLinked {
-                    provider: p.provider.clone(),
-                    path: p.path.clone(),
-                    links: meta.nlink(),
-                })
-            }
-            Ok(meta) => Ok(SourceToProtect {
-                provider: &p.provider,
-                path: &p.path,
-                kind: EntryKind::from_file_type(meta.file_type()),
-            }),
-            Err(e) => Err(CompileError::ProtectedSource {
-                provider: p.provider.clone(),
-                path: p.path.clone(),
-                kind: e.kind(),
-            }),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    debug_assert!(
-        protected.iter().all(|p| p.kind != EntryKind::Symlink),
-        "protected sources are canonical"
-    );
+    let protected = check_protected_sources(protected)?;
     let fail = |profile: &ProfileRef| {
         let profile = profile.clone();
         move |error| CompileError::Profile {
@@ -3335,27 +3895,48 @@ pub fn compile_session_granted(
             error: Box::new(error),
         }
     };
+    let mut resolve_cache = ResolveCache::default();
     let mut planned = Vec::with_capacity(merged.order().len());
     let mut roots = UntrustedRoots::new(ctx.workspace_host());
+    let is_supervisor_profile = |p: &ProfileRef| p.as_str().starts_with("stopit.");
     for (profile, grants) in merged.iter() {
-        let p = plan_profile(grants, ctx).map_err(fail(profile))?;
-        roots.add_rw_mounts(Some(profile), &p.plan.mounts);
+        let p = plan_profile(grants, ctx, &mut resolve_cache).map_err(fail(profile))?;
+        if !is_supervisor_profile(profile) {
+            roots.add_rw_mounts(Some(profile), &p.plan.mounts);
+        }
         planned.push(p);
     }
     roots.add_granted(granted);
+    for ((profile, _), p) in merged.iter().zip(&planned) {
+        if is_supervisor_profile(profile) {
+            roots.add_rw_mounts(Some(profile), &p.plan.mounts);
+        }
+    }
     let mut profiles = BTreeMap::new();
     for ((profile, grants), p) in merged.iter().zip(planned) {
         let parent = graph
             .get(profile)
             .and_then(|node| node.parent.as_ref())
             .map(|p| merged.get(p).expect("every parent is a merged profile"));
-        let compiled = finish_profile(p, grants, parent, ctx, &roots, &protected, state)
-            .map_err(fail(profile))?;
+        let compiled = finish_profile_inner(
+            p,
+            grants,
+            parent,
+            ctx,
+            &roots,
+            &protected,
+            state,
+            defer_socket_scan,
+            &scan_cache,
+        )
+        .map_err(fail(profile))?;
         profiles.insert(profile.clone(), compiled);
     }
     Ok(CompiledSession {
         profiles,
         order: merged.order().to_vec(),
+        roots,
+        scan_cache,
     })
 }
 
@@ -5833,19 +6414,24 @@ mod tests {
         let roots = UntrustedRoots::new(&f.ws());
         let Some((under, alone)) = with_mode(std::slice::from_ref(&d), 0o600, || {
             let mut warnings = Vec::new();
+            let scan_cache = Arc::new(SocketScanCache::default());
             let under = check_host_sources(
                 vec![ws.clone(), mask.clone(), protected.clone()],
                 false,
+                false,
+                &scan_cache,
                 &f.ctx,
                 &roots,
                 &[],
                 &f.state,
                 &mut warnings,
             )
-            .map(|(kept, _)| (kept, warnings));
+            .map(|(kept, _, _)| (kept, warnings));
             let alone = check_host_sources(
                 vec![ws.clone(), protected.clone()],
                 false,
+                false,
+                &scan_cache,
                 &f.ctx,
                 &roots,
                 &[],
@@ -5919,6 +6505,8 @@ mod tests {
         let e = check_host_sources(
             vec![m],
             false,
+            false,
+            &Arc::new(SocketScanCache::default()),
             &f.ctx,
             &roots,
             &[],
@@ -9899,5 +10487,144 @@ fs.masked = [\"{workspace}/hidden\"]
                 "{rule}: {rm:?}"
             );
         }
+    }
+
+    #[test]
+    fn lazy_socket_scan_defers_until_resolved_and_matches_eager() {
+        use std::os::unix::net::UnixListener;
+        let f = Fixture::new();
+        f.mkdir("ws/sub");
+        let _ws_sock = UnixListener::bind(f.ws().join("sub/ws.sock")).unwrap();
+        f.mkdir("home/other_rw/nested");
+        let other_rw = f.root.join("home/other_rw");
+        let _other_sock = UnixListener::bind(other_rw.join("nested/other.sock")).unwrap();
+
+        let src = format!(
+            "[profiles.other]\n{}",
+            prov("p", "other", "fs.rw = [\"~/other_rw\"]")
+        );
+        let cfg = Config::from_toml_str(&src).unwrap();
+        let eager = compile_session_granted(
+            &cfg,
+            f.outputs(&cfg),
+            &[],
+            &f.state,
+            &f.ctx,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let lazy = compile_session_granted_lazy(
+            &cfg,
+            f.outputs(&cfg),
+            &[],
+            &f.state,
+            &f.ctx,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+
+        // Before `other` is entered, its rw tree has not been scanned for sockets.
+        assert!(
+            !lazy.scan_cache.dirs.lock().unwrap().contains_key(&other_rw),
+            "expected lazy socket scan not to scan unused profile's rw tree at compile time"
+        );
+
+        for name in ["main", "other"] {
+            let e_prof = get(&eager, name);
+            let l_prof = get(&lazy, name);
+            assert_eq!(l_prof.resolved_spec(), e_prof.resolved_spec(), "{name}");
+            let e_warns: Vec<String> = e_prof.all_warnings().map(ToString::to_string).collect();
+            let l_warns: Vec<String> = l_prof.all_warnings().map(ToString::to_string).collect();
+            assert_eq!(l_warns, e_warns, "{name}");
+        }
+        assert!(
+            lazy.scan_cache.dirs.lock().unwrap().contains_key(&other_rw),
+            "expected resolving `other` to populate the socket scan cache for its rw tree"
+        );
+    }
+
+    #[test]
+    fn compile_extra_profile_lazy_and_without_profile_match_full_session_compile() {
+        use std::os::unix::net::UnixListener;
+        let f = Fixture::new();
+        f.mkdir("home/ro_dir");
+        f.file("home/ro_dir/data.txt");
+        f.mkdir("home/rw_dir");
+        let _sock = UnixListener::bind(f.root.join("home/rw_dir/a.sock")).unwrap();
+
+        let cfg = Config::from_toml_str("").unwrap();
+        let base_session = compile_session_granted_lazy(
+            &cfg,
+            f.outputs(&cfg),
+            &[],
+            &f.state,
+            &f.ctx,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+
+        let extra_manifest: crate::manifest::Manifest = toml::from_str(
+            r#"
+            [profiles.grant]
+            inherit = "main"
+            [profiles.grant.sandbox]
+            grant = false
+            [profiles.grant.fs]
+            ro = ["~/ro_dir"]
+            [profiles.grant.network]
+            mode = "proxy"
+            allow_domains = ["example.com"]
+            "#,
+        )
+        .unwrap();
+        let provider: ProviderName = "stopit".parse().unwrap();
+        let target = ProfileRef::contributed(&provider, &"grant".parse().unwrap());
+        let extra = (
+            provider,
+            ProviderOutput {
+                profile: ProfileRef::main(),
+                manifest: extra_manifest,
+                origin: crate::config::ProviderOrigin::Workspace,
+            },
+        );
+
+        let fast = base_session
+            .compile_extra_profile_lazy(
+                &cfg,
+                &f.outputs(&cfg),
+                extra.clone(),
+                &[],
+                &f.state,
+                &f.ctx,
+            )
+            .unwrap()
+            .expect("single-leaf extra profile");
+        let mut full_outputs = f.outputs(&cfg);
+        full_outputs.push(extra);
+        let full = compile_session_granted_lazy(
+            &cfg,
+            full_outputs,
+            &[],
+            &f.state,
+            &f.ctx,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fast.get(&target).unwrap().resolved_spec(),
+            full.get(&target).unwrap().resolved_spec()
+        );
+        assert_eq!(
+            fast.without_profile(&target)
+                .get(&ProfileRef::main())
+                .unwrap()
+                .resolved_spec(),
+            base_session
+                .get(&ProfileRef::main())
+                .unwrap()
+                .resolved_spec()
+        );
+        assert!(fast.without_profile(&target).get(&target).is_none());
     }
 }

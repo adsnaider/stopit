@@ -55,8 +55,8 @@ use crate::config::{ProviderName, ProviderOrigin};
 use crate::error::is_missing;
 use crate::escape::shell_quote;
 use crate::expand::{
-    EntryKind, ExpandError, ExpandedPattern, ExpansionContext, ResolveWarning, ResolvedPath,
-    expand_bind, expand_pattern, resolve,
+    EntryKind, ExpandError, ExpandedPattern, ExpansionContext, ResolveCache, ResolveWarning,
+    ResolvedPath, expand_bind, expand_pattern, resolve_with_cache,
 };
 use crate::manifest::PathPattern;
 use crate::policy::PathMode;
@@ -189,7 +189,7 @@ pub struct PlannedMount {
 }
 
 /// The outcome of [`plan_mounts`].
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct MountPlan {
     /// One mount per sandbox path, ordered by the number of components of
     /// the sandbox path and then lexicographically, so that every mount
@@ -200,7 +200,7 @@ pub struct MountPlan {
 }
 
 /// A non-fatal problem with one rule; the rule's affected paths are skipped.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 #[error("provider {:?}, rule {:?}: {kind}", .provider.as_str(), .pattern)]
 pub struct PlanWarning {
     /// The provider that granted the rule.
@@ -209,6 +209,14 @@ pub struct PlanWarning {
     pub pattern: String,
     /// What went wrong.
     pub kind: PlanWarningKind,
+}
+
+fn clone_io_error(error: &io::Error) -> io::Error {
+    if let Some(code) = error.raw_os_error() {
+        io::Error::from_raw_os_error(code)
+    } else {
+        io::Error::new(error.kind(), error.to_string())
+    }
 }
 
 /// What a [`PlanWarning`] is about.
@@ -289,6 +297,51 @@ pub enum PlanWarningKind {
         /// The host workspace.
         workspace: PathBuf,
     },
+}
+
+impl Clone for PlanWarningKind {
+    fn clone(&self) -> Self {
+        match self {
+            PlanWarningKind::Resolve(w) => PlanWarningKind::Resolve(w.clone()),
+            PlanWarningKind::InaccessibleMasked {
+                mode,
+                path,
+                error,
+                dir,
+                sandbox,
+            } => PlanWarningKind::InaccessibleMasked {
+                mode: *mode,
+                path: path.clone(),
+                error: clone_io_error(error),
+                dir: dir.clone(),
+                sandbox: sandbox.clone(),
+            },
+            PlanWarningKind::GrantHidden {
+                mode,
+                sandbox,
+                dir,
+                workspace,
+            } => PlanWarningKind::GrantHidden {
+                mode: *mode,
+                sandbox: sandbox.clone(),
+                dir: dir.clone(),
+                workspace: *workspace,
+            },
+            PlanWarningKind::SymlinkTarget { path, error } => PlanWarningKind::SymlinkTarget {
+                path: path.clone(),
+                error: clone_io_error(error),
+            },
+            PlanWarningKind::WalkRootLink {
+                root,
+                link,
+                workspace,
+            } => PlanWarningKind::WalkRootLink {
+                root: root.clone(),
+                link: link.clone(),
+                workspace: workspace.clone(),
+            },
+        }
+    }
 }
 
 /// The message for a mount of a grant (`mode` at `sandbox`) hidden entirely
@@ -515,10 +568,21 @@ impl Candidate<'_> {
 /// same sandbox path; identical candidates collapse into one mount, credited
 /// to the first rule's provider.
 pub fn plan_mounts(fs: &[FsRule], ctx: &ExpansionContext) -> Result<MountPlan, PathPlanError> {
+    let mut cache = ResolveCache::default();
+    plan_mounts_with_cache(fs, ctx, &mut cache)
+}
+
+/// [`plan_mounts`] sharing glob directory walks and pattern resolutions via
+/// `cache`.
+pub fn plan_mounts_with_cache(
+    fs: &[FsRule],
+    ctx: &ExpansionContext,
+    cache: &mut ResolveCache,
+) -> Result<MountPlan, PathPlanError> {
     let mut warnings = Vec::new();
     let mut by_path: BTreeMap<PathBuf, Vec<Candidate<'_>>> = BTreeMap::new();
     for rule in fs {
-        for c in rule_candidates(rule, ctx, &mut warnings)? {
+        for c in rule_candidates(rule, ctx, cache, &mut warnings)? {
             by_path.entry(c.sandbox.clone()).or_default().push(c);
         }
     }
@@ -566,6 +630,7 @@ fn plan_warning(rule: &FsRule, kind: PlanWarningKind) -> PlanWarning {
 fn rule_candidates<'a>(
     rule: &'a FsRule,
     ctx: &ExpansionContext,
+    cache: &mut ResolveCache,
     warnings: &mut Vec<PlanWarning>,
 ) -> Result<Vec<Candidate<'a>>, PathPlanError> {
     let candidate = |sandbox, source, mode, literal, glob_link| Candidate {
@@ -603,7 +668,7 @@ fn rule_candidates<'a>(
             let literal = !expanded.has_glob();
             let refused = unskippable(*mode);
             let Some(HostResolution { paths, masks }) =
-                resolve_host(rule, pattern, &expanded, refused, ctx, warnings)?
+                resolve_host(rule, pattern, &expanded, refused, ctx, cache, warnings)?
             else {
                 return Ok(Vec::new());
             };
@@ -678,7 +743,7 @@ fn rule_candidates<'a>(
             // final link is kept: the bind follows it, as the spec compiler
             // does when checking the source.
             let Some(HostResolution { paths, masks }) =
-                resolve_host(rule, pattern, &expanded, None, ctx, warnings)?
+                resolve_host(rule, pattern, &expanded, None, ctx, cache, warnings)?
             else {
                 return Ok(Vec::new());
             };
@@ -727,6 +792,7 @@ fn resolve_host(
     expanded: &ExpandedPattern,
     refused: Option<PathMode>,
     ctx: &ExpansionContext,
+    cache: &mut ResolveCache,
     warnings: &mut Vec<PlanWarning>,
 ) -> Result<Option<HostResolution>, PathPlanError> {
     if let Some((root, link)) = check_walk_root(expanded, ctx) {
@@ -753,7 +819,7 @@ fn resolve_host(
             }
         };
     }
-    let res = resolve(expanded).map_err(|error| PathPlanError::Expand {
+    let res = resolve_with_cache(expanded, cache).map_err(|error| PathPlanError::Expand {
         provider: rule.provider.clone(),
         pattern: pattern.clone(),
         error,
@@ -815,7 +881,7 @@ fn resolve_host(
     if let (Some(mode), true) = (refused, expanded.has_glob()) {
         let mut kept = Vec::with_capacity(paths.len());
         for p in paths {
-            match p.host.symlink_metadata() {
+            match cache.symlink_metadata(&p.host) {
                 Ok(_) => kept.push(p),
                 Err(error) if is_missing(error.kind()) => warnings.push(plan_warning(
                     rule,
