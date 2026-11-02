@@ -25,9 +25,12 @@
 //!   `vcs.remote` according to `fetch` and `push`.
 //!
 //! Layouts it supports: a plain `.git` directory, a `.jj` directory with or
-//! without a colocated `.git`, and a git worktree whose `.git` file names
-//! an admin directory outside the workspace that names it back. Other
-//! layouts get the mask but no VCS profiles, with a warning.
+//! without a colocated `.git`, a `jj` secondary workspace (`jj workspace
+//! add`) whose `.jj/repo` file names a primary `.jj/repo` directory outside
+//! the workspace that names it back in `workspace_store/index`, and a git
+//! worktree whose `.git` file names an admin directory outside the workspace
+//! that names it back. Other layouts get the mask but no VCS profiles, with
+//! a warning.
 
 use std::fs;
 use std::os::unix::fs::FileTypeExt;
@@ -231,8 +234,17 @@ pub struct Layout {
     /// worktree's admin directory and common directory. Empty when git is
     /// not supported here.
     pub git_dirs: Vec<PathBuf>,
-    /// Whether the `.jj` directory is a whole repository the provider
-    /// supports, not a secondary workspace.
+    /// External directories a jj secondary workspace writes: its primary
+    /// `.jj/repo` directory, and its primary `.git` directory when the
+    /// primary repository is colocated. Empty for a primary jj repository
+    /// or when jj is not supported here.
+    pub jj_dirs: Vec<PathBuf>,
+    /// Whether `.jj/repo` is a secondary-workspace pointer file holding a
+    /// relative path (which requires `mount == workspace` so `jj -R` can
+    /// resolve it inside the sandbox).
+    pub jj_relative_repo: bool,
+    /// Whether the `.jj` directory is a repository or secondary workspace
+    /// the provider supports.
     pub jj_supported: bool,
     /// What the provider could not support, for warnings.
     pub unsupported: Vec<String>,
@@ -280,10 +292,25 @@ pub fn discover(workspace: &Path) -> Layout {
             match jj_repo(workspace, &dot_jj) {
                 // jj writes the workspace's `.git` then, which must be a
                 // layout git is brokered for, with its config locked.
-                Ok(true) if layout.git_dirs.is_empty() => layout.unsupported.push(format!(
-                    "the jj repository at {workspace:?}, whose colocated .git is not supported"
-                )),
-                Ok(_) => layout.jj_supported = true,
+                Ok(jj) if jj.colocated_with_own_git && layout.git_dirs.is_empty() => {
+                    layout.unsupported.push(format!(
+                        "the jj repository at {workspace:?}, whose colocated .git is not supported"
+                    ));
+                }
+                Ok(jj)
+                    if !jj.external_dirs.is_empty()
+                        && layout.dot_git.is_some()
+                        && layout.git_dirs.is_empty() =>
+                {
+                    layout.unsupported.push(format!(
+                        "the jj secondary workspace at {workspace:?}, whose .git is not supported"
+                    ));
+                }
+                Ok(jj) => {
+                    layout.jj_dirs = jj.external_dirs;
+                    layout.jj_relative_repo = jj.relative_pointer;
+                    layout.jj_supported = true;
+                }
                 Err(why) => layout.unsupported.push(why),
             }
             layout.dot_jj = Some(dot_jj);
@@ -320,17 +347,31 @@ fn is_real_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
 
-/// Checks that the `.jj` directory `dot_jj` holds a whole repository: a
-/// `repo` directory, whose git store, if it has one, is the workspace's
-/// own `.git` directory or inside the store. Returns whether it is the
-/// workspace's `.git`.
-fn jj_repo(workspace: &Path, dot_jj: &Path) -> Result<bool, String> {
+struct JjRepo {
+    /// Whether the repository's git store is the workspace's own `.git`
+    /// directory (a colocated primary repository).
+    colocated_with_own_git: bool,
+    /// External directories a secondary workspace writes: the primary
+    /// `.jj/repo` directory, followed by the primary `.git` directory when
+    /// the primary repository is colocated. Empty for a primary repository.
+    external_dirs: Vec<PathBuf>,
+    /// Whether `.jj/repo` is a file holding a relative path.
+    relative_pointer: bool,
+}
+
+/// Checks that the `.jj` directory `dot_jj` holds a primary repository or a
+/// supported secondary workspace (`jj workspace add`).
+fn jj_repo(workspace: &Path, dot_jj: &Path) -> Result<JjRepo, String> {
     let repo = dot_jj.join("repo");
     match fs::symlink_metadata(&repo) {
         Ok(m) if m.is_dir() => {}
+        Ok(m) if m.is_file() => {
+            return jj_secondary_repo(workspace, dot_jj, &repo)
+                .map_err(|why| format!("the jj secondary workspace at {workspace:?}: {why}"));
+        }
         Ok(_) => {
             return Err(format!(
-                "the jj secondary workspace at {workspace:?}, whose repository lives elsewhere"
+                "{dot_jj:?}, whose repo is neither a file nor a directory"
             ));
         }
         Err(_) => return Err(format!("{dot_jj:?}, which has no repo directory")),
@@ -341,10 +382,32 @@ fn jj_repo(workspace: &Path, dot_jj: &Path) -> Result<bool, String> {
     }
     let target_file = store.join("git_target");
     if !is_present(&target_file) {
-        return Ok(false);
+        return Ok(JjRepo {
+            colocated_with_own_git: false,
+            external_dirs: Vec::new(),
+            relative_pointer: false,
+        });
     }
     let target = read_small(&target_file).map_err(|why| format!("the jj repository: {why}"))?;
-    let resolved = fs::canonicalize(store.join(target.trim_end()))
+    let target = target.trim_end();
+    let leading_parents = check_pointer_target(Path::new(target), 0)
+        .map_err(|why| format!("the jj repository at {workspace:?}: {why}"))?;
+    if leading_parents > 0 && target != "../../../.git" {
+        return Err(format!(
+            "the jj repository at {workspace:?}: its git_target traverses outside the store"
+        ));
+    }
+    let workspace_canon = fs::canonicalize(workspace).map_err(|e| e.to_string())?;
+    let joined = store.join(target);
+    if crate::spec::first_link_inside(&joined, &workspace_canon)
+        .map_err(|e| format!("the jj repository's git store cannot be resolved: {e}"))?
+        .is_some()
+    {
+        return Err(format!(
+            "the jj repository at {workspace:?}: its git_target traverses a symlink inside the workspace"
+        ));
+    }
+    let resolved = fs::canonicalize(&joined)
         .map_err(|e| format!("the jj repository's git store cannot be resolved: {e}"))?;
     let store = fs::canonicalize(&store).map_err(|e| e.to_string())?;
     let dot_git = workspace.join(".git");
@@ -352,14 +415,251 @@ fn jj_repo(workspace: &Path, dot_jj: &Path) -> Result<bool, String> {
         .then(|| fs::canonicalize(&dot_git).ok())
         .flatten();
     if Some(&resolved) == own_git.as_ref() {
-        Ok(true)
+        Ok(JjRepo {
+            colocated_with_own_git: true,
+            external_dirs: Vec::new(),
+            relative_pointer: false,
+        })
     } else if resolved.starts_with(&store) {
-        Ok(false)
+        Ok(JjRepo {
+            colocated_with_own_git: false,
+            external_dirs: Vec::new(),
+            relative_pointer: false,
+        })
     } else {
         Err(format!(
             "the jj repository at {workspace:?}, whose git store {resolved:?} is elsewhere"
         ))
     }
+}
+
+/// Checks the lexical shape of a `.jj/repo` or `store/git_target` pointer
+/// string: no `.` components, `..` components only as a leading prefix of a
+/// relative path, at least `min_leading_parents` leading `..` components when
+/// relative, and at least one normal component. Returns the number of leading
+/// `..` components.
+fn check_pointer_target(
+    target: &Path,
+    min_leading_parents: usize,
+) -> Result<usize, &'static str> {
+    use std::path::Component;
+    let mut leading_parents = 0usize;
+    let mut seen_normal_or_root = false;
+    let mut has_normal = false;
+    for comp in target.components() {
+        match comp {
+            Component::RootDir => {
+                seen_normal_or_root = true;
+            }
+            Component::ParentDir => {
+                if seen_normal_or_root {
+                    return Err("its target path contains `..` after a path component");
+                }
+                leading_parents += 1;
+            }
+            Component::Normal(_) => {
+                seen_normal_or_root = true;
+                has_normal = true;
+            }
+            Component::CurDir | Component::Prefix(_) => {
+                return Err("its target path contains `.` or an invalid prefix");
+            }
+        }
+    }
+    if !has_normal {
+        return Err("its target path has no final component");
+    }
+    if target.is_relative() && leading_parents < min_leading_parents {
+        return Err("its relative target path is inside the workspace");
+    }
+    Ok(leading_parents)
+}
+
+/// Validates a `jj` secondary workspace whose `.jj/repo` file is `repo_file`.
+/// The primary `.jj/repo` directory must lie outside `workspace` and name
+/// `workspace` back in `workspace_store/index`, so a `.jj/repo` file written
+/// inside the sandbox cannot point to an unrelated repository.
+fn jj_secondary_repo(workspace: &Path, dot_jj: &Path, repo_file: &Path) -> Result<JjRepo, String> {
+    let text = read_small(repo_file)?;
+    let target = text.trim_end();
+    if target.is_empty() {
+        return Err("its .jj/repo file is empty".to_owned());
+    }
+    check_pointer_target(Path::new(target), 2)?;
+    let relative_pointer = Path::new(target).is_relative();
+    let workspace = fs::canonicalize(workspace).map_err(|e| e.to_string())?;
+    let joined = dot_jj.join(target);
+    if crate::spec::first_link_inside(&joined, &workspace)
+        .map_err(|e| format!("cannot resolve its repository: {e}"))?
+        .is_some()
+    {
+        return Err("its .jj/repo path traverses a symlink inside the workspace".to_owned());
+    }
+    let repo_dir = fs::canonicalize(&joined)
+        .map_err(|e| format!("cannot resolve its repository: {e}"))?;
+    if repo_dir.starts_with(&workspace) {
+        return Err("its repository is inside the workspace".to_owned());
+    }
+    if repo_dir.file_name() != Some(std::ffi::OsStr::new("repo"))
+        || repo_dir.parent().and_then(Path::file_name) != Some(std::ffi::OsStr::new(".jj"))
+    {
+        return Err("its .jj/repo file does not point to a .jj/repo directory".to_owned());
+    }
+    let store = repo_dir.join("store");
+    if !is_real_dir(&store) {
+        return Err("its repository has no store directory".to_owned());
+    }
+    let ws_store = repo_dir.join("workspace_store");
+    if !is_real_dir(&ws_store) {
+        return Err("its repository has no workspace_store directory".to_owned());
+    }
+    let index_bytes = read_small_bytes(&ws_store.join("index"), 65536)?;
+    let paths = parse_workspace_store_paths(&index_bytes)
+        .ok_or_else(|| "its repository's workspace_store/index is invalid".to_owned())?;
+    let names_us = paths.iter().any(|p| {
+        !p.is_empty()
+            && fs::canonicalize(repo_dir.join(p)).ok().as_deref() == Some(workspace.as_path())
+    });
+    if !names_us {
+        return Err("its repository does not name this workspace back".to_owned());
+    }
+    let mut external_dirs = vec![repo_dir.clone()];
+    let target_file = store.join("git_target");
+    if is_present(&target_file) {
+        let git_target = read_small(&target_file)?;
+        let git_target = git_target.trim_end();
+        let leading_parents = check_pointer_target(Path::new(git_target), 0)?;
+        if leading_parents > 0 && git_target != "../../../.git" {
+            return Err("its repository's git_target traverses outside the store".to_owned());
+        }
+        let git_joined = store.join(git_target);
+        if crate::spec::first_link_inside(&git_joined, &workspace)
+            .map_err(|e| format!("its repository's git store cannot be resolved: {e}"))?
+            .is_some()
+            || crate::spec::first_link_inside(&git_joined, &repo_dir)
+                .map_err(|e| format!("its repository's git store cannot be resolved: {e}"))?
+                .is_some()
+        {
+            return Err(
+                "its repository's git_target traverses a symlink inside the workspace or repository"
+                    .to_owned(),
+            );
+        }
+        let resolved = fs::canonicalize(&git_joined)
+            .map_err(|e| format!("its repository's git store cannot be resolved: {e}"))?;
+        let store_canon = fs::canonicalize(&store).map_err(|e| e.to_string())?;
+        if !resolved.starts_with(&store_canon) {
+            let primary_git = repo_dir
+                .parent()
+                .and_then(Path::parent)
+                .map(|p| p.join(".git"));
+            let valid_colocated = primary_git.as_deref().is_some_and(|git| {
+                is_real_dir(git)
+                    && fs::canonicalize(git).ok().as_ref() == Some(&resolved)
+                    && !resolved.starts_with(&workspace)
+                    && is_real_dir(&resolved.join("objects"))
+                    && fs::symlink_metadata(resolved.join("HEAD")).is_ok_and(|m| m.is_file())
+                    && !is_present(&resolved.join("commondir"))
+            });
+            if !valid_colocated {
+                return Err(format!(
+                    "its repository's git store {resolved:?} is elsewhere"
+                ));
+            }
+            external_dirs.push(resolved);
+        }
+    }
+    Ok(JjRepo {
+        colocated_with_own_git: false,
+        external_dirs,
+        relative_pointer,
+    })
+}
+
+fn read_varint(buf: &mut &[u8]) -> Option<u64> {
+    let mut val = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let (&b, rest) = buf.split_first()?;
+        *buf = rest;
+        if shift == 63 && b > 1 {
+            return None;
+        }
+        val |= u64::from(b & 0x7f) << shift;
+        if b & 0x80 == 0 {
+            return Some(val);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return None;
+        }
+    }
+}
+
+fn skip_protobuf_field<'a>(buf: &mut &'a [u8], wire_type: u64) -> Option<Option<&'a [u8]>> {
+    match wire_type {
+        0 => {
+            read_varint(buf)?;
+            Some(None)
+        }
+        1 => {
+            if buf.len() < 8 {
+                return None;
+            }
+            *buf = &buf[8..];
+            Some(None)
+        }
+        2 => {
+            let len = usize::try_from(read_varint(buf)?).ok()?;
+            if buf.len() < len {
+                return None;
+            }
+            let (slice, rest) = buf.split_at(len);
+            *buf = rest;
+            Some(Some(slice))
+        }
+        5 => {
+            if buf.len() < 4 {
+                return None;
+            }
+            *buf = &buf[4..];
+            Some(None)
+        }
+        _ => None,
+    }
+}
+
+/// Parses the workspace paths (field 2 of each repeated field 1 entry) from
+/// a `jj` `simple_workspace_store` index file (`workspace_store/index`).
+fn parse_workspace_store_paths(mut buf: &[u8]) -> Option<Vec<String>> {
+    let mut paths = Vec::new();
+    while !buf.is_empty() {
+        let tag = read_varint(&mut buf)?;
+        let field = tag >> 3;
+        let wire_type = tag & 7;
+        if field == 0 {
+            return None;
+        }
+        let payload = skip_protobuf_field(&mut buf, wire_type)?;
+        if field == 1 {
+            let mut entry = payload?;
+            while !entry.is_empty() {
+                let entry_tag = read_varint(&mut entry)?;
+                let entry_field = entry_tag >> 3;
+                let entry_wire = entry_tag & 7;
+                if entry_field == 0 {
+                    return None;
+                }
+                let entry_payload = skip_protobuf_field(&mut entry, entry_wire)?;
+                if entry_field == 2 {
+                    let bytes = entry_payload?;
+                    let path = std::str::from_utf8(bytes).ok()?;
+                    paths.push(path.to_owned());
+                }
+            }
+        }
+    }
+    Some(paths)
 }
 
 /// The admin and common directories of the git worktree whose `.git` file
@@ -400,12 +700,13 @@ fn worktree_dirs(workspace: &Path, dot_git: &Path) -> Result<Vec<PathBuf>, Strin
     Ok(vec![admin, common])
 }
 
-/// The text of the small regular file at `path`, opened without following
-/// a link and without opening anything else.
-fn read_small(path: &Path) -> Result<String, String> {
+/// The bytes of the small regular file at `path` (up to `max_len` bytes),
+/// opened without following a link and without opening anything else.
+fn read_small_bytes(path: &Path, max_len: usize) -> Result<Vec<u8>, String> {
     use rustix::fs::{FileType, Mode, OFlags};
     use std::io::Read;
     let cannot = |e: &dyn std::fmt::Display| format!("cannot read {path:?}: {e}");
+    let limit = u64::try_from(max_len).unwrap_or(u64::MAX);
     // An `O_PATH` descriptor first, which opens no device or FIFO, then
     // the file itself through it once it is known to be a regular one.
     let handle = rustix::fs::open(
@@ -415,7 +716,9 @@ fn read_small(path: &Path) -> Result<String, String> {
     )
     .map_err(|e| cannot(&e))?;
     let stat = rustix::fs::fstat(&handle).map_err(|e| cannot(&e))?;
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || stat.st_size > 4096 {
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+        || u64::try_from(stat.st_size).map_err(|_| format!("{path:?} is not a small file"))? > limit
+    {
         return Err(format!("{path:?} is not a small file"));
     }
     let fd = rustix::fs::open(
@@ -424,15 +727,22 @@ fn read_small(path: &Path) -> Result<String, String> {
         Mode::empty(),
     )
     .map_err(|e| cannot(&e))?;
-    let mut text = String::new();
+    let mut bytes = Vec::new();
     fs::File::from(fd)
-        .take(4097)
-        .read_to_string(&mut text)
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
         .map_err(|e| cannot(&e))?;
-    if text.len() > 4096 {
+    if bytes.len() > max_len {
         return Err(format!("{path:?} is not a small file"));
     }
-    Ok(text)
+    Ok(bytes)
+}
+
+/// The text of the small regular file at `path`, opened without following
+/// a link and without opening anything else.
+fn read_small(path: &Path) -> Result<String, String> {
+    let bytes = read_small_bytes(path, 4096)?;
+    String::from_utf8(bytes).map_err(|e| format!("cannot read {path:?}: {e}"))
 }
 
 /// The host user's `user.name` and `user.email`, from the user's own git
@@ -493,7 +803,7 @@ impl VcsProvider {
             |items: Vec<String>| Value::Array(items.into_iter().map(Value::String).collect());
         let mut root = self.main_view(workspace, layout)?;
         let git = !layout.git_dirs.is_empty();
-        let jj = layout.jj_supported;
+        let jj = layout.jj_supported && (!layout.jj_relative_repo || mount == workspace);
         if !git && !jj {
             return manifest_from(root);
         }
@@ -508,36 +818,61 @@ impl VcsProvider {
         .flatten()
         .map(|p| path(p))
         .collect::<Result<_, _>>()?;
-        let mut storage = metadata.clone();
-        for dir in &layout.git_dirs {
-            let p = path(dir)?;
-            if !storage.contains(&p) {
-                storage.push(p);
+        let push_unique = |vec: &mut Vec<String>, item: String| {
+            if !vec.contains(&item) {
+                vec.push(item);
             }
+        };
+        let mut storage = metadata;
+        for dir in layout
+            .git_dirs
+            .iter()
+            .chain(layout.jj_dirs.iter().filter(|_| jj))
+        {
+            push_unique(&mut storage, path(dir)?);
         }
         let mut locked = Vec::new();
         let mut masked = Vec::new();
-        for dir in &layout.git_dirs {
+        for dir in layout
+            .git_dirs
+            .iter()
+            .chain(layout.jj_dirs.iter().skip(1).filter(|_| jj))
+        {
             for file in ["config", "config.worktree", "info/attributes"] {
                 if is_present(&dir.join(file)) {
-                    locked.push(path(&dir.join(file))?);
+                    push_unique(&mut locked, path(&dir.join(file))?);
                 }
             }
             if is_real_dir(&dir.join("modules")) {
-                locked.push(format!("{}/modules/*/config", path(dir)?));
-                masked.push(format!("{}/modules/*/hooks", path(dir)?));
+                push_unique(&mut locked, format!("{}/modules/*/config", path(dir)?));
+                push_unique(&mut masked, format!("{}/modules/*/hooks", path(dir)?));
             }
             if is_real_dir(&dir.join("worktrees")) {
-                locked.push(format!("{}/worktrees/*/config.worktree", path(dir)?));
+                push_unique(
+                    &mut locked,
+                    format!("{}/worktrees/*/config.worktree", path(dir)?),
+                );
             }
             if is_present(&dir.join("hooks")) {
-                masked.push(path(&dir.join("hooks"))?);
+                push_unique(&mut masked, path(&dir.join("hooks"))?);
             }
         }
-        if let Some(dot_jj) = &layout.dot_jj {
-            let config = dot_jj.join("repo/config.toml");
-            if is_present(&config) {
-                locked.push(path(&config)?);
+        if jj && let Some(dot_jj) = &layout.dot_jj {
+            if let Some(repo_dir) = layout.jj_dirs.first() {
+                push_unique(&mut locked, path(&dot_jj.join("repo"))?);
+                for file in ["config.toml", "store/git_target"] {
+                    let p = repo_dir.join(file);
+                    if is_present(&p) {
+                        push_unique(&mut locked, path(&p)?);
+                    }
+                }
+            } else {
+                for file in ["repo/config.toml", "repo/store/git_target"] {
+                    let p = dot_jj.join(file);
+                    if is_present(&p) {
+                        push_unique(&mut locked, path(&p)?);
+                    }
+                }
             }
         }
         // Where a host path appears in the sandbox: below the workspace
@@ -707,7 +1042,8 @@ impl VcsProvider {
     /// The view of the workspace's own metadata in `main`, which every
     /// layout gets: masked, or read-only with `view = "ro"`.
     ///
-    /// A worktree's admin and common directories get the same view, so a
+    /// A worktree's admin and common directories and a jj secondary
+    /// workspace's primary repository directories get the same view, so a
     /// grant of `main` that covers them does not expose them either. One
     /// whose path no rule can name is left out.
     fn main_view(&self, workspace: &Path, layout: &Layout) -> Result<toml::Table, String> {
@@ -720,9 +1056,17 @@ impl VcsProvider {
                     .ok_or_else(|| format!("no rule can name {p:?}"))
             })
             .collect::<Result<_, _>>()?;
-        for dir in layout.git_dirs.iter().filter(|d| !d.starts_with(workspace)) {
+        for dir in layout
+            .git_dirs
+            .iter()
+            .chain(layout.jj_dirs.iter())
+            .filter(|d| !d.starts_with(workspace))
+        {
             if let Some(p) = rule_path(workspace, dir) {
-                metadata.push(toml::Value::String(p));
+                let v = toml::Value::String(p);
+                if !metadata.contains(&v) {
+                    metadata.push(v);
+                }
             }
         }
         let mut root = toml::Table::new();
@@ -987,7 +1331,18 @@ impl Provider for VcsProvider {
                 ))
             );
         };
-        let layout = discover(&ctx.workspace);
+        let mut layout = discover(&ctx.workspace);
+        if layout.jj_supported
+            && layout.jj_relative_repo
+            && ctx.resolved_workspace_mount() != ctx.workspace
+        {
+            layout.jj_supported = false;
+            layout.unsupported.push(format!(
+                "the jj secondary workspace at {:?}, whose relative .jj/repo pointer needs \
+                 `mount = \"host\"` in `[workspace]`",
+                ctx.workspace
+            ));
+        }
         for what in &layout.unsupported {
             warn(what);
         }
@@ -1383,7 +1738,8 @@ mod tests {
         assert_eq!(layout.unsupported.len(), 2, "{:?}", layout.unsupported);
         let m = manifest(&ws, &[]);
         assert!(m.profiles.is_empty() && m.grants.shims.is_empty());
-        // A secondary workspace: masked, nothing brokered.
+        // A secondary workspace pointing to a non-existent repo: masked,
+        // nothing brokered.
         let (_o, other) = workspace();
         fs::create_dir_all(other.join(".jj")).unwrap();
         fs::write(other.join(".jj/repo"), "/somewhere/.jj/repo").unwrap();
@@ -1394,6 +1750,197 @@ mod tests {
         assert!(m.grants.shims.is_empty());
         assert!(m.profiles.is_empty());
         assert_eq!(patterns(&m.grants.fs.masked), ["{workspace}/.jj"]);
+    }
+
+    fn encode_workspace_store_index(entries: &[(&str, &str)]) -> Vec<u8> {
+        let push_varint = |buf: &mut Vec<u8>, mut v: usize| {
+            while v >= 0x80 {
+                buf.push((v as u8 & 0x7f) | 0x80);
+                v >>= 7;
+            }
+            buf.push(v as u8);
+        };
+        let push_bytes = |buf: &mut Vec<u8>, tag: u8, bytes: &[u8]| {
+            buf.push(tag);
+            push_varint(buf, bytes.len());
+            buf.extend_from_slice(bytes);
+        };
+        let mut out = Vec::new();
+        for (name, path) in entries {
+            let mut entry = Vec::new();
+            push_bytes(&mut entry, 0x0a, name.as_bytes());
+            push_bytes(&mut entry, 0x12, path.as_bytes());
+            push_bytes(&mut out, 0x0a, &entry);
+        }
+        out
+    }
+
+    #[test]
+    fn jj_secondary_workspace_requires_back_pointer_and_brokers_primary_storage() {
+        let (_d, root) = workspace();
+        let primary = root.join("primary");
+        let secondary = root.join("secondary");
+        let repo_dir = primary.join(".jj/repo");
+        fs::create_dir_all(repo_dir.join("store/git")).unwrap();
+        fs::create_dir_all(repo_dir.join("workspace_store")).unwrap();
+        fs::write(repo_dir.join("store/git_target"), "git").unwrap();
+        fs::write(repo_dir.join("config.toml"), "[user]\n").unwrap();
+        fs::write(
+            repo_dir.join("workspace_store/index"),
+            encode_workspace_store_index(&[
+                ("default", "../.."),
+                ("secondary", "../../../secondary"),
+            ]),
+        )
+        .unwrap();
+        fs::create_dir_all(secondary.join(".jj")).unwrap();
+        // Relative pointer (`../../primary/.jj/repo`), as `jj workspace add` writes.
+        fs::write(secondary.join(".jj/repo"), "../../primary/.jj/repo").unwrap();
+
+        let layout = discover(&secondary);
+        assert!(layout.jj_supported, "{:?}", layout.unsupported);
+        assert!(layout.jj_relative_repo);
+        assert_eq!(layout.jj_dirs, vec![repo_dir.clone()]);
+
+        // With `mount != workspace` (`/workspace`), a relative `.jj/repo` pointer
+        // cannot resolve inside `/workspace`, so `jj` is not brokered unless
+        // `mount = "host"` (`mount == workspace`) or `.jj/repo` is absolute.
+        let m_rel_default_mount = manifest(&secondary, &[]);
+        assert!(m_rel_default_mount.grants.shims.is_empty());
+        assert_eq!(
+            patterns(&m_rel_default_mount.grants.fs.masked),
+            ["{workspace}/.jj", repo_dir.to_str().unwrap()]
+        );
+
+        // With `mount == workspace` (`mount = "host"`), the relative pointer works.
+        let m_host_mount = provider()
+            .manifest_for(
+                &secondary,
+                &secondary,
+                &layout,
+                &[],
+                &SshRemote::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            m_host_mount
+                .grants
+                .shims
+                .keys()
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>(),
+            ["jj"]
+        );
+        let local = profile(&m_host_mount, "local");
+        assert_eq!(
+            patterns(&local.grants.fs.rw),
+            ["{workspace}/.jj", repo_dir.to_str().unwrap()]
+        );
+        assert_eq!(
+            patterns(&local.grants.fs.ro),
+            [
+                "{workspace}/.jj/repo",
+                repo_dir.join("config.toml").to_str().unwrap(),
+                repo_dir.join("store/git_target").to_str().unwrap(),
+            ]
+        );
+
+        // A `.jj/repo` path that traverses a workspace subdirectory (`../sub/../../primary/.jj/repo`)
+        // or a symlink inside the workspace is refused so `main` cannot swap it at runtime.
+        fs::create_dir_all(secondary.join("sub")).unwrap();
+        fs::write(
+            secondary.join(".jj/repo"),
+            "../sub/../../primary/.jj/repo",
+        )
+        .unwrap();
+        let layout_traversal = discover(&secondary);
+        assert!(!layout_traversal.jj_supported);
+        assert!(
+            layout_traversal.unsupported[0].contains("contains `..` after a path component"),
+            "{:?}",
+            layout_traversal.unsupported
+        );
+        std::os::unix::fs::symlink(&repo_dir, secondary.join("repo-link")).unwrap();
+        fs::write(
+            secondary.join(".jj/repo"),
+            secondary.join("repo-link").to_str().unwrap(),
+        )
+        .unwrap();
+        let layout_link = discover(&secondary);
+        assert!(!layout_link.jj_supported);
+        assert!(
+            layout_link.unsupported[0].contains("traverses a symlink inside the workspace"),
+            "{:?}",
+            layout_link.unsupported
+        );
+
+        // With an absolute path in `.jj/repo`, even `mount = "/workspace"` works.
+        fs::write(secondary.join(".jj/repo"), repo_dir.to_str().unwrap()).unwrap();
+        let layout_abs = discover(&secondary);
+        assert!(layout_abs.jj_supported);
+        assert!(!layout_abs.jj_relative_repo);
+        let m_abs = manifest(&secondary, &[]);
+        assert_eq!(
+            m_abs
+                .grants
+                .shims
+                .keys()
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>(),
+            ["jj"]
+        );
+
+        // Colocated primary repository: `.jj/repo/store/git_target` points to
+        // `primary/.git`, so its config and hooks are locked/masked too.
+        git_init(&primary);
+        fs::write(repo_dir.join("store/git_target"), "../../../.git").unwrap();
+        let layout_colocated = discover(&secondary);
+        assert!(
+            layout_colocated.jj_supported,
+            "{:?}",
+            layout_colocated.unsupported
+        );
+        assert_eq!(
+            layout_colocated.jj_dirs,
+            vec![repo_dir.clone(), primary.join(".git")]
+        );
+        let m_colocated = manifest(&secondary, &[]);
+        let local_colocated = profile(&m_colocated, "local");
+        assert_eq!(
+            patterns(&local_colocated.grants.fs.rw),
+            [
+                "{workspace}/.jj",
+                repo_dir.to_str().unwrap(),
+                primary.join(".git").to_str().unwrap()
+            ]
+        );
+        assert_eq!(
+            patterns(&local_colocated.grants.fs.ro),
+            [
+                primary.join(".git/config").to_str().unwrap(),
+                "{workspace}/.jj/repo",
+                repo_dir.join("config.toml").to_str().unwrap(),
+                repo_dir.join("store/git_target").to_str().unwrap(),
+            ]
+        );
+        assert_eq!(
+            patterns(&local_colocated.grants.fs.masked),
+            [primary.join(".git/hooks").to_str().unwrap()]
+        );
+
+        // If `workspace_store/index` does not name `secondary` back, it is refused.
+        fs::write(
+            repo_dir.join("workspace_store/index"),
+            encode_workspace_store_index(&[("default", "../..")]),
+        )
+        .unwrap();
+        let layout_unlisted = discover(&secondary);
+        assert!(!layout_unlisted.jj_supported);
+        assert!(
+            layout_unlisted.unsupported[0].contains("does not name this workspace back"),
+            "{:?}",
+            layout_unlisted.unsupported
+        );
     }
 
     #[test]
