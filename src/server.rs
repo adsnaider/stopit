@@ -152,6 +152,7 @@ fn run_server(workspace: Option<&Path>, quiet: bool) -> Result<ExitCode, RunErro
     // below, and only unblocked while the main thread waits.
     let mask = BlockedSignals::block().map_err(RunError::Signals)?;
     let runs: SharedRuns = Arc::default();
+    let reloading = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut workers = Vec::new();
     let mut next_run = 1u64;
     let ended: Result<libc::c_int, RunError> = loop {
@@ -178,26 +179,63 @@ fn run_server(workspace: Option<&Path>, quiet: bool) -> Result<ExitCode, RunErro
             Err(e) => break Err(listen_error(e)),
         }
         if idle_slot.is_some_and(|slot| fds[slot].revents != 0) {
+            let mut want_reload = false;
             while let Some(key) = approver.read_idle_key() {
                 if matches!(key, b'r' | b'R') {
-                    match loaded.reload() {
+                    want_reload = true;
+                }
+            }
+            if want_reload
+                && reloading
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .is_ok()
+            {
+                workers.retain(|w: &std::thread::JoinHandle<()>| !w.is_finished());
+                if !quiet {
+                    approver.show_status("stopit: reloading configuration...");
+                }
+                let reload_loaded = loaded.clone();
+                let reload_approver = approver.clone();
+                let reload_flag = reloading.clone();
+                let run_reload = move || {
+                    struct ResetReload(Arc<std::sync::atomic::AtomicBool>);
+                    impl Drop for ResetReload {
+                        fn drop(&mut self) {
+                            self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    let _reset = ResetReload(reload_flag);
+                    match reload_loaded.reload() {
                         Ok((warnings, timeout)) => {
-                            approver.set_timeout(timeout);
-                            approver.clear_quiet();
+                            reload_approver.set_timeout(timeout);
+                            reload_approver.clear_quiet();
                             for line in warnings {
-                                approver.log(&line);
+                                reload_approver.log(&line);
                             }
                             if !quiet {
-                                approver.log("stopit: reloaded configuration");
+                                reload_approver.log("stopit: reloaded configuration");
                             }
                         }
                         Err(e) => {
-                            approver.log(&format!(
+                            reload_approver.log(&format!(
                                 "stopit: error reloading configuration: {}",
                                 escape_message(&e.to_string())
                             ));
                         }
                     }
+                    reload_approver.flush_idle_keys();
+                };
+                match std::thread::Builder::new()
+                    .name("reload".to_owned())
+                    .spawn(run_reload.clone())
+                {
+                    Ok(worker) => workers.push(worker),
+                    Err(_) => run_reload(),
                 }
             }
         }

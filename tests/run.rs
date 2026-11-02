@@ -5936,14 +5936,28 @@ fn server_reloads_configuration_on_r_key_and_keeps_ephemeral_state() {
     let results = s.probe(&[], &[write("/tmp/shared", "kept across reload")]);
     assert_eq!(ok(&results[0]), &Data::Done);
 
-    // Edit `.stopit.toml` and `stopit allow` it, then press `r` on the server terminal.
+    // Edit `.stopit.toml` and `stopit allow` it, then press `r` repeatedly on
+    // the server terminal: a burst of `r` keys triggers a single reload with
+    // immediate "reloading configuration..." feedback.
     s.write_config(&format!(
         "{config}\
          [[provider]]\ntype = \"config\"\nname = \"extra\"\n[provider.sandbox]\n\
          env.set = {{ RELOADED = \"yes\" }}\n"
     ));
-    (&server_master).write_all(b"r").unwrap();
-    server.wait_for_log("stopit: reloaded configuration");
+    server.log.lock().unwrap().clear();
+    (&server_master).write_all(b"rrrr").unwrap();
+    let reload_log = server.wait_for_log("stopit: reloaded configuration");
+    assert!(
+        reload_log.contains("stopit: reloading configuration..."),
+        "{reload_log:?}"
+    );
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        server.log().matches("stopit: reloaded configuration").count(),
+        1,
+        "{:?}",
+        server.log()
+    );
 
     let out = output(
         s.stopit(&[

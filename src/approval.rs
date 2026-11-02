@@ -24,6 +24,10 @@ use crate::pty::{CbreakMode, RawMode};
 /// How long a prompt ignores keys after it appears.
 const ARMING_DELAY: Duration = Duration::from_millis(300);
 
+/// The action bar shown at the bottom of an active approval prompt.
+const PROMPT_ACTION_BAR: &str =
+    "  [y] allow once  [s] allow for this session  [p] allow and persist  [n] deny: ";
+
 /// How long requests in a scope are denied without a prompt after the user
 /// denied one in it, so a sandbox cannot bury the user in prompts.
 pub const QUIET_AFTER_DENY: Duration = Duration::from_secs(5);
@@ -240,6 +244,10 @@ struct State {
     quiet: HashMap<String, Instant>,
     /// Whether a prompt is on the terminal.
     prompting: bool,
+    /// Whether a transient status line (such as `"stopit: reloading
+    /// configuration..."`) is currently shown on the terminal without a
+    /// trailing newline.
+    transient_status: bool,
     /// Whether the server's terminal has hung up (EOF / EIO).
     terminal_hup: bool,
     /// Log lines held back while a prompt is up, at most [`MAX_HELD`].
@@ -413,10 +421,57 @@ impl Approver {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Displays a dimmed transient status line (such as `"stopit: reloading
+    /// configuration..."`) in-place on the server's terminal if no prompt is
+    /// currently up. Cleared automatically by the next [`log`](Self::log) or
+    /// prompt.
+    pub fn show_status(&self, status: &str) {
+        let Some(terminal) = &self.terminal else {
+            return;
+        };
+        if self.require_foreground
+            && rustix::termios::tcgetpgrp(terminal).ok() != Some(rustix::process::getpgrp())
+        {
+            return;
+        }
+        {
+            let mut state = self.state();
+            if state.prompting || state.terminal_hup {
+                return;
+            }
+            state.transient_status = true;
+        }
+        let line = format!("\r\x1b[2K\x1b[2m{}\x1b[0m", escape_message(status));
+        let _ = write_all(terminal.as_fd(), line.as_bytes());
+    }
+
+    /// Discards any unread keys currently buffered on the server's terminal
+    /// when no approval prompt is active.
+    pub fn flush_idle_keys(&self) {
+        let Some(_guard) = self.prompt.try_lock().ok() else {
+            return;
+        };
+        {
+            let state = self.state();
+            if state.prompting || state.terminal_hup {
+                return;
+            }
+        }
+        let Some(terminal) = &self.terminal else {
+            return;
+        };
+        if self.require_foreground
+            && rustix::termios::tcgetpgrp(terminal).ok() != Some(rustix::process::getpgrp())
+        {
+            return;
+        }
+        flush_input(terminal.as_fd());
+    }
+
     /// Prints `line` to stderr, or holds it until the prompt on the
     /// terminal is answered, so log lines never cut into a prompt.
     pub fn log(&self, line: &str) {
-        {
+        let clear_transient = {
             let mut state = self.state();
             if state.prompting {
                 if state.held.len() < MAX_HELD {
@@ -426,6 +481,10 @@ impl Approver {
                 }
                 return;
             }
+            std::mem::replace(&mut state.transient_status, false)
+        };
+        if clear_transient && let Some(terminal) = &self.terminal {
+            let _ = write_all(terminal.as_fd(), b"\r\x1b[2K");
         }
         // Printed without the lock, so a stalled stderr holds up no
         // prompt.
@@ -571,23 +630,62 @@ impl Approver {
             );
             return Verdict::Denied;
         }
-        self.state().prompting = true;
+        let clear_transient = {
+            let mut state = self.state();
+            state.prompting = true;
+            std::mem::replace(&mut state.transient_status, false)
+        };
         // Lets held log lines out even if asking panics.
         let prompting = Prompting(self);
-        let verdict = self
+        if clear_transient {
+            let _ = write_all(terminal.as_fd(), b"\r\x1b[2K");
+        }
+        let (verdict, drawn_rows) = self
             .ask(terminal.as_fd(), asker, &description, cancel)
-            .unwrap_or(Verdict::Denied);
+            .unwrap_or((Verdict::Denied, None));
+        let redrawn_prefix = drawn_rows.map(|rows_up| {
+            let erase = if rows_up > 0 {
+                format!("\r\x1b[{rows_up}A\x1b[J")
+            } else {
+                "\r\x1b[J".to_owned()
+            };
+            let mut block = format!(
+                "{erase}\x1b[2mstopit: run {} (profile {}, {}) asked to\x1b[0m\r\n",
+                asker.run,
+                escape_message(&format!("{:?}", asker.profile)),
+                asker.command
+            );
+            for line in &description {
+                if line.starts_with("[s] covers these grants for ") {
+                    continue;
+                }
+                block.push_str(&format!("\x1b[2m  {line}\x1b[0m\r\n"));
+            }
+            block
+        });
         let said = match verdict {
             Verdict::Once => "allowed once".to_owned(),
             Verdict::Session => "allowed for this session".to_owned(),
             Verdict::Persist => match (&self.persister, persist) {
-                (Some(persister), Some(target)) => match persister(target) {
-                    Ok(()) => "allowed and persisted to .stopit.toml".to_owned(),
-                    Err(err) => format!(
-                        "allowed for this session (could not persist to .stopit.toml: {})",
-                        escape_message(&err)
-                    ),
-                },
+                (Some(persister), Some(target)) => {
+                    if let Some(prefix) = &redrawn_prefix {
+                        let loading =
+                            format!("{prefix}\x1b[2m  reloading configuration...\x1b[0m");
+                        let _ = write_all(terminal.as_fd(), loading.as_bytes());
+                    }
+                    let outcome = match persister(target) {
+                        Ok(()) => "allowed and persisted to .stopit.toml".to_owned(),
+                        Err(err) => format!(
+                            "allowed for this session (could not persist to .stopit.toml: {})",
+                            escape_message(&err)
+                        ),
+                    };
+                    if redrawn_prefix.is_some() {
+                        let final_line = format!("\r\x1b[2K\x1b[2m  -> {outcome}\x1b[0m\r\n");
+                        let _ = write_all(terminal.as_fd(), final_line.as_bytes());
+                    }
+                    outcome
+                }
                 (Some(_), None) => {
                     "allowed for this session (this request cannot be persisted to .stopit.toml)"
                         .to_owned()
@@ -596,7 +694,13 @@ impl Approver {
             },
             Verdict::DeniedByUser | Verdict::Denied => "denied".to_owned(),
         };
-        let _ = write_all(terminal.as_fd(), format!("{said}\r\n").as_bytes());
+        if !(verdict == Verdict::Persist && self.persister.is_some() && persist.is_some()) {
+            let out = match redrawn_prefix {
+                Some(prefix) => format!("{prefix}\x1b[2m  -> {said}\x1b[0m\r\n"),
+                None => format!("\x1b[2m  -> {said}\x1b[0m\r\n"),
+            };
+            let _ = write_all(terminal.as_fd(), out.as_bytes());
+        }
         {
             let mut state = self.state();
             match verdict {
@@ -619,20 +723,24 @@ impl Approver {
         asker: &Asker,
         description: &[String],
         cancel: BorrowedFd<'_>,
-    ) -> io::Result<Verdict> {
+    ) -> io::Result<(Verdict, Option<usize>)> {
         let raw = RawMode::enter(terminal)?;
-        let mut text = format!(
-            "\x07\r\nstopit: run {} (profile {}, {}) asks to\r\n",
+        let cols = terminal_cols(terminal);
+        let header = format!(
+            "stopit: run {} (profile {}, {}) asks to",
             asker.run,
             escape_message(&format!("{:?}", asker.profile)),
             asker.command
         );
+        let mut rows_up = line_rows(header.chars().count(), cols);
+        let mut text = format!("\x07\r\n{header}\r\n");
         for line in description {
-            text.push_str(&format!("  {line}\r\n"));
+            let indented = format!("  {line}");
+            rows_up += line_rows(indented.chars().count(), cols);
+            text.push_str(&format!("{indented}\r\n"));
         }
-        text.push_str(
-            "  [y] allow once  [s] allow for this session  [p] allow and persist  [n] deny: ",
-        );
+        rows_up += bar_rows(PROMPT_ACTION_BAR.len(), cols);
+        text.push_str(PROMPT_ACTION_BAR);
         write_all(terminal, text.as_bytes())?;
         // Keys typed before the prompt, and during its first moment, do not
         // count.
@@ -697,7 +805,35 @@ impl Approver {
             }
         };
         drop(raw);
-        Ok(verdict)
+        Ok((verdict, Some(rows_up)))
+    }
+}
+
+/// Returns the terminal's column width, or `0` if unknown.
+fn terminal_cols(terminal: BorrowedFd<'_>) -> usize {
+    rustix::termios::tcgetwinsize(terminal)
+        .ok()
+        .map(|w| w.ws_col as usize)
+        .unwrap_or(0)
+}
+
+/// Number of visual rows a `\r\n`-terminated line of `chars` characters
+/// advances the cursor down on a terminal of width `cols` (`0` = no wrap).
+fn line_rows(chars: usize, cols: usize) -> usize {
+    if chars == 0 || cols == 0 {
+        1
+    } else {
+        ((chars - 1) / cols) + 1
+    }
+}
+
+/// Number of visual rows an unterminated line of `chars` characters wraps
+/// down from its starting row on a terminal of width `cols` (`0` = no wrap).
+fn bar_rows(chars: usize, cols: usize) -> usize {
+    if chars == 0 || cols == 0 {
+        0
+    } else {
+        (chars - 1) / cols
     }
 }
 
@@ -747,12 +883,16 @@ fn drain_pipe(fd: BorrowedFd<'_>) {
     while matches!(rustix::io::read(fd, &mut buf), Ok(n) if n > 0) {}
 }
 
-/// Prints `line` to stderr, ignoring errors: `eprintln!` would panic on a
-/// hung-up terminal, and abort the server if that happened while a panic
-/// unwinds through [`Prompting`].
+/// Prints `line` to stderr (dimmed when stderr is a terminal), ignoring
+/// errors: `eprintln!` would panic on a hung-up terminal, and abort the
+/// server if that happened while a panic unwinds through [`Prompting`].
 fn print_line(line: &str) {
     use std::io::Write as _;
-    let _ = writeln!(io::stderr(), "{line}");
+    if rustix::termios::isatty(io::stderr()) {
+        let _ = writeln!(io::stderr(), "\x1b[2m{line}\x1b[0m");
+    } else {
+        let _ = writeln!(io::stderr(), "{line}");
+    }
 }
 
 /// Whether `fd` is readable now.
@@ -1374,8 +1514,14 @@ mod tests {
         assert!(Verdict::Persist.allows());
         let shown = user.join().unwrap();
         assert!(shown.contains("[p] allow and persist"), "{shown:?}");
+        assert!(shown.contains("\x1b[3A\x1b[J"), "{shown:?}");
         assert!(
-            shown.contains("allowed and persisted to .stopit.toml"),
+            shown.contains("\x1b[2mstopit: run 3 (profile \"main\", claude --x) asked to\x1b[0m"),
+            "{shown:?}"
+        );
+        assert!(shown.contains("reloading configuration..."), "{shown:?}");
+        assert!(
+            shown.contains("-> allowed and persisted to .stopit.toml"),
             "{shown:?}"
         );
         assert_eq!(persisted.lock().unwrap().len(), 1);
@@ -1446,5 +1592,20 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(key, Some(b'r'));
+
+        // `show_status` writes an in-place dimmed status line, and `log`
+        // clears it with `\r\x1b[2K`.
+        t.approver.show_status("stopit: reloading configuration...");
+        let status_out = wait_for(&t.master, "stopit: reloading configuration...");
+        assert!(status_out.contains("\x1b[2K\x1b[2mstopit: reloading configuration...\x1b[0m"));
+        t.approver.log("stopit: reloaded configuration");
+        let clear_out = wait_for(&t.master, "\x1b[2K");
+        assert!(clear_out.contains("\x1b[2K"));
+
+        // `flush_idle_keys` discards buffered keys when no prompt is active.
+        rustix::io::write(&t.master, b"rrr").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        t.approver.flush_idle_keys();
+        assert_eq!(t.approver.read_idle_key(), None);
     }
 }
