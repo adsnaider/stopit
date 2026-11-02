@@ -14,9 +14,9 @@ With an empty `.stopit.toml` (or none), a sandbox has:
 - secrets in the project masked: `.env`, `.env.*`, `*.pem`, `*.key`, `.npmrc`, `.pypirc`, `.netrc`, SSH keys and others show up empty and unreadable;
 - files that exist when the session starts and would let it escape on your next run made read-only: `.stopit.toml`, `*.nix`, `flake.lock`, `.envrc`, `.vscode`, `.idea`, `.github/workflows`, the project settings of Claude Code, Gemini CLI and some editors (`.claude`, `.gemini`, `.cursor`, `.mcp.json`, `.zed`), and others (DESIGN.md, Appendix A);
 - the repository's `.git` and `.jj` masked, with `git` and `jj` brokered instead (see [Version control](#version-control));
-- an empty home directory at `/home/user` and an empty `/tmp`, both deleted when the session ends;
-- its own `/proc` and a minimal `/dev`;
-- generated `/etc/passwd`, `/etc/group`, `/etc/hosts` and `/etc/nsswitch.conf` naming the user `user` and the host `stopit`;
+- an empty home directory at `/home/stopit` and an empty `/tmp`, both deleted when the session ends;
+- its own `/proc`, a minimal `/dev`, and `/var/run` linked to `/run`;
+- generated `/etc/passwd`, `/etc/group`, `/etc/hosts` and `/etc/nsswitch.conf` naming the user `stopit` and the host `stopit`;
 - loopback networking only;
 - an environment holding `HOME`, `USER`, `LOGNAME`, plus `TERM`, `LANG` and `COLORTERM` from yours. Variables matching `*_TOKEN`, `*_KEY`, `*_SECRET`, `*_PASSWORD`, `AWS_*`, `GITHUB_*`, `SSH_AUTH_SOCK` or `NIX_CONFIG` are never passed, in any letter case.
 
@@ -69,7 +69,7 @@ imports = [ stopit.homeModules.default ];   # adds stopit to home.packages
    env.path_prepend = ["/run/current-system/sw/bin"]
    ```
 
-   `/usr/bin/env` and `/bin/sh` are there for scripts that start with `#!/usr/bin/env`. For packages from Home Manager, add your profile (`/etc/profiles/per-user/<you>`, or `~/.nix-profile`) to `fs.ro`, and its `bin` as the sandbox sees it (`/etc/profiles/per-user/<you>/bin` or `/home/user/.nix-profile/bin`) to `env.path_prepend`. Granting all of `/nix/store` is fine for trying stopit out. On NixOS the store can hold rendered secrets, so a careful setup grants only the paths a development shell needs (DESIGN.md section 3.6).
+   `/usr/bin/env` and `/bin/sh` are there for scripts that start with `#!/usr/bin/env`. For packages from Home Manager, add your profile (`/etc/profiles/per-user/<you>`, or `~/.nix-profile`) to `fs.ro`, and its `bin` as the sandbox sees it (`/etc/profiles/per-user/<you>/bin` or `/home/stopit/.nix-profile/bin`) to `env.path_prepend`. Granting all of `/nix/store` is fine for trying stopit out. On NixOS the store can hold rendered secrets, so a careful setup grants only the paths a development shell needs (DESIGN.md section 3.6).
 
    This file needs no `stopit allow`. stopit trusts it because only you can write it, and it checks that no sandbox can.
 
@@ -125,10 +125,10 @@ name = "claude"
 type = "config"
 profile = "claude"
 [provider.sandbox]
-fs.bind = [{ host = "~/.stopit-agents/claude", sandbox = "/home/user/.claude", mode = "rw" }]
+fs.bind = [{ host = "~/.stopit-agents/claude", sandbox = "/home/stopit/.claude", mode = "rw" }]
 fs.ro = ["~/.local/bin/claude"]
-env.path_prepend = ["/home/user/.local/bin"]
-env.set = { CLAUDE_CONFIG_DIR = "/home/user/.claude", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1" }
+env.path_prepend = ["/home/stopit/.local/bin"]
+env.set = { CLAUDE_CONFIG_DIR = "/home/stopit/.claude", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1" }
 network = { mode = "proxy", allow_domains = ["api.anthropic.com", "console.anthropic.com", "claude.ai"] }
 ```
 
@@ -144,9 +144,9 @@ name = "gemini"
 type = "config"
 profile = "gemini"
 [provider.sandbox]
-fs.bind = [{ host = "~/.stopit-agents/gemini", sandbox = "/home/user/.gemini", mode = "rw" }]
+fs.bind = [{ host = "~/.stopit-agents/gemini", sandbox = "/home/stopit/.gemini", mode = "rw" }]
 fs.ro = ["~/.npm-global"]
-env.path_prepend = ["/home/user/.npm-global/bin"]
+env.path_prepend = ["/home/stopit/.npm-global/bin"]
 network = { mode = "proxy", allow_domains = ["generativelanguage.googleapis.com", "cloudcode-pa.googleapis.com", "oauth2.googleapis.com"] }
 ```
 
@@ -162,7 +162,7 @@ name = "codex"
 type = "config"
 profile = "codex"
 [provider.sandbox]
-fs.bind = [{ host = "~/.stopit-agents/codex", sandbox = "/home/user/.codex", mode = "rw" }]
+fs.bind = [{ host = "~/.stopit-agents/codex", sandbox = "/home/stopit/.codex", mode = "rw" }]
 network = { mode = "proxy", allow_domains = ["api.openai.com", "chatgpt.com", "auth.openai.com"] }
 ```
 
@@ -181,8 +181,8 @@ type = "config"
 profile = "opencode"
 [provider.sandbox]
 fs.bind = [
-  { host = "~/.stopit-agents/opencode/config", sandbox = "/home/user/.config/opencode", mode = "rw" },
-  { host = "~/.stopit-agents/opencode/data", sandbox = "/home/user/.local/share/opencode", mode = "rw" },
+  { host = "~/.stopit-agents/opencode/config", sandbox = "/home/stopit/.config/opencode", mode = "rw" },
+  { host = "~/.stopit-agents/opencode/data", sandbox = "/home/stopit/.local/share/opencode", mode = "rw" },
 ]
 network = { mode = "proxy", allow_domains = ["models.dev", "registry.npmjs.org", "api.anthropic.com", "api.openai.com"] }
 ```
@@ -210,7 +210,7 @@ The `vcs` provider, on by default, masks the project's `.git` and `.jj` in the s
 
 A refused command exits with 126 and says why on its stderr, as `[stopit: git: ...]`. Commits carry the `user.name` and `user.email` that `git config --global` gives on the host. jj's own user settings are not read.
 
-The broker supports a plain git repository, a jj repository, colocated or not, and a git worktree. Others (a jj secondary workspace, a project below a checkout's root) get the mask without the broker, with a warning.
+The broker supports a plain git repository, a jj repository (colocated or not), a git worktree, and a jj secondary workspace (`jj workspace add`, with `[workspace] mount = "host"` when `.jj/repo` uses a relative path). A project below a checkout's root gets the mask without the broker, with a warning.
 
 For projects whose build reads `.git` itself, show it read-only instead. This shows `.git/config` too, including any credentials in remote URLs.
 
@@ -246,10 +246,23 @@ name = "cargo-cache"
 type = "config"
 [provider.sandbox]
 fs.rw = ["~/.cargo/registry"]
-env.set = { CARGO_HOME = "/home/user/.cargo" }
+env.set = { CARGO_HOME = "/home/stopit/.cargo" }
 ```
 
-`~` in a rule means your host home directory for the source and the sandbox home (`/home/user`) for where it appears. stopit refuses a read-write grant that contains its own state directories, so `rw ~` does not work. Grant narrower paths.
+`~` in a rule means your host home directory for the source and the sandbox home (`/home/stopit` by default, or `/home/<username>` when `system.user` sets a sandbox username) for where it appears. stopit refuses a read-write grant that contains its own state directories, so `rw ~` does not work. Grant narrower paths.
+
+### Use your host username or pass through host devices
+
+Tools that derive credential paths from your username or `/etc/passwd`, or emulators that need `/dev/kvm` or `/dev/net/tun`, can configure `system.user` and `system.devices`:
+
+```toml
+[[provider]]
+name = "host-identity-and-devices"
+type = "config"
+[provider.sandbox]
+system.user = "host"   # or { username = "builder" }; sets default home to /home/<username>
+system.devices = ["/dev/kvm", "/dev/net/tun"]
+```
 
 ### Hide or protect more files
 
@@ -293,7 +306,7 @@ profile = "publish"
 network = { mode = "proxy", allow_domains = ["crates.io", "index.crates.io", "static.crates.io"] }
 ```
 
-The publish profile still has no registry token, since the default filter drops `CARGO_REGISTRY_TOKEN`. In `cmd = ["binary", ...args]`, standalone `"{workspace}"` and `"{workspace}/..."` arguments expand to the sandbox workspace mount (pass flags and paths as separate arguments, such as `cmd = ["jj", "-R", "{workspace}"]`). Rules are evaluated in first-match-wins order against the caller's space-joined arguments (`literal`, `prefix`, or `regex`). For full custom argument parsing or dynamic per-invocation profiles, set `proxy = "./my-proxy.sh"` on a shim instead. Set `tty = true` on a shim for a full-screen TUI or interactive shell so foreground terminal calls get a pseudo-terminal and window-size updates of their own. DESIGN.md section 7.1 describes the rules.
+The publish profile still has no registry token, since the default filter drops `CARGO_REGISTRY_TOKEN`. In `cmd = ["binary", ...args]`, standalone `"{workspace}"` and `"{workspace}/..."` arguments expand to the sandbox workspace mount (pass flags and paths as separate arguments, such as `cmd = ["jj", "-R", "{workspace}"]`). Rules are evaluated in first-match-wins order against the caller's space-joined arguments (`literal`, `prefix`, or `regex`). For full custom argument parsing or dynamic per-invocation profiles, set `proxy = "./my-proxy.sh"` on a shim instead. Set `tty = true` on a shim for a full-screen TUI or interactive shell so foreground terminal calls get a pseudo-terminal and window-size updates of their own. Set `shims.<name> = false` (or `{ enabled = false }`) to disable a shim inherited from a parent profile or lower layer, and `enabled = false` on a `[[provider]]` to disable a provider by name. DESIGN.md section 7.1 describes the rules.
 
 ### Mount the project at its host path
 
@@ -363,7 +376,7 @@ Allowed configurations are recorded by path and content hash in `~/.local/share/
 
 ## Startup summary
 
-Before the sandbox starts, `stopit run` and `stopit shell` print to stderr what the profile grants beyond the default base: mounts of host content outside the workspace or wider than the workspace's own mount, unmasked sockets, network access, shared namespaces, re-enabled syscalls, brokered commands, script providers with `protect = false`, and extra environment variable names (never values). `-q` / `--quiet` leaves the summary out (warnings and errors are still printed). Give it before the command, since after it `-q` is the command's own.
+Before the sandbox starts, `stopit run` and `stopit shell` print to stderr what the profile grants beyond the default base: mounts of host content outside the workspace or wider than the workspace's own mount, unmasked sockets, network access, passed-through host devices, shared namespaces, re-enabled syscalls, brokered commands, script providers with `protect = false`, and extra environment variable names (never values). `-q` / `--quiet` leaves the summary out (warnings and errors are still printed). Give it before the command, since after it `-q` is the command's own.
 
 ## Current limitations
 
