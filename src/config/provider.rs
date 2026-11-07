@@ -121,8 +121,8 @@ impl TryFrom<String> for ScriptSource {
 
 /// Shell attribute name selected by a `nix` provider (`shell = "agent"`).
 ///
-/// Non-empty, free of NUL bytes, whitespace, `#` and `/`, not starting with
-/// `-`, and not equal to `.` or `..`.
+/// Non-empty, free of NUL bytes, whitespace, control characters, `#`, `?` and
+/// `/`, not starting with `-`, and not equal to `.` or `..`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 #[serde(try_from = "String")]
 pub struct NixShell(String);
@@ -156,11 +156,17 @@ impl FromStr for NixShell {
                 "must not contain `#` (set `flake` or `file` separately from `shell`)",
             ));
         }
+        if s.contains('?') {
+            return Err(bad("must not contain `?`"));
+        }
         if s.contains('/') {
             return Err(bad("must not contain `/`"));
         }
         if s.chars().any(char::is_whitespace) {
             return Err(bad("must not contain whitespace"));
+        }
+        if s.chars().any(char::is_control) {
+            return Err(bad("must not contain control characters"));
         }
         Ok(NixShell(s.to_owned()))
     }
@@ -183,9 +189,10 @@ impl fmt::Display for NixShell {
 /// File or flake directory path configured on a `nix` provider (`file` or
 /// `flake`).
 ///
-/// Non-empty, free of NUL bytes, and not starting with `-`. Supports
-/// `{workspace}`, `{workspace}/…`, `~`, `~/…`, absolute paths, and paths
-/// relative to the configuration file's directory.
+/// Non-empty, free of NUL bytes, `#` and `?`, not starting with `-`, and a
+/// local filesystem path rather than a flake URI. Supports `{workspace}`,
+/// `{workspace}/…`, `~`, `~/…`, absolute paths, and paths relative to the
+/// configuration file's directory.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 #[serde(try_from = "String")]
 pub struct NixSource(String);
@@ -236,12 +243,42 @@ impl FromStr for NixSource {
         if s.starts_with('-') {
             return Err(bad("must not start with `-`"));
         }
-        if s.starts_with("{workspace}") && s != "{workspace}" && !s.starts_with("{workspace}/") {
-            return Err(bad("`{workspace}` must be followed by `/` or stand alone"));
+        if s.contains('#') {
+            return Err(bad(
+                "must not contain `#` (set `shell` separately from `flake` or `file`)",
+            ));
+        }
+        if s.contains('?') {
+            return Err(bad("must not contain `?`"));
+        }
+        if let Some(rest) = s.strip_prefix("{workspace}/") {
+            if rest.is_empty() {
+                return Err(bad("must not end with a trailing `/` after `{workspace}`"));
+            }
+            if rest.contains("{workspace}") {
+                return Err(bad(
+                    "`{workspace}` may only appear once, as `{workspace}` or prefix `{workspace}/...`",
+                ));
+            }
+        } else if s != "{workspace}" && s.contains("{workspace}") {
+            return Err(bad(
+                "`{workspace}` is only expanded as `{workspace}` or prefix `{workspace}/...`",
+            ));
         }
         if s.starts_with('~') && s != "~" && !s.starts_with("~/") {
             return Err(bad(
                 "`~` must stand alone or be followed by `/` (`~user` is not supported)",
+            ));
+        }
+        if let Some((scheme, _)) = s.split_once(':')
+            && !scheme.is_empty()
+            && !scheme.contains('/')
+            && !s.starts_with('/')
+            && !s.starts_with('~')
+            && !s.starts_with("{workspace}")
+        {
+            return Err(bad(
+                "must be a local filesystem path, not a flake URI (write `./...` if a local path contains `:`)",
             ));
         }
         Ok(NixSource(s.to_owned()))
@@ -1149,18 +1186,46 @@ mod tests {
         let msg = err("[[provider]]\ntype = \"nix\"\nfile = \"shell.nix\"\nflake = \".\"");
         assert!(msg.contains("cannot set both `file` and `flake`"), "{msg}");
 
-        for bad_shell in ["", "-flag", ".", "..", "a#b", "a/b", "a b", "a\0b"] {
+        for bad_shell in [
+            "",
+            "-flag",
+            ".",
+            "..",
+            "a#b",
+            "a?b",
+            "a/b",
+            "a b",
+            "a\0b",
+            "a\x07b",
+            "a\x1bb",
+        ] {
             assert!(
                 bad_shell.parse::<NixShell>().is_err(),
                 "expected {bad_shell:?} to be rejected"
             );
         }
-        for bad_path in ["", "-f", "{workspace}x", "~other", "a\0b"] {
+        for bad_path in [
+            "",
+            "-f",
+            "{workspace}x",
+            "{workspace}/",
+            "a/{workspace}",
+            "{workspace}/{workspace}",
+            "~other",
+            "a\0b",
+            ".#agent",
+            "sub?dir=evil",
+            "github:NixOS/nixpkgs",
+            "path:.",
+            "git+https://example.com/repo",
+        ] {
             assert!(
                 bad_path.parse::<NixSource>().is_err(),
                 "expected {bad_path:?} to be rejected"
             );
         }
+        let local_colon: NixSource = "./dir:with:colon".parse().unwrap();
+        assert_eq!(local_colon.as_str(), "./dir:with:colon");
         let ws = Path::new("/ws");
         let base = Path::new("/cfg");
         let home = Path::new("/home/u");

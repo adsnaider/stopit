@@ -87,7 +87,8 @@ pub struct LayeredProviderEntry {
     /// Which configuration layer declared this entry.
     pub origin: ProviderOrigin,
     /// Directory of the declaring configuration file, used to resolve relative
-    /// `script` provider `source` paths and set their working directory.
+    /// `script` provider `source` paths (and set their working directory),
+    /// `config` proxy shim paths, and relative `nix` `file` or `flake` paths.
     pub base_dir: PathBuf,
     /// Parsed provider entry.
     pub entry: ProviderEntry,
@@ -1321,5 +1322,16 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(msg.contains("duplicate provider name \"a\""), "{msg}");
+
+        // Disabling a named global `nix` provider in `.stopit.toml` without
+        // setting `type` preserves `ProviderKind::Nix` and marks it disabled.
+        let l = layered(
+            Some("[[provider]]\ntype = \"nix\"\nname = \"custom-nix\"\nshell = \"agent\"\n"),
+            Some("[[provider]]\nname = \"custom-nix\"\nenabled = false\n"),
+        );
+        assert_eq!(l.providers.len(), 1);
+        assert_eq!(l.providers[0].entry.name.as_str(), "custom-nix");
+        assert!(!l.providers[0].entry.enabled);
+        assert_eq!(l.providers[0].entry.kind.type_name(), "nix");
     }
 }

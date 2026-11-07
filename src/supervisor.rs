@@ -904,14 +904,10 @@ fn load_policy<S>(
     );
     let mut warnings = Vec::new();
     if let Some(gf) = &global_file {
-        for name in replaced.iter().filter(|n| {
-            is_default_provider_name(n)
-                && config
-                    .providers
-                    .iter()
-                    .find(|p| &p.name == *n)
-                    .is_none_or(|p| p.enabled)
-        }) {
+        for name in replaced
+            .iter()
+            .filter(|n| should_warn_unnamed_replacement(n, &global_entries, &config.providers))
+        {
             warnings.push(format!(
                 "the [[provider]] named \"{name}\" in {CONFIG_FILE} replaces the one of that \
                  name in {:?}; give one of them another `name` to keep both",
@@ -2813,13 +2809,74 @@ pub fn check_config_trust(file: Ownership, dir: Ownership, uid: u32) -> Result<(
 /// Whether `name` is the name a `[[provider]]` gets without `name`, its
 /// type.
 fn is_default_provider_name(name: &ProviderName) -> bool {
-    matches!(name.as_str(), "config" | "script" | "vcs")
+    matches!(name.as_str(), "config" | "script" | "vcs" | "nix")
+}
+
+/// Whether replacing a global provider named `name` with the workspace entry in
+/// `effective_providers` should emit the unnamed-collision warning.
+///
+/// Suppresses the warning when the workspace entry disables the global one
+/// (`enabled = false`), or when an unnamed workspace-scoped `nix` entry
+/// overrides a workspace-scoped global `nix` entry targeting the same profile
+/// (for example setting `shell = "agent"`), since two `nix` devShells in one
+/// profile cannot both be kept without `env.set` conflicts. Replacing a global
+/// `nix` entry that points at a non-workspace `file` or `flake` still warns.
+fn should_warn_unnamed_replacement(
+    name: &ProviderName,
+    global_entries: &[ProviderEntry],
+    effective_providers: &[ProviderEntry],
+) -> bool {
+    if !is_default_provider_name(name) {
+        return false;
+    }
+    let Some(project_entry) = effective_providers.iter().find(|p| &p.name == name) else {
+        return true;
+    };
+    if !project_entry.enabled {
+        return false;
+    }
+    if name.as_str() == "nix"
+        && let Some(global_entry) = global_entries.iter().find(|p| &p.name == name)
+        && let (
+            ProviderKind::Nix {
+                profile: g_prof,
+                file: g_file,
+                flake: g_flake,
+                ..
+            },
+            ProviderKind::Nix {
+                profile: p_prof,
+                file: p_file,
+                flake: p_flake,
+                ..
+            },
+        ) = (&global_entry.kind, &project_entry.kind)
+    {
+        let global_is_workspace = g_file
+            .as_ref()
+            .is_none_or(|s| s.uses_workspace_placeholder())
+            && g_flake
+                .as_ref()
+                .is_none_or(|s| s.uses_workspace_placeholder());
+        let project_is_workspace = p_file
+            .as_ref()
+            .is_none_or(|s| s.uses_workspace_placeholder())
+            && p_flake
+                .as_ref()
+                .is_none_or(|s| s.uses_workspace_placeholder());
+        if global_is_workspace && project_is_workspace && g_prof == p_prof {
+            return false;
+        }
+    }
+    true
 }
 
 /// The paths to protect for the global configuration `file`, whose
 /// `[[provider]]` entries are `entries`, declared in `config_dir`: its
-/// canonical path and the canonical source of every protected `script`
-/// entry, used in this session or not.
+/// canonical path, the canonical source of every protected `script` entry,
+/// every protected `config` proxy shim, and every non-workspace `nix` `file`
+/// or `flake` directory (plus its `flake.nix` and `flake.lock`), used in this
+/// session or not.
 ///
 /// Each is resolved from its declared path and refused if the way runs
 /// through a symbolic link inside `workspace` or one of `rw_grants`, which
@@ -2924,6 +2981,13 @@ fn guard_global_config(
                     && !flake.uses_workspace_placeholder()
                 {
                     let declared_dir = flake.expand(config_dir, workspace, home);
+                    let flake_dir = resolve(
+                        &declared_dir,
+                        &format!("nix provider {:?} flake directory", entry.name.as_str()),
+                    )?;
+                    if !paths.contains(&flake_dir) {
+                        paths.push(flake_dir.clone());
+                    }
                     let flake_nix_declared = declared_dir.join("flake.nix");
                     let flake_nix = resolve(
                         &flake_nix_declared,
@@ -2933,13 +2997,30 @@ fn guard_global_config(
                         paths.push(flake_nix);
                     }
                     let flake_lock_declared = declared_dir.join("flake.lock");
-                    if std::fs::symlink_metadata(&flake_lock_declared).is_ok() {
-                        let flake_lock = resolve(
-                            &flake_lock_declared,
-                            &format!("nix provider {:?} flake.lock", entry.name.as_str()),
-                        )?;
-                        if !paths.contains(&flake_lock) {
-                            paths.push(flake_lock);
+                    let what_lock = format!("nix provider {:?} flake.lock", entry.name.as_str());
+                    match resolve_script_path(&flake_lock_declared, workspace, rw_grants) {
+                        Ok(flake_lock) => {
+                            if !paths.contains(&flake_lock) {
+                                paths.push(flake_lock);
+                            }
+                        }
+                        Err(ScriptPathError::Link { link, root }) => {
+                            return Err(untrusted(format!(
+                                "the way to {what_lock} {flake_lock_declared:?} runs through the \
+                                 symbolic link {link:?} inside {root}, which a sandbox can write, \
+                                 so it could re-point the link; use a path with no symbolic link \
+                                 inside that directory"
+                            )));
+                        }
+                        Err(ScriptPathError::Lookup(e)) => {
+                            let genuinely_missing = e.kind() == io::ErrorKind::NotFound
+                                && std::fs::symlink_metadata(flake_dir.join("flake.lock"))
+                                    .is_err_and(|m_err| m_err.kind() == io::ErrorKind::NotFound);
+                            if !genuinely_missing {
+                                return Err(untrusted(format!(
+                                    "cannot resolve {what_lock} {flake_lock_declared:?}: {e}"
+                                )));
+                            }
                         }
                     }
                 }
@@ -4609,6 +4690,113 @@ mod tests {
             .map(|n| n.as_str())
             .collect();
         assert_eq!(names, ["active"]);
+    }
+
+    #[test]
+    fn global_nix_providers_are_guarded_and_unnamed_replacements_checked() {
+        let (_d, root) = tmp();
+        let ws = root.join("ws");
+        fs::create_dir(&ws).unwrap();
+        let dirs = global_dir(&root);
+        let cfg_path = dirs.active.path.join(GLOBAL_CONFIG_FILE);
+        fs::write(&cfg_path, "").unwrap();
+        chmod(&cfg_path, 0o600);
+        let file = read_ok(&dirs);
+
+        // Non-workspace `file` and `flake` (with and without `flake.lock`), plus
+        // `{workspace}` entries which are skipped for global guarding.
+        let nix_file = root.join("shell.nix");
+        fs::write(&nix_file, "{}").unwrap();
+        let flake_a = root.join("flake-a");
+        fs::create_dir(&flake_a).unwrap();
+        fs::write(flake_a.join("flake.nix"), "{}").unwrap();
+        fs::write(flake_a.join("flake.lock"), "{}").unwrap();
+        let flake_b = root.join("flake-b");
+        fs::create_dir(&flake_b).unwrap();
+        fs::write(flake_b.join("flake.nix"), "{}").unwrap();
+
+        let entries = ConfigLayer::from_toml_str(&format!(
+            "[[provider]]\ntype = \"nix\"\nname = \"f\"\nfile = {:?}\n\
+             [[provider]]\ntype = \"nix\"\nname = \"fa\"\nflake = {:?}\n\
+             [[provider]]\ntype = \"nix\"\nname = \"fb\"\nflake = {:?}\n\
+             [[provider]]\ntype = \"nix\"\nname = \"ws-auto\"\n\
+             [[provider]]\ntype = \"nix\"\nname = \"ws-file\"\nfile = \"{{workspace}}/shell.nix\"\n\
+             [[provider]]\ntype = \"nix\"\nname = \"ws-flake\"\nflake = \"{{workspace}}/sub\"\n",
+            nix_file, flake_a, flake_b
+        ))
+        .unwrap()
+        .providers;
+
+        let guarded =
+            guard_global_config(&file, &entries, &dirs.active.path, &root, &ws, &[]).unwrap();
+        assert_eq!(
+            guarded,
+            [
+                file.canonical_path.clone(),
+                nix_file.clone(),
+                flake_a.clone(),
+                flake_a.join("flake.nix"),
+                flake_a.join("flake.lock"),
+                flake_b.clone(),
+                flake_b.join("flake.nix"),
+            ]
+        );
+
+        // A dangling symlink at `flake.lock` is not genuinely missing and fails closed.
+        symlink(root.join("missing.lock"), flake_b.join("flake.lock")).unwrap();
+        let err =
+            guard_global_config(&file, &entries, &dirs.active.path, &root, &ws, &[]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot resolve nix provider \"fb\" flake.lock"),
+            "{err}"
+        );
+        fs::remove_file(flake_b.join("flake.lock")).unwrap();
+
+        // An untrusted symlink inside `rw_grants` on a global `flake` path is refused.
+        let rw = root.join("rw");
+        fs::create_dir(&rw).unwrap();
+        symlink(&flake_a, rw.join("linked-flake")).unwrap();
+        let linked_entries = ConfigLayer::from_toml_str(&format!(
+            "[[provider]]\ntype = \"nix\"\nflake = {:?}\n",
+            rw.join("linked-flake")
+        ))
+        .unwrap()
+        .providers;
+        let err = guard_global_config(
+            &file,
+            &linked_entries,
+            &dirs.active.path,
+            &root,
+            &ws,
+            &[rw_root(&rw)],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("runs through the symbolic link"),
+            "{err}"
+        );
+
+        // `is_default_provider_name` includes `"nix"`, and unnamed replacement
+        // warns when clobbering a global non-workspace flake or changing type,
+        // while staying quiet on workspace-to-workspace shell overrides and
+        // `enabled = false`.
+        let nix_name: ProviderName = "nix".parse().unwrap();
+        assert!(is_default_provider_name(&nix_name));
+        let parse_entries = |src: &str| ConfigLayer::from_toml_str(src).unwrap().providers;
+        let g_ws = parse_entries("[[provider]]\ntype = \"nix\"\n");
+        let p_shell = parse_entries("[[provider]]\ntype = \"nix\"\nshell = \"agent\"\n");
+        let p_disabled = parse_entries("[[provider]]\nname = \"nix\"\nenabled = false\n");
+        let p_cfg = parse_entries("[[provider]]\ntype = \"config\"\nname = \"nix\"\n");
+        let g_ext = parse_entries("[[provider]]\ntype = \"nix\"\nflake = \"~/global-tools\"\n");
+        assert!(!should_warn_unnamed_replacement(&nix_name, &g_ws, &p_shell));
+        assert!(!should_warn_unnamed_replacement(
+            &nix_name,
+            &g_ws,
+            &p_disabled
+        ));
+        assert!(should_warn_unnamed_replacement(&nix_name, &g_ws, &p_cfg));
+        assert!(should_warn_unnamed_replacement(&nix_name, &g_ext, &p_shell));
     }
 
     #[test]

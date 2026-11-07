@@ -67,7 +67,7 @@ impl ProviderContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderOutput {
     /// The profile the manifest's top-level grants apply to: the `profile`
-    /// of a `config` provider, `main` for every other type.
+    /// of a `config` or `nix` provider, `main` for every other type.
     pub profile: ProfileRef,
     /// The manifest. Contributed profiles stay in `manifest.profiles`,
     /// unprefixed; the provider-name prefix is added during resolution.
@@ -830,5 +830,21 @@ mod tests {
         let p_link = from_entry(&es_link[0], &root).unwrap();
         let err = p_link.manifest(&c).unwrap_err();
         assert!(matches!(err, ProviderError::SourceLink { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn nix_entry_currently_returns_unsupported_until_implemented() {
+        let es = entries("[[provider]]\ntype = \"nix\"\nname = \"my-nix\"");
+        let err = match from_entry(&es[0], Path::new("/cfg")) {
+            Ok(_) => panic!("expected ProviderError::Unsupported"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(
+                &err,
+                ProviderError::Unsupported { name, kind: "nix" } if name.as_str() == "my-nix"
+            ),
+            "{err:?}"
+        );
     }
 }
