@@ -52,9 +52,43 @@
       }
     )
     // {
-      homeModules.default = {pkgs, ...}: {
-        home.packages = [
-          self.packages.${pkgs.system}.stopit
+      homeModules.default = {
+        config,
+        lib,
+        pkgs,
+        ...
+      }: let
+        tomlFormat = pkgs.formats.toml {};
+        settings = lib.recursiveUpdate config.stopit.config config.programs.stopit.config;
+      in {
+        options = {
+          programs.stopit.config = lib.mkOption {
+            type = tomlFormat.type;
+            default = {};
+            description = "Configuration written to ~/.config/stopit/config.toml";
+          };
+          stopit.config = lib.mkOption {
+            type = tomlFormat.type;
+            default = {};
+            description = "Alias for programs.stopit.config";
+          };
+        };
+
+        config = lib.mkMerge [
+          {
+            home.packages = [
+              self.packages.${pkgs.system}.stopit
+            ];
+          }
+          (lib.mkIf (settings != {}) {
+            xdg.configFile."stopit/config.toml".source =
+              tomlFormat.generate "stopit-config.toml" settings;
+          })
+          (lib.mkIf (config ? skills) {
+            skills = {
+              stopit-sandbox = "${self}/skills/stopit-sandbox";
+            };
+          })
         ];
       };
     };
