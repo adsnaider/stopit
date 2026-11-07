@@ -161,9 +161,9 @@ A symbolic link is accepted too, since Home Manager and dotfile managers install
 
 A file or target with more than one hard link is refused when the user could write it, since a sandbox could rewrite it through the other name. Nix store files that `auto-optimise-store` hard-links pass, as for script sources (§3.6). Every failure names the file and the reason. A missing directory or a missing `config.toml` means no global configuration.
 
-The target and the scripts of the global configuration often live outside the reserved directory, so the supervisor guards them in every session. Before any provider runs, it resolves `config.toml` and the source of every protected global `script` provider from their declared paths. A symbolic link on the way inside the workspace or a `config` provider's `rw` grant is refused, since a sandbox could re-point it, as for script providers (§3.6). The canonical paths are then protected in every profile, like the workspace's `.stopit.toml`. A workspace granting `rw` on a dotfiles repository therefore cannot change the file a link names, rename it, rename a directory above it, or give it a second name. This holds for global scripts the session does not run too, such as one a workspace provider replaced by name.
+The target and the scripts of the global configuration often live outside the reserved directory, so the supervisor guards them in every session. Before any provider runs, it resolves `config.toml`, the source of every protected global `script` provider, every protected global `config` proxy shim, and every non-workspace `file` or `flake` directory (along with its `flake.nix` and `flake.lock` when present) of a global `nix` provider from their declared paths. A symbolic link on the way inside the workspace or a `config` provider's `rw` grant is refused, since a sandbox could re-point it, as for script providers (§3.6). The canonical paths are then protected in every profile, like the workspace's `.stopit.toml`. A workspace granting `rw` on a dotfiles repository therefore cannot change the file a link names, rename it, rename a directory above it, or give it a second name. This holds for global providers the session does not run too, such as one a workspace provider replaced by name or disabled with `enabled = false`.
 
-Relative `script` provider sources in `config.toml` resolve against the configuration directory, which is also their working directory.
+Relative `script` provider sources and `nix` provider `file` and `flake` paths in `config.toml` resolve against the configuration directory, which is also a global script provider's working directory.
 
 When the workspace's `.stopit.toml` sets `base = "none"`, the global layer does not apply. stopit still reads, checks and parses `config.toml` to guard its target and scripts, so a broken or untrusted one stops that workspace too. Otherwise the two layer as described in §3.5.
 
@@ -269,7 +269,7 @@ Profiles come from two places:
   [profiles.bare]
   inherit = "none"         # starts from the empty sandbox, ignoring base
   ```
-  Grants are then attached by providers (`config` providers take `profile = "<name>"`; §3.6).
+  Grants are then attached by providers (`config` and `nix` providers take `profile = "<name>"`; §3.6).
 * **Contributed by providers** as part of their manifest. These are prefixed with the provider's name to avoid collisions: the `vcs` provider contributes `vcs.ro`, `vcs.local`, `vcs.remote`. Inside the manifest they are written as plain single-segment names (`ro`, `local`, `remote`) and the prefix is added automatically (§3.6). Most users never see them.
 
 `inherit = "<profile>"` (default `"main"`) means the profile starts from the parent's fully merged grants, then adds its own. `inherit = "none"` starts from the empty sandbox. `stopit-grant` (§7.5) creates a temporary profile: the caller's profile plus the requested delta.
@@ -317,7 +317,7 @@ All providers' manifests are merged per profile, in order: base providers first,
 
 * A top-level field written in `.stopit.toml` overrides the same field in `config.toml`, field by field (`base`, `workspace.mount`, each `[limits]` value, `approval.timeout`, `terminal.clipboard_write`). Writing the built-in default counts as writing it. A field neither file writes takes the built-in default.
 * `[profiles.<name>]` declarations are a union, and `.stopit.toml`'s declaration of a name replaces `config.toml`'s.
-* A `[[provider]]` in `.stopit.toml` with the same name as one in `config.toml` replaces it, including the implicit names such as `config`. Setting `enabled = false` on a `[[provider]]` disables that entry (or a lower-layer or built-in `vcs` provider of the same name) so it is never instantiated or executed. When both are unnamed, stopit warns, since that is rarely meant. Two providers with one name in the same file stay an error.
+* A `[[provider]]` in `.stopit.toml` with the same name as one in `config.toml` replaces it, including the implicit names (`config`, `script`, `vcs`, `nix`). Setting `enabled = false` on a `[[provider]]` disables that entry (or a lower-layer or built-in `vcs` provider of the same name) so it is never instantiated or executed. When both are unnamed, stopit warns, since that is rarely meant, except when the workspace entry sets `enabled = false` or when both are workspace-scoped `nix` entries targeting the same `profile` (such as overriding `shell = "agent"`). Two providers with one name in the same file stay an error.
 * Within a profile's own contributions, `env.set` variables, `shims` names, `system.user`, and `system.home` from a higher layer override a lower layer's (setting `shims.<name> = false` or `{ enabled = false }` removes a lower-layer or inherited shim of that name). Two providers of the same layer that disagree stay an error, even when a higher layer also sets the key, except that a `.stopit.toml` provider named `approvals` or `approvals-<profile>` (§5.4) also overrides a shim of the same name from an earlier `.stopit.toml` provider.
 * Two path rules or binds at one sandbox path with the same rank under the rules below and different sources go to the higher of the global and workspace layers, so a project `fs.bind` can replace a global one at the same destination and mode. Two such sources within one layer conflict, even when a higher layer also has one, as for `env.set`. A built-in rule is never replaced this way, and a user rule of the same rank with another source conflicts with it.
 * `env.path_prepend` needs nothing new. Later providers come first, so project entries precede global ones in `PATH`.
@@ -356,15 +356,15 @@ A **provider** produces a **manifest**: the canonical grant structure used by ev
 
 | Field | Applies to | Meaning |
 | :--- | :--- | :--- |
-| `type` | all (optional when `enabled = false` and `name` is set) | `config`, `script`, `vcs` (later: `nix`, …) |
+| `type` | all (optional when `enabled = false` and `name` is set) | `config`, `script`, `vcs`, `nix` |
 | `name` | all | Optional; defaults to `type`. Prefix for contributed profiles; shown in the startup summary |
 | `enabled` | all | Optional boolean (default `true`). When `false`, disables this provider entry (or a lower-layer/built-in provider with the same `name`) |
-| `profile` | `config` | Profile the grants apply to (default `main`) |
+| `profile` | `config`, `nix` | Profile the grants apply to (default `main`) |
 | `[provider.sandbox]` | `config` | The manifest itself, written inline in TOML |
 | `source` | `script` | Path to the executable, relative to `.stopit.toml`; executed **on the host** |
 | `protect` | `script` | Whether `source` is automatically `protected` (default `true`) |
 | `[provider.config]` | `script` only | Free-form parameters for the script, passed as JSON on stdin. Only scripts need a free-form keyspace |
-| type-specific keys | built-in types (`vcs`, later `nix`) | Options written directly under `[[provider]]` (e.g. `view`, `tools`, `devshell`) |
+| type-specific keys | built-in types (`vcs`, `nix`) | Options written directly under `[[provider]]` (e.g. `view`, `tools`, `shell`, `file`, `flake`, `cache`) |
 
 ```toml
 [[provider]]
@@ -405,7 +405,7 @@ view = "masked"
 }
 ```
 
-* Top-level manifest sections apply to the target profile (`profile` for `config`; `main` for other types). Entries under `profiles` are contributed profiles, prefixed with the provider's `name`.
+* Top-level manifest sections apply to the target profile (`profile` for `config` and `nix`; `main` for other types). Entries under `profiles` are contributed profiles, prefixed with the provider's `name`.
 * **Contributed profile keys** inside a manifest are plain single-segment names (e.g. `local`); the provider's `name` prefix is added automatically (`vcs.local`). Contributed profiles cannot themselves contain `profiles` or `version`.
 * **Reference rule:** within a manifest, a plain profile reference (`inherit = "local"`, shim `profile = "ro"`) resolves first to that manifest's own contributed profile, then to a user-declared profile. `main` and other providers' profiles are referenced by their full names. A full name (e.g. `vcs.local`) always resolves globally, including to the manifest's own profiles; plain names are preferred inside a manifest because the provider `name` can change.
 * **Validation:** every manifest table accepts only maps (array forms are rejected) and unknown keys are rejected. A JSON manifest from a script **must** include `"version"`; an inline `[provider.sandbox]` may omit it (defaults to 1). Bind `mode` is one of `ro`, `rw`, `protected` only (`masked` and `ephemeral` have no host content to bind). Bind `host`/`sandbox` paths contain no globs (glob characters are `*`, `?`, `[`, `]`), and a bind's `sandbox` side additionally allows no `{workspace}` placeholder. Path rules are also validated syntactically at load time (§3.4).
@@ -425,7 +425,7 @@ pub trait Provider: Send + Sync {
 }
 ```
 
-`config`, `script`, and built-in `vcs` providers emit manifests with declarative (`cmd` + `default` + `rules`) or host-proxy (`proxy`) shims (§7.1).
+`config`, `script`, and built-in `vcs` providers emit manifests with declarative (`cmd` + `default` + `rules`) or host-proxy (`proxy`) shims (§7.1); the built-in `nix` provider emits closure `fs.ro` store-path mounts and devShell environment grants.
 
 **Provider types:**
 
@@ -434,11 +434,16 @@ pub trait Provider: Send + Sync {
 | `config` | v1 | The manifest written inline in `[provider.sandbox]` |
 | `script` | v1 | Runs `source`, passes `[provider.config]` + context on stdin, parses the manifest |
 | `vcs` | v1 | Repository-root resolution, `.git`/`.jj` masking, VCS profiles and `jj`/`git` shims (§7.3) |
-| `nix` | later | `devshell = "<name>"`: runtime closure of the devShell's `inputDerivation` plus `nix print-dev-env --json`, resolved on the host |
+| `nix` | v1 | Auto-detects `flake.nix` or `shell.nix` (or reads `file` / `flake`) and optional `shell = "<name>"`, resolves the runtime closure and `nix print-dev-env --json` on the host, and caches results under `<data_dir>/nix/` |
 
 **Host daemons.** A provider may grant access to a host daemon's socket (e.g. a future `buck2` provider talking to the buck2 daemon). Such daemons run *outside* the sandbox (buck2 executes build rules on the host), so granting the socket is equivalent to granting host code execution (the same reason the Nix daemon is never exposed). This is allowed as a deliberate choice; socket grants are flagged as **delegates to host** in the startup summary.
 
-**Nix guidance (outside `stopit` core).** Define a `devShells.agent` (or similar) in your flake with every tool the agent needs and expose it through a `script` provider (later the `nix` provider). The closure-only manifest means only the store paths that environment needs are visible, not all of `/nix/store`, which on NixOS can contain secrets (e.g. `access-tokens` rendered into `nix.conf`). The `nix` provider refuses closures that pull in paths named `*-etc`, `*-home-manager-files`, or `*nix.conf*`. The sandbox has **no access to the Nix daemon**; changing the tool environment requires the user to edit the (protected) flake and restart or reload the session.
+**The `nix` provider.** `[[provider]] type = "nix"` resolves a Nix development shell on the host and mounts only the store paths in its runtime closure, never all of `/nix/store` (which on NixOS can contain rendered secrets such as `access-tokens` in `nix.conf`) and never the Nix daemon socket. Changing the tool environment requires the user to edit the protected Nix files on the host and restart or reload the session.
+
+* **Target selection and options.** When neither `file` nor `flake` is set (`file` and `flake` are mutually exclusive), the provider checks `{workspace}/flake.nix` first and `{workspace}/shell.nix` second (`default.nix` is evaluated only when named explicitly via `file = "default.nix"`). When neither exists and `shell` is unset, the provider returns an empty manifest so a global `[[provider]] type = "nix"` is a quiet no-op in non-Nix workspaces. If `flake.nix` exists without a default development shell or package (or if `shell`, `file`, or `flake` is configured and missing or fails to evaluate), startup fails; library or module flakes without a shell can set `enabled = false` on the `nix` provider in `.stopit.toml`. `shell = "<attr>"` selects `devShells.<system>.<attr>` on flakes or `-A <attr>` on classic Nix files. `profile` sets the target sandbox profile (default `"main"`).
+* **Input validation and host execution.** Before invoking `nix`, the provider resolves its entry-point paths component by component, walks the target directory tree (always, regardless of `cache`), and refuses any symlink inside an untrusted root on a `.nix` file, `flake.lock`, or directory whose target tree holds Nix inputs (while allowing build links such as `result -> /nix/store/...`), as well as any regular `.nix` or `flake.lock` file with rewritable hard links. The evaluated entry-point files (`flake.nix` and `flake.lock`, or `file`) are added to the supervisor's protected paths in every profile. The `nix` binary is resolved only from absolute `PATH` entries that do not traverse an untrusted root and have no rewritable hard links, and runs in its own process group with a scrubbed allowlisted host environment (dropping `NIX_CONFIG`, `SSH_AUTH_SOCK`, cloud/VCS tokens, and `*_KEY`/`*_SECRET`/`*_TOKEN` variables). Flake evaluation omits `--write-lock-file` so `flake.lock` is never mutated by startup, and retries with a `path:` flake reference when Nix's libgit2 rejects a repository's `extensions.refstorage` (such as Git reftables).
+* **Closure mounts and environment grants.** `nix print-dev-env --json` provides both the shell's store references and its environment, and `nix path-info --recursive` expands those references to their full runtime closure, mounted `fs.ro` one store directory per path. Any non-store path, wildcard character, or secret-bearing store derivation (`*-etc`, `*-home-manager-files`, `*nix.conf*`) aborts startup. `shellHook` is never executed; only `"type": "exported"` variables are read. Exported `/nix/store/...` entries from `PATH` become `env.path_prepend`, and remaining exported variables become `env.set` after filtering `stdenv`/build-sandbox internals (`NIX_BUILD_*`, `TMPDIR`, `HOME`, `USER`, `SHELL`, `SHLVL`, `Builder`/`outputs`/`phases` attributes, proxy variables) and dummy `/no-cert-file.crt` bundle placeholders (while keeping real `/nix/store/...` CA bundle paths).
+* **Persistent caching and GC roots.** With `cache = true` (default), resolved closures and environment grants are stored under `<data_dir>/nix/<sha256>/env.json` alongside `--profile` GC root symlinks so `nix-collect-garbage` preserves cached closures across sessions. Cache keys cover the provider options, canonical target path, Nix version, `NIX_PATH` (for classic files), and a content hash of every `.nix` and `flake.lock` file in the target tree; a cached entry is verified on hit to ensure every store path still exists on disk, re-evaluating transparently if garbage collection removed one. With `cache = false`, `--profile` roots live in the session directory for the lifetime of the session.
 
 ---
 
@@ -968,9 +973,9 @@ Session-wide, so not a provider setting. Off unless configured. Mitigates forkbo
 ## 11. Known limitations and future work
 
 * **Nested repository creation.** The sandbox can create `subdir/.git` (or `.jj`) with hostile config (e.g. `core.fsmonitor`) that a shell prompt running `git status` on `cd` would execute on the host. Not mitigated in v1. Future fix: full-workspace FUSE (below) can intercept `mkdir .git` anywhere.
-* **Self-loading settings created in the session.** Protected rules for agent and editor settings (`.claude`, `.gemini`, `.mcp.json`, `.vscode`, `.envrc` and others, Appendix A) cover only paths that exist at session start (§3.4). In a project without them, the sandbox can create, say, `.claude/settings.json` with a hook or `opencode.json` with an MCP command, which the host tool runs the next time it starts there. §3.4's reasoning that new files are safe because every file that could reference them is protected does not hold for tools that load a directory by name. The future fix is the same as for nested repositories.
+* **Self-loading settings created in the session.** Protected rules for agent and editor settings (`.claude`, `.gemini`, `.mcp.json`, `.vscode`, `.envrc` and others, Appendix A) and Nix entry points (`flake.nix`, `flake.lock`, `shell.nix` when `[[provider]] type = "nix"` is active) cover only paths that exist at session start (§3.4). In a project without them, the sandbox can create, say, `.claude/settings.json` with a hook, `opencode.json` with an MCP command, or a `flake.nix` / `shell.nix` in a previously non-Nix workspace, which the host tool or the next session's `nix` provider evaluates when it starts there. §3.4's reasoning that new files are safe because every file that could reference them is protected does not hold for tools that load a directory or entry-point file by name. The future fix is the same as for nested repositories.
 * **Ignored `close()` errors** make denied in-place writes look successful to some programs (§4.3).
-* **Auto-import patterns** (`import-tree`, haumea, `listFilesRecursive`) evaluate *new* `.nix` files without any protected file changing. Data files read during provider evaluation (`rust-toolchain.toml`, `Cargo.toml`) are not protected by default.
+* **Auto-import patterns and imported Nix files under `base = "none"`.** Auto-import helpers (`import-tree`, haumea, `listFilesRecursive`) evaluate *new* `.nix` files without any protected file changing. Under `base = "none"`, the `nix` provider automatically protects its entry-point `flake.nix`, `flake.lock`, or `file`, while other `.nix` files imported from writable directories need an explicit `protected` rule (such as `"{workspace}/**/*.nix"`, which `base = "default"` includes). Data files read during provider evaluation (`rust-toolchain.toml`, `Cargo.toml`) are not protected by default.
 * **Secrets inside granted tool closures** (packages that embed tokens) are visible.
 * **Git history** (including removed secrets) is reachable through brokered VCS commands.
 * **HTTPS remote credentials** in `.git/config` are readable when `vcs` uses `view = "ro"`.
@@ -1008,8 +1013,7 @@ Session-wide, so not a provider setting. Off unless configured. Mitigates forkbo
   * A supervisor killed by `SIGKILL` (or any signal it does not catch) leaves its session directory behind (see "Session directory cleanup is best effort"); `SIGINT`, `SIGQUIT`, `SIGTERM` and `SIGHUP` are caught (§5). After a forwarded signal kills bwrap, the sandbox is killed asynchronously (`--die-with-parent`), so the session directory is removed while it may still be exiting.
 * **Mount count.** bwrap accepts at most 9000 arguments, so about 3000 mounts (§6.2), and parses the whole mount table after each bind, so its start time grows quadratically with the number of mounts: about 13 s for 3000 file binds on a desktop machine. A profile granting thousands of single files (closure-only binds) starts slowly or not at all; granting directories keeps the count down. Future work, roughly by effort:
   * **Prune redundant nested mounts:** a mount whose parent mount already shows the same host content with the same mode adds nothing.
-  * **Collapse full globs:** when a glob matches every entry of a directory with the same mode, bind the directory once instead of each entry.
-  * **Nix closures as store paths:** grant each store path of a closure as one directory instead of its files one by one.
+  * **Collapse full globs:** when a glob matches every entry of a directory with the same mode, bind the directory once instead of each entry (as the `nix` provider already does per store path in a closure).
   * **Mount from `__init`:** in the long term, have `__init` (or a helper before it) build the mounts itself with `open_tree`/`move_mount` on descriptors the supervisor hands in, which is linear in the number of mounts. bwrap's `--bind-fd` does not help: it goes through the same per-bind mount-table parse.
 * **Only mount destinations and stopit's own state are reserved.** The reserved-path check (§6.2) looks at where a rule or bind is mounted; host sources are only checked against stopit's state directories (§6.2, Reserved host paths): a bind or absolute rule whose host source is (or links to) `/proc` or `/sys` can still expose host process information elsewhere in the sandbox (e.g. at `/hostproc`). A wider host-source check is future work, tied to how far providers are trusted.
 * **Untrusted links are found by resolving link text.** The host-source checks (§6.2, Workspace exposure, Restricted content exposure and Untrusted links) resolve host sources in userspace, following each symlink by what `readlink` returns. `/proc` magic links (`/proc/<pid>/root`, `/proc/self/fd/N`) are followed by the kernel to the object they refer to, not to that text, so a source through one may resolve differently when mounted than when checked.
@@ -1034,7 +1038,7 @@ Session-wide, so not a provider setting. Off unless configured. Mitigates forkbo
 * **`WorkspaceBackend` abstraction** with `BindBackend` (v1) and `FuseBackend`: full-workspace FUSE using FUSE passthrough (Linux 6.9+), likely built on `fuse-backend-rs`. Gains: renames handled natively (no seccomp hook), nested-`.git` control, live policy changes, a write log. Costs: the daemon becomes a security boundary (requires `O_PATH`-per-inode, `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` discipline), and every lookup/stat still goes through the supervisor. Benchmark on a cargo build and an `npm install` before adopting; keep kernel bind mounts for `.git` stubs and masks on top, and allow large low-risk directories (`target/`, `node_modules/`) to bypass FUSE.
 * **`cow` mode** with session-end diff review.
 * **Additional bases** between `none` and `default`.
-* **More providers:** `nix`, `buck2` (host-daemon delegation, §3.6), script-based broker handlers.
+* **More providers:** `buck2` (host-daemon delegation, §3.6), script-based broker handlers.
 * **Other engines** behind `SandboxEngine` (e.g. macOS).
 
 ---
@@ -1047,7 +1051,7 @@ Where the phases stand:
 * Phase 2 has the PTY proxy, the output filter and window-size forwarding. Prompts appear on the terminal of `stopit server` instead of an overlay (§5.4, §5.5).
 * Phase 3 has the broker, declarative shims with `args`, and the `vcs` provider for local work (§7.3, Implemented so far). `stopit-grant` is built with `+net` and `+rw`/`+ro` (§7.5). Handlers, `vcs.remote` with remote access and signing, and `stopit-grant`'s `+secret` and `+ssh-agent` are not built.
 * Phase 4 is not built. Protected files are read-only.
-* Phase 5 has the proxy (SNI matching, an uploads list in the startup summary) and `[limits]` (§10). The `nix` provider is not built.
+* Phase 5 has the proxy (SNI matching, an uploads list in the startup summary), `[limits]` (§10), and the `nix` provider (§3.6).
 
 ### Phase 1. Scaffold, configuration, providers, `BwrapEngine`
 * Cargo package (a library plus the `stopit` binary) + `flake.nix` dev environment (Rust toolchain, bubblewrap, jujutsu, git).

@@ -4,7 +4,7 @@ stopit runs a program, such as an LLM coding agent, a shell or a build, in a Lin
 
 It is a single Rust binary built on [bubblewrap](https://github.com/containers/bubblewrap), Landlock and seccomp. Agents with full-screen terminal interfaces (Claude Code, Gemini CLI, Codex, OpenCode) run in it through a terminal proxy that filters what they may send to your terminal. `git` and `jj` run through a broker that keeps the repository's metadata out of the agent's reach.
 
-> **Status: usable, still young.** These work and are tested against real sandboxes: the sandbox itself, the configuration and its trust checks, the terminal proxy, `stopit server` with its prompts, live configuration reload and saved approvals, the `full` and `proxy` network modes, brokered `git` and `jj` (including remote fetch and push via `vcs.remote` and `ssh-agent`), and resource limits. `stopit-grant` works for network and paths. Prompts for writes to protected files are not built yet. stopit has had no outside security review. [DESIGN.md](DESIGN.md) describes the design, and its section 11 lists the known gaps.
+> **Status: usable, still young.** These work and are tested against real sandboxes: the sandbox itself, the configuration and its trust checks, the terminal proxy, `stopit server` with its prompts, live configuration reload and saved approvals, the `full` and `proxy` network modes, brokered `git` and `jj` (including remote fetch and push via `vcs.remote` and `ssh-agent`), the `nix` development-shell provider, and resource limits. `stopit-grant` works for network and paths. Prompts for writes to protected files are not built yet. stopit has had no outside security review. [DESIGN.md](DESIGN.md) describes the design, and its section 11 lists the known gaps.
 
 ## What the sandbox gets by default
 
@@ -69,7 +69,7 @@ imports = [ stopit.homeModules.default ];   # adds stopit to home.packages
    env.path_prepend = ["/run/current-system/sw/bin"]
    ```
 
-   `/usr/bin/env` and `/bin/sh` are there for scripts that start with `#!/usr/bin/env`. For packages from Home Manager, add your profile (`/etc/profiles/per-user/<you>`, or `~/.nix-profile`) to `fs.ro`, and its `bin` as the sandbox sees it (`/etc/profiles/per-user/<you>/bin` or `/home/stopit/.nix-profile/bin`) to `env.path_prepend`. Granting all of `/nix/store` is fine for trying stopit out. On NixOS the store can hold rendered secrets, so a careful setup grants only the paths a development shell needs (DESIGN.md section 3.6).
+   `/usr/bin/env` and `/bin/sh` are there for scripts that start with `#!/usr/bin/env`. For packages from Home Manager, add your profile (`/etc/profiles/per-user/<you>`, or `~/.nix-profile`) to `fs.ro`, and its `bin` as the sandbox sees it (`/etc/profiles/per-user/<you>/bin` or `/home/stopit/.nix-profile/bin`) to `env.path_prepend`. Granting all of `/nix/store` is fine for trying stopit out. On NixOS the store can hold rendered secrets, so a careful setup grants only `/usr/bin/env`, `/bin/sh`, and `/etc/ssl/certs` globally and adds `[[provider]] type = "nix"` to mount each project's development shell closure (see [Use a Nix development shell](#use-a-nix-development-shell)).
 
    This file needs no `stopit allow`. stopit trusts it because only you can write it, and it checks that no sandbox can.
 
@@ -344,6 +344,29 @@ cpu    = "400%"   # of one CPU
 
 The limits cover the whole session, which is one run, or a server with all its runs. stopit asks your systemd for a scope of its own and refuses to start unless the limits are in place there.
 
+### Use a Nix development shell
+
+Add `[[provider]] type = "nix"` in `~/.config/stopit/config.toml` or `.stopit.toml` to resolve a project's Nix development shell on the host and mount only its runtime closure inside the sandbox, without exposing all of `/nix/store` or the Nix daemon:
+
+```toml
+[[provider]]
+type = "nix"
+```
+
+When placed after fallback host tool providers in `config.toml`, the development shell's `PATH` entries precede host tools in projects that have a `flake.nix` or `shell.nix`, and the provider does nothing in projects that have neither. In `.stopit.toml`, customize it per project:
+
+```toml
+[[provider]]
+type = "nix"
+shell = "agent"            # devShells.<system>.agent on flakes, or -A agent on shell.nix
+# file = "nix/ci.nix"      # evaluate a specific classic Nix file (mutually exclusive with flake)
+# flake = "nix"            # evaluate a flake in another directory
+# profile = "main"         # target sandbox profile (default "main")
+# cache = true             # cache resolved closures + GC roots in ~/.local/share/stopit/nix
+```
+
+`flake.lock` is never modified during evaluation, `shellHook` is not executed, exported variables from the shell (other than internal `stdenv`, sandbox identity, and proxy variables) are applied to the profile, and closures containing secret-bearing derivations (`*-etc`, `*-home-manager-files`, `*nix.conf*`) are refused. Set `enabled = false` on `[[provider]] name = "nix"` in `.stopit.toml` for a library or module flake that defines no development shell or default package.
+
 ### Generate grants with a script
 
 A script provider runs on your host at every start and prints a manifest as JSON. Use it to compute grants, for example from a development shell:
@@ -386,7 +409,7 @@ Before the sandbox starts, `stopit run` and `stopit shell` print to stderr what 
 - A prompt holds up the run's output until you answer it.
 - `tty` and `ttyname` fail inside the sandbox.
 - Script providers are not hashed by `stopit allow`. A script you change after allowing still runs.
-- A sandbox can create files that host tools run or trust where none existed when the session started: a `.git` in a subdirectory, or in the project when it has none, or agent and editor settings such as `.claude/`, `.gemini/`, `.mcp.json`, `opencode.json`, `.opencode/`, `.codex/` and `.vscode/`. Look before running git or an agent on the host there.
+- A sandbox can create files that host tools run or trust where none existed when the session started: a `.git` in a subdirectory, or in the project when it has none, a `flake.nix` or `shell.nix` when `type = "nix"` is enabled in a project that had none, or agent and editor settings such as `.claude/`, `.gemini/`, `.mcp.json`, `opencode.json`, `.opencode/`, `.codex/` and `.vscode/`. Look before running git, nix or an agent on the host there.
 
 DESIGN.md section 11 has the complete list.
 
