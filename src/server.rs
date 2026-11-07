@@ -38,6 +38,7 @@ use crate::control::{
 use crate::escape::escape_message;
 use crate::filter::ClipboardPolicy;
 use crate::filter::ClipboardRequest;
+use crate::provider::ProviderError;
 use crate::session::{CONTROL_SOCKET, LiveServer, ServerRecord, live_servers};
 use crate::supervisor::{
     BlockedSignals, EXIT_SUPERVISOR_FAILED, Invocation, LoadedSession, RunError, SandboxTerminal,
@@ -64,6 +65,13 @@ const MAX_SOCKET_PATH: usize = 107;
 pub fn serve(workspace: Option<PathBuf>, quiet: bool) -> ExitCode {
     match run_server(workspace.as_deref(), quiet) {
         Ok(code) => code,
+        Err(RunError::Provider(
+            ProviderError::Interrupted { signal, .. }
+            | ProviderError::NixInterrupted { signal, .. },
+        )) => {
+            let _ = take_signal();
+            ExitCode::from(signal_exit_code(signal))
+        }
         Err(e) => {
             print_error(&e.to_string());
             match take_signal() {

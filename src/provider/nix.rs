@@ -34,7 +34,7 @@ use crate::supervisor::Ownership;
 use crate::trust::check_store_file;
 
 /// Domain tag and schema version mixed into every persistent Nix cache key.
-const CACHE_DOMAIN: &[u8] = b"stopit-nix-cache-v1\0";
+const CACHE_DOMAIN: &[u8] = b"stopit-nix-cache-v2\0";
 
 /// Format version stored inside `cache.json`.
 const CACHE_FORMAT_VERSION: u32 = 1;
@@ -56,11 +56,15 @@ const CACHE_FILE_MODE: u32 = 0o600;
 /// stalling startup.
 const MAX_HASH_WALK_ENTRIES: usize = 50_000;
 
+/// Maximum number of filesystem entries inspected when checking a project tree
+/// for untrusted symlinks or rewritable hard links on `*.nix` and `flake.lock`.
+const MAX_VALIDATE_WALK_ENTRIES: usize = 250_000;
+
 /// Maximum size of a single `.nix` or `flake.lock` file hashed for caching.
 const MAX_NIX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Directory names skipped when walking a workspace or flake tree for `.nix`
-/// and `flake.lock` cache inputs.
+/// and `flake.lock` inputs.
 const IGNORED_WALK_DIRS: &[&str] = &[
     ".git",
     ".jj",
@@ -71,24 +75,74 @@ const IGNORED_WALK_DIRS: &[&str] = &[
     ".cache",
 ];
 
+/// Host environment variables passed through to `nix` on the host. All other
+/// host variables (including `NIX_CONFIG`, `SSH_AUTH_SOCK`, and secret tokens)
+/// are stripped so they cannot influence evaluation or leak via `builtins.getEnv`
+/// into `env.set` and `cache.json`.
+const ALLOWED_NIX_HOST_ENV_VARS: &[&str] = &[
+    "ALL_PROXY",
+    "CURL_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+    "HOME",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOCALE_ARCHIVE",
+    "LOGNAME",
+    "NIX_CONF_DIR",
+    "NIX_DATA_DIR",
+    "NIX_LOG_DIR",
+    "NIX_PATH",
+    "NIX_PROFILES",
+    "NIX_REMOTE",
+    "NIX_SSL_CERT_FILE",
+    "NIX_STATE_DIR",
+    "NIX_STORE_DIR",
+    "NIX_USER_CONF_FILES",
+    "NO_PROXY",
+    "PATH",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "TZ",
+    "USER",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+];
+
 /// Exported variables from `nix print-dev-env --json` that belong to Nix's
-/// isolated build sandbox, shell identity, or `mkDerivation` recipe attributes
-/// rather than the runtime development toolchain.
+/// isolated build sandbox, shell identity, proxy settings, or `mkDerivation`
+/// recipe attributes rather than the runtime development toolchain.
 const IGNORED_EXPORTED_VARS: &[&str] = &[
-    // Sandbox / user / terminal / session identity managed by stopit.
+    // Sandbox / user / terminal / proxy / session identity managed by stopit.
+    "ALL_PROXY",
     "COLORTERM",
     "DISPLAY",
     "EUID",
+    "FTP_PROXY",
     "GROUPS",
     "HOME",
     "HOSTNAME",
     "HOST_PATH",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
     "LANG",
     "LC_ALL",
     "LOGNAME",
     "NIX_BUILD_TOP",
     "NIX_CONFIG",
     "NIX_LOG_FD",
+    "NO_PROXY",
     "OLDPWD",
     "PATH",
     "PWD",
@@ -105,8 +159,9 @@ const IGNORED_EXPORTED_VARS: &[&str] = &[
     "USER",
     "WAYLAND_DISPLAY",
     "_",
-    // Internal stdenv / mkShell derivation attributes.
+    // Internal stdenv / mkShell derivation attributes and lowercase proxy vars.
     "__structuredAttrs",
+    "all_proxy",
     "allowSubstitutes",
     "buildInputs",
     "buildPhase",
@@ -124,9 +179,13 @@ const IGNORED_EXPORTED_VARS: &[&str] = &[
     "doCheck",
     "doInstallCheck",
     "dontAddDisableDepTrack",
+    "ftp_proxy",
+    "http_proxy",
+    "https_proxy",
     "mesonFlags",
     "name",
     "nativeBuildInputs",
+    "no_proxy",
     "out",
     "outputs",
     "patches",
@@ -156,6 +215,10 @@ pub struct NixProvider {
     nix_program: Option<PathBuf>,
     #[cfg(test)]
     store_check_root: Option<PathBuf>,
+    #[cfg(test)]
+    path_env_override: Option<OsString>,
+    #[cfg(test)]
+    extra_host_env: Vec<(OsString, OsString)>,
     protected: OnceLock<Vec<PathBuf>>,
 }
 
@@ -236,6 +299,10 @@ impl NixProvider {
             nix_program: None,
             #[cfg(test)]
             store_check_root: None,
+            #[cfg(test)]
+            path_env_override: None,
+            #[cfg(test)]
+            extra_host_env: Vec::new(),
             protected: OnceLock::new(),
         }
     }
@@ -254,11 +321,54 @@ impl NixProvider {
         self
     }
 
+    /// Overrides the `PATH` searched by [`Self::resolve_nix_binary`] in unit tests.
+    #[cfg(test)]
+    pub(crate) fn with_path_env(mut self, path_env: impl Into<OsString>) -> Self {
+        self.path_env_override = Some(path_env.into());
+        self
+    }
+
+    /// Appends host environment entries prior to [`scrubbed_nix_host_env`] filtering in unit tests.
+    #[cfg(test)]
+    pub(crate) fn with_extra_host_env(
+        mut self,
+        vars: impl IntoIterator<Item = (impl Into<OsString>, impl Into<OsString>)>,
+    ) -> Self {
+        self.extra_host_env = vars
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        self
+    }
+
     fn nix_err(&self, reason: impl Into<String>) -> ProviderError {
         ProviderError::Nix {
             name: self.name.clone(),
             reason: reason.into(),
         }
+    }
+
+    fn untrusted_link_err(
+        &self,
+        declared: &Path,
+        link: &Path,
+        root: &crate::spec::UntrustedRoot,
+    ) -> ProviderError {
+        self.nix_err(format!(
+            "refusing to evaluate {}: path runs through symlink {} inside {root}, \
+             which a sandbox can write",
+            declared.display(),
+            link.display()
+        ))
+    }
+
+    fn hard_linked_err(&self, declared: &Path, resolved: &Path, links: u64) -> ProviderError {
+        self.nix_err(format!(
+            "refusing to evaluate {} ({}): file has {links} hard links and is writable, \
+             so a sandbox could rewrite it through another name",
+            declared.display(),
+            resolved.display()
+        ))
     }
 
     /// Resolves a candidate file or directory path through `resolve_script_path`,
@@ -270,22 +380,21 @@ impl NixProvider {
         ctx: &ProviderContext,
     ) -> Result<PathBuf, ProviderError> {
         let lookup_err = |error: io::Error| {
-            if check_base_dir
-                && let Some(err) = super::base_dir_error(&self.name, declared, &self.base_dir)
-            {
-                return err;
+            if check_base_dir && let Err(dir_err) = fs::metadata(&self.base_dir) {
+                return self.nix_err(format!(
+                    "cannot resolve {} in {}: {dir_err}",
+                    declared.display(),
+                    self.base_dir.display()
+                ));
             }
             self.nix_err(format!("cannot resolve {}: {error}", declared.display()))
         };
         let abs = std::path::absolute(declared).map_err(lookup_err)?;
         match resolve_script_path(&abs, &ctx.workspace, &ctx.rw_grants) {
             Ok(resolved) => Ok(resolved),
-            Err(ScriptPathError::Link { link, root }) => Err(ProviderError::SourceLink {
-                name: self.name.clone(),
-                script: abs,
-                link,
-                root: Box::new(root),
-            }),
+            Err(ScriptPathError::Link { link, root }) => {
+                Err(self.untrusted_link_err(&abs, &link, &root))
+            }
             Err(ScriptPathError::Lookup(error)) => Err(lookup_err(error)),
         }
     }
@@ -305,12 +414,9 @@ impl NixProvider {
                 self.check_regular_unlinked_file(&abs, &resolved)?;
                 Ok(Some(resolved))
             }
-            Err(ScriptPathError::Link { link, root }) => Err(ProviderError::SourceLink {
-                name: self.name.clone(),
-                script: abs,
-                link,
-                root: Box::new(root),
-            }),
+            Err(ScriptPathError::Link { link, root }) => {
+                Err(self.untrusted_link_err(&abs, &link, &root))
+            }
             Err(ScriptPathError::Lookup(error)) => {
                 let genuinely_missing = error.kind() == io::ErrorKind::NotFound
                     && fs::symlink_metadata(&abs)
@@ -324,7 +430,7 @@ impl NixProvider {
         }
     }
 
-    /// Ensures `resolved` is a regular file without rewritable hard links.
+    /// Checks that `resolved` is a regular file without rewritable hard links.
     fn check_regular_unlinked_file(
         &self,
         declared: &Path,
@@ -336,12 +442,102 @@ impl NixProvider {
             return Err(self.nix_err(format!("{} is not a regular file", declared.display())));
         }
         if has_rewritable_hard_links(resolved, &meta) {
-            return Err(ProviderError::SourceHardLinked {
-                name: self.name.clone(),
-                script: declared.to_owned(),
-                path: resolved.to_owned(),
-                links: meta.nlink(),
-            });
+            return Err(self.hard_linked_err(declared, resolved, meta.nlink()));
+        }
+        Ok(())
+    }
+
+    /// Validates all `*.nix` and `flake.lock` entries in `target`'s directory
+    /// tree (even when `cache = false`) so imported Nix files cannot run through
+    /// untrusted symlinks or rewritable hard links.
+    fn validate_target_inputs(
+        &self,
+        target: &NixTarget,
+        ctx: &ProviderContext,
+    ) -> Result<(), ProviderError> {
+        let root_to_walk = match target {
+            NixTarget::Flake { dir } => Some(dir.as_path()),
+            NixTarget::File { file } => file
+                .parent()
+                .filter(|p| *p != Path::new("/") && *p != ctx.home),
+        };
+        if let Some(root) = root_to_walk {
+            let mut visited = 0usize;
+            self.validate_nix_tree(root, root, ctx, &mut visited)?;
+        }
+        Ok(())
+    }
+
+    fn validate_nix_tree(
+        &self,
+        root: &Path,
+        dir: &Path,
+        ctx: &ProviderContext,
+        visited: &mut usize,
+    ) -> Result<(), ProviderError> {
+        let read_dir = match fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(e) if dir != root && e.kind() == io::ErrorKind::PermissionDenied => return Ok(()),
+            Err(e) => {
+                return Err(self.nix_err(format!("cannot read directory {}: {e}", dir.display())));
+            }
+        };
+        for item in read_dir {
+            *visited = visited.saturating_add(1);
+            if *visited > MAX_VALIDATE_WALK_ENTRIES {
+                return Err(self.nix_err(format!(
+                    "cannot validate Nix inputs in {}: directory exceeds {MAX_VALIDATE_WALK_ENTRIES} entries",
+                    root.display()
+                )));
+            }
+            let entry = item.map_err(|e| {
+                self.nix_err(format!(
+                    "cannot read directory entry in {}: {e}",
+                    dir.display()
+                ))
+            })?;
+            let file_name = entry.file_name();
+            let name_str = file_name.to_str();
+            let full_path = entry.path();
+            let ft = entry.file_type().map_err(|e| {
+                self.nix_err(format!("cannot inspect {}: {e}", full_path.display()))
+            })?;
+
+            if ft.is_dir() {
+                if name_str.is_some_and(|n| IGNORED_WALK_DIRS.contains(&n)) {
+                    continue;
+                }
+                self.validate_nix_tree(root, &full_path, ctx, visited)?;
+                continue;
+            }
+
+            let is_nix_name = name_str.is_some_and(|n| n == "flake.lock" || n.ends_with(".nix"));
+
+            if ft.is_symlink() {
+                if let Some(untrusted) = innermost_untrusted_root(&full_path, ctx) {
+                    if is_nix_name {
+                        return Err(self.untrusted_link_err(&full_path, &full_path, &untrusted));
+                    }
+                    // Allow `nix build`'s `result* -> /nix/store/...` links, while
+                    // refusing any directory symlink inside a writable root whose
+                    // target tree holds `.nix` or `flake.lock` inputs.
+                    let is_store_result_link = name_str
+                        .is_some_and(|n| n == "result" || n.starts_with("result-"))
+                        && fs::canonicalize(&full_path).is_ok_and(|c| c.starts_with("/nix/store/"));
+                    if !is_store_result_link
+                        && fs::metadata(&full_path).is_ok_and(|m| m.is_dir())
+                        && dir_contains_nix_inputs(&full_path, visited)
+                            .map_err(|r| self.nix_err(r))?
+                    {
+                        return Err(self.untrusted_link_err(&full_path, &full_path, &untrusted));
+                    }
+                }
+                continue;
+            }
+
+            if ft.is_file() && is_nix_name {
+                self.check_regular_unlinked_file(&full_path, &full_path)?;
+            }
         }
         Ok(())
     }
@@ -452,13 +648,46 @@ impl NixProvider {
     }
 
     /// Resolves the `nix` executable to a canonical host file outside the
-    /// workspace and static `rw` grants, returning its path and metadata.
+    /// workspace and static `rw` grants, returning its path and post-resolution
+    /// metadata.
     fn resolve_nix_binary(
         &self,
         ctx: &ProviderContext,
     ) -> Result<(PathBuf, fs::Metadata), ProviderError> {
         let in_untrusted_root = |p: &Path| {
             p.starts_with(&ctx.workspace) || ctx.rw_grants.iter().any(|r| p.starts_with(&r.path))
+        };
+        let verify_resolved_bin = |declared: &Path,
+                                   resolved: PathBuf|
+         -> Result<(PathBuf, fs::Metadata), ProviderError> {
+            if in_untrusted_root(&resolved) {
+                return Err(self.nix_err(format!(
+                    "refusing to execute nix binary {} inside a writable directory",
+                    resolved.display()
+                )));
+            }
+            let meta = fs::symlink_metadata(&resolved).map_err(|e| {
+                self.nix_err(format!(
+                    "cannot inspect nix binary {}: {e}",
+                    resolved.display()
+                ))
+            })?;
+            if !meta.is_file() {
+                return Err(self.nix_err(format!(
+                    "nix binary {} is not a regular file",
+                    resolved.display()
+                )));
+            }
+            if rustix::fs::access(&resolved, rustix::fs::Access::EXEC_OK).is_err() {
+                return Err(self.nix_err(format!(
+                    "nix binary {} is not executable",
+                    resolved.display()
+                )));
+            }
+            if has_rewritable_hard_links(&resolved, &meta) {
+                return Err(self.hard_linked_err(declared, &resolved, meta.nlink()));
+            }
+            Ok((resolved, meta))
         };
 
         if let Some(explicit) = &self.nix_program {
@@ -471,12 +700,7 @@ impl NixProvider {
             let resolved = match resolve_script_path(&abs, &ctx.workspace, &ctx.rw_grants) {
                 Ok(r) => r,
                 Err(ScriptPathError::Link { link, root }) => {
-                    return Err(ProviderError::SourceLink {
-                        name: self.name.clone(),
-                        script: abs,
-                        link,
-                        root: Box::new(root),
-                    });
+                    return Err(self.untrusted_link_err(&abs, &link, &root));
                 }
                 Err(ScriptPathError::Lookup(e)) => {
                     return Err(
@@ -484,28 +708,18 @@ impl NixProvider {
                     );
                 }
             };
-            if in_untrusted_root(&resolved) {
-                return Err(self.nix_err(format!(
-                    "refusing to execute nix binary {} inside a writable directory",
-                    resolved.display()
-                )));
-            }
-            let meta = fs::metadata(&resolved).map_err(|e| {
-                self.nix_err(format!(
-                    "cannot inspect nix binary {}: {e}",
-                    resolved.display()
-                ))
-            })?;
-            if !meta.is_file() {
-                return Err(self.nix_err(format!(
-                    "nix binary {} is not a regular file",
-                    resolved.display()
-                )));
-            }
-            return Ok((resolved, meta));
+            return verify_resolved_bin(&abs, resolved);
         }
 
-        let Some(path_os) = std::env::var_os("PATH") else {
+        #[cfg(test)]
+        let path_os = self
+            .path_env_override
+            .clone()
+            .or_else(|| std::env::var_os("PATH"));
+        #[cfg(not(test))]
+        let path_os = std::env::var_os("PATH");
+
+        let Some(path_os) = path_os else {
             return Err(self.nix_err("could not find `nix` because PATH is not set on the host"));
         };
         for dir in std::env::split_paths(&path_os) {
@@ -515,43 +729,51 @@ impl NixProvider {
                 continue;
             }
             let candidate = dir.join("nix");
-            if rustix::fs::access(&candidate, rustix::fs::Access::EXEC_OK).is_err() {
-                continue;
-            }
-            let Ok(meta) = fs::metadata(&candidate) else {
-                continue;
-            };
-            if !meta.is_file() {
-                continue;
-            }
             let resolved = match resolve_script_path(&candidate, &ctx.workspace, &ctx.rw_grants) {
                 Ok(r) => r,
                 Err(ScriptPathError::Link { link, root }) => {
-                    return Err(ProviderError::SourceLink {
-                        name: self.name.clone(),
-                        script: candidate,
-                        link,
-                        root: Box::new(root),
-                    });
+                    return Err(self.untrusted_link_err(&candidate, &link, &root));
                 }
                 Err(ScriptPathError::Lookup(_)) => continue,
             };
             if in_untrusted_root(&resolved) {
                 continue;
             }
+            let Ok(meta) = fs::symlink_metadata(&resolved) else {
+                continue;
+            };
+            if !meta.is_file()
+                || rustix::fs::access(&resolved, rustix::fs::Access::EXEC_OK).is_err()
+            {
+                continue;
+            }
+            if has_rewritable_hard_links(&resolved, &meta) {
+                return Err(self.hard_linked_err(&candidate, &resolved, meta.nlink()));
+            }
             return Ok((resolved, meta));
         }
         Err(self.nix_err("could not find an executable `nix` binary on the host PATH"))
     }
 
-    /// Runs `nix` on the host in `/` and maps non-zero exit, signals, and output
-    /// limits to [`ProviderError`].
+    fn host_env_for_nix(&self) -> Vec<(OsString, OsString)> {
+        #[cfg(test)]
+        if !self.extra_host_env.is_empty() {
+            let mut combined: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+            combined.extend(self.extra_host_env.iter().cloned());
+            return scrubbed_nix_host_env_from(combined);
+        }
+        scrubbed_nix_host_env_from(std::env::vars_os())
+    }
+
+    /// Runs `nix` on the host in `/` with a scrubbed environment and maps
+    /// non-zero exit, signals, and output limits to [`ProviderError`].
     fn invoke_nix(&self, nix_bin: &Path, args: &[OsString]) -> HostCommandResult {
         #[cfg(test)]
         let _guard = super::script::EXEC_LOCK
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        run_host_command(nix_bin, args, Path::new("/"), None)
+        let env = self.host_env_for_nix();
+        run_host_command(nix_bin, args, Path::new("/"), None, Some(&env))
     }
 
     fn finish_nix_result(
@@ -693,6 +915,13 @@ impl NixProvider {
             NixTarget::File { file } => {
                 hasher.update(b"file\0");
                 hash_len_bytes(&mut hasher, file.as_os_str().as_bytes());
+                match std::env::var_os("NIX_PATH") {
+                    Some(np) => {
+                        hasher.update([1u8]);
+                        hash_len_bytes(&mut hasher, np.as_bytes());
+                    }
+                    None => hasher.update([0u8]),
+                }
                 hash_regular_file(file, &mut hasher).map_err(|reason| self.nix_err(reason))?;
                 if let Some(parent) = file.parent()
                     && parent != Path::new("/")
@@ -737,10 +966,9 @@ impl NixProvider {
                 )));
             }
         }
-        check_private_dir(&root_dir).map_err(|e| {
-            self.nix_err(format!("session nix directory {}: {e}", root_dir.display()))
-        })?;
-        clear_stale_profile_links(&root_dir);
+        let root_fd =
+            open_verified_private_dir(&root_dir).map_err(|reason| self.nix_err(reason))?;
+        clear_stale_profile_links_at(&root_dir, &root_fd).map_err(|reason| self.nix_err(reason))?;
         self.evaluate_uncached(nix_bin, target, &root_dir.join("profile"))
     }
 
@@ -785,7 +1013,7 @@ impl NixProvider {
             return Ok(cached);
         }
 
-        clear_stale_profile_links(entry_dir);
+        clear_stale_profile_links_at(entry_dir, entry_fd).map_err(|reason| self.nix_err(reason))?;
         let profile_path = entry_dir.join("profile");
         let fresh = self.evaluate_uncached(nix_bin, target, &profile_path)?;
         write_cached_env(entry_dir, entry_fd, &fresh).map_err(|reason| self.nix_err(reason))?;
@@ -810,6 +1038,7 @@ impl Provider for NixProvider {
             });
         };
 
+        self.validate_target_inputs(&target, ctx)?;
         let (nix_bin, nix_meta) = self.resolve_nix_binary(ctx)?;
         let env = self.resolve_env(&nix_bin, &nix_meta, &target, ctx)?;
         let manifest = build_manifest(&env).map_err(|reason| self.nix_err(reason))?;
@@ -822,69 +1051,10 @@ impl Provider for NixProvider {
     }
 
     fn protected_paths(&self) -> Result<Vec<PathBuf>, ProviderError> {
-        if let Some(paths) = self.protected.get() {
-            return Ok(paths.clone());
-        }
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
-        if let Some(file_src) = &self.file
-            && !file_src.uses_workspace_placeholder()
-        {
-            let declared = file_src.expand(&self.base_dir, Path::new(""), &home);
-            let canonical = fs::canonicalize(&declared).map_err(|error| {
-                if Self::uses_base_dir(file_src)
-                    && let Some(err) = super::base_dir_error(&self.name, &declared, &self.base_dir)
-                {
-                    return err;
-                }
-                self.nix_err(format!("cannot resolve {}: {error}", declared.display()))
-            })?;
-            return Ok(vec![canonical]);
-        }
-        if let Some(flake_src) = &self.flake
-            && !flake_src.uses_workspace_placeholder()
-        {
-            let declared_dir = flake_src.expand(&self.base_dir, Path::new(""), &home);
-            let canonical_dir = fs::canonicalize(&declared_dir).map_err(|error| {
-                if Self::uses_base_dir(flake_src)
-                    && let Some(err) =
-                        super::base_dir_error(&self.name, &declared_dir, &self.base_dir)
-                {
-                    return err;
-                }
-                self.nix_err(format!(
-                    "cannot resolve {}: {error}",
-                    declared_dir.display()
-                ))
-            })?;
-            let flake_nix = fs::canonicalize(declared_dir.join("flake.nix")).map_err(|e| {
-                self.nix_err(format!(
-                    "cannot resolve {}: {e}",
-                    declared_dir.join("flake.nix").display()
-                ))
-            })?;
-            let mut out = vec![canonical_dir, flake_nix];
-            let lock_path = declared_dir.join("flake.lock");
-            match fs::symlink_metadata(&lock_path) {
-                Ok(_) => {
-                    let lock = fs::canonicalize(&lock_path).map_err(|e| {
-                        self.nix_err(format!("cannot resolve {}: {e}", lock_path.display()))
-                    })?;
-                    if !out.contains(&lock) {
-                        out.push(lock);
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(
-                        self.nix_err(format!("cannot inspect {}: {e}", lock_path.display()))
-                    );
-                }
-            }
-            return Ok(out);
-        }
-        Ok(Vec::new())
+        self.protected
+            .get()
+            .cloned()
+            .ok_or_else(|| self.nix_err("internal error: protected_paths called before manifest"))
     }
 }
 
@@ -959,14 +1129,19 @@ fn validate_store_path(path: &str) -> Result<(), String> {
             "refusing malformed store path {path:?} in Nix closure"
         ));
     };
+    if store_name.contains('?') {
+        return Err(format!(
+            "refusing store path {path:?} containing '?' in Nix closure"
+        ));
+    }
     if hash.len() != 32
         || !hash
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
         || store_name.is_empty()
-        || !store_name.bytes().all(|b| {
-            b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.' | b'_' | b'?' | b'=')
-        })
+        || !store_name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.' | b'_' | b'='))
     {
         return Err(format!(
             "refusing malformed store path {path:?} in Nix closure"
@@ -1026,7 +1201,9 @@ fn parse_dev_env_json(bytes: &[u8]) -> Result<(Vec<String>, BTreeMap<String, Str
             }
             continue;
         }
-        if IGNORED_EXPORTED_VARS.binary_search(&name.as_str()).is_ok() {
+        if IGNORED_EXPORTED_VARS.binary_search(&name.as_str()).is_ok()
+            || is_dummy_nix_env_value(&name, val)
+        {
             continue;
         }
         name.parse::<EnvName>()
@@ -1039,16 +1216,89 @@ fn parse_dev_env_json(bytes: &[u8]) -> Result<(Vec<String>, BTreeMap<String, Str
     Ok((path_prepend, env_set))
 }
 
+fn is_dummy_nix_env_value(name: &str, val: &str) -> bool {
+    matches!(
+        name,
+        "SSL_CERT_FILE" | "NIX_SSL_CERT_FILE" | "GIT_SSL_CAINFO" | "CURL_CA_BUNDLE"
+    ) && val == "/no-cert-file.crt"
+}
+
+fn scrubbed_nix_host_env_from(
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    let mut kept = BTreeMap::new();
+    for (k, v) in vars {
+        if let Some(name) = k.to_str()
+            && ALLOWED_NIX_HOST_ENV_VARS.binary_search(&name).is_ok()
+        {
+            kept.insert(k, v);
+        }
+    }
+    kept.into_iter().collect()
+}
+
+fn innermost_untrusted_root(
+    path: &Path,
+    ctx: &ProviderContext,
+) -> Option<crate::spec::UntrustedRoot> {
+    let mut best: Option<crate::spec::UntrustedRoot> = None;
+    if path.starts_with(&ctx.workspace) {
+        best = Some(crate::spec::UntrustedRoot {
+            path: ctx.workspace.clone(),
+            kind: crate::spec::UntrustedKind::Workspace,
+        });
+    }
+    for root in &ctx.rw_grants {
+        if path.starts_with(&root.path)
+            && best
+                .as_ref()
+                .is_none_or(|cur| root.path.as_os_str().len() > cur.path.as_os_str().len())
+        {
+            best = Some(root.clone());
+        }
+    }
+    best
+}
+
+fn dir_contains_nix_inputs(dir: &Path, visited: &mut usize) -> Result<bool, String> {
+    let read_dir = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Ok(false),
+        Err(e) => return Err(format!("cannot read directory {}: {e}", dir.display())),
+    };
+    for item in read_dir {
+        *visited = visited.saturating_add(1);
+        if *visited > MAX_VALIDATE_WALK_ENTRIES {
+            return Err(format!(
+                "cannot validate symlinked directory {}: exceeds {MAX_VALIDATE_WALK_ENTRIES} entries",
+                dir.display()
+            ));
+        }
+        let entry =
+            item.map_err(|e| format!("cannot read directory entry in {}: {e}", dir.display()))?;
+        let file_name = entry.file_name();
+        let name_str = file_name.to_str();
+        if name_str.is_some_and(|n| n == "flake.lock" || n.ends_with(".nix")) {
+            return Ok(true);
+        }
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("cannot inspect {}: {e}", entry.path().display()))?;
+        if ft.is_dir()
+            && !name_str.is_some_and(|n| IGNORED_WALK_DIRS.contains(&n))
+            && dir_contains_nix_inputs(&entry.path(), visited)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn build_manifest(env: &CachedNixEnv) -> Result<Manifest, String> {
     let mut manifest = Manifest::default();
     for sp in &env.store_paths {
         validate_store_path(sp)?;
-        let pattern_str = if sp.contains('?') {
-            sp.replace('?', "[?]")
-        } else {
-            sp.clone()
-        };
-        let pattern: PathPattern = pattern_str
+        let pattern: PathPattern = sp
             .parse()
             .map_err(|e| format!("invalid store path rule {sp:?}: {e}"))?;
         manifest.grants.fs.ro.push(pattern);
@@ -1060,7 +1310,10 @@ fn build_manifest(env: &CachedNixEnv) -> Result<Manifest, String> {
         manifest.grants.env.path_prepend.push(sp);
     }
     for (k, v) in &env.env_set {
-        if k == "PATH" || IGNORED_EXPORTED_VARS.binary_search(&k.as_str()).is_ok() {
+        if k == "PATH"
+            || IGNORED_EXPORTED_VARS.binary_search(&k.as_str()).is_ok()
+            || is_dummy_nix_env_value(k, v)
+        {
             continue;
         }
         let name: EnvName = k
@@ -1129,7 +1382,12 @@ fn hash_nix_tree(
 ) -> Result<bool, String> {
     let read_dir = match fs::read_dir(dir) {
         Ok(rd) => rd,
-        Err(e) if dir != root && e.kind() == io::ErrorKind::PermissionDenied => return Ok(true),
+        Err(e) if dir != root && e.kind() == io::ErrorKind::PermissionDenied => {
+            let rel = dir.strip_prefix(root).unwrap_or(dir);
+            hasher.update(b"unreadable_dir\0");
+            hash_len_bytes(hasher, rel.as_os_str().as_bytes());
+            return Ok(true);
+        }
         Err(e) => return Err(format!("cannot read directory {}: {e}", dir.display())),
     };
     let mut entries = Vec::new();
@@ -1321,34 +1579,74 @@ fn write_cached_env(
     let mut json = serde_json::to_vec_pretty(env).expect("CachedNixEnv serializes");
     json.push(b'\n');
 
-    let mut file = File::from(fd);
-    file.write_all(&json)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| format!("cannot write nix cache {}: {e}", cache_path.display()))?;
-    drop(file);
+    let written = (|| -> Result<(), String> {
+        rustix::fs::fchmod(&fd, Mode::from_raw_mode(CACHE_FILE_MODE))
+            .map_err(|e| format!("cannot set mode on nix cache {}: {e}", cache_path.display()))?;
+        let mut file = File::from(fd);
+        file.write_all(&json)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| format!("cannot write nix cache {}: {e}", cache_path.display()))?;
+        drop(file);
 
-    rustix::fs::renameat(entry_fd, CACHE_TEMP_FILE, entry_fd, CACHE_FILE)
-        .map_err(|e| format!("cannot finalize nix cache {}: {e}", cache_path.display()))?;
-    rustix::fs::fsync(entry_fd).map_err(|e| {
-        format!(
-            "cannot sync nix cache directory {}: {e}",
-            entry_dir.display()
-        )
-    })?;
+        rustix::fs::renameat(entry_fd, CACHE_TEMP_FILE, entry_fd, CACHE_FILE)
+            .map_err(|e| format!("cannot finalize nix cache {}: {e}", cache_path.display()))?;
+        rustix::fs::fsync(entry_fd).map_err(|e| {
+            format!(
+                "cannot sync nix cache directory {}: {e}",
+                entry_dir.display()
+            )
+        })?;
+        Ok(())
+    })();
+
+    if let Err(err) = written {
+        let _ = rustix::fs::unlinkat(entry_fd, CACHE_TEMP_FILE, AtFlags::empty());
+        return Err(err);
+    }
     Ok(())
 }
 
-fn clear_stale_profile_links(entry_dir: &Path) {
-    let Ok(rd) = fs::read_dir(entry_dir) else {
-        return;
-    };
-    for entry in rd.flatten() {
-        if let Some(name) = entry.file_name().to_str()
+fn clear_stale_profile_links_at(entry_dir: &Path, entry_fd: &OwnedFd) -> Result<(), String> {
+    let dir_fd = rustix::fs::openat(
+        entry_fd,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| {
+        format!(
+            "cannot open {} for profile cleanup: {e}",
+            entry_dir.display()
+        )
+    })?;
+    let dir = rustix::fs::Dir::read_from(dir_fd).map_err(|e| {
+        format!(
+            "cannot read {} for profile cleanup: {e}",
+            entry_dir.display()
+        )
+    })?;
+    let mut names = Vec::new();
+    for item in dir {
+        let entry =
+            item.map_err(|e| format!("cannot read entry in {}: {e}", entry_dir.display()))?;
+        if let Ok(name) = entry.file_name().to_str()
             && (name == "profile" || name.starts_with("profile-"))
         {
-            let _ = fs::remove_file(entry.path());
+            names.push(name.to_owned());
         }
     }
+    for name in names {
+        match rustix::fs::unlinkat(entry_fd, &name, AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => {}
+            Err(e) => {
+                return Err(format!(
+                    "cannot remove stale nix profile entry {}/{name}: {e}",
+                    entry_dir.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1432,11 +1730,19 @@ mod tests {
     }
 
     #[test]
-    fn ignored_exported_vars_is_sorted_for_binary_search() {
+    fn sorted_tables_are_in_ascii_order_for_binary_search() {
         for pair in IGNORED_EXPORTED_VARS.windows(2) {
             assert!(
                 pair[0] < pair[1],
                 "IGNORED_EXPORTED_VARS out of order: {:?} >= {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        for pair in ALLOWED_NIX_HOST_ENV_VARS.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "ALLOWED_NIX_HOST_ENV_VARS out of order: {:?} >= {:?}",
                 pair[0],
                 pair[1]
             );
@@ -1723,6 +2029,7 @@ fi
             format!("/nix/store/{HASH_A}-custom-nix.conf-gen"),
             "/etc/passwd".to_owned(),
             format!("/nix/store/{HASH_A}-pkg/bin"),
+            format!("/nix/store/{HASH_A}-bad?pkg"),
             "/nix/store/short-pkg".to_owned(),
         ] {
             let err = validate_store_path(&bad).unwrap_err();
@@ -1738,10 +2045,14 @@ fi
         fs::write(&outside, "{}").unwrap();
         let nix_bin = write_fake_nix(&f.bin, "exit 99\n");
 
-        // Symlink `flake.nix` inside the workspace is refused with `SourceLink`.
+        // Symlink `flake.nix` inside the workspace is refused with a `nix`-specific error.
         symlink(&outside, f.ws.join("flake.nix")).unwrap();
         let err = f.provider(&nix_bin).manifest(&f.ctx()).unwrap_err();
-        assert!(matches!(err, ProviderError::SourceLink { .. }), "{err:?}");
+        assert!(matches!(err, ProviderError::Nix { .. }), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("nix provider \"nix\""), "{msg}");
+        assert!(!msg.contains("script provider"), "{msg}");
+        assert!(msg.contains("runs through symlink"), "{msg}");
         fs::remove_file(f.ws.join("flake.nix")).unwrap();
 
         // Symlink inside a static `rw` grant on explicit `file` is refused.
@@ -1768,17 +2079,191 @@ fi
         )
         .with_nix_program(&nix_bin);
         let err = p_rw.manifest(&ctx).unwrap_err();
-        assert!(matches!(err, ProviderError::SourceLink { .. }), "{err:?}");
+        assert!(matches!(err, ProviderError::Nix { .. }), "{err:?}");
+        assert!(err.to_string().contains("runs through symlink"), "{err}");
 
-        // Regular file with rewritable hard link is refused with `SourceHardLinked`.
+        // Regular `flake.nix` with rewritable hard link is refused.
         let real = f.ws.join("flake.nix");
         fs::write(&real, "{}").unwrap();
-        fs::hard_link(&real, f.ws.join("other-link.nix")).unwrap();
+        fs::hard_link(&real, f.ws.join("other-link.txt")).unwrap();
         let err = f.provider(&nix_bin).manifest(&f.ctx()).unwrap_err();
-        assert!(
-            matches!(err, ProviderError::SourceHardLinked { .. }),
-            "{err:?}"
+        assert!(matches!(err, ProviderError::Nix { .. }), "{err:?}");
+        assert!(err.to_string().contains("hard links"), "{err}");
+        fs::remove_file(f.ws.join("other-link.txt")).unwrap();
+
+        // Imported subdirectory `.nix` symlink (`nix/dev.nix -> ../writable.txt`) is refused
+        // even when `cache = false`.
+        let p_uncached = NixProvider::new(
+            "nix".parse().unwrap(),
+            ProfileRef::main(),
+            None,
+            None,
+            None,
+            false,
+            &f.ws,
+        )
+        .with_nix_program(&nix_bin);
+        fs::create_dir(f.ws.join("nix")).unwrap();
+        fs::write(f.ws.join("writable.txt"), "{}").unwrap();
+        symlink("../writable.txt", f.ws.join("nix/dev.nix")).unwrap();
+        let err = p_uncached.manifest(&f.ctx()).unwrap_err();
+        assert!(err.to_string().contains("runs through symlink"), "{err}");
+        fs::remove_file(f.ws.join("nix/dev.nix")).unwrap();
+
+        // Imported subdirectory `.nix` regular file with rewritable hard link is refused.
+        fs::write(f.ws.join("nix/dev.nix"), "{}").unwrap();
+        fs::hard_link(f.ws.join("nix/dev.nix"), f.ws.join("scratch.txt")).unwrap();
+        let err = p_uncached.manifest(&f.ctx()).unwrap_err();
+        assert!(err.to_string().contains("hard links"), "{err}");
+        fs::remove_file(f.ws.join("scratch.txt")).unwrap();
+        fs::remove_dir_all(f.ws.join("nix")).unwrap();
+
+        // Directory symlink inside the workspace pointing to a directory containing `.nix`
+        // files is refused, while a directory symlink with no `.nix` files is allowed.
+        let ext_with_nix = f.root.join("ext-with-nix");
+        fs::create_dir(&ext_with_nix).unwrap();
+        fs::write(ext_with_nix.join("imported.nix"), "{}").unwrap();
+        symlink(&ext_with_nix, f.ws.join("nix-link")).unwrap();
+        let err = p_uncached.manifest(&f.ctx()).unwrap_err();
+        assert!(err.to_string().contains("runs through symlink"), "{err}");
+        fs::remove_file(f.ws.join("nix-link")).unwrap();
+    }
+
+    #[test]
+    fn path_discovery_skips_untrusted_segments_and_scrubs_secrets_and_dummy_certs() {
+        let f = TestFixture::new();
+        fs::write(f.ws.join("flake.nix"), "{}").unwrap();
+
+        // Place a poisoned `nix` inside the workspace and inside an `rw` grant, plus a
+        // relative segment; none of them may execute.
+        write_fake_nix(&f.ws, "echo poisoned-ws >&2; exit 91\n");
+        let rw_dir = f.root.join("rw-bin");
+        fs::create_dir(&rw_dir).unwrap();
+        write_fake_nix(&rw_dir, "echo poisoned-rw >&2; exit 92\n");
+
+        // Place the real `nix` behind a trusted symlink (`trusted-link/nix -> real-bin/nix`)
+        // to verify post-resolution canonical path and metadata.
+        let real_bin_dir = f.root.join("real-bin");
+        let link_bin_dir = f.root.join("link-bin");
+        fs::create_dir(&real_bin_dir).unwrap();
+        fs::create_dir(&link_bin_dir).unwrap();
+        let store_a = format!("/nix/store/{HASH_A}-ca-1.0");
+        let env_dump = f.root.join("host-env.txt");
+        let real_nix = write_fake_nix(
+            &real_bin_dir,
+            &format!(
+                r#"env > {env_dump:?}
+if [ "$3" = "print-dev-env" ]; then
+  ln -sf /bin/sh "$6"
+  cat <<'JSON'
+{{
+  "variables": {{
+    "PATH": {{"type": "exported", "value": "{store_a}/bin"}},
+    "SSL_CERT_FILE": {{"type": "exported", "value": "/no-cert-file.crt"}},
+    "NIX_SSL_CERT_FILE": {{"type": "exported", "value": "/no-cert-file.crt"}},
+    "CURL_CA_BUNDLE": {{"type": "exported", "value": "{store_a}/etc/ssl/certs/ca-bundle.crt"}},
+    "HTTP_PROXY": {{"type": "exported", "value": "http://evil:8080"}},
+    "https_proxy": {{"type": "exported", "value": "http://evil:8080"}},
+    "CC": {{"type": "exported", "value": "clang"}}
+  }}
+}}
+JSON
+elif [ "$3" = "path-info" ]; then
+  printf '%s\n' "{store_a}"
+fi
+"#,
+                env_dump = env_dump,
+                store_a = store_a,
+            ),
         );
+        symlink(&real_nix, link_bin_dir.join("nix")).unwrap();
+
+        let mut ctx = f.ctx();
+        ctx.rw_grants.push(UntrustedRoot {
+            path: rw_dir.clone(),
+            kind: UntrustedKind::RwGrant {
+                provider: "cfg".parse().unwrap(),
+                profile: Some(ProfileRef::main()),
+                host: rw_dir.clone(),
+            },
+        });
+
+        let custom_path = format!(
+            ":relative/bin:{}:{}:{}",
+            f.ws.display(),
+            rw_dir.display(),
+            link_bin_dir.display()
+        );
+        let p = NixProvider::new(
+            "nix".parse().unwrap(),
+            ProfileRef::main(),
+            None,
+            None,
+            None,
+            false,
+            &f.ws,
+        )
+        .with_path_env(custom_path)
+        .with_extra_host_env([
+            ("GITHUB_TOKEN", "ghp_supersecret"),
+            ("AWS_SECRET_ACCESS_KEY", "aws_supersecret"),
+            ("NIX_CONFIG", "access-tokens = github.com=secret"),
+            ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
+            (
+                "NIX_PATH",
+                "nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixos",
+            ),
+        ]);
+
+        let (resolved_bin, _) = p.resolve_nix_binary(&ctx).unwrap();
+        assert_eq!(resolved_bin, real_nix);
+
+        let out = p.manifest(&ctx).unwrap();
+        let env_set: BTreeMap<&str, &str> = out
+            .manifest
+            .grants
+            .env
+            .set
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        // Dummy `/no-cert-file.crt` and proxy variables are stripped, while real cert paths remain.
+        assert_eq!(
+            env_set,
+            BTreeMap::from([
+                ("CC", "clang"),
+                (
+                    "CURL_CA_BUNDLE",
+                    format!("{store_a}/etc/ssl/certs/ca-bundle.crt").as_str()
+                ),
+            ])
+        );
+
+        // Host secrets and `NIX_CONFIG` never reached the `nix` child process.
+        let child_env = fs::read_to_string(&env_dump).unwrap();
+        assert!(!child_env.contains("GITHUB_TOKEN"), "{child_env}");
+        assert!(!child_env.contains("AWS_SECRET_ACCESS_KEY"), "{child_env}");
+        assert!(!child_env.contains("NIX_CONFIG"), "{child_env}");
+        assert!(!child_env.contains("SSH_AUTH_SOCK"), "{child_env}");
+        assert!(child_env.contains("NIX_PATH="), "{child_env}");
+
+        // Calling `protected_paths()` before `manifest()` returns an explicit error instead of
+        // running `fs::canonicalize`.
+        let fresh_p = NixProvider::new(
+            "nix".parse().unwrap(),
+            ProfileRef::main(),
+            None,
+            Some("shell.nix".parse().unwrap()),
+            None,
+            false,
+            &f.ws,
+        );
+        assert!(fresh_p.protected_paths().is_err());
+
+        // A hard-linked `nix` binary is refused.
+        fs::hard_link(&real_nix, f.ws.join("nix-hardlink")).unwrap();
+        let err = p.resolve_nix_binary(&ctx).unwrap_err();
+        assert!(err.to_string().contains("hard links"), "{err}");
     }
 
     #[test]

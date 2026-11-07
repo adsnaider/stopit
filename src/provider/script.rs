@@ -305,7 +305,7 @@ impl ScriptProvider {
         // a relative program path ambiguous; it is made absolute anyway.
         let program = self.canonical_source()?;
         let cwd = std::path::absolute(&self.base_dir).map_err(spawn_err)?;
-        match run_host_command(program, &[], &cwd, Some(input)) {
+        match run_host_command(program, &[], &cwd, Some(input), None) {
             HostCommandResult::Success(out) => Ok(out),
             HostCommandResult::StdoutTooLarge => Err(ProviderError::StdoutTooLarge {
                 name: self.name.clone(),
@@ -349,12 +349,14 @@ pub(super) enum HostCommandResult {
 /// Runs `program` with `args` in `cwd` inside a detached session (`setsid`),
 /// capping stdout at [`STDOUT_LIMIT`] and stderr at [`STDERR_LIMIT`], and
 /// killing the whole process group if interrupted by a supervisor signal or if
-/// stdout exceeds the limit.
+/// stdout exceeds the limit. When `env_override` is `Some`, the child starts
+/// with a cleared environment populated only from those pairs.
 pub(super) fn run_host_command(
     program: &Path,
     args: &[std::ffi::OsString],
     cwd: &Path,
     input: Option<Vec<u8>>,
+    env_override: Option<&[(std::ffi::OsString, std::ffi::OsString)]>,
 ) -> HostCommandResult {
     if let Some(signal) = crate::supervisor::pending_signal() {
         return HostCommandResult::Interrupted(signal);
@@ -377,6 +379,12 @@ pub(super) fn run_host_command(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(vars) = env_override {
+        cmd.env_clear();
+        for (k, v) in vars {
+            cmd.env(k, v);
+        }
+    }
     // SAFETY: the closure runs in the forked child before `exec`, where
     // only async-signal-safe operations are allowed. It only calls
     // `setsid(2)`, which is async-signal-safe (POSIX), through rustix's

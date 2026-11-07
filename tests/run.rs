@@ -5953,7 +5953,10 @@ fn server_reloads_configuration_on_r_key_and_keeps_ephemeral_state() {
     );
     thread::sleep(Duration::from_millis(100));
     assert_eq!(
-        server.log().matches("stopit: reloaded configuration").count(),
+        server
+            .log()
+            .matches("stopit: reloaded configuration")
+            .count(),
         1,
         "{:?}",
         server.log()
@@ -6115,10 +6118,7 @@ fn proxy_shims_protect_their_script_and_support_named_inline_and_deny_decisions(
         "proxy-protected\nmain-no-secret\nproxy-main:pcli:arg2\nfrom-inline-profile\ndeny_rc=126\n"
     );
     let err = stderr(&out);
-    assert!(
-        err.contains("[stopit: pcli: custom proxy denial]"),
-        "{err}"
-    );
+    assert!(err.contains("[stopit: pcli: custom proxy denial]"), "{err}");
 }
 
 #[test]
@@ -6310,4 +6310,72 @@ fi
         logged.contains(&format!("{}#agent", s.ws().display())),
         "{logged}"
     );
+}
+
+#[test]
+fn signal_during_nix_provider_kills_its_process_group_and_exits_cleanly() {
+    let s = Setup::new();
+    fs::write(s.ws().join("flake.nix"), "{}").unwrap();
+    let nix_bin_dir = s.root.join("nix-bin");
+    fs::create_dir_all(&nix_bin_dir).unwrap();
+    fs::set_permissions(&nix_bin_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let nix_bin = nix_bin_dir.join("nix");
+    let pids_file = s.root.join("pids.txt");
+    let ready_file = s.root.join("ready.txt");
+    fs::write(
+        &nix_bin,
+        format!(
+            "#!/bin/sh\n\
+             sleep 60 &\n\
+             bg=$!\n\
+             printf '%s\\n%s\\n' \"$$\" \"$bg\" > \"{}\"\n\
+             printf 'ok' > \"{}\"\n\
+             wait \"$bg\"\n",
+            pids_file.display(),
+            ready_file.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&nix_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+    s.write_config("[[provider]]\ntype = \"nix\"\ncache = false\n");
+
+    let host_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut path_with_nix = OsString::from(&nix_bin_dir);
+    path_with_nix.push(":");
+    path_with_nix.push(&host_path);
+
+    let mut command = s.run_probe_command(&[]);
+    command
+        .env("PATH", &path_with_nix)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let child = command.spawn().unwrap();
+    let stopit_pid = child.id() as i32;
+
+    let deadline = Instant::now() + BWRAP_DEADLINE;
+    while !ready_file.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "nix provider did not start in time"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let pids: Vec<i32> = fs::read_to_string(&pids_file)
+        .unwrap()
+        .lines()
+        .map(|l| l.parse().unwrap())
+        .collect();
+    assert_eq!(pids.len(), 2);
+
+    kill(-stopit_pid, libc::SIGINT);
+    let out = finish(child);
+    assert_eq!(code(&out), 128 + libc::SIGINT, "{out:?}");
+    assert_eq!(stderr(&out), "", "{out:?}");
+    assert!(s.no_session_left());
+    for pid in pids {
+        wait_gone(pid);
+    }
 }

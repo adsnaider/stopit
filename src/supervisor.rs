@@ -499,7 +499,10 @@ fn unprotected_providers(config: &Config) -> Vec<&ProviderName> {
 pub fn run(invocation: Invocation) -> ExitCode {
     match supervise(invocation) {
         Ok(code) => code,
-        Err(RunError::Provider(ProviderError::Interrupted { signal, .. })) => {
+        Err(RunError::Provider(
+            ProviderError::Interrupted { signal, .. }
+            | ProviderError::NixInterrupted { signal, .. },
+        )) => {
             let _ = take_signal();
             ExitCode::from(signal_exit_code(signal))
         }
