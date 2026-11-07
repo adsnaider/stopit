@@ -358,7 +358,7 @@ When placed after fallback host tool providers in `config.toml`, the development
 ```toml
 [[provider]]
 type = "nix"
-shell = "agent"            # devShells.<system>.agent on flakes, or -A agent on shell.nix
+shell = "agent"            # devShells.<system>.agent on flakes, or attribute agent on shell.nix
 # file = "nix/ci.nix"      # evaluate a specific classic Nix file (mutually exclusive with flake)
 # flake = "nix"            # evaluate a flake in another directory
 # profile = "main"         # target sandbox profile (default "main")
@@ -409,7 +409,7 @@ Before the sandbox starts, `stopit run` and `stopit shell` print to stderr what 
 - A prompt holds up the run's output until you answer it.
 - `tty` and `ttyname` fail inside the sandbox.
 - Script providers are not hashed by `stopit allow`. A script you change after allowing still runs.
-- A sandbox can create files that host tools run or trust where none existed when the session started: a `.git` in a subdirectory, or in the project when it has none, a `flake.nix` or `shell.nix` when `type = "nix"` is enabled in a project that had none, or agent and editor settings such as `.claude/`, `.gemini/`, `.mcp.json`, `opencode.json`, `.opencode/`, `.codex/` and `.vscode/`. Look before running git, nix or an agent on the host there.
+- A sandbox can create files that host tools run or trust where none existed when the session started: a `.git` in a subdirectory, or in the project when it has none, a `flake.nix`, `flake.lock` or `shell.nix` when `type = "nix"` is enabled in a project that lacked them, or agent and editor settings such as `.claude/`, `.gemini/`, `.mcp.json`, `opencode.json`, `.opencode/`, `.codex/` and `.vscode/`. Look before running git, nix or an agent on the host there.
 
 DESIGN.md section 11 has the complete list.
 
