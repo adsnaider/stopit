@@ -12,7 +12,9 @@ mod profile;
 mod provider;
 
 pub use profile::{Inherit, ProfileDecl, ProfileName, ProfileRef};
-pub use provider::{ProviderEntry, ProviderKind, ProviderName, ScriptSource, VcsTool, VcsView};
+pub use provider::{
+    NixShell, NixSource, ProviderEntry, ProviderKind, ProviderName, ScriptSource, VcsTool, VcsView,
+};
 
 #[cfg(test)]
 pub(crate) use provider::APPENDIX_A_WITHOUT_VCS;
@@ -316,7 +318,8 @@ impl ConfigLayer {
             for mut entry in p_layer.providers {
                 if !entry.enabled
                     && matches!(entry.kind, ProviderKind::Config { .. })
-                    && let Some(kind @ ProviderKind::Vcs { .. }) = replaced_kinds.get(&entry.name)
+                    && let Some(kind @ (ProviderKind::Vcs { .. } | ProviderKind::Nix { .. })) =
+                        replaced_kinds.get(&entry.name)
                 {
                     entry.kind = kind.clone();
                 }

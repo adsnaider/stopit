@@ -43,6 +43,10 @@ pub struct ProviderContext {
     pub home: PathBuf,
     /// The session runtime directory.
     pub session_dir: PathBuf,
+    /// Optional stopit persistent data directory (`<home>/.local/share/stopit`
+    /// or `STOPIT_STATE_DIR`) used by providers that cache resolved manifests
+    /// across sessions (`type = "nix"`).
+    pub data_dir: Option<PathBuf>,
     /// The host directories the `config` providers grant `rw`, known
     /// before any script runs
     /// ([`static_rw_roots`](crate::spec::static_rw_roots)): with the workspace,
@@ -568,6 +572,10 @@ pub fn from_entry_with_origin(
             )
             .with_signing(*signing),
         )),
+        ProviderKind::Nix { .. } => Err(ProviderError::Unsupported {
+            name: entry.name.clone(),
+            kind: "nix",
+        }),
     }
 }
 
@@ -593,6 +601,7 @@ mod tests {
             workspace_mount: "/workspace".parse().unwrap(),
             home: PathBuf::from(format!("/home/{tag}")),
             session_dir: PathBuf::from(format!("/run/{tag}")),
+            data_dir: None,
             rw_grants: Vec::new(),
         }
     }

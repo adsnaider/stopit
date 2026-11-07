@@ -135,6 +135,7 @@ mod tests {
             workspace_mount: "/workspace".parse().unwrap(),
             home: PathBuf::from("/home/h"),
             session_dir: PathBuf::from("/run/s"),
+            data_dir: None,
             rw_grants: Vec::new(),
         }
     }

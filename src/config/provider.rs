@@ -25,7 +25,7 @@ use crate::policy::Decision;
 use crate::serde_util::MapOnly;
 
 /// The provider types that exist, as spelled in `type`.
-const TYPES: [&str; 3] = ["config", "script", "vcs"];
+const TYPES: [&str; 4] = ["config", "script", "vcs", "nix"];
 
 /// The effective name of a provider: the prefix of its contributed profiles
 /// (`vcs.local`) and its label in the startup summary.
@@ -119,6 +119,149 @@ impl TryFrom<String> for ScriptSource {
     }
 }
 
+/// Shell attribute name selected by a `nix` provider (`shell = "agent"`).
+///
+/// Non-empty, free of NUL bytes, whitespace, `#` and `/`, not starting with
+/// `-`, and not equal to `.` or `..`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(try_from = "String")]
+pub struct NixShell(String);
+
+impl NixShell {
+    /// The shell attribute name as written.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for NixShell {
+    type Err = ValueError;
+
+    fn from_str(s: &str) -> Result<Self, ValueError> {
+        let bad = |why: &str| ValueError::new(format!("invalid nix shell {s:?}: {why}"));
+        if s.is_empty() {
+            return Err(bad("must not be empty"));
+        }
+        if s.contains('\0') {
+            return Err(bad("must not contain NUL bytes"));
+        }
+        if s.starts_with('-') {
+            return Err(bad("must not start with `-`"));
+        }
+        if s == "." || s == ".." {
+            return Err(bad("must not be `.` or `..`"));
+        }
+        if s.contains('#') {
+            return Err(bad(
+                "must not contain `#` (set `flake` or `file` separately from `shell`)",
+            ));
+        }
+        if s.contains('/') {
+            return Err(bad("must not contain `/`"));
+        }
+        if s.chars().any(char::is_whitespace) {
+            return Err(bad("must not contain whitespace"));
+        }
+        Ok(NixShell(s.to_owned()))
+    }
+}
+
+impl TryFrom<String> for NixShell {
+    type Error = ValueError;
+
+    fn try_from(s: String) -> Result<Self, ValueError> {
+        s.parse()
+    }
+}
+
+impl fmt::Display for NixShell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// File or flake directory path configured on a `nix` provider (`file` or
+/// `flake`).
+///
+/// Non-empty, free of NUL bytes, and not starting with `-`. Supports
+/// `{workspace}`, `{workspace}/…`, `~`, `~/…`, absolute paths, and paths
+/// relative to the configuration file's directory.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(try_from = "String")]
+pub struct NixSource(String);
+
+impl NixSource {
+    /// The raw path string as written.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether this path starts with `{workspace}`.
+    pub fn uses_workspace_placeholder(&self) -> bool {
+        self.0 == "{workspace}" || self.0.starts_with("{workspace}/")
+    }
+
+    /// Expands `{workspace}`, `~`, or joins a relative path against `base_dir`.
+    pub fn expand(&self, base_dir: &Path, workspace: &Path, home: &Path) -> PathBuf {
+        if self.0 == "{workspace}" {
+            workspace.to_path_buf()
+        } else if let Some(rest) = self.0.strip_prefix("{workspace}/") {
+            workspace.join(rest)
+        } else if self.0 == "~" {
+            home.to_path_buf()
+        } else if let Some(rest) = self.0.strip_prefix("~/") {
+            home.join(rest)
+        } else {
+            let p = Path::new(&self.0);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                base_dir.join(p)
+            }
+        }
+    }
+}
+
+impl FromStr for NixSource {
+    type Err = ValueError;
+
+    fn from_str(s: &str) -> Result<Self, ValueError> {
+        let bad = |why: &str| ValueError::new(format!("invalid nix path {s:?}: {why}"));
+        if s.is_empty() {
+            return Err(bad("must not be empty"));
+        }
+        if s.contains('\0') {
+            return Err(bad("must not contain NUL bytes"));
+        }
+        if s.starts_with('-') {
+            return Err(bad("must not start with `-`"));
+        }
+        if s.starts_with("{workspace}") && s != "{workspace}" && !s.starts_with("{workspace}/") {
+            return Err(bad("`{workspace}` must be followed by `/` or stand alone"));
+        }
+        if s.starts_with('~') && s != "~" && !s.starts_with("~/") {
+            return Err(bad(
+                "`~` must stand alone or be followed by `/` (`~user` is not supported)",
+            ));
+        }
+        Ok(NixSource(s.to_owned()))
+    }
+}
+
+impl TryFrom<String> for NixSource {
+    type Error = ValueError;
+
+    fn try_from(s: String) -> Result<Self, ValueError> {
+        s.parse()
+    }
+}
+
+impl fmt::Display for NixSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// How the `vcs` provider presents VCS metadata in the main profile (§7.3).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -190,6 +333,20 @@ pub enum ProviderKind {
         /// Offer the signing key in `vcs.local` and `vcs.remote`.
         signing: bool,
     },
+    /// The built-in `nix` provider (§3.6).
+    Nix {
+        /// Profile the grants apply to; defaults to `main`.
+        profile: ProfileRef,
+        /// Optional devShell or attribute name; defaults to the default shell.
+        shell: Option<NixShell>,
+        /// Optional classic Nix file (`--file`); mutually exclusive with `flake`.
+        file: Option<NixSource>,
+        /// Optional flake directory; mutually exclusive with `file`.
+        flake: Option<NixSource>,
+        /// Whether resolved manifests are cached under stopit's data directory;
+        /// defaults to `true`.
+        cache: bool,
+    },
 }
 
 impl ProviderKind {
@@ -199,6 +356,7 @@ impl ProviderKind {
             ProviderKind::Config { .. } => "config",
             ProviderKind::Script { .. } => "script",
             ProviderKind::Vcs { .. } => "vcs",
+            ProviderKind::Nix { .. } => "nix",
         }
     }
 }
@@ -239,6 +397,11 @@ struct RawProviderEntry {
     fetch: Option<Decision>,
     push: Option<Decision>,
     signing: Option<bool>,
+    // nix
+    shell: Option<NixShell>,
+    file: Option<NixSource>,
+    flake: Option<NixSource>,
+    cache: Option<bool>,
 }
 
 impl TryFrom<MapOnly<RawProviderEntry>> for ProviderEntry {
@@ -249,10 +412,10 @@ impl TryFrom<MapOnly<RawProviderEntry>> for ProviderEntry {
         let ty = match raw.kind.as_deref() {
             Some(ty) => ty,
             None if !enabled && raw.name.is_some() => {
-                if raw.name.as_ref().is_some_and(|n| n.as_str() == "vcs") {
-                    "vcs"
-                } else {
-                    "config"
+                match raw.name.as_ref().map(ProviderName::as_str) {
+                    Some("vcs") => "vcs",
+                    Some("nix") => "nix",
+                    _ => "config",
                 }
             }
             None => {
@@ -269,24 +432,32 @@ impl TryFrom<MapOnly<RawProviderEntry>> for ProviderEntry {
         }
 
         // Keys that are present, with the types that accept them.
-        let present: [(&str, bool, &str); 10] = [
-            ("profile", raw.profile.is_some(), "config"),
-            ("sandbox", raw.sandbox.is_some(), "config"),
-            ("source", raw.source.is_some(), "script"),
-            ("protect", raw.protect.is_some(), "script"),
-            ("config", raw.config.is_some(), "script"),
-            ("view", raw.view.is_some(), "vcs"),
-            ("tools", raw.tools.is_some(), "vcs"),
-            ("fetch", raw.fetch.is_some(), "vcs"),
-            ("push", raw.push.is_some(), "vcs"),
-            ("signing", raw.signing.is_some(), "vcs"),
+        let present: [(&str, bool, &[&str]); 14] = [
+            ("profile", raw.profile.is_some(), &["config", "nix"]),
+            ("sandbox", raw.sandbox.is_some(), &["config"]),
+            ("source", raw.source.is_some(), &["script"]),
+            ("protect", raw.protect.is_some(), &["script"]),
+            ("config", raw.config.is_some(), &["script"]),
+            ("view", raw.view.is_some(), &["vcs"]),
+            ("tools", raw.tools.is_some(), &["vcs"]),
+            ("fetch", raw.fetch.is_some(), &["vcs"]),
+            ("push", raw.push.is_some(), &["vcs"]),
+            ("signing", raw.signing.is_some(), &["vcs"]),
+            ("shell", raw.shell.is_some(), &["nix"]),
+            ("file", raw.file.is_some(), &["nix"]),
+            ("flake", raw.flake.is_some(), &["nix"]),
+            ("cache", raw.cache.is_some(), &["nix"]),
         ];
-        if let Some((key, _, owner)) = present
+        if let Some((key, _, owners)) = present
             .iter()
-            .find(|(_, is_set, owner)| *is_set && *owner != ty)
+            .find(|(_, is_set, owners)| *is_set && !owners.contains(&ty))
         {
+            let allowed_for = match owners {
+                [only] => format!("type {only:?}"),
+                many => format!("types {many:?}"),
+            };
             return Err(ValueError::new(format!(
-                "key {key:?} is not allowed for provider type {ty:?} (it applies to type {owner:?})"
+                "key {key:?} is not allowed for provider type {ty:?} (it applies to {allowed_for})"
             )));
         }
 
@@ -312,6 +483,21 @@ impl TryFrom<MapOnly<RawProviderEntry>> for ProviderEntry {
                 protect: raw.protect.unwrap_or(true),
                 config: raw.config.unwrap_or_default(),
             },
+            "nix" => {
+                if raw.file.is_some() && raw.flake.is_some() {
+                    return Err(ValueError::new(
+                        "provider type \"nix\" cannot set both `file` and `flake`; \
+                         set `flake` for a flake directory or `file` for a classic Nix file",
+                    ));
+                }
+                ProviderKind::Nix {
+                    profile: raw.profile.unwrap_or_else(ProfileRef::main),
+                    shell: raw.shell,
+                    file: raw.file,
+                    flake: raw.flake,
+                    cache: raw.cache.unwrap_or(true),
+                }
+            }
             _ => {
                 let tools = match raw.tools {
                     None => vec![VcsTool::Jj, VcsTool::Git],
@@ -744,7 +930,7 @@ mod tests {
 
     #[test]
     fn unknown_type() {
-        for bad in ["nix", "Config", "", "vcs "] {
+        for bad in ["bazel", "Config", "", "vcs "] {
             let msg = err(&format!("[[provider]]\ntype = \"{bad}\""));
             assert!(msg.contains(&format!("{bad:?}")), "{bad:?}: {msg}");
             assert!(msg.contains("unknown provider type"), "{bad:?}: {msg}");
@@ -898,9 +1084,100 @@ mod tests {
 
     #[test]
     fn unknown_type_is_reported_before_key_checks() {
-        let msg = err("[[provider]]\ntype = \"nix\"\nview = \"ro\"");
-        assert!(msg.contains("unknown provider type \"nix\""), "{msg}");
+        let msg = err("[[provider]]\ntype = \"bazel\"\nview = \"ro\"");
+        assert!(msg.contains("unknown provider type \"bazel\""), "{msg}");
         assert!(!msg.contains("not allowed"), "{msg}");
+    }
+
+    #[test]
+    fn nix_defaults_and_options() {
+        let e = one("[[provider]]\ntype = \"nix\"");
+        assert_eq!(e.name, name("nix"));
+        assert!(e.enabled);
+        assert_eq!(e.kind.type_name(), "nix");
+        assert_eq!(
+            e.kind,
+            ProviderKind::Nix {
+                profile: ProfileRef::main(),
+                shell: None,
+                file: None,
+                flake: None,
+                cache: true,
+            }
+        );
+
+        let e = one(r#"
+            [[provider]]
+            type = "nix"
+            name = "nix-agent"
+            profile = "harness"
+            shell = "agent"
+            flake = "./sub"
+            cache = false
+            "#);
+        assert_eq!(e.name, name("nix-agent"));
+        assert_eq!(
+            e.kind,
+            ProviderKind::Nix {
+                profile: "harness".parse().unwrap(),
+                shell: Some("agent".parse().unwrap()),
+                file: None,
+                flake: Some("./sub".parse().unwrap()),
+                cache: false,
+            }
+        );
+
+        let e = one("[[provider]]\ntype = \"nix\"\nfile = \"default.nix\"\nshell = \"ci\"");
+        assert_eq!(
+            e.kind,
+            ProviderKind::Nix {
+                profile: ProfileRef::main(),
+                shell: Some("ci".parse().unwrap()),
+                file: Some("default.nix".parse().unwrap()),
+                flake: None,
+                cache: true,
+            }
+        );
+
+        let disabled = one("[[provider]]\nname = \"nix\"\nenabled = false");
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.kind.type_name(), "nix");
+    }
+
+    #[test]
+    fn nix_validation() {
+        let msg = err("[[provider]]\ntype = \"nix\"\nfile = \"shell.nix\"\nflake = \".\"");
+        assert!(msg.contains("cannot set both `file` and `flake`"), "{msg}");
+
+        for bad_shell in ["", "-flag", ".", "..", "a#b", "a/b", "a b", "a\0b"] {
+            assert!(
+                bad_shell.parse::<NixShell>().is_err(),
+                "expected {bad_shell:?} to be rejected"
+            );
+        }
+        for bad_path in ["", "-f", "{workspace}x", "~other", "a\0b"] {
+            assert!(
+                bad_path.parse::<NixSource>().is_err(),
+                "expected {bad_path:?} to be rejected"
+            );
+        }
+        let ws = Path::new("/ws");
+        let base = Path::new("/cfg");
+        let home = Path::new("/home/u");
+        let s: NixSource = "{workspace}/nix/shell.nix".parse().unwrap();
+        assert!(s.uses_workspace_placeholder());
+        assert_eq!(s.expand(base, ws, home), PathBuf::from("/ws/nix/shell.nix"));
+        let s: NixSource = "~/dotfiles".parse().unwrap();
+        assert!(!s.uses_workspace_placeholder());
+        assert_eq!(s.expand(base, ws, home), PathBuf::from("/home/u/dotfiles"));
+        let s: NixSource = "rel/shell.nix".parse().unwrap();
+        assert!(!s.uses_workspace_placeholder());
+        assert_eq!(s.expand(base, ws, home), PathBuf::from("/cfg/rel/shell.nix"));
+
+        let msg = err("[[provider]]\ntype = \"nix\"\nsource = \"x.sh\"");
+        assert!(msg.contains("not allowed"), "{msg}");
+        let msg = err("[[provider]]\ntype = \"config\"\nshell = \"agent\"");
+        assert!(msg.contains("not allowed"), "{msg}");
     }
 
     #[test]

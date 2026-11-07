@@ -904,7 +904,14 @@ fn load_policy<S>(
     );
     let mut warnings = Vec::new();
     if let Some(gf) = &global_file {
-        for name in replaced.iter().filter(|n| is_default_provider_name(n)) {
+        for name in replaced.iter().filter(|n| {
+            is_default_provider_name(n)
+                && config
+                    .providers
+                    .iter()
+                    .find(|p| &p.name == *n)
+                    .is_none_or(|p| p.enabled)
+        }) {
             warnings.push(format!(
                 "the [[provider]] named \"{name}\" in {CONFIG_FILE} replaces the one of that \
                  name in {:?}; give one of them another `name` to keep both",
@@ -942,6 +949,7 @@ fn load_policy<S>(
         workspace_mount: mount.clone(),
         home: home.clone(),
         session_dir,
+        data_dir: Some(data_dirs.store.path.clone()),
         rw_grants,
     };
     let outputs = providers
@@ -2895,6 +2903,43 @@ fn guard_global_config(
                         )?;
                         if !paths.contains(&proxy_path) {
                             paths.push(proxy_path);
+                        }
+                    }
+                }
+            }
+            ProviderKind::Nix { file, flake, .. } => {
+                if let Some(file) = file
+                    && !file.uses_workspace_placeholder()
+                {
+                    let declared = file.expand(config_dir, workspace, home);
+                    let nix_file = resolve(
+                        &declared,
+                        &format!("nix provider {:?} file", entry.name.as_str()),
+                    )?;
+                    if !paths.contains(&nix_file) {
+                        paths.push(nix_file);
+                    }
+                }
+                if let Some(flake) = flake
+                    && !flake.uses_workspace_placeholder()
+                {
+                    let declared_dir = flake.expand(config_dir, workspace, home);
+                    let flake_nix_declared = declared_dir.join("flake.nix");
+                    let flake_nix = resolve(
+                        &flake_nix_declared,
+                        &format!("nix provider {:?} flake.nix", entry.name.as_str()),
+                    )?;
+                    if !paths.contains(&flake_nix) {
+                        paths.push(flake_nix);
+                    }
+                    let flake_lock_declared = declared_dir.join("flake.lock");
+                    if std::fs::symlink_metadata(&flake_lock_declared).is_ok() {
+                        let flake_lock = resolve(
+                            &flake_lock_declared,
+                            &format!("nix provider {:?} flake.lock", entry.name.as_str()),
+                        )?;
+                        if !paths.contains(&flake_lock) {
+                            paths.push(flake_lock);
                         }
                     }
                 }

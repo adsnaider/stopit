@@ -4221,6 +4221,7 @@ mod tests {
                 workspace_mount: self.ws_mount.parse().unwrap(),
                 home: self.root.join("home"),
                 session_dir: self.root.join("session"),
+                data_dir: None,
                 rw_grants: Vec::new(),
             };
             session_providers(cfg, Path::new("/cfg"))

@@ -2110,6 +2110,7 @@ mod tests {
             workspace_mount: MOUNT.parse().unwrap(),
             home: home.clone(),
             session_dir: session.clone(),
+            data_dir: None,
             rw_grants: Vec::new(),
         };
         let discovered = SshRemote::discover_with_sock(&ctx, Some(&sock_path));

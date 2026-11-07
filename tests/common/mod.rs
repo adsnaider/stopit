@@ -482,6 +482,7 @@ impl SpecFixture {
             workspace_mount: WORKSPACE_MOUNT.parse().unwrap(),
             home: self.home(),
             session_dir: self.root.join("runtime"),
+            data_dir: None,
             rw_grants: static_rw_roots(&static_outputs(&providers), &ctx),
         };
         let outputs = providers
