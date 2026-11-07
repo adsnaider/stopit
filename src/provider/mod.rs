@@ -5,6 +5,7 @@
 
 mod base;
 mod config;
+mod nix;
 mod script;
 mod vcs;
 
@@ -27,6 +28,7 @@ pub use base::{
     session_providers,
 };
 pub use config::ConfigProvider;
+pub use nix::NixProvider;
 pub use script::{STDERR_LIMIT, STDOUT_LIMIT, ScriptProvider};
 pub use vcs::{
     Layout as VcsLayout, SshRemote, VCS_PROVIDER_NAME, VcsProvider, discover as discover_vcs,
@@ -338,6 +340,26 @@ pub enum ProviderError {
         /// Why.
         reason: String,
     },
+
+    /// The `nix` provider failed to discover, evaluate, or validate its
+    /// development environment.
+    #[error("nix provider {:?}: {reason}", .name.as_str())]
+    Nix {
+        /// Effective name of the entry.
+        name: ProviderName,
+        /// Why it failed.
+        reason: String,
+    },
+
+    /// A caught supervisor signal interrupted a running `nix` command and
+    /// killed its process group.
+    #[error("nix provider {:?} interrupted by signal {signal}", .name.as_str())]
+    NixInterrupted {
+        /// Effective name of the entry.
+        name: ProviderName,
+        /// Signal number.
+        signal: i32,
+    },
 }
 
 /// A source of grants.
@@ -572,10 +594,22 @@ pub fn from_entry_with_origin(
             )
             .with_signing(*signing),
         )),
-        ProviderKind::Nix { .. } => Err(ProviderError::Unsupported {
-            name: entry.name.clone(),
-            kind: "nix",
-        }),
+        ProviderKind::Nix {
+            profile,
+            shell,
+            file,
+            flake,
+            cache,
+        } => Ok(Box::new(NixProvider::with_origin(
+            entry.name.clone(),
+            profile.clone(),
+            shell.clone(),
+            file.clone(),
+            flake.clone(),
+            *cache,
+            base_dir,
+            origin,
+        ))),
     }
 }
 
@@ -803,7 +837,12 @@ mod tests {
         let mut c = ctx("x");
         c.workspace = root.clone();
         let out = p.manifest(&c).unwrap();
-        let p1 = out.manifest.grants.shims.get(&"p1".parse().unwrap()).unwrap();
+        let p1 = out
+            .manifest
+            .grants
+            .shims
+            .get(&"p1".parse().unwrap())
+            .unwrap();
         assert!(matches!(
             &p1.kind,
             ShimKind::Proxy {
@@ -833,18 +872,16 @@ mod tests {
     }
 
     #[test]
-    fn nix_entry_currently_returns_unsupported_until_implemented() {
-        let es = entries("[[provider]]\ntype = \"nix\"\nname = \"my-nix\"");
-        let err = match from_entry(&es[0], Path::new("/cfg")) {
-            Ok(_) => panic!("expected ProviderError::Unsupported"),
-            Err(e) => e,
-        };
-        assert!(
-            matches!(
-                &err,
-                ProviderError::Unsupported { name, kind: "nix" } if name.as_str() == "my-nix"
-            ),
-            "{err:?}"
-        );
+    fn a_nix_entry_builds_the_nix_provider() {
+        let es = entries("[[provider]]\ntype = \"nix\"\nname = \"my-nix\"\nprofile = \"harness\"");
+        let p = from_entry(&es[0], Path::new("/cfg")).unwrap();
+        assert_eq!(p.name().as_str(), "my-nix");
+        let ws = tempfile::TempDir::new().unwrap();
+        let mut c = ctx("x");
+        c.workspace = std::fs::canonicalize(ws.path()).unwrap();
+        let out = p.manifest(&c).unwrap();
+        assert_eq!(out.profile.as_str(), "harness");
+        assert_eq!(out.manifest, Manifest::default());
+        assert!(p.protected_paths().unwrap().is_empty());
     }
 }

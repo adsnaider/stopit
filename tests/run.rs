@@ -6120,3 +6120,194 @@ fn proxy_shims_protect_their_script_and_support_named_inline_and_deny_decisions(
         "{err}"
     );
 }
+
+#[test]
+fn nix_provider_end_to_end_auto_detects_mounts_caches_and_overrides_shell() {
+    let s = Setup::new();
+    // Mark `ws` as a VCS root so workspace discovery resolves `ws` before `.stopit.toml` exists.
+    fs::create_dir(s.ws().join(".git")).unwrap();
+
+    // Provision a self-contained copy of `stopit-probe` inside the workspace so `[[provider]] type = "nix"`
+    // can be tested as the sole user provider under `base = "default"`.
+    let ws_probe_dir = s.ws().join("probe-bin");
+    fs::create_dir_all(&ws_probe_dir).unwrap();
+    let provisioned =
+        stopit::provision::provision(Path::new(env!("CARGO_BIN_EXE_stopit-probe")), &ws_probe_dir)
+            .unwrap();
+    let sandbox_probe_argv = provisioned.command_prefix(Path::new("/workspace/probe-bin"));
+
+    // Pick an existing non-secret `/nix/store/<hash>-<name>` object if `/nix/store` is present on
+    // this host, falling back to a synthetic store path on hosts without Nix installed.
+    let existing_store_obj = fs::read_dir("/nix/store").ok().and_then(|rd| {
+        rd.flatten()
+            .filter_map(|e| e.path().to_str().map(str::to_owned))
+            .find(|p| {
+                let Some(rest) = p.strip_prefix("/nix/store/") else {
+                    return false;
+                };
+                let Some((hash, name)) = rest.split_once('-') else {
+                    return false;
+                };
+                hash.len() == 32
+                    && hash
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                    && !name.is_empty()
+                    && name != "etc"
+                    && !name.ends_with("-etc")
+                    && !name.contains("home-manager-files")
+                    && !name.contains("nix.conf")
+                    && !rest.contains(['?', '*', '['])
+            })
+    });
+    let has_real_store_obj = existing_store_obj.is_some();
+    let store_path = existing_store_obj
+        .unwrap_or_else(|| "/nix/store/00000000000000000000000000000001-fake-dev".to_owned());
+    let gc_target = if has_real_store_obj {
+        PathBuf::from(&store_path)
+    } else {
+        PathBuf::from("/bin/sh")
+    };
+
+    let nix_bin_dir = s.root.join("nix-bin");
+    fs::create_dir_all(&nix_bin_dir).unwrap();
+    fs::set_permissions(&nix_bin_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let nix_bin = nix_bin_dir.join("nix");
+    let counter_file = s.root.join("nix-calls");
+    let args_log = s.root.join("nix-args.log");
+    fs::write(
+        &nix_bin,
+        format!(
+            r#"#!/bin/sh
+set -eu
+count=0
+if [ -f {counter:?} ]; then
+  count=$(cat {counter:?})
+fi
+count=$((count + 1))
+printf '%s' "$count" > {counter:?}
+printf '%s\n' "$*" >> {log:?}
+if [ "$3" = "print-dev-env" ]; then
+  ln -sf {gc_target:?} "$6"
+  cat <<'JSON'
+{{
+  "variables": {{
+    "PATH": {{"type": "exported", "value": "{store}/bin:/path-not-exists"}},
+    "NIX_DEV_VAR": {{"type": "exported", "value": "from-flake"}},
+    "HOME": {{"type": "exported", "value": "/homeless-shelter"}},
+    "SHELL": {{"type": "exported", "value": "/nix/store/x/bin/bash"}},
+    "shellHook": {{"type": "exported", "value": "echo pwned"}}
+  }}
+}}
+JSON
+elif [ "$3" = "path-info" ]; then
+  printf '%s\n' "{store}"
+else
+  exit 2
+fi
+"#,
+            counter = counter_file,
+            log = args_log,
+            gc_target = gc_target,
+            store = store_path,
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&nix_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let host_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut path_with_nix = OsString::from(&nix_bin_dir);
+    path_with_nix.push(":");
+    path_with_nix.push(&host_path);
+
+    let make_cmd = || {
+        let mut cmd = s.stopit(&["run", "--quiet", "--"]);
+        cmd.args(&sandbox_probe_argv);
+        cmd.env("PATH", &path_with_nix);
+        cmd
+    };
+    let calls = || {
+        fs::read_to_string(&counter_file)
+            .ok()
+            .and_then(|t| t.parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+
+    // Configure `[[provider]] type = "nix"` in the global config alone.
+    s.write_global_config("[[provider]]\ntype = \"nix\"\n");
+
+    // 1. Without `flake.nix` or `shell.nix`, the nix provider is a no-op, so `base = "default"`
+    // reports that no tools were configured.
+    let no_flake_out = output(make_cmd(), b"[]");
+    assert_ne!(code(&no_flake_out), 0, "{no_flake_out:?}");
+    assert!(
+        stderr(&no_flake_out).contains("no tools"),
+        "{}",
+        stderr(&no_flake_out)
+    );
+    assert_eq!(calls(), 0);
+
+    // 2. Add `flake.nix` and `flake.lock` (without needing `stopit allow`).
+    fs::write(s.ws().join("flake.nix"), "{}").unwrap();
+    fs::write(s.ws().join("flake.lock"), "{}").unwrap();
+
+    let mut ops = vec![
+        Op::Env,
+        write("/workspace/flake.nix", "tampered"),
+        write("/workspace/flake.lock", "tampered"),
+    ];
+    if has_real_store_obj {
+        ops.push(stat(&store_path));
+    }
+    let input = serde_json::to_vec(&ops).unwrap();
+    let run1 = output(make_cmd(), &input);
+    let results = probe_results("nix run 1", &run1, &ops);
+    if has_real_store_obj {
+        assert_eq!(stderr(&run1), "", "{}", stderr(&run1));
+        ok(&results[3]);
+    }
+    let Data::Env(env_map) = ok(&results[0]) else {
+        panic!("expected env map");
+    };
+    assert_eq!(
+        env_map.get("PATH").map(String::as_str),
+        Some(format!("/run/stopit/bin:{store_path}/bin").as_str())
+    );
+    assert_eq!(
+        env_map.get("NIX_DEV_VAR").map(String::as_str),
+        Some("from-flake")
+    );
+    assert_eq!(
+        env_map.get("HOME").map(String::as_str),
+        Some("/home/stopit")
+    );
+    assert!(!env_map.contains_key("SHELL"));
+    assert!(!env_map.contains_key("shellHook"));
+    assert_eq!(errno(&results[1]), "EROFS");
+    assert_eq!(errno(&results[2]), "EROFS");
+    assert_eq!(calls(), 2);
+
+    // 3. Second run with unchanged Nix files hits the persistent cache when the store path exists.
+    if has_real_store_obj {
+        let run2 = output(make_cmd(), b"[]");
+        let _ = probe_results("nix run 2", &run2, &[]);
+        assert_eq!(stderr(&run2), "");
+        assert_eq!(calls(), 2);
+    }
+
+    // 4. Overriding `shell = "agent"` in `.stopit.toml` replaces the global `nix` provider cleanly
+    // without an unnamed-replacement warning and passes `#agent` to `nix print-dev-env`.
+    s.write_raw_config("[[provider]]\ntype = \"nix\"\nshell = \"agent\"\n");
+    let run3 = output(make_cmd(), b"[]");
+    let _ = probe_results("nix run 3", &run3, &[]);
+    assert!(
+        !stderr(&run3).contains("replaces the one of that name"),
+        "{}",
+        stderr(&run3)
+    );
+    let logged = fs::read_to_string(&args_log).unwrap();
+    assert!(
+        logged.contains(&format!("{}#agent", s.ws().display())),
+        "{logged}"
+    );
+}

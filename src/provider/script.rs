@@ -305,108 +305,163 @@ impl ScriptProvider {
         // a relative program path ambiguous; it is made absolute anyway.
         let program = self.canonical_source()?;
         let cwd = std::path::absolute(&self.base_dir).map_err(spawn_err)?;
-        let (out_done_r, out_done_w) = notify_pipe().map_err(io_err)?;
-        let (err_done_r, err_done_w) = notify_pipe().map_err(io_err)?;
-        let mut cmd = Command::new(program);
-        cmd.current_dir(&cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        // SAFETY: the closure runs in the forked child before `exec`, where
-        // only async-signal-safe operations are allowed. It only calls
-        // `setsid(2)`, which is async-signal-safe (POSIX), through rustix's
-        // raw syscall wrapper: no allocation, no locks. Converting the
-        // `Errno` into `io::Error` is a plain integer wrap (the `Os`
-        // representation), which does not allocate either.
-        unsafe {
-            cmd.pre_exec(|| rustix::process::setsid().map(drop).map_err(io::Error::from));
+        match run_host_command(program, &[], &cwd, Some(input)) {
+            HostCommandResult::Success(out) => Ok(out),
+            HostCommandResult::StdoutTooLarge => Err(ProviderError::StdoutTooLarge {
+                name: self.name.clone(),
+                script: self.source.clone(),
+                limit: STDOUT_LIMIT,
+            }),
+            HostCommandResult::Failed { status, stderr } => Err(ProviderError::Failed {
+                name: self.name.clone(),
+                script: self.source.clone(),
+                status,
+                stderr,
+            }),
+            HostCommandResult::Interrupted(signal) => Err(ProviderError::Interrupted {
+                name: self.name.clone(),
+                script: self.source.clone(),
+                signal,
+            }),
+            HostCommandResult::Spawn(error) => Err(spawn_err(error)),
+            HostCommandResult::Io(error) => Err(io_err(error)),
         }
-        let mut child = cmd.spawn().map_err(spawn_err)?;
-        let pidfd = pidfd_open(Pid::from_child(&child), PidfdFlags::empty()).ok();
-        let mut stdin = child.stdin.take().expect("stdin is piped");
-        let mut stdout = child.stdout.take().expect("stdout is piped");
-        let mut stderr = child.stderr.take().expect("stderr is piped");
-
-        // Worker threads handle stdin, stdout, and stderr so pipes cannot
-        // deadlock. This thread polls completion alongside caught signals
-        // before reaping `child` so `kill_group` can signal a live process
-        // group.
-        thread::scope(|s| {
-            let writer = s.spawn(move || {
-                // `stdin` is dropped (closed) when this closure returns. A
-                // script may exit without reading its input: not an error.
-                // (std ignores SIGPIPE in Rust binaries, so this surfaces as
-                // `BrokenPipe` rather than killing the supervisor.)
-                match stdin.write_all(&input) {
-                    Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-                    r => r,
-                }
-            });
-            let out_reader = s.spawn(move || {
-                let _done = out_done_w;
-                read_capped(&mut stdout, STDOUT_LIMIT)
-            });
-            let err_reader = s.spawn(move || {
-                let _done = err_done_w;
-                read_stderr(&mut stderr)
-            });
-
-            let abort_on_signal = |signal: libc::c_int, child: &mut Child| -> ProviderError {
-                kill_group(child);
-                let _ = child.wait();
-                ProviderError::Interrupted {
-                    name: self.name.clone(),
-                    script: self.source.clone(),
-                    signal,
-                }
-            };
-
-            if let Err(signal) = wait_fd_or_signal(out_done_r.as_raw_fd()) {
-                return Err(abort_on_signal(signal, &mut child));
-            }
-            let out = out_reader.join().expect("stdout reader panicked");
-            if !matches!(out, Ok(Some(_))) {
-                // Too much output or a read error: stop the script and
-                // anything it started.
-                kill_group(&child);
-            }
-            if let Err(signal) = wait_fd_or_signal(err_done_r.as_raw_fd()) {
-                return Err(abort_on_signal(signal, &mut child));
-            }
-            if let Some(ref pidfd) = pidfd
-                && let Err(signal) = wait_fd_or_signal(pidfd.as_raw_fd())
-            {
-                return Err(abort_on_signal(signal, &mut child));
-            }
-            let status = child.wait();
-            let written = writer.join().expect("stdin writer panicked");
-            let stderr = err_reader.join().expect("stderr reader panicked");
-
-            let out = match out.map_err(io_err)? {
-                Some(out) => out,
-                None => {
-                    return Err(ProviderError::StdoutTooLarge {
-                        name: self.name.clone(),
-                        script: self.source.clone(),
-                        limit: STDOUT_LIMIT,
-                    });
-                }
-            };
-            let status = status.map_err(io_err)?;
-            if !status.success() {
-                let stderr = stderr.unwrap_or_else(|e| format!("[could not read stderr: {e}]"));
-                return Err(ProviderError::Failed {
-                    name: self.name.clone(),
-                    script: self.source.clone(),
-                    status,
-                    stderr,
-                });
-            }
-            stderr.map_err(io_err)?;
-            written.map_err(io_err)?;
-            Ok(out)
-        })
     }
+}
+
+/// Outcome of running a host command in its own detached session via
+/// [`run_host_command`].
+pub(super) enum HostCommandResult {
+    /// Exited with code 0 and produced stdout within [`STDOUT_LIMIT`].
+    Success(Vec<u8>),
+    /// Printed more than [`STDOUT_LIMIT`] bytes on stdout.
+    StdoutTooLarge,
+    /// Exited with non-zero status or signal.
+    Failed { status: ExitStatus, stderr: String },
+    /// A caught supervisor signal interrupted the command and killed its group.
+    Interrupted(i32),
+    /// Spawning the child failed.
+    Spawn(io::Error),
+    /// Pipe setup, reading, writing, or waiting failed.
+    Io(io::Error),
+}
+
+/// Runs `program` with `args` in `cwd` inside a detached session (`setsid`),
+/// capping stdout at [`STDOUT_LIMIT`] and stderr at [`STDERR_LIMIT`], and
+/// killing the whole process group if interrupted by a supervisor signal or if
+/// stdout exceeds the limit.
+pub(super) fn run_host_command(
+    program: &Path,
+    args: &[std::ffi::OsString],
+    cwd: &Path,
+    input: Option<Vec<u8>>,
+) -> HostCommandResult {
+    if let Some(signal) = crate::supervisor::pending_signal() {
+        return HostCommandResult::Interrupted(signal);
+    }
+    let (out_done_r, out_done_w) = match notify_pipe() {
+        Ok(p) => p,
+        Err(e) => return HostCommandResult::Io(e),
+    };
+    let (err_done_r, err_done_w) = match notify_pipe() {
+        Ok(p) => p,
+        Err(e) => return HostCommandResult::Io(e),
+    };
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .current_dir(cwd)
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: the closure runs in the forked child before `exec`, where
+    // only async-signal-safe operations are allowed. It only calls
+    // `setsid(2)`, which is async-signal-safe (POSIX), through rustix's
+    // raw syscall wrapper, with no allocation and no locks. Converting the
+    // `Errno` into `io::Error` is a plain integer wrap (`Os`), which does
+    // not allocate either.
+    unsafe {
+        cmd.pre_exec(|| rustix::process::setsid().map(drop).map_err(io::Error::from));
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return HostCommandResult::Spawn(e),
+    };
+    let pidfd = pidfd_open(Pid::from_child(&child), PidfdFlags::empty()).ok();
+    let stdin = child.stdin.take();
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+
+    // Worker threads handle stdin, stdout, and stderr so pipes cannot
+    // deadlock. This thread polls completion alongside caught signals
+    // before reaping `child` so `kill_group` can signal a live process
+    // group.
+    thread::scope(|s| {
+        let writer = input.map(|bytes| {
+            let mut stdin = stdin.expect("stdin is piped when input is Some");
+            s.spawn(move || match stdin.write_all(&bytes) {
+                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+                r => r,
+            })
+        });
+        let out_reader = s.spawn(move || {
+            let _done = out_done_w;
+            read_capped(&mut stdout, STDOUT_LIMIT)
+        });
+        let err_reader = s.spawn(move || {
+            let _done = err_done_w;
+            read_stderr(&mut stderr)
+        });
+
+        let abort_on_signal = |signal: libc::c_int, child: &mut Child| -> HostCommandResult {
+            kill_group(child);
+            let _ = child.wait();
+            HostCommandResult::Interrupted(signal)
+        };
+
+        if let Err(signal) = wait_fd_or_signal(out_done_r.as_raw_fd()) {
+            return abort_on_signal(signal, &mut child);
+        }
+        let out = out_reader.join().expect("stdout reader panicked");
+        if !matches!(out, Ok(Some(_))) {
+            kill_group(&child);
+        }
+        if let Err(signal) = wait_fd_or_signal(err_done_r.as_raw_fd()) {
+            return abort_on_signal(signal, &mut child);
+        }
+        if let Some(ref pidfd) = pidfd
+            && let Err(signal) = wait_fd_or_signal(pidfd.as_raw_fd())
+        {
+            return abort_on_signal(signal, &mut child);
+        }
+        let status = child.wait();
+        let written = writer.map(|w| w.join().expect("stdin writer panicked"));
+        let stderr = err_reader.join().expect("stderr reader panicked");
+
+        let out = match out {
+            Ok(Some(out)) => out,
+            Ok(None) => return HostCommandResult::StdoutTooLarge,
+            Err(e) => return HostCommandResult::Io(e),
+        };
+        let status = match status {
+            Ok(s) => s,
+            Err(e) => return HostCommandResult::Io(e),
+        };
+        if !status.success() {
+            let stderr = stderr.unwrap_or_else(|e| format!("[could not read stderr: {e}]"));
+            return HostCommandResult::Failed { status, stderr };
+        }
+        if let Err(e) = stderr {
+            return HostCommandResult::Io(e);
+        }
+        if let Some(Err(e)) = written {
+            return HostCommandResult::Io(e);
+        }
+        HostCommandResult::Success(out)
+    })
 }
 
 impl Provider for ScriptProvider {
@@ -637,13 +692,19 @@ pub(super) fn describe_stderr(stderr: &str) -> String {
     }
 }
 
+/// Writing an executable while another test thread forks can leave a
+/// write descriptor open in the child for a moment, making `exec` of the
+/// new file fail with ETXTBSY. Scripts are written under the write lock
+/// and run under the read lock, so no fork overlaps a write.
+#[cfg(test)]
+pub(super) static EXEC_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
     use std::fs;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::RwLock;
 
     use serde_json::json;
     use tempfile::TempDir;
@@ -651,12 +712,6 @@ mod tests {
     use super::*;
     use crate::config::{Config, ProviderKind};
     use crate::spec::UntrustedRoot;
-
-    /// Writing an executable while another test thread forks can leave a
-    /// write descriptor open in the child for a moment, making `exec` of the
-    /// new file fail with ETXTBSY. Scripts are written under the write lock
-    /// and run under the read lock, so no fork overlaps a write.
-    static EXEC_LOCK: RwLock<()> = RwLock::new(());
 
     fn write_script(dir: &Path, file: &str, body: &str) -> PathBuf {
         let _guard = EXEC_LOCK.write().unwrap_or_else(|e| e.into_inner());
