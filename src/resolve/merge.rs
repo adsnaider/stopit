@@ -834,7 +834,9 @@ mod tests {
     }
 
     const CHAIN: &str = r#"
+        [profiles.main]
         [profiles.gp]
+        inherit = "main"
         [profiles.parent]
         inherit = "gp"
         [profiles.child]
@@ -843,7 +845,7 @@ mod tests {
 
     #[test]
     fn defaults_are_the_empty_sandbox() {
-        let m = merged("[profiles.harness]");
+        let m = merged("[profiles.main]\n[profiles.harness]\ninherit = \"main\"");
         for p in ["main", "harness"] {
             let e = eff(&m, p);
             assert_eq!(e, &EffectiveGrants::default());
@@ -857,7 +859,7 @@ mod tests {
         }
         // Empty contributions change nothing either.
         let m = merged(&format!(
-            "{}{}",
+            "[profiles.main]\n{}{}",
             prov("a", "main", ""),
             prov("b", "main", "")
         ));
@@ -890,7 +892,8 @@ mod tests {
     #[test]
     fn proc_is_or_within_and_own_overrides_inherited() {
         let m = merged(&format!(
-            "[profiles.off]\n[profiles.unset]\n[profiles.mixed]\n\
+            "[profiles.main]\n[profiles.off]\ninherit = \"main\"\n\
+             [profiles.unset]\ninherit = \"main\"\n[profiles.mixed]\ninherit = \"main\"\n\
              [profiles.bare]\ninherit = \"none\"\n{}{}{}{}{}{}{}",
             prov("a", "main", "system.proc = true"),
             prov("b", "off", "system.proc = false"),
@@ -910,13 +913,20 @@ mod tests {
         // Only `false` (and unset) within a profile: false.
         assert!(!eff(&m, "bare").system.proc);
         // No contribution at all and nothing inherited: false.
-        assert!(!merged("").get(&ProfileRef::main()).unwrap().system.proc);
+        assert!(
+            !merged("[profiles.main]")
+                .get(&pr("main"))
+                .unwrap()
+                .system
+                .proc
+        );
     }
 
     #[test]
     fn dev_is_or_within_and_own_overrides_inherited() {
         let m = merged(&format!(
-            "[profiles.unset]\n[profiles.bare]\ninherit = \"none\"\n{}{}{}{}",
+            "[profiles.main]\n[profiles.unset]\ninherit = \"main\"\n\
+             [profiles.bare]\ninherit = \"none\"\n{}{}{}{}",
             prov("a", "main", "system.dev = \"minimal\""),
             prov("b", "main", ""),
             prov("c", "bare", ""),
@@ -935,7 +945,8 @@ mod tests {
     #[test]
     fn etc_is_a_union() {
         let m = merged(&format!(
-            "[profiles.child]\n[profiles.bare]\ninherit = \"none\"\n{}{}{}{}",
+            "[profiles.main]\n[profiles.child]\ninherit = \"main\"\n\
+             [profiles.bare]\ninherit = \"none\"\n{}{}{}{}",
             prov("a", "main", "system.etc = [\"passwd\", \"hosts\"]"),
             prov("b", "main", "system.etc = [\"group\", \"passwd\"]"),
             prov("c", "child", "system.etc = [\"nsswitch.conf\"]"),
@@ -956,7 +967,8 @@ mod tests {
     #[test]
     fn devices_is_a_union() {
         let m = merged(&format!(
-            "[profiles.child]\n[profiles.bare]\ninherit = \"none\"\n{}{}{}{}",
+            "[profiles.main]\n[profiles.child]\ninherit = \"main\"\n\
+             [profiles.bare]\ninherit = \"none\"\n{}{}{}{}",
             prov(
                 "a",
                 "main",
@@ -980,7 +992,8 @@ mod tests {
     #[test]
     fn home_conflicts_within_and_own_overrides_inherited() {
         let m = merged(&format!(
-            "[profiles.child]\n[profiles.unset]\n{}{}{}{}",
+            "[profiles.main]\n[profiles.child]\ninherit = \"main\"\n\
+             [profiles.unset]\ninherit = \"main\"\n{}{}{}{}",
             prov("a", "main", "system.home = \"/home/user\""),
             // Identical values within a profile are fine.
             prov("b", "main", "system.home = \"/home/user\""),
@@ -996,7 +1009,8 @@ mod tests {
     #[test]
     fn user_conflicts_within_and_own_overrides_inherited() {
         let m = merged(&format!(
-            "[profiles.child]\n[profiles.unset]\n{}{}{}{}",
+            "[profiles.main]\n[profiles.child]\ninherit = \"main\"\n\
+             [profiles.unset]\ninherit = \"main\"\n{}{}{}{}",
             prov("a", "main", "system.user = \"host\""),
             prov("b", "main", "system.user = \"host\""),
             prov("c", "child", ""),
@@ -1011,7 +1025,7 @@ mod tests {
         assert_eq!(eff(&merged("[profiles.p]"), "p").system.user, None);
 
         let e = merge_err(&format!(
-            "{}{}",
+            "[profiles.main]\n{}{}",
             prov("a", "main", "system.user = \"host\""),
             prov("b", "main", "system.user = { username = \"alice\" }"),
         ));
@@ -1024,7 +1038,8 @@ mod tests {
     #[test]
     fn env_pass_and_deny_are_ordered_deduplicated_unions() {
         let m = merged(&format!(
-            "[profiles.child]\n[profiles.bare]\ninherit = \"none\"\n{}{}{}{}",
+            "[profiles.main]\n[profiles.child]\ninherit = \"main\"\n\
+             [profiles.bare]\ninherit = \"none\"\n{}{}{}{}",
             prov(
                 "a",
                 "main",
@@ -1060,7 +1075,8 @@ mod tests {
     #[test]
     fn env_set_merges_per_variable() {
         let m = merged(&format!(
-            "[profiles.child]\n[profiles.bare]\ninherit = \"none\"\n{}{}{}{}",
+            "[profiles.main]\n[profiles.child]\ninherit = \"main\"\n\
+             [profiles.bare]\ninherit = \"none\"\n{}{}{}{}",
             prov("a", "main", "env.set = { EDITOR = \"vi\", LANG = \"C\" }"),
             // Identical values within a profile are fine.
             prov("b", "main", "env.set = { LANG = \"C\", PAGER = \"less\" }"),
@@ -1092,7 +1108,8 @@ mod tests {
     #[test]
     fn path_prepend_puts_later_and_own_entries_first() {
         let m = merged(&format!(
-            "[profiles.child]\n[profiles.bare]\ninherit = \"none\"\n{}{}{}{}{}",
+            "[profiles.main]\n[profiles.child]\ninherit = \"main\"\n\
+             [profiles.bare]\ninherit = \"none\"\n{}{}{}{}{}",
             prov("a", "main", "env.path_prepend = [\"/a\", \"/b\"]"),
             prov("b", "main", "env.path_prepend = [\"/c\", \"/a\"]"),
             prov("c", "child", "env.path_prepend = [\"/d\", \"/c\"]"),
@@ -1123,7 +1140,8 @@ mod tests {
     #[test]
     fn network_mode_is_most_permissive_within_and_own_overrides() {
         let m = merged(&format!(
-            "[profiles.strict]\n[profiles.unset]\n[profiles.bare]\ninherit = \"none\"\n{}{}{}{}{}",
+            "[profiles.main]\n[profiles.strict]\ninherit = \"main\"\n\
+             [profiles.unset]\ninherit = \"main\"\n[profiles.bare]\ninherit = \"none\"\n{}{}{}{}{}",
             prov("a", "main", "network.mode = \"proxy\""),
             prov("b", "main", "network.mode = \"loopback\""),
             prov("c", "main", ""),
@@ -1138,7 +1156,7 @@ mod tests {
         assert_eq!(eff(&m, "bare").network.mode, NetworkMode::None);
 
         let m = merged(&format!(
-            "[profiles.child]\n{}{}",
+            "[profiles.main]\n[profiles.child]\ninherit = \"main\"\n{}{}",
             prov("a", "child", "network.mode = \"full\""),
             prov("b", "child", "network.mode = \"loopback\""),
         ));
@@ -1149,7 +1167,8 @@ mod tests {
     #[test]
     fn allow_domains_is_a_union() {
         let m = merged(&format!(
-            "[profiles.child]\n[profiles.bare]\ninherit = \"none\"\n{}{}{}{}",
+            "[profiles.main]\n[profiles.child]\ninherit = \"main\"\n\
+             [profiles.bare]\ninherit = \"none\"\n{}{}{}{}",
             prov(
                 "a",
                 "main",
@@ -1177,7 +1196,8 @@ mod tests {
     #[test]
     fn sandbox_opt_outs_are_unions() {
         let m = merged(&format!(
-            "[profiles.child]\n[profiles.bare]\ninherit = \"none\"\n{}{}{}{}",
+            "[profiles.main]\n[profiles.child]\ninherit = \"main\"\n\
+             [profiles.bare]\ninherit = \"none\"\n{}{}{}{}",
             prov(
                 "a",
                 "main",
@@ -1223,7 +1243,8 @@ mod tests {
     #[test]
     fn shims_union_and_own_replaces_inherited() {
         let m = merged(&format!(
-            "[profiles.child]\n[profiles.bare]\ninherit = \"none\"\n{}{}{}{}",
+            "[profiles.main]\n[profiles.child]\ninherit = \"main\"\n\
+             [profiles.bare]\ninherit = \"none\"\n{}{}{}{}",
             prov("a", "main", &shim("jj", "jj")),
             prov(
                 "b",
@@ -1247,11 +1268,12 @@ mod tests {
         );
         assert_eq!(shims(&m, "bare"), triples(&[("x", "x", "d")]));
         // The spec itself is carried over unchanged.
-        let g = graph(&prov("a", "main", &shim("jj", "jj")));
+        let g = graph(&format!(
+            "[profiles.main]\n{}",
+            prov("a", "main", &shim("jj", "jj"))
+        ));
         let m = merge_profiles(&g).unwrap();
-        let own = &g.get(&ProfileRef::main()).unwrap().contributions[0]
-            .grants
-            .shims;
+        let own = &g.get(&pr("main")).unwrap().contributions[0].grants.shims;
         let (spec, provider) = &eff(&m, "main").shims[&"jj".parse().unwrap()];
         assert_eq!(spec, &own[&"jj".parse().unwrap()]);
         assert_eq!(provider, &pn("a"));
@@ -1260,7 +1282,7 @@ mod tests {
     #[test]
     fn disabled_shim_tombstone_removes_inherited_and_lower_or_same_rank_shims() {
         let m = merged(&format!(
-            "[profiles.child]\n{}{}{}{}",
+            "[profiles.main]\n[profiles.child]\ninherit = \"main\"\n{}{}{}{}",
             prov(
                 "a",
                 "main",
@@ -1277,7 +1299,8 @@ mod tests {
     #[test]
     fn mask_sockets_true_wins_within_and_own_overrides() {
         let m = merged(&format!(
-            "[profiles.off]\n[profiles.unset]\n[profiles.mixed]\n\
+            "[profiles.main]\n[profiles.off]\ninherit = \"main\"\n\
+             [profiles.unset]\ninherit = \"main\"\n[profiles.mixed]\ninherit = \"main\"\n\
              [profiles.bare]\ninherit = \"none\"\n{}{}{}{}{}{}",
             prov("a", "main", "fs.mask_sockets = true"),
             prov("b", "off", "fs.mask_sockets = false"),
@@ -1298,7 +1321,7 @@ mod tests {
     #[test]
     fn fs_rules_are_collected_with_provider_and_depth() {
         let m = merged(&format!(
-            "[profiles.child]\n{}{}{}",
+            "[profiles.main]\n[profiles.child]\ninherit = \"main\"\n{}{}{}",
             prov(
                 "a",
                 "main",
@@ -1342,7 +1365,8 @@ mod tests {
     #[test]
     fn inherit_none_starts_empty() {
         let m = merged(&format!(
-            "[profiles.bare]\ninherit = \"none\"\n[profiles.empty]\ninherit = \"none\"\n\
+            "[profiles.main]\n[profiles.bare]\ninherit = \"none\"\n\
+             [profiles.empty]\ninherit = \"none\"\n\
              [profiles.below]\ninherit = \"bare\"\n{}{}",
             prov(
                 "a",
@@ -1474,12 +1498,12 @@ mod tests {
     #[test]
     fn contributed_profiles_merge_like_any_other() {
         let m = merged(&format!(
-            "{}{}",
+            "[profiles.main]\n{}{}",
             prov(
                 "vcs",
                 "main",
                 "network.mode = \"loopback\"\nfs.masked = [\"{workspace}/.git\"]\n\
-                 [provider.sandbox.profiles.local]\nfs.rw = [\"{workspace}/.git\"]\nnetwork.mode = \"none\""
+                 [provider.sandbox.profiles.local]\ninherit = \"main\"\nfs.rw = [\"{workspace}/.git\"]\nnetwork.mode = \"none\""
             ),
             prov("extra", "vcs.local", "fs.ro = [\"/etc/gitconfig\"]"),
         ));
@@ -1497,7 +1521,7 @@ mod tests {
     #[test]
     fn conflicting_home_within_a_profile() {
         let e = merge_err(&format!(
-            "{}{}{}",
+            "[profiles.main]\n{}{}{}",
             prov("a", "main", "system.home = \"/home/a\""),
             prov("b", "main", "system.home = \"/home/a\""),
             prov("c", "main", "system.home = \"/home/c\""),
@@ -1509,7 +1533,7 @@ mod tests {
         assert_eq!(
             e,
             MergeError::HomeConflict {
-                profile: ProfileRef::main(),
+                profile: pr("main"),
                 first_provider: pn("a"),
                 first: "/home/a".parse().unwrap(),
                 second_provider: pn("c"),
@@ -1519,7 +1543,7 @@ mod tests {
         // In a child profile; the inherited value is not part of the
         // conflict.
         let e = merge_err(&format!(
-            "[profiles.child]\n{}{}{}",
+            "[profiles.main]\n[profiles.child]\ninherit = \"main\"\n{}{}{}",
             prov("a", "main", "system.home = \"/home/a\""),
             prov("b", "child", "system.home = \"/home/b\""),
             prov("c", "child", "system.home = \"/home/c\""),
@@ -1533,7 +1557,7 @@ mod tests {
     #[test]
     fn conflicting_env_set_within_a_profile() {
         let e = merge_err(&format!(
-            "{}{}",
+            "[profiles.main]\n{}{}",
             prov("a", "main", "env.set = { EDITOR = \"vi\", LANG = \"C\" }"),
             prov("b", "main", "env.set = { LANG = \"C.UTF-8\" }"),
         ));
@@ -1544,7 +1568,7 @@ mod tests {
         assert_eq!(
             e,
             MergeError::EnvSetConflict(Box::new(EnvSetConflict {
-                profile: ProfileRef::main(),
+                profile: pr("main"),
                 name: "LANG".parse().unwrap(),
                 first_provider: pn("a"),
                 first: "C".parse().unwrap(),
@@ -1554,11 +1578,11 @@ mod tests {
         );
         // In a contributed profile.
         let e = merge_err(&format!(
-            "{}{}",
+            "[profiles.main]\n{}{}",
             prov(
                 "vcs",
                 "main",
-                "[provider.sandbox.profiles.local]\nenv.set = { X = \"1\" }"
+                "[provider.sandbox.profiles.local]\ninherit = \"main\"\nenv.set = { X = \"1\" }"
             ),
             prov("extra", "vcs.local", "env.set = { X = \"2\" }"),
         ));
@@ -1571,7 +1595,7 @@ mod tests {
     #[test]
     fn duplicate_shim_within_a_profile() {
         let e = merge_err(&format!(
-            "[profiles.child]\n{}{}{}",
+            "[profiles.main]\n[profiles.child]\ninherit = \"main\"\n{}{}{}",
             prov("a", "child", &shim("jj", "jj")),
             prov("b", "child", &shim("git", "git")),
             prov("c", "child", &shim("jj", "jj2")),
@@ -1591,7 +1615,7 @@ mod tests {
         );
         // Even identical specs collide.
         let e = merge_err(&format!(
-            "{}{}",
+            "[profiles.main]\n{}{}",
             prov("a", "main", &shim("jj", "jj")),
             prov("b", "main", &shim("jj", "jj")),
         ));
@@ -1609,9 +1633,10 @@ mod tests {
         use crate::config::ConfigLayer;
         use crate::provider::from_layered_entry;
 
+        let global = format!("[profiles.main]\n{global}");
         let layered = ConfigLayer::layer(
             Some((
-                ConfigLayer::from_toml_str(global).unwrap(),
+                ConfigLayer::from_toml_str(&global).unwrap(),
                 Path::new("/cfg"),
             )),
             Some((
@@ -1686,7 +1711,7 @@ mod tests {
         let m = layered(
             &prov("g", "main", "system.home = \"/home/global\""),
             &format!(
-                "[profiles.child]\n{}",
+                "[profiles.child]\ninherit = \"main\"\n{}",
                 prov("p", "main", "system.home = \"/home/project\"")
             ),
         )

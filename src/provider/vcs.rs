@@ -32,18 +32,16 @@
 //! that names it back. Other layouts get the mask but no VCS profiles, with
 //! a warning.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use super::{Provider, ProviderContext, ProviderError, ProviderOutput};
-use crate::config::{ProfileRef, ProviderName, ProviderOrigin, VcsTool, VcsView};
-use crate::manifest::Manifest;
-use crate::policy::Decision;
-
-/// The name of the built-in `vcs` provider of `base = "default"`.
-pub const VCS_PROVIDER_NAME: &str = "vcs";
+use crate::config::{ProfileRef, ProviderName, ProviderOrigin, VcsView};
+use crate::manifest::{Manifest, ShimName, ShimSpec};
 
 /// The git configuration every brokered git command gets, over any file:
 /// no hooks, no filesystem monitor, no pager, no `ext::` transport, no
@@ -106,15 +104,16 @@ impl SshRemote {
         let Ok(session_dir) = crate::state::resolve_allowing_missing(&ctx.session_dir) else {
             return SshRemote::default();
         };
-        let runtime_dir = match ctx.session_dir.parent().filter(|rt| {
-            rt.file_name() == Some(std::ffi::OsStr::new(crate::state::STATE_DIR_NAME))
-        }) {
-            Some(rt) => match crate::state::resolve_allowing_missing(rt) {
-                Ok(resolved) => Some(resolved.path),
-                Err(_) => return SshRemote::default(),
-            },
-            None => None,
-        };
+        let runtime_dir =
+            match ctx.session_dir.parent().filter(|rt| {
+                rt.file_name() == Some(std::ffi::OsStr::new(crate::state::STATE_DIR_NAME))
+            }) {
+                Some(rt) => match crate::state::resolve_allowing_missing(rt) {
+                    Ok(resolved) => Some(resolved.path),
+                    Err(_) => return SshRemote::default(),
+                },
+                None => None,
+            };
         let Ok(ctx_data) = crate::state::data_dirs(&ctx.home, None) else {
             return SshRemote::default();
         };
@@ -164,31 +163,33 @@ impl SshRemote {
 #[derive(Debug, Clone)]
 pub struct VcsProvider {
     name: ProviderName,
+    profile: ProfileRef,
     view: VcsView,
-    tools: Vec<VcsTool>,
-    fetch: Decision,
-    push: Decision,
+    shims: BTreeMap<ShimName, ShimSpec>,
+    base_dir: PathBuf,
+    protected_proxies: OnceLock<Vec<PathBuf>>,
     /// Asked for, but not supported yet, so only warned about.
     signing: bool,
     origin: ProviderOrigin,
 }
 
 impl VcsProvider {
-    /// A provider named `name` with these options.
+    /// A provider named `name` targeting `profile` with explicit `shims`.
     pub fn new(
         name: ProviderName,
+        profile: ProfileRef,
         view: VcsView,
-        tools: Vec<VcsTool>,
-        fetch: Decision,
-        push: Decision,
+        shims: BTreeMap<ShimName, ShimSpec>,
+        base_dir: &Path,
         origin: ProviderOrigin,
     ) -> Self {
         VcsProvider {
             name,
+            profile,
             view,
-            tools,
-            fetch,
-            push,
+            shims,
+            base_dir: base_dir.to_owned(),
+            protected_proxies: OnceLock::new(),
             signing: false,
             origin,
         }
@@ -208,18 +209,6 @@ impl VcsProvider {
             );
         }
         out
-    }
-
-    /// The provider of `base = "default"`: the defaults of §7.3.
-    pub fn builtin() -> Self {
-        VcsProvider::new(
-            VCS_PROVIDER_NAME.parse().expect("a valid provider name"),
-            VcsView::Masked,
-            vec![VcsTool::Jj, VcsTool::Git],
-            Decision::Ask,
-            Decision::Ask,
-            ProviderOrigin::Builtin,
-        )
     }
 }
 
@@ -438,10 +427,7 @@ fn jj_repo(workspace: &Path, dot_jj: &Path) -> Result<JjRepo, String> {
 /// relative path, at least `min_leading_parents` leading `..` components when
 /// relative, and at least one normal component. Returns the number of leading
 /// `..` components.
-fn check_pointer_target(
-    target: &Path,
-    min_leading_parents: usize,
-) -> Result<usize, &'static str> {
+fn check_pointer_target(target: &Path, min_leading_parents: usize) -> Result<usize, &'static str> {
     use std::path::Component;
     let mut leading_parents = 0usize;
     let mut seen_normal_or_root = false;
@@ -495,8 +481,8 @@ fn jj_secondary_repo(workspace: &Path, dot_jj: &Path, repo_file: &Path) -> Resul
     {
         return Err("its .jj/repo path traverses a symlink inside the workspace".to_owned());
     }
-    let repo_dir = fs::canonicalize(&joined)
-        .map_err(|e| format!("cannot resolve its repository: {e}"))?;
+    let repo_dir =
+        fs::canonicalize(&joined).map_err(|e| format!("cannot resolve its repository: {e}"))?;
     if repo_dir.starts_with(&workspace) {
         return Err("its repository is inside the workspace".to_owned());
     }
@@ -935,6 +921,7 @@ impl VcsProvider {
         // of these profiles would mount host paths beside the metadata.
         let no_grant = || Value::Table(table([("grant", false.into())]));
         let mut ro = toml::Table::new();
+        ro.insert("inherit".into(), self.profile.as_str().into());
         ro.insert("network".into(), offline());
         ro.insert("system".into(), system());
         ro.insert("sandbox".into(), no_grant());
@@ -958,6 +945,7 @@ impl VcsProvider {
             local_fs.insert("masked".into(), list(masked));
         }
         let mut local = toml::Table::new();
+        local.insert("inherit".into(), self.profile.as_str().into());
         local.insert("network".into(), offline());
         local.insert("system".into(), system());
         local.insert("sandbox".into(), no_grant());
@@ -967,76 +955,78 @@ impl VcsProvider {
             Value::Table(table([("set", Value::Table(env.clone()))])),
         );
         profiles.insert("local".into(), Value::Table(local));
-        if self.fetch != Decision::Deny || self.push != Decision::Deny {
-            let mut remote_fs = local_fs;
-            remote_fs.insert(
-                "ephemeral".into(),
-                list(vec![VCS_HOME.to_owned(), format!("{VCS_HOME}/.ssh")]),
-            );
-            let mut binds = Vec::new();
-            let sock_rule = ssh.auth_sock.as_deref().map(&path).transpose()?;
-            if let Some(sock) = &sock_rule {
-                binds.push(Value::Table(table([
-                    ("host", sock.clone().into()),
-                    ("sandbox", VCS_SSH_AGENT_SOCK.into()),
-                    ("mode", "ro".into()),
-                ])));
-            }
-            let kh_rule = ssh.known_hosts.as_deref().map(&path).transpose()?;
-            if let Some(kh) = &kh_rule {
-                binds.push(Value::Table(table([
-                    ("host", kh.clone().into()),
-                    ("sandbox", VCS_KNOWN_HOSTS.into()),
-                    ("mode", "ro".into()),
-                ])));
-            }
-            if !binds.is_empty() {
-                remote_fs.insert("bind".into(), Value::Array(binds));
-            }
-            let mut remote_env = env;
-            if sock_rule.is_some() {
-                remote_env.insert("SSH_AUTH_SOCK".into(), VCS_SSH_AGENT_SOCK.into());
-            }
-            let known_hosts_arg = if kh_rule.is_some() {
-                VCS_KNOWN_HOSTS
-            } else {
-                "/dev/null"
-            };
-            remote_env.insert(
-                "GIT_SSH_COMMAND".into(),
-                format!(
-                    "ssh -F /dev/null -o IdentityFile=/dev/null -o StrictHostKeyChecking=yes -o UserKnownHostsFile={known_hosts_arg}"
-                )
-                .into(),
-            );
-            let mut remote = toml::Table::new();
-            remote.insert(
-                "network".into(),
-                Value::Table(table([("mode", "full".into())])),
-            );
-            remote.insert("system".into(), system());
-            remote.insert("sandbox".into(), no_grant());
-            remote.insert("fs".into(), Value::Table(remote_fs));
-            remote.insert(
-                "env".into(),
-                Value::Table(table([("set", Value::Table(remote_env))])),
-            );
-            profiles.insert("remote".into(), Value::Table(remote));
+
+        let mut remote_fs = local_fs;
+        remote_fs.insert(
+            "ephemeral".into(),
+            list(vec![VCS_HOME.to_owned(), format!("{VCS_HOME}/.ssh")]),
+        );
+        let mut binds = Vec::new();
+        let sock_rule = ssh.auth_sock.as_deref().map(path).transpose()?;
+        if let Some(sock) = &sock_rule {
+            binds.push(Value::Table(table([
+                ("host", sock.clone().into()),
+                ("sandbox", VCS_SSH_AGENT_SOCK.into()),
+                ("mode", "ro".into()),
+            ])));
         }
+        let kh_rule = ssh.known_hosts.as_deref().map(path).transpose()?;
+        if let Some(kh) = &kh_rule {
+            binds.push(Value::Table(table([
+                ("host", kh.clone().into()),
+                ("sandbox", VCS_KNOWN_HOSTS.into()),
+                ("mode", "ro".into()),
+            ])));
+        }
+        if !binds.is_empty() {
+            remote_fs.insert("bind".into(), Value::Array(binds));
+        }
+        let mut remote_env = env;
+        if sock_rule.is_some() {
+            remote_env.insert("SSH_AUTH_SOCK".into(), VCS_SSH_AGENT_SOCK.into());
+        }
+        let known_hosts_arg = if kh_rule.is_some() {
+            VCS_KNOWN_HOSTS
+        } else {
+            "/dev/null"
+        };
+        remote_env.insert(
+            "GIT_SSH_COMMAND".into(),
+            format!(
+                "ssh -F /dev/null -o IdentityFile=/dev/null -o StrictHostKeyChecking=yes -o UserKnownHostsFile={known_hosts_arg}"
+            )
+            .into(),
+        );
+        let mut remote = toml::Table::new();
+        remote.insert("inherit".into(), self.profile.as_str().into());
+        remote.insert(
+            "network".into(),
+            Value::Table(table([("mode", "full".into())])),
+        );
+        remote.insert("system".into(), system());
+        remote.insert("sandbox".into(), no_grant());
+        remote.insert("fs".into(), Value::Table(remote_fs));
+        remote.insert(
+            "env".into(),
+            Value::Table(table([("set", Value::Table(remote_env))])),
+        );
+        profiles.insert("remote".into(), Value::Table(remote));
         root.insert("profiles".into(), Value::Table(profiles));
-        let mut shims = toml::Table::new();
-        for tool in &self.tools {
-            let shim = match tool {
-                VcsTool::Jj if jj => jj_shim(self.fetch, self.push),
-                VcsTool::Git if git => git_shim(self.fetch, self.push),
-                _ => continue,
+        let mut manifest = manifest_from(root)?;
+        for (shim_name, shim_spec) in &self.shims {
+            let include = match shim_name.as_str() {
+                "jj" => jj,
+                "git" => git,
+                _ => git || jj,
             };
-            shims.insert(tool.as_str().into(), shim);
+            if include {
+                manifest
+                    .grants
+                    .shims
+                    .insert(shim_name.clone(), shim_spec.clone());
+            }
         }
-        if !shims.is_empty() {
-            root.insert("shims".into(), Value::Table(shims));
-        }
-        manifest_from(root)
+        Ok(manifest)
     }
 
     /// The view of the workspace's own metadata in `main`, which every
@@ -1096,225 +1086,18 @@ fn manifest_from(root: toml::Table) -> Result<Manifest, String> {
     toml::from_str(&root.to_string()).map_err(|e| e.to_string())
 }
 
-/// Builds a regex pattern matching any non-empty prefix of the long flag name
-/// `name` (without the leading `--`).
-fn long_flag_prefix_pattern(name: &str) -> String {
-    let mut chars = name.chars().rev();
-    let Some(last) = chars.next() else {
-        return String::new();
-    };
-    let mut acc = regex_escape_char(last);
-    for ch in chars {
-        let escaped = regex_escape_char(ch);
-        acc = format!("{escaped}(?:{acc})?");
-    }
-    acc
-}
-
-fn regex_escape_char(ch: char) -> String {
-    match ch {
-        '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' | '\\' => {
-            format!("\\{ch}")
-        }
-        _ => ch.to_string(),
-    }
-}
-
-/// Builds a regex matching any of `flags` (short flags in clusters or with
-/// attached values, and long flags or their prefix abbreviations).
-fn deny_flags_regex(flags: &[&str]) -> String {
-    let mut short = String::new();
-    let mut long = Vec::new();
-    for flag in flags {
-        if let Some(name) = flag.strip_prefix("--") {
-            long.push(long_flag_prefix_pattern(name));
-        } else if let Some(ch) = flag.strip_prefix('-') {
-            short.push_str(ch);
-        }
-    }
-    let long_pat = long.join("|");
-    match (!short.is_empty(), !long_pat.is_empty()) {
-        (true, true) => {
-            format!(r"(?:^| )(?:-[^- =]*[{short}]|--(?:{long_pat})(?: |=|$))")
-        }
-        (true, false) => format!(r"(?:^| )-[^- =]*[{short}]"),
-        (false, true) => format!(r"(?:^| )--(?:{long_pat})(?: |=|$)"),
-        (false, false) => unreachable!("deny_flags_regex called with empty flags"),
-    }
-}
-
-/// A `decision = "deny"` regex rule for `flags`.
-fn deny_flags_rule(flags: &[&str]) -> toml::Value {
-    let mut t = toml::Table::new();
-    t.insert("regex".into(), deny_flags_regex(flags).into());
-    t.insert("decision".into(), "deny".into());
-    toml::Value::Table(t)
-}
-
-/// Rules for `subcommands` with `decision` and `profile` (`prefix` rules for
-/// literal subcommands, `regex` rules for `<word> *` wildcards).
-fn rules_for(subcommands: &[&str], decision: &str, profile: Option<&str>) -> Vec<toml::Value> {
-    subcommands
-        .iter()
-        .map(|sub| {
-            let mut t = toml::Table::new();
-            if let Some(prefix) = sub.strip_suffix(" *") {
-                t.insert("regex".into(), format!(r"^{prefix} [^-][^ ]*(?: |$)").into());
-            } else {
-                t.insert("prefix".into(), (*sub).into());
-            }
-            t.insert("decision".into(), decision.into());
-            if let Some(p) = profile {
-                t.insert("profile".into(), p.into());
-            }
-            toml::Value::Table(t)
-        })
-        .collect()
-}
-
-/// Rules for remote commands (`fetch` or `push`), routed to `vcs.remote`
-/// unless `decision` is [`Decision::Deny`].
-fn remote_rules(subcommands: &[&str], decision: Decision) -> Vec<toml::Value> {
-    let profile = match decision {
-        Decision::Allow | Decision::Ask => Some("remote"),
-        Decision::Deny => None,
-    };
-    rules_for(subcommands, decision.as_str(), profile)
-}
-
-/// A declarative shim running `cmd` (`[binary, args...]`), with first-match-wins
-/// `rules` and asking to run anything else in `vcs.local`.
-fn shim(binary: &str, args: &[&str], rules: Vec<toml::Value>) -> toml::Value {
-    let cmd: Vec<toml::Value> = std::iter::once(binary)
-        .chain(args.iter().copied())
-        .map(toml::Value::from)
-        .collect();
-    let mut t = toml::Table::new();
-    t.insert("cmd".into(), toml::Value::Array(cmd));
-    t.insert(
-        "default".into(),
-        toml::Value::Table(table([
-            ("decision", "ask".into()),
-            ("profile", "local".into()),
-        ])),
-    );
-    t.insert("rules".into(), toml::Value::Array(rules));
-    toml::Value::Table(t)
-}
-
-/// The `jj` shim of §7.4. It runs `jj --no-pager -R {workspace}`, which the
-/// broker expands to the sandbox workspace mount so jj uses that repository
-/// whatever directory the caller is in. Options that name another
-/// repository, add configuration or run a diff or merge tool are refused.
-/// Reading commands run in `vcs.local` too, since jj snapshots the working
-/// copy first, which writes to `.jj`.
-fn jj_shim(fetch: Decision, push: Decision) -> toml::Value {
-    let mut rules = Vec::new();
-    rules.push(deny_flags_rule(&[
-        "--config",
-        "--config-file",
-        "--config-toml",
-        "-R",
-        "--repository",
-        "--tool",
-        "-i",
-        "--interactive",
-    ]));
-    rules.extend(rules_for(
-        &[
-            "status",
-            "st",
-            "diff",
-            "log",
-            "show",
-            "evolog",
-            "op log",
-            "file show",
-        ],
-        "allow",
-        Some("local"),
-    ));
-    rules.extend(rules_for(
-        &[
-            "squash",
-            "rebase",
-            "abandon",
-            "restore",
-            "undo",
-            "bookmark *",
-            "op *",
-        ],
-        "ask",
-        Some("local"),
-    ));
-    rules.extend(remote_rules(&["git fetch", "git clone"], fetch));
-    rules.extend(remote_rules(&["git push"], push));
-    rules.push(deny_flags_rule(&[
-        "-A",
-        "--insert-after",
-        "--after",
-        "-B",
-        "--insert-before",
-        "--before",
-    ]));
-    rules.extend(rules_for(
-        &["new", "commit", "ci", "describe", "desc"],
-        "allow",
-        Some("local"),
-    ));
-    shim("jj", &["--no-pager", "-R", "{workspace}"], rules)
-}
-
-/// The `git` shim of §7.4. It runs `git --no-pager`, and the profiles'
-/// `GIT_DIR` and `GIT_WORK_TREE` name the repository. Options that add
-/// configuration, run other programs, write files outside git's control or
-/// name another repository are refused. `--exec` is `push`'s and
-/// `ls-remote`'s other name for `--receive-pack` and `--upload-pack`, and
-/// `--output` makes `diff`, `log` and their kin write to any path the
-/// profile can write.
-fn git_shim(fetch: Decision, push: Decision) -> toml::Value {
-    let mut rules = Vec::new();
-    rules.push(deny_flags_rule(&[
-        "-c",
-        "--config-env",
-        "--exec-path",
-        "--upload-pack",
-        "--receive-pack",
-        "--exec",
-        "--output",
-        "-C",
-        "--git-dir",
-        "--work-tree",
-        "--namespace",
-    ]));
-    rules.extend(rules_for(
-        &["status", "diff", "log", "show", "add", "commit"],
-        "allow",
-        Some("local"),
-    ));
-    rules.extend(rules_for(
-        &[
-            "reset", "rebase", "checkout", "switch", "branch", "tag", "clean", "stash",
-        ],
-        "ask",
-        Some("local"),
-    ));
-    rules.extend(remote_rules(
-        &["fetch", "pull", "ls-remote", "remote update"],
-        fetch,
-    ));
-    rules.extend(remote_rules(&["push"], push));
-    rules.push(deny_flags_rule(&["-u", "--template"]));
-    rules.extend(remote_rules(&["clone"], fetch));
-    shim("git", &["--no-pager"], rules)
-}
-
 impl Provider for VcsProvider {
     fn name(&self) -> &ProviderName {
         &self.name
     }
 
     fn manifest(&self, ctx: &ProviderContext) -> Result<ProviderOutput, ProviderError> {
+        let mut probe_manifest = Manifest::default();
+        probe_manifest.grants.shims = self.shims.clone();
+        let protected =
+            super::resolve_manifest_proxies(&self.name, &self.base_dir, &mut probe_manifest, ctx)?;
+        let _ = self.protected_proxies.set(protected);
+
         for what in self.unsupported_options() {
             eprintln!(
                 "stopit: warning: {}",
@@ -1356,7 +1139,7 @@ impl Provider for VcsProvider {
         } else {
             SshRemote::discover(ctx)
         };
-        let manifest = match self.manifest_for(
+        let mut manifest = match self.manifest_for(
             &ctx.workspace,
             ctx.resolved_workspace_mount(),
             &layout,
@@ -1375,11 +1158,26 @@ impl Provider for VcsProvider {
                     })?
             }
         };
+        for (name, resolved_spec) in probe_manifest.grants.shims {
+            if manifest.grants.shims.contains_key(&name) {
+                manifest.grants.shims.insert(name, resolved_spec);
+            }
+        }
         Ok(ProviderOutput {
-            profile: ProfileRef::main(),
+            profile: self.profile.clone(),
             manifest,
             origin: self.origin,
         })
+    }
+
+    fn protected_paths(&self) -> Result<Vec<PathBuf>, ProviderError> {
+        self.protected_proxies
+            .get()
+            .cloned()
+            .ok_or_else(|| ProviderError::Vcs {
+                name: self.name.clone(),
+                reason: "internal error: protected_paths() called before manifest()".to_owned(),
+            })
     }
 }
 
@@ -1392,7 +1190,30 @@ mod tests {
     const MOUNT: &str = "/workspace";
 
     fn provider() -> VcsProvider {
-        VcsProvider::builtin()
+        let cfg = crate::config::Config::from_toml_str(crate::config::DEFAULT_CONFIG_TOML).unwrap();
+        let entry = cfg
+            .providers
+            .into_iter()
+            .find(|p| p.name.as_str() == "vcs")
+            .unwrap();
+        let crate::config::ProviderKind::Vcs {
+            profile,
+            view,
+            shims,
+            signing,
+        } = entry.kind
+        else {
+            panic!("expected vcs provider");
+        };
+        VcsProvider::new(
+            entry.name,
+            profile,
+            view,
+            shims,
+            Path::new(""),
+            ProviderOrigin::Workspace,
+        )
+        .with_signing(signing)
     }
 
     fn git_init(dir: &Path) {
@@ -1814,13 +1635,7 @@ mod tests {
 
         // With `mount == workspace` (`mount = "host"`), the relative pointer works.
         let m_host_mount = provider()
-            .manifest_for(
-                &secondary,
-                &secondary,
-                &layout,
-                &[],
-                &SshRemote::default(),
-            )
+            .manifest_for(&secondary, &secondary, &layout, &[], &SshRemote::default())
             .unwrap();
         assert_eq!(
             m_host_mount
@@ -1848,11 +1663,7 @@ mod tests {
         // A `.jj/repo` path that traverses a workspace subdirectory (`../sub/../../primary/.jj/repo`)
         // or a symlink inside the workspace is refused so `main` cannot swap it at runtime.
         fs::create_dir_all(secondary.join("sub")).unwrap();
-        fs::write(
-            secondary.join(".jj/repo"),
-            "../sub/../../primary/.jj/repo",
-        )
-        .unwrap();
+        fs::write(secondary.join(".jj/repo"), "../sub/../../primary/.jj/repo").unwrap();
         let layout_traversal = discover(&secondary);
         assert!(!layout_traversal.jj_supported);
         assert!(
@@ -2001,7 +1812,13 @@ mod tests {
             ..provider()
         };
         let m = p
-            .manifest_for(&ws, Path::new(MOUNT), &discover(&ws), &[], &SshRemote::default())
+            .manifest_for(
+                &ws,
+                Path::new(MOUNT),
+                &discover(&ws),
+                &[],
+                &SshRemote::default(),
+            )
             .unwrap();
         assert_eq!(patterns(&m.grants.fs.ro), ["{workspace}/.git"]);
         assert!(m.grants.fs.masked.is_empty());
@@ -2010,19 +1827,14 @@ mod tests {
     #[test]
     fn options_without_effect_yet_are_warned_about() {
         assert!(provider().unsupported_options().is_empty());
-        let p = VcsProvider {
-            fetch: Decision::Allow,
-            push: Decision::Deny,
-            ..provider()
-        }
-        .with_signing(true);
+        let p = provider().with_signing(true);
         let warnings = p.unsupported_options();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].starts_with("signing = true"), "{warnings:?}");
     }
 
     #[test]
-    fn vcs_remote_binds_ssh_agent_and_known_hosts_read_only_and_is_omitted_when_denied() {
+    fn vcs_remote_binds_ssh_agent_and_known_hosts_read_only() {
         let (_d, ws) = workspace();
         git_init(&ws);
         let ssh = SshRemote {
@@ -2076,16 +1888,6 @@ mod tests {
             assert_eq!(env(p, "GIT_SSH_COMMAND"), None);
             assert!(p.grants.fs.bind.is_empty());
         }
-        // When both `fetch` and `push` are `deny`, `vcs.remote` is not created.
-        let denied = VcsProvider {
-            fetch: Decision::Deny,
-            push: Decision::Deny,
-            ..provider()
-        };
-        let m_denied = denied
-            .manifest_for(&ws, Path::new(MOUNT), &discover(&ws), &[], &ssh)
-            .unwrap();
-        assert!(!m_denied.profiles.contains_key(&"remote".parse().unwrap()));
     }
 
     #[test]
@@ -2164,30 +1966,6 @@ mod tests {
         ] {
             assert_eq!(run(name, line), Outcome::Ask(remote()), "{name} {line}");
         }
-        // With `fetch = "allow"` and `push = "deny"`, fetch allows in `remote`
-        // and push is denied.
-        let p = VcsProvider {
-            fetch: Decision::Allow,
-            push: Decision::Deny,
-            ..provider()
-        };
-        let m_custom = p
-            .manifest_for(
-                &ws,
-                Path::new(MOUNT),
-                &discover(&ws),
-                &[],
-                &SshRemote::default(),
-            )
-            .unwrap();
-        let run_custom = |name: &str, line: &str| {
-            let args: Vec<Vec<u8>> = line.split(' ').map(|a| a.as_bytes().to_vec()).collect();
-            decide(shim(&m_custom, name), &args).0
-        };
-        assert_eq!(run_custom("git", "fetch"), Outcome::Allow(remote()));
-        assert_eq!(run_custom("jj", "git fetch"), Outcome::Allow(remote()));
-        assert!(matches!(run_custom("git", "push origin main"), Outcome::Deny(_)));
-        assert!(matches!(run_custom("jj", "git push"), Outcome::Deny(_)));
         assert_eq!(run("git", "status -u"), Outcome::Allow(local()));
         assert_eq!(run("git", "add -u"), Outcome::Allow(local()));
         assert_eq!(run("git", "push -u origin main"), Outcome::Ask(remote()));

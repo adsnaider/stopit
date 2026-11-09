@@ -4,13 +4,14 @@
 //! manifests are not merged, and no path is resolved or touched: a script
 //! `source` is stored as written, relative to the `.stopit.toml` it came from.
 //!
-//! The entry type is selected by the required `type` key. Serde's internally
-//! tagged enums cannot combine with `deny_unknown_fields` (and the tag is
-//! visible to the variants), so the entry is deserialized through a raw struct
-//! holding every key of every type as an `Option`, and [`TryFrom`] then
-//! validates per type, naming any key that does not belong to it. Keys
-//! unknown to every type are rejected by the raw struct itself.
+//! The entry type is selected by the `type` key. Serde's internally tagged
+//! enums cannot combine with `deny_unknown_fields` (and the tag is visible to
+//! the variants), so the entry is deserialized through a raw struct holding
+//! every key of every type as an `Option`, and [`TryFrom`] then validates per
+//! type, naming any key that does not belong to it. Keys unknown to every type
+//! are rejected by the raw struct itself.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -18,22 +19,21 @@ use std::str::FromStr;
 use serde::Deserialize;
 
 use super::ProfileRef;
-use super::profile::{MAIN, NONE, check_segment};
+use super::profile::{NONE, check_segment};
 use crate::error::ValueError;
-use crate::manifest::Manifest;
-use crate::policy::Decision;
+use crate::manifest::{Manifest, ShimName, ShimSpec};
 use crate::serde_util::MapOnly;
 
 /// The provider types that exist, as spelled in `type`.
 const TYPES: [&str; 4] = ["config", "script", "vcs", "nix"];
 
-/// The effective name of a provider: the prefix of its contributed profiles
+/// The explicit name of a provider: the prefix of its contributed profiles
 /// (`vcs.local`) and its label in the startup summary.
 ///
 /// Follows the profile segment rules: non-empty, ASCII lowercase letters,
-/// digits, `-` and `_`, starting with a letter. No dots, and `main` and `none`
-/// are rejected (they are reserved profile words). Uniqueness across entries
-/// is checked by [`Config`](super::Config).
+/// digits, `-` and `_`, starting with a letter. No dots, and `none` is
+/// rejected (it is the `inherit` keyword). Uniqueness across entries is
+/// checked by [`Config`](super::Config).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 #[serde(try_from = "String")]
 pub struct ProviderName(String);
@@ -50,9 +50,6 @@ impl FromStr for ProviderName {
 
     fn from_str(s: &str) -> Result<Self, ValueError> {
         let bad = |why: &str| ValueError::new(format!("invalid provider name {s:?}: {why}"));
-        if s == MAIN {
-            return Err(bad("`main` is reserved (it is the implicit profile)"));
-        }
         if s == NONE {
             return Err(bad("`none` is reserved (it is the `inherit` keyword)"));
         }
@@ -299,7 +296,7 @@ impl fmt::Display for NixSource {
     }
 }
 
-/// How the `vcs` provider presents VCS metadata in the main profile (§7.3).
+/// How the `vcs` provider presents VCS metadata in its target profile (§7.3).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VcsView {
@@ -310,32 +307,6 @@ pub enum VcsView {
     Ro,
 }
 
-/// A VCS tool the `vcs` provider brokers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum VcsTool {
-    /// Jujutsu.
-    Jj,
-    /// Git.
-    Git,
-}
-
-impl VcsTool {
-    /// The lowercase spelling used in configuration.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            VcsTool::Jj => "jj",
-            VcsTool::Git => "git",
-        }
-    }
-}
-
-impl fmt::Display for VcsTool {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 /// The type-specific part of a provider entry.
 ///
 /// Not `Eq`: a script's free-form `config` may contain floats.
@@ -343,13 +314,15 @@ impl fmt::Display for VcsTool {
 pub enum ProviderKind {
     /// The manifest written inline.
     Config {
-        /// Profile the grants apply to; defaults to `main`.
+        /// Profile the grants apply to.
         profile: ProfileRef,
         /// The inline manifest (`[provider.sandbox]`); defaults to empty.
         sandbox: Box<Manifest>,
     },
     /// A host executable that prints a manifest.
     Script {
+        /// Profile the top-level manifest grants apply to.
+        profile: ProfileRef,
         /// The executable.
         source: ScriptSource,
         /// Whether `source` is automatically `protected`; defaults to true.
@@ -359,20 +332,20 @@ pub enum ProviderKind {
     },
     /// The built-in `vcs` provider (§7.3).
     Vcs {
-        /// How `.git` / `.jj` appear in the main profile.
+        /// Profile the metadata view and shims apply to, and that `ro`,
+        /// `local`, and `remote` inherit from.
+        profile: ProfileRef,
+        /// How `.git` / `.jj` appear in `profile`.
         view: VcsView,
-        /// Brokered tools: non-empty, no duplicates; defaults to `[jj, git]`.
-        tools: Vec<VcsTool>,
-        /// Policy for fetch-like commands; defaults to ask.
-        fetch: Decision,
-        /// Policy for push; defaults to ask.
-        push: Decision,
+        /// Explicit shims (`[provider.shims.<name>]`) attached when a
+        /// supported repository is discovered.
+        shims: BTreeMap<ShimName, ShimSpec>,
         /// Offer the signing key in `vcs.local` and `vcs.remote`.
         signing: bool,
     },
     /// The built-in `nix` provider (§3.6).
     Nix {
-        /// Profile the grants apply to; defaults to `main`.
+        /// Profile the grants apply to.
         profile: ProfileRef,
         /// Optional devShell or attribute name; defaults to the default shell.
         shell: Option<NixShell>,
@@ -405,7 +378,7 @@ impl ProviderKind {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(try_from = "MapOnly<RawProviderEntry>")]
 pub struct ProviderEntry {
-    /// Effective name: the `name` key, or the type when absent.
+    /// Explicit provider name.
     pub name: ProviderName,
     /// Whether this provider is enabled; defaults to `true`.
     pub enabled: bool,
@@ -421,8 +394,8 @@ struct RawProviderEntry {
     kind: Option<String>,
     name: Option<ProviderName>,
     enabled: Option<bool>,
-    // config
     profile: Option<ProfileRef>,
+    // config
     sandbox: Option<Manifest>,
     // script
     source: Option<ScriptSource>,
@@ -430,9 +403,7 @@ struct RawProviderEntry {
     config: Option<toml::Table>,
     // vcs
     view: Option<VcsView>,
-    tools: Option<Vec<VcsTool>>,
-    fetch: Option<Decision>,
-    push: Option<Decision>,
+    shims: Option<MapOnly<BTreeMap<ShimName, ShimSpec>>>,
     signing: Option<bool>,
     // nix
     shell: Option<NixShell>,
@@ -446,18 +417,16 @@ impl TryFrom<MapOnly<RawProviderEntry>> for ProviderEntry {
 
     fn try_from(MapOnly(raw): MapOnly<RawProviderEntry>) -> Result<Self, ValueError> {
         let enabled = raw.enabled.unwrap_or(true);
+        let name = raw
+            .name
+            .ok_or_else(|| ValueError::new("provider entry is missing the required key `name`"))?;
         let ty = match raw.kind.as_deref() {
             Some(ty) => ty,
-            None if !enabled && raw.name.is_some() => {
-                match raw.name.as_ref().map(ProviderName::as_str) {
-                    Some("vcs") => "vcs",
-                    Some("nix") => "nix",
-                    _ => "config",
-                }
-            }
+            None if !enabled => "config",
             None => {
                 return Err(ValueError::new(format!(
-                    "provider entry is missing the required key `type` (one of {TYPES:?})"
+                    "provider {:?} is missing the required key `type` (one of {TYPES:?})",
+                    name.as_str()
                 )));
             }
         };
@@ -469,16 +438,18 @@ impl TryFrom<MapOnly<RawProviderEntry>> for ProviderEntry {
         }
 
         // Keys that are present, with the types that accept them.
-        let present: [(&str, bool, &[&str]); 14] = [
-            ("profile", raw.profile.is_some(), &["config", "nix"]),
+        let present: [(&str, bool, &[&str]); 12] = [
+            (
+                "profile",
+                raw.profile.is_some(),
+                &["config", "script", "vcs", "nix"],
+            ),
             ("sandbox", raw.sandbox.is_some(), &["config"]),
             ("source", raw.source.is_some(), &["script"]),
             ("protect", raw.protect.is_some(), &["script"]),
             ("config", raw.config.is_some(), &["script"]),
             ("view", raw.view.is_some(), &["vcs"]),
-            ("tools", raw.tools.is_some(), &["vcs"]),
-            ("fetch", raw.fetch.is_some(), &["vcs"]),
-            ("push", raw.push.is_some(), &["vcs"]),
+            ("shims", raw.shims.is_some(), &["vcs"]),
             ("signing", raw.signing.is_some(), &["vcs"]),
             ("shell", raw.shell.is_some(), &["nix"]),
             ("file", raw.file.is_some(), &["nix"]),
@@ -498,16 +469,24 @@ impl TryFrom<MapOnly<RawProviderEntry>> for ProviderEntry {
             )));
         }
 
-        let name = match raw.name {
-            Some(n) => n,
-            None => ty.parse()?,
+        let profile = match raw.profile {
+            Some(p) => p,
+            None if !enabled => "disabled".parse().expect("valid profile ref"),
+            None => {
+                return Err(ValueError::new(format!(
+                    "provider {:?} is missing the required key `profile`",
+                    name.as_str()
+                )));
+            }
         };
+
         let kind = match ty {
             "config" => ProviderKind::Config {
-                profile: raw.profile.unwrap_or_else(ProfileRef::main),
+                profile,
                 sandbox: Box::new(raw.sandbox.unwrap_or_default()),
             },
             "script" => ProviderKind::Script {
+                profile,
                 source: match raw.source {
                     Some(source) => source,
                     None if !enabled => ScriptSource(PathBuf::new()),
@@ -528,41 +507,19 @@ impl TryFrom<MapOnly<RawProviderEntry>> for ProviderEntry {
                     ));
                 }
                 ProviderKind::Nix {
-                    profile: raw.profile.unwrap_or_else(ProfileRef::main),
+                    profile,
                     shell: raw.shell,
                     file: raw.file,
                     flake: raw.flake,
                     cache: raw.cache.unwrap_or(true),
                 }
             }
-            _ => {
-                let tools = match raw.tools {
-                    None => vec![VcsTool::Jj, VcsTool::Git],
-                    Some(tools) => {
-                        if tools.is_empty() {
-                            return Err(ValueError::new(
-                                "invalid vcs tools []: must name at least one of \"jj\", \"git\"",
-                            ));
-                        }
-                        for (i, t) in tools.iter().enumerate() {
-                            if tools[..i].contains(t) {
-                                return Err(ValueError::new(format!(
-                                    "invalid vcs tools: duplicate tool {:?}",
-                                    t.as_str()
-                                )));
-                            }
-                        }
-                        tools
-                    }
-                };
-                ProviderKind::Vcs {
-                    view: raw.view.unwrap_or_default(),
-                    tools,
-                    fetch: raw.fetch.unwrap_or(Decision::Ask),
-                    push: raw.push.unwrap_or(Decision::Ask),
-                    signing: raw.signing.unwrap_or(false),
-                }
-            }
+            _ => ProviderKind::Vcs {
+                profile,
+                view: raw.view.unwrap_or_default(),
+                shims: raw.shims.map(|m| m.0).unwrap_or_default(),
+                signing: raw.signing.unwrap_or(false),
+            },
         };
         Ok(ProviderEntry {
             name,
@@ -572,62 +529,10 @@ impl TryFrom<MapOnly<RawProviderEntry>> for ProviderEntry {
     }
 }
 
-/// DESIGN.md Appendix A (`base = "default"` written out under
-/// `base = "none"`) up to, not including, its `vcs` provider, verbatim.
-/// Shared by the tests parsing it and the expressiveness golden test.
-#[cfg(test)]
-pub(crate) const APPENDIX_A_WITHOUT_VCS: &str = r#"
-base = "none"
-
-[workspace]
-mount = "/workspace"
-
-[approval]
-timeout = "off"
-
-[terminal]
-clipboard_write = "block"
-
-# --- What the built-in default `config` provider grants ---
-[[provider]]
-type = "config"
-name = "base"
-profile = "main"
-[provider.sandbox]
-system = { proc = true, dev = "minimal", etc = ["passwd", "group", "hosts", "nsswitch.conf"] }
-network = { mode = "loopback" }
-sandbox = { grant = true }
-[provider.sandbox.fs]
-rw = ["{workspace}"]
-masked = [
-  "{workspace}/**/.env", "{workspace}/**/.env.*", "{workspace}/**/*.pem",
-  "{workspace}/**/*.key", "{workspace}/**/.npmrc", "{workspace}/**/.pypirc",
-  "{workspace}/**/.netrc", "{workspace}/**/*.p12", "{workspace}/**/*.pfx",
-  "{workspace}/**/*credentials*.json", "{workspace}/**/id_rsa",
-  "{workspace}/**/id_ed25519", "{workspace}/**/.terraformrc",
-]
-mask_sockets = true
-protected = [
-  "{workspace}/**/*.nix", "{workspace}/flake.lock", "{workspace}/.envrc",
-  "{workspace}/.stopit.toml", "{workspace}/**/.stopit.toml", "{workspace}/.vscode",
-  "{workspace}/.idea", "{workspace}/.github/workflows",
-  "{workspace}/.gitmodules",
-  "{workspace}/.cargo/config.toml", "{workspace}/.cargo/config",
-  "{workspace}/.bazelrc", "{workspace}/.claude", "{workspace}/.gemini",
-  "{workspace}/.cursor", "{workspace}/.mcp.json", "{workspace}/.zed",
-  "{workspace}/**/.nvim.lua", "{workspace}/**/.exrc",
-  "{workspace}/.gdbinit", "{workspace}/.lldbinit",
-]
-ephemeral = ["/tmp", "~"]
-[provider.sandbox.env]
-pass = ["TERM", "LANG", "COLORTERM"]
-deny = ["*_TOKEN", "*_KEY", "*_SECRET", "*_PASSWORD", "AWS_*", "GITHUB_*", "SSH_AUTH_SOCK", "NIX_CONFIG"]
-"#;
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, DEFAULT_CONFIG_TOML};
     use crate::policy::NetworkMode;
 
     fn providers(src: &str) -> Vec<ProviderEntry> {
@@ -651,14 +556,8 @@ mod tests {
         s.parse().unwrap()
     }
 
-    fn vcs_defaults() -> ProviderKind {
-        ProviderKind::Vcs {
-            view: VcsView::Masked,
-            tools: vec![VcsTool::Jj, VcsTool::Git],
-            fetch: Decision::Ask,
-            push: Decision::Ask,
-            signing: false,
-        }
+    fn pref(s: &str) -> ProfileRef {
+        s.parse().unwrap()
     }
 
     #[test]
@@ -668,45 +567,63 @@ mod tests {
     }
 
     #[test]
-    fn section_3_1_example() {
-        let p = providers(
-            r#"
-            [[provider]]
-            type = "script"
-            source = "scripts/agent-env.sh"
+    fn default_config_providers_parse() {
+        let cfg = Config::from_toml_str(DEFAULT_CONFIG_TOML).unwrap();
+        assert_eq!(cfg.default_profile, Some(pref("main")));
+        assert!(cfg.profiles.contains_key(&"main".parse().unwrap()));
+        let names: Vec<&str> = cfg.providers.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["base", "protect-nix", "vcs"]);
 
-            [[provider]]
-            type = "config"
-            [provider.sandbox]
-            fs.ro = ["/etc/ssl/certs"]
-            network = { mode = "proxy", allow_domains = ["static.crates.io", "index.crates.io"] }
-            "#,
-        );
-        assert_eq!(p.len(), 2);
-        assert_eq!(p[0].name, name("script"));
-        assert_eq!(
-            p[0].kind,
-            ProviderKind::Script {
-                source: "scripts/agent-env.sh".parse().unwrap(),
-                protect: true,
-                config: toml::Table::new(),
-            }
-        );
-        assert_eq!(p[1].name, name("config"));
-        let ProviderKind::Config { profile, sandbox } = &p[1].kind else {
-            panic!("{:?}", p[1].kind);
+        let ProviderKind::Config { profile, sandbox } = &cfg.providers[0].kind else {
+            panic!("{:?}", cfg.providers[0].kind);
         };
-        assert_eq!(profile, &ProfileRef::main());
-        assert_eq!(sandbox.grants.fs.ro.len(), 1);
-        assert_eq!(sandbox.grants.network.mode, Some(NetworkMode::Proxy));
-        assert_eq!(sandbox.grants.network.allow_domains.len(), 2);
+        assert_eq!(profile, &pref("main"));
+        let g = &sandbox.grants;
+        assert_eq!(g.fs.rw.len(), 1);
+        assert_eq!(g.fs.masked.len(), 13);
+        assert_eq!(g.fs.protected.len(), 22);
+        assert_eq!(g.fs.ephemeral.len(), 2);
+        assert_eq!(g.fs.mask_sockets, Some(true));
+        assert_eq!(g.fs.warn_missing, Some(false));
+        assert_eq!(g.system.proc, Some(true));
+        assert_eq!(g.system.etc.len(), 4);
+        assert_eq!(g.network.mode, Some(NetworkMode::Loopback));
+        assert_eq!(g.env.pass.len(), 3);
+        assert_eq!(g.env.deny.len(), 8);
+
+        let ProviderKind::Config {
+            profile: nix_prof,
+            sandbox: nix_sb,
+        } = &cfg.providers[1].kind
+        else {
+            panic!("{:?}", cfg.providers[1].kind);
+        };
+        assert_eq!(nix_prof, &pref("main"));
+        assert_eq!(nix_sb.grants.fs.warn_missing, Some(false));
+        assert_eq!(nix_sb.grants.fs.protected.len(), 2);
+
+        let ProviderKind::Vcs {
+            profile: vcs_prof,
+            view,
+            shims,
+            signing,
+        } = &cfg.providers[2].kind
+        else {
+            panic!("{:?}", cfg.providers[2].kind);
+        };
+        assert_eq!(vcs_prof, &pref("main"));
+        assert_eq!(*view, VcsView::Masked);
+        assert!(!*signing);
+        assert!(shims.contains_key(&"jj".parse().unwrap()));
+        assert!(shims.contains_key(&"git".parse().unwrap()));
     }
 
     #[test]
-    fn section_3_6_example() {
+    fn all_provider_types_require_explicit_name_type_and_profile_when_enabled() {
         let p = providers(
             r#"
             [[provider]]
+            name = "certs"
             type = "config"
             profile = "main"
             [provider.sandbox]
@@ -714,266 +631,99 @@ mod tests {
             env.pass = ["RUST_*", "CARGO_*"]
 
             [[provider]]
+            name = "agent-env"
             type = "script"
+            profile = "main"
             source = "scripts/agent-env.sh"
             protect = true
             [provider.config]
             devshell = "agent"
 
             [[provider]]
+            name = "vcs"
             type = "vcs"
-            view = "masked"
+            profile = "main"
+            view = "ro"
+            signing = true
             "#,
         );
         assert_eq!(p.len(), 3);
-        let ProviderKind::Config { profile, sandbox } = &p[0].kind else {
-            panic!("{:?}", p[0].kind);
-        };
-        assert_eq!(profile.as_str(), "main");
-        assert_eq!(sandbox.grants.fs.ro.len(), 1);
-        assert_eq!(sandbox.grants.env.pass.len(), 2);
-
-        let mut table = toml::Table::new();
-        table.insert("devshell".into(), "agent".into());
-        assert_eq!(
-            p[1].kind,
-            ProviderKind::Script {
-                source: "scripts/agent-env.sh".parse().unwrap(),
-                protect: true,
-                config: table,
-            }
-        );
-        assert_eq!(p[2].kind, vcs_defaults());
-    }
-
-    #[test]
-    fn section_7_3_example() {
-        let e = one(r#"
-            [[provider]]
-            type    = "vcs"
-            view    = "masked"
-            tools   = ["jj", "git"]
-            fetch   = "ask"
-            push    = "ask"
-            signing = false
-            "#);
-        assert_eq!(e.name, name("vcs"));
-        assert_eq!(e.kind, vcs_defaults());
-    }
-
-    #[test]
-    fn appendix_a_providers() {
-        let p = providers(&format!(
-            r#"{APPENDIX_A_WITHOUT_VCS}
-            # --- The built-in `vcs` provider with its default options ---
-            [[provider]]
-            type    = "vcs"
-            view    = "masked"
-            tools   = ["jj", "git"]
-            fetch   = "ask"
-            push    = "ask"
-            signing = false
-            "#,
-        ));
-        assert_eq!(p.len(), 2);
-        assert_eq!(p[0].name, name("base"));
-        let ProviderKind::Config { profile, sandbox } = &p[0].kind else {
-            panic!("{:?}", p[0].kind);
-        };
-        assert_eq!(profile, &ProfileRef::main());
-        // The embedded default base is exactly Appendix A's config provider.
-        assert_eq!(**sandbox, crate::provider::default_base_manifest().unwrap());
-        let g = &sandbox.grants;
-        assert_eq!(g.fs.rw.len(), 1);
-        assert_eq!(g.fs.masked.len(), 13);
-        assert_eq!(g.fs.protected.len(), 21);
-        assert_eq!(g.fs.ephemeral.len(), 2);
-        assert_eq!(g.fs.mask_sockets, Some(true));
-        assert_eq!(g.system.proc, Some(true));
-        assert_eq!(g.system.etc.len(), 4);
-        assert_eq!(g.network.mode, Some(NetworkMode::Loopback));
-        assert_eq!(g.env.pass.len(), 3);
-        assert_eq!(g.env.deny.len(), 8);
-        assert_eq!(p[1].name, name("vcs"));
-        assert_eq!(p[1].kind, vcs_defaults());
-    }
-
-    #[test]
-    fn config_defaults() {
-        let e = one("[[provider]]\ntype = \"config\"");
-        assert_eq!(e.name, name("config"));
-        assert!(e.enabled);
-        assert_eq!(
-            e.kind,
-            ProviderKind::Config {
-                profile: ProfileRef::main(),
-                sandbox: Box::default(),
-            }
-        );
-        assert_eq!(e.kind.type_name(), "config");
-    }
-
-    #[test]
-    fn disabled_provider_entry_parses() {
-        let e = one("[[provider]]\ntype = \"vcs\"\nenabled = false");
-        assert_eq!(e.name, name("vcs"));
-        assert!(!e.enabled);
-        assert_eq!(e.kind.type_name(), "vcs");
-
-        let e = one("[[provider]]\nname = \"corp\"\nenabled = false");
-        assert_eq!(e.name, name("corp"));
-        assert!(!e.enabled);
-
-        let e = one("[[provider]]\ntype = \"script\"\nname = \"corp\"\nenabled = false");
-        assert_eq!(e.name, name("corp"));
-        assert!(!e.enabled);
-    }
-
-    #[test]
-    fn config_targets_other_profiles() {
-        for target in ["harness", "vcs.local"] {
-            let e = one(&format!(
-                "[[provider]]\ntype = \"config\"\nprofile = \"{target}\""
-            ));
-            let ProviderKind::Config { profile, .. } = e.kind else {
-                panic!()
-            };
-            assert_eq!(profile.as_str(), target);
-        }
-    }
-
-    #[test]
-    fn script_defaults() {
-        let e = one("[[provider]]\ntype = \"script\"\nsource = \"/usr/bin/env\"");
-        assert_eq!(e.name, name("script"));
+        assert_eq!(p[0].name, name("certs"));
+        assert_eq!(p[1].name, name("agent-env"));
         let ProviderKind::Script {
+            profile,
             source,
             protect,
             config,
-        } = &e.kind
+        } = &p[1].kind
         else {
-            panic!("{:?}", e.kind);
+            panic!("{:?}", p[1].kind);
         };
-        assert_eq!(source.as_path(), Path::new("/usr/bin/env"));
+        assert_eq!(profile, &pref("main"));
+        assert_eq!(source.as_path(), Path::new("scripts/agent-env.sh"));
         assert!(*protect);
-        assert!(config.is_empty());
-        assert_eq!(e.kind.type_name(), "script");
-    }
+        assert_eq!(config["devshell"].as_str(), Some("agent"));
 
-    #[test]
-    fn script_options() {
-        let e = one(r#"
-            [[provider]]
-            type = "script"
-            source = "../x.sh"
-            protect = false
-            [provider.config]
-            n = 1
-            nested = { a = [1, 2.5], b = "c" }
-            "#);
-        let ProviderKind::Script {
-            source,
-            protect,
-            config,
-        } = &e.kind
-        else {
-            panic!("{:?}", e.kind);
-        };
-        assert_eq!(source.as_path(), Path::new("../x.sh"));
-        assert!(!*protect);
-        assert_eq!(config["n"].as_integer(), Some(1));
-        assert_eq!(config["nested"]["b"].as_str(), Some("c"));
-    }
-
-    #[test]
-    fn vcs_defaults_when_bare() {
-        let e = one("[[provider]]\ntype = \"vcs\"");
-        assert_eq!(e.name, name("vcs"));
-        assert_eq!(e.kind, vcs_defaults());
-        assert_eq!(e.kind.type_name(), "vcs");
-    }
-
-    #[test]
-    fn vcs_options() {
-        let e = one(r#"
-            [[provider]]
-            type = "vcs"
-            view = "ro"
-            tools = ["git"]
-            fetch = "allow"
-            push = "deny"
-            signing = true
-            "#);
         assert_eq!(
-            e.kind,
+            p[2].kind,
             ProviderKind::Vcs {
+                profile: pref("main"),
                 view: VcsView::Ro,
-                tools: vec![VcsTool::Git],
-                fetch: Decision::Allow,
-                push: Decision::Deny,
+                shims: BTreeMap::new(),
                 signing: true,
             }
         );
-        // Order is preserved.
-        let e = one("[[provider]]\ntype = \"vcs\"\ntools = [\"git\", \"jj\"]");
-        let ProviderKind::Vcs { tools, .. } = e.kind else {
-            panic!()
-        };
-        assert_eq!(tools, [VcsTool::Git, VcsTool::Jj]);
     }
 
     #[test]
-    fn explicit_names() {
-        let p = providers(
-            r#"
-            [[provider]]
-            type = "config"
-            name = "a"
-            [[provider]]
-            type = "config"
-            name = "b-1_x"
-            [[provider]]
-            type = "config"
-            [[provider]]
-            type = "vcs"
-            name = "git-stuff"
-            "#,
-        );
-        let names: Vec<&str> = p.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, ["a", "b-1_x", "config", "git-stuff"]);
-        assert_eq!(p[3].name.to_string(), "git-stuff");
+    fn disabled_provider_entry_needs_only_name() {
+        let e = one("[[provider]]\nname = \"protect-nix\"\nenabled = false");
+        assert_eq!(e.name, name("protect-nix"));
+        assert!(!e.enabled);
+
+        let e = one("[[provider]]\nname = \"vcs\"\ntype = \"vcs\"\nenabled = false");
+        assert_eq!(e.name, name("vcs"));
+        assert!(!e.enabled);
+        assert_eq!(e.kind.type_name(), "vcs");
+
+        let e = one("[[provider]]\nname = \"corp\"\ntype = \"script\"\nenabled = false");
+        assert_eq!(e.name, name("corp"));
+        assert!(!e.enabled);
     }
 
     #[test]
-    fn explicit_name_may_equal_another_types_default() {
-        // Names are not tied to types: only effective names must be unique.
-        let p = providers(
-            "[[provider]]\ntype = \"config\"\nname = \"vcs\"\n[[provider]]\ntype = \"vcs\"\nname = \"v\"",
-        );
-        assert_eq!(p.len(), 2);
-    }
+    fn missing_name_type_or_profile_is_rejected() {
+        let msg = err("[[provider]]\ntype = \"config\"\nprofile = \"main\"");
+        assert!(msg.contains("`name`"), "{msg}");
 
-    #[test]
-    fn missing_type() {
         for src in [
-            "[[provider]]",
             "[[provider]]\nname = \"x\"",
-            "[[provider]]\nsource = \"x.sh\"",
+            "[[provider]]\nname = \"x\"\nprofile = \"main\"",
         ] {
             let msg = err(src);
             assert!(msg.contains("`type`"), "{src:?}: {msg}");
+        }
+
+        for src in [
+            "[[provider]]\nname = \"x\"\ntype = \"config\"",
+            "[[provider]]\nname = \"x\"\ntype = \"script\"\nsource = \"x.sh\"",
+            "[[provider]]\nname = \"x\"\ntype = \"vcs\"",
+            "[[provider]]\nname = \"x\"\ntype = \"nix\"",
+        ] {
+            let msg = err(src);
+            assert!(msg.contains("`profile`"), "{src:?}: {msg}");
         }
     }
 
     #[test]
     fn unknown_type() {
         for bad in ["bazel", "Config", "", "vcs "] {
-            let msg = err(&format!("[[provider]]\ntype = \"{bad}\""));
+            let msg = err(&format!(
+                "[[provider]]\nname = \"p\"\ntype = \"{bad}\"\nprofile = \"main\""
+            ));
             assert!(msg.contains(&format!("{bad:?}")), "{bad:?}: {msg}");
             assert!(msg.contains("unknown provider type"), "{bad:?}: {msg}");
         }
-        err("[[provider]]\ntype = 5");
-        err("[[provider]]\ntype = [\"vcs\"]");
     }
 
     #[test]
@@ -983,18 +733,11 @@ mod tests {
             ("type = \"config\"\nprotect = true", "protect", "config"),
             ("type = \"config\"\nconfig = {}", "config", "config"),
             ("type = \"config\"\nview = \"ro\"", "view", "config"),
-            ("type = \"config\"\ntools = [\"jj\"]", "tools", "config"),
-            ("type = \"config\"\nfetch = \"ask\"", "fetch", "config"),
-            ("type = \"config\"\npush = \"ask\"", "push", "config"),
+            ("type = \"config\"\nshims = {}", "shims", "config"),
             ("type = \"config\"\nsigning = true", "signing", "config"),
             (
                 "type = \"script\"\nsource = \"x\"\nsandbox = {}",
                 "sandbox",
-                "script",
-            ),
-            (
-                "type = \"script\"\nsource = \"x\"\nprofile = \"main\"",
-                "profile",
                 "script",
             ),
             (
@@ -1009,16 +752,12 @@ mod tests {
             ),
             ("type = \"vcs\"\nsource = \"x\"", "source", "vcs"),
             ("type = \"vcs\"\nsandbox = {}", "sandbox", "vcs"),
-            ("type = \"vcs\"\nprofile = \"main\"", "profile", "vcs"),
             ("type = \"vcs\"\nprotect = true", "protect", "vcs"),
             ("type = \"vcs\"\nconfig = {}", "config", "vcs"),
-            (
-                "type = \"vcs\"\n[provider.config]\nview = \"ro\"",
-                "config",
-                "vcs",
-            ),
         ] {
-            let msg = err(&format!("[[provider]]\n{src}"));
+            let msg = err(&format!(
+                "[[provider]]\nname = \"p\"\nprofile = \"main\"\n{src}"
+            ));
             assert!(msg.contains(&format!("{key:?}")), "{src:?}: {msg}");
             assert!(msg.contains(&format!("{ty:?}")), "{src:?}: {msg}");
             assert!(msg.contains("not allowed"), "{src:?}: {msg}");
@@ -1026,116 +765,28 @@ mod tests {
     }
 
     #[test]
-    fn unknown_keys_are_rejected() {
-        for (src, key) in [
-            ("type = \"config\"\nprofle = \"main\"", "profle"),
-            ("type = \"script\"\nsource = \"x\"\nprotec = true", "protec"),
-            ("type = \"vcs\"\ndevshell = \"agent\"", "devshell"),
-            ("type = \"vcs\"\nextra = 1", "extra"),
-        ] {
-            let msg = err(&format!("[[provider]]\n{src}"));
-            assert!(msg.contains(key), "{src:?}: {msg}");
-        }
-        // The manifest's own unknown-key rejection applies inside `sandbox`.
-        let msg = err("[[provider]]\ntype = \"config\"\n[provider.sandbox]\nbogus = 1");
-        assert!(msg.contains("bogus"), "{msg}");
-    }
-
-    #[test]
-    fn script_requires_source() {
-        let msg = err("[[provider]]\ntype = \"script\"");
-        assert!(msg.contains("`source`"), "{msg}");
-        let msg = err("[[provider]]\ntype = \"script\"\nprotect = false");
-        assert!(msg.contains("`source`"), "{msg}");
-    }
-
-    #[test]
-    fn invalid_script_sources() {
-        let msg = err("[[provider]]\ntype = \"script\"\nsource = \"\"");
-        assert!(msg.contains("script source \"\""), "{msg}");
-        assert!(msg.contains("empty"), "{msg}");
-        let msg = err("[[provider]]\ntype = \"script\"\nsource = \"a\\u0000b\"");
-        assert!(msg.contains("NUL"), "{msg}");
-        let own = "a\0b".parse::<ScriptSource>().unwrap_err().to_string();
-        assert!(
-            own.contains("NUL") && own.contains("script source"),
-            "{own}"
-        );
-        let own = "".parse::<ScriptSource>().unwrap_err().to_string();
-        assert!(own.contains("\"\""), "{own}");
-        err("[[provider]]\ntype = \"script\"\nsource = 5");
-        err("[[provider]]\ntype = \"script\"\nsource = [\"a.sh\"]");
-    }
-
-    #[test]
-    fn script_source_is_not_touched() {
-        // Neither existence nor normalization matters here.
-        let s: ScriptSource = "does/not/./exist/../x".parse().unwrap();
-        assert_eq!(s.as_path(), Path::new("does/not/./exist/../x"));
-    }
-
-    #[test]
     fn invalid_names() {
-        for bad in ["Vcs", "main", "none", "a.b", "1x", "", "-x", "a b", "a."] {
+        for bad in ["Vcs", "none", "a.b", "1x", "", "-x", "a b", "a."] {
             let own = bad.parse::<ProviderName>().unwrap_err().to_string();
             assert!(own.contains(&format!("{bad:?}")), "{bad:?}: {own}");
             let msg = err(&format!(
-                "[[provider]]\ntype = \"config\"\nname = \"{bad}\""
+                "[[provider]]\ntype = \"config\"\nname = \"{bad}\"\nprofile = \"main\""
             ));
             assert!(msg.contains("provider name"), "{bad:?}: {msg}");
-            assert!(msg.contains(&format!("{bad:?}")), "{bad:?}: {msg}");
         }
-        let main = "main".parse::<ProviderName>().unwrap_err().to_string();
-        assert!(main.contains("reserved"), "{main}");
-        let dot = "a.b".parse::<ProviderName>().unwrap_err().to_string();
-        assert!(dot.contains("`.`"), "{dot}");
-        err("[[provider]]\ntype = \"config\"\nname = 5");
+        // `main` is no longer reserved.
+        assert_eq!("main".parse::<ProviderName>().unwrap().as_str(), "main");
     }
 
     #[test]
-    fn duplicate_implicit_names() {
-        let msg = err("[[provider]]\ntype = \"config\"\n[[provider]]\ntype = \"config\"");
-        assert!(msg.contains("duplicate provider name \"config\""), "{msg}");
-        assert!(msg.contains("`name`"), "{msg}");
-        let msg = err("[[provider]]\ntype = \"vcs\"\n[[provider]]\ntype = \"vcs\"");
-        assert!(msg.contains("\"vcs\""), "{msg}");
-        assert!(msg.contains("entries 1 and 2"), "{msg}");
-        let msg = err(
-            "[[provider]]\ntype = \"vcs\"\n[[provider]]\ntype = \"config\"\n[[provider]]\ntype = \"vcs\"",
-        );
-        assert!(
-            msg.contains("duplicate provider name \"vcs\" ([[provider]] entries 1 and 3)"),
-            "{msg}"
-        );
-    }
-
-    #[test]
-    fn reserved_words_as_name_prefixes_are_fine() {
-        for good in ["main-x", "none_1", "mainx", "nonesuch"] {
-            let e = one(&format!(
-                "[[provider]]\ntype = \"config\"\nname = \"{good}\""
-            ));
-            assert_eq!(e.name.as_str(), good);
-        }
-    }
-
-    #[test]
-    fn unknown_type_is_reported_before_key_checks() {
-        let msg = err("[[provider]]\ntype = \"bazel\"\nview = \"ro\"");
-        assert!(msg.contains("unknown provider type \"bazel\""), "{msg}");
-        assert!(!msg.contains("not allowed"), "{msg}");
-    }
-
-    #[test]
-    fn nix_defaults_and_options() {
-        let e = one("[[provider]]\ntype = \"nix\"");
+    fn nix_defaults_and_validation() {
+        let e = one("[[provider]]\nname = \"nix\"\ntype = \"nix\"\nprofile = \"main\"");
         assert_eq!(e.name, name("nix"));
         assert!(e.enabled);
-        assert_eq!(e.kind.type_name(), "nix");
         assert_eq!(
             e.kind,
             ProviderKind::Nix {
-                profile: ProfileRef::main(),
+                profile: pref("main"),
                 shell: None,
                 file: None,
                 flake: None,
@@ -1143,292 +794,19 @@ mod tests {
             }
         );
 
-        let e = one(r#"
-            [[provider]]
-            type = "nix"
-            name = "nix-agent"
-            profile = "harness"
-            shell = "agent"
-            flake = "./sub"
-            cache = false
-            "#);
-        assert_eq!(e.name, name("nix-agent"));
-        assert_eq!(
-            e.kind,
-            ProviderKind::Nix {
-                profile: "harness".parse().unwrap(),
-                shell: Some("agent".parse().unwrap()),
-                file: None,
-                flake: Some("./sub".parse().unwrap()),
-                cache: false,
-            }
-        );
-
-        let e = one("[[provider]]\ntype = \"nix\"\nfile = \"default.nix\"\nshell = \"ci\"");
-        assert_eq!(
-            e.kind,
-            ProviderKind::Nix {
-                profile: ProfileRef::main(),
-                shell: Some("ci".parse().unwrap()),
-                file: Some("default.nix".parse().unwrap()),
-                flake: None,
-                cache: true,
-            }
-        );
-
-        let disabled = one("[[provider]]\nname = \"nix\"\nenabled = false");
-        assert!(!disabled.enabled);
-        assert_eq!(disabled.kind.type_name(), "nix");
-    }
-
-    #[test]
-    fn nix_validation() {
-        let msg = err("[[provider]]\ntype = \"nix\"\nfile = \"shell.nix\"\nflake = \".\"");
-        assert!(msg.contains("cannot set both `file` and `flake`"), "{msg}");
-
-        for bad_shell in [
-            "",
-            "-flag",
-            ".",
-            "..",
-            "a#b",
-            "a?b",
-            "a/b",
-            "a b",
-            "a\0b",
-            "a\x07b",
-            "a\x1bb",
-        ] {
-            assert!(
-                bad_shell.parse::<NixShell>().is_err(),
-                "expected {bad_shell:?} to be rejected"
-            );
-        }
-        for bad_path in [
-            "",
-            "-f",
-            "{workspace}x",
-            "{workspace}/",
-            "a/{workspace}",
-            "{workspace}/{workspace}",
-            "~other",
-            "a\0b",
-            ".#agent",
-            "sub?dir=evil",
-            "github:NixOS/nixpkgs",
-            "path:.",
-            "git+https://example.com/repo",
-        ] {
-            assert!(
-                bad_path.parse::<NixSource>().is_err(),
-                "expected {bad_path:?} to be rejected"
-            );
-        }
-        let local_colon: NixSource = "./dir:with:colon".parse().unwrap();
-        assert_eq!(local_colon.as_str(), "./dir:with:colon");
-        let ws = Path::new("/ws");
-        let base = Path::new("/cfg");
-        let home = Path::new("/home/u");
-        let s: NixSource = "{workspace}/nix/shell.nix".parse().unwrap();
-        assert!(s.uses_workspace_placeholder());
-        assert_eq!(s.expand(base, ws, home), PathBuf::from("/ws/nix/shell.nix"));
-        let s: NixSource = "~/dotfiles".parse().unwrap();
-        assert!(!s.uses_workspace_placeholder());
-        assert_eq!(s.expand(base, ws, home), PathBuf::from("/home/u/dotfiles"));
-        let s: NixSource = "rel/shell.nix".parse().unwrap();
-        assert!(!s.uses_workspace_placeholder());
-        assert_eq!(s.expand(base, ws, home), PathBuf::from("/cfg/rel/shell.nix"));
-
-        let msg = err("[[provider]]\ntype = \"nix\"\nsource = \"x.sh\"");
-        assert!(msg.contains("not allowed"), "{msg}");
-        let msg = err("[[provider]]\ntype = \"config\"\nshell = \"agent\"");
-        assert!(msg.contains("not allowed"), "{msg}");
-    }
-
-    #[test]
-    fn duplicate_explicit_names() {
         let msg = err(
-            "[[provider]]\ntype = \"config\"\nname = \"x\"\n[[provider]]\ntype = \"script\"\nsource = \"a\"\nname = \"x\"",
+            "[[provider]]\nname = \"nix\"\ntype = \"nix\"\nprofile = \"main\"\n\
+             file = \"shell.nix\"\nflake = \".\"",
+        );
+        assert!(msg.contains("cannot set both `file` and `flake`"), "{msg}");
+    }
+
+    #[test]
+    fn duplicate_names() {
+        let msg = err(
+            "[[provider]]\ntype = \"config\"\nname = \"x\"\nprofile = \"main\"\n\
+             [[provider]]\ntype = \"script\"\nsource = \"a\"\nname = \"x\"\nprofile = \"main\"",
         );
         assert!(msg.contains("duplicate provider name \"x\""), "{msg}");
-    }
-
-    #[test]
-    fn duplicate_implicit_vs_explicit() {
-        let msg =
-            err("[[provider]]\ntype = \"vcs\"\n[[provider]]\ntype = \"config\"\nname = \"vcs\"");
-        assert!(msg.contains("duplicate provider name \"vcs\""), "{msg}");
-        // Non-adjacent duplicates are found too.
-        let msg = err(
-            "[[provider]]\ntype = \"config\"\nname = \"a\"\n[[provider]]\ntype = \"vcs\"\n[[provider]]\ntype = \"config\"\nname = \"a\"",
-        );
-        assert!(msg.contains("\"a\""), "{msg}");
-    }
-
-    #[test]
-    fn distinct_names_for_same_type_are_fine() {
-        let p = providers(
-            "[[provider]]\ntype = \"config\"\nname = \"a\"\n[[provider]]\ntype = \"config\"\nname = \"b\"\n[[provider]]\ntype = \"config\"",
-        );
-        assert_eq!(p.len(), 3);
-    }
-
-    #[test]
-    fn invalid_vcs_tools() {
-        let msg = err("[[provider]]\ntype = \"vcs\"\ntools = []");
-        assert!(msg.contains("tools []"), "{msg}");
-        assert!(msg.contains("at least one"), "{msg}");
-        let msg = err("[[provider]]\ntype = \"vcs\"\ntools = [\"jj\", \"jj\"]");
-        assert!(msg.contains("duplicate"), "{msg}");
-        assert!(msg.contains("duplicate tool \"jj\""), "{msg}");
-        assert!(!msg.contains("Jj"), "{msg}");
-        assert_eq!(VcsTool::Git.to_string(), "git");
-        let msg = err("[[provider]]\ntype = \"vcs\"\ntools = [\"git\", \"jj\", \"git\"]");
-        assert!(msg.contains("duplicate"), "{msg}");
-        let msg = err("[[provider]]\ntype = \"vcs\"\ntools = [\"hg\"]");
-        assert!(msg.contains("hg"), "{msg}");
-        err("[[provider]]\ntype = \"vcs\"\ntools = [\"JJ\"]");
-        err("[[provider]]\ntype = \"vcs\"\ntools = \"jj\"");
-        err("[[provider]]\ntype = \"vcs\"\ntools = [1]");
-    }
-
-    #[test]
-    fn invalid_vcs_enums() {
-        for (key, bad) in [
-            ("view", "visible"),
-            ("view", "Masked"),
-            ("view", "rw"),
-            ("fetch", "prompt"),
-            ("fetch", "Allow"),
-            ("push", "yes"),
-            ("push", ""),
-        ] {
-            let msg = err(&format!("[[provider]]\ntype = \"vcs\"\n{key} = \"{bad}\""));
-            assert!(msg.contains("unknown variant"), "{key}={bad:?}: {msg}");
-        }
-        err("[[provider]]\ntype = \"vcs\"\nsigning = \"yes\"");
-        err("[[provider]]\ntype = \"vcs\"\nsigning = 1");
-        err("[[provider]]\ntype = \"script\"\nsource = \"x\"\nprotect = \"yes\"");
-    }
-
-    #[test]
-    fn invalid_config_profile() {
-        let msg = err("[[provider]]\ntype = \"config\"\nprofile = \"none\"");
-        assert!(msg.contains("profile reference \"none\""), "{msg}");
-        let msg = err("[[provider]]\ntype = \"config\"\nprofile = \"Main\"");
-        assert!(msg.contains("\"Main\""), "{msg}");
-    }
-
-    #[test]
-    fn script_config_must_be_a_table() {
-        for bad in ["5", "\"x\"", "[1, 2]", "[]", "[[1]]"] {
-            err(&format!(
-                "[[provider]]\ntype = \"script\"\nsource = \"x\"\nconfig = {bad}"
-            ));
-        }
-        let msg =
-            err("[[provider]]\ntype = \"script\"\nsource = \"x\"\n[[provider.config]]\na = 1");
-        assert!(msg.contains("map"), "{msg}");
-        // An empty inline table is fine.
-        let e = one("[[provider]]\ntype = \"script\"\nsource = \"x\"\nconfig = {}");
-        let ProviderKind::Script { config, .. } = e.kind else {
-            panic!()
-        };
-        assert!(config.is_empty());
-    }
-
-    #[test]
-    fn sandbox_must_be_a_table() {
-        for bad in ["5", "\"x\"", "[]", "[1]"] {
-            err(&format!("[[provider]]\ntype = \"config\"\nsandbox = {bad}"));
-        }
-        let msg = err("[[provider]]\ntype = \"config\"\n[[provider.sandbox]]\nversion = 1");
-        assert!(msg.contains("map"), "{msg}");
-    }
-
-    #[test]
-    fn array_forms_are_rejected() {
-        for src in [
-            // `provider` itself must be an array of tables.
-            "provider = { type = \"vcs\" }",
-            "provider = \"vcs\"",
-            "provider = 5",
-            "[provider]\ntype = \"vcs\"",
-            // Each entry must be a table.
-            "provider = [\"vcs\"]",
-            "provider = [[\"vcs\"]]",
-            "provider = [[]]",
-            "provider = [5]",
-        ] {
-            err(src);
-        }
-        let msg = err("provider = [[\"vcs\"]]");
-        assert!(msg.contains("expected a map"), "{msg}");
-        let msg = err("provider = [[\"vcs\"]]\n");
-        assert!(msg.contains("map"), "{msg}");
-    }
-
-    #[test]
-    fn full_document() {
-        let cfg = Config::from_toml_str(
-            r#"
-            base = "default"
-
-            [workspace]
-            mount = "/workspace"
-
-            [limits]
-            memory = "8G"
-            pids = 4096
-
-            [approval]
-            timeout = "5m"
-
-            [terminal]
-            clipboard_write = "ask"
-
-            [profiles.harness]
-            [profiles.child]
-            inherit = "vcs.local"
-
-            [[provider]]
-            type = "script"
-            source = "scripts/agent-env.sh"
-            [provider.config]
-            devshell = "agent"
-
-            [[provider]]
-            type = "config"
-            [provider.sandbox]
-            fs.ro = ["/etc/ssl/certs"]
-            network = { mode = "proxy", allow_domains = ["static.crates.io"] }
-
-            [[provider]]
-            type = "config"
-            name = "harness-creds"
-            profile = "harness"
-            [provider.sandbox.env]
-            pass = ["ANTHROPIC_API_KEY"]
-
-            [[provider]]
-            type = "vcs"
-            fetch = "allow"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(cfg.profiles.len(), 2);
-        assert_eq!(cfg.limits.pids.map(|n| n.get()), Some(4096));
-        let names: Vec<&str> = cfg.providers.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["script", "config", "harness-creds", "vcs"]);
-        let kinds: Vec<&str> = cfg.providers.iter().map(|p| p.kind.type_name()).collect();
-        assert_eq!(kinds, ["script", "config", "config", "vcs"]);
-        let ProviderKind::Config { profile, .. } = &cfg.providers[2].kind else {
-            panic!()
-        };
-        assert_eq!(profile.as_str(), "harness");
-        let ProviderKind::Vcs { fetch, push, .. } = &cfg.providers[3].kind else {
-            panic!()
-        };
-        assert_eq!((*fetch, *push), (Decision::Allow, Decision::Ask));
     }
 }

@@ -1853,19 +1853,21 @@ mod tests {
     }
 
     #[test]
-    fn empty_contributed_profile_inherits_main() {
+    fn empty_contributed_profile_inherits_none() {
         let m = toml_ok("[profiles.ro]");
         assert_eq!(m.profiles.len(), 1);
         assert_eq!(m.profiles[&pname("ro")], ContributedProfile::default());
-        assert_eq!(m.profiles[&pname("ro")].inherit, inherit_ref("main"));
+        assert_eq!(m.profiles[&pname("ro")].inherit, Inherit::None);
         assert_eq!(jv_ok(r#""profiles": {"ro": {}}"#), m);
     }
 
     const APPENDIX_PROFILES_TOML: &str = r#"
-        [profiles.ro]       # inherits "main"
+        [profiles.ro]
+        inherit = "main"
         fs.ro = ["{workspace}/.git", "{workspace}/.jj", "~/.config/jj/repos/abc123"]
 
         [profiles.local]
+        inherit = "main"
         fs.rw = ["{workspace}/.git", "{workspace}/.jj"]
         fs.ro = [
           "{workspace}/.git/config", "{workspace}/.git/config.worktree", "{workspace}/.git/info/attributes",
@@ -1945,8 +1947,9 @@ mod tests {
     #[test]
     fn appendix_a_contributed_profiles_as_json_match_toml() {
         let json = r#"{"version": 1, "profiles": {
-            "ro": {"fs": {"ro": ["{workspace}/.git", "{workspace}/.jj", "~/.config/jj/repos/abc123"]}},
+            "ro": {"inherit": "main", "fs": {"ro": ["{workspace}/.git", "{workspace}/.jj", "~/.config/jj/repos/abc123"]}},
             "local": {
+                "inherit": "main",
                 "fs": {
                     "rw": ["{workspace}/.git", "{workspace}/.jj"],
                     "ro": ["{workspace}/.git/config", "{workspace}/.git/config.worktree",
@@ -2017,15 +2020,19 @@ mod tests {
 
     #[test]
     fn invalid_contributed_profile_names() {
-        for bad in ["main", "none", "vcs.local", "Local", "1a", "", "a b"] {
+        for bad in ["none", "vcs.local", "Local", "1a", "", "a b"] {
             let msg = toml_err(&format!("[profiles.\"{bad}\"]"));
             assert!(msg.contains("profile name"), "{bad:?}: {msg}");
             assert!(msg.contains(&format!("{bad:?}")), "{bad:?}: {msg}");
             let msg = jv_err(&format!(r#""profiles": {{"{bad}": {{}}}}"#));
             assert!(msg.contains("profile name"), "{bad:?}: {msg}");
         }
-        let msg = toml_err("[profiles.main]");
-        assert!(msg.contains("reserved"), "{msg}");
+        // `"main"` is valid as a contributed profile name (`<provider>.main`).
+        assert!(
+            toml_ok("[profiles.main]")
+                .profiles
+                .contains_key(&pname("main"))
+        );
         let msg = toml_err("[profiles.none]");
         assert!(msg.contains("reserved"), "{msg}");
         // Unquoted, this is the nested table `profiles.vcs` with key `local`.

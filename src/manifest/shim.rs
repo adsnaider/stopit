@@ -360,6 +360,116 @@ impl fmt::Display for ShimRegex {
     }
 }
 
+/// A validated list of CLI short (`-x`) and long (`--name`) flags compiled
+/// into a regex matching clustered short flags and unambiguous long-flag
+/// prefix abbreviations on space-joined arguments.
+#[derive(Debug, Clone)]
+pub struct ShimFlags {
+    flags: Vec<String>,
+    compiled: ShimRegex,
+}
+
+impl PartialEq for ShimFlags {
+    fn eq(&self, other: &Self) -> bool {
+        self.flags == other.flags
+    }
+}
+
+impl Eq for ShimFlags {}
+
+impl ShimFlags {
+    /// Parses and compiles a non-empty list of short (`-<char>`) and long
+    /// (`--<name>`) flags.
+    pub fn new(flags: Vec<String>) -> Result<Self, ValueError> {
+        if flags.is_empty() {
+            return Err(ValueError::new(
+                "invalid shim flags []: must list at least one flag",
+            ));
+        }
+        let mut short = String::new();
+        let mut long = Vec::new();
+        for flag in &flags {
+            if flag.contains('\0') || flag.chars().any(char::is_whitespace) {
+                return Err(ValueError::new(format!(
+                    "invalid shim flag {flag:?}: must not contain whitespace or NUL bytes"
+                )));
+            }
+            if let Some(name) = flag.strip_prefix("--") {
+                if name.is_empty() || name.contains('=') {
+                    return Err(ValueError::new(format!(
+                        "invalid long shim flag {flag:?}: expected `--<name>` without `=`"
+                    )));
+                }
+                long.push(long_flag_prefix_pattern(name));
+            } else if let Some(rest) = flag.strip_prefix('-') {
+                let mut chars = rest.chars();
+                let Some(ch) = chars.next() else {
+                    return Err(ValueError::new(
+                        "invalid shim flag \"-\": expected `-<char>` or `--<name>`",
+                    ));
+                };
+                if chars.next().is_some() || ch == '-' || ch == '=' {
+                    return Err(ValueError::new(format!(
+                        "invalid short shim flag {flag:?}: expected single-character `-<char>` or `--<name>`"
+                    )));
+                }
+                short.push_str(&regex_escape_char(ch));
+            } else {
+                return Err(ValueError::new(format!(
+                    "invalid shim flag {flag:?}: must start with `-` or `--`"
+                )));
+            }
+        }
+        let long_pat = long.join("|");
+        let pattern = match (!short.is_empty(), !long_pat.is_empty()) {
+            (true, true) => {
+                format!(r"(?:^| )(?:-[^- =]*[{short}]|--(?:{long_pat})(?: |=|$))")
+            }
+            (true, false) => format!(r"(?:^| )-[^- =]*[{short}]"),
+            (false, true) => format!(r"(?:^| )--(?:{long_pat})(?: |=|$)"),
+            (false, false) => unreachable!("flags was checked non-empty"),
+        };
+        let compiled = pattern.parse()?;
+        Ok(ShimFlags { flags, compiled })
+    }
+
+    /// The configured flag strings in order.
+    pub fn flags(&self) -> &[String] {
+        &self.flags
+    }
+
+    /// Whether `joined_args` contains any of the configured flags.
+    pub fn is_match(&self, joined_args: &[u8]) -> bool {
+        self.compiled.is_match(joined_args)
+    }
+
+    /// Compiled regex string.
+    pub fn regex_str(&self) -> &str {
+        self.compiled.as_str()
+    }
+}
+
+fn long_flag_prefix_pattern(name: &str) -> String {
+    let mut chars = name.chars().rev();
+    let Some(last) = chars.next() else {
+        return String::new();
+    };
+    let mut acc = regex_escape_char(last);
+    for ch in chars {
+        let escaped = regex_escape_char(ch);
+        acc = format!("{escaped}(?:{acc})?");
+    }
+    acc
+}
+
+fn regex_escape_char(ch: char) -> String {
+    match ch {
+        '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' | '\\'
+        | '-' => format!("\\{ch}"),
+        _ => ch.to_string(),
+    }
+}
+
 /// How a [`ShimRule`] matches the caller's space-joined arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShimMatcher {
@@ -370,6 +480,9 @@ pub enum ShimMatcher {
     Prefix(String),
     /// Matches when the regular expression matches the space-joined arguments.
     Regex(ShimRegex),
+    /// Matches when any of the given short (`-x`, including clusters) or long
+    /// (`--name`, including unambiguous prefix abbreviations) flags appear.
+    Flags(ShimFlags),
 }
 
 impl ShimMatcher {
@@ -384,6 +497,7 @@ impl ShimMatcher {
                     || (joined_args.starts_with(p) && joined_args.get(p.len()) == Some(&b' '))
             }
             ShimMatcher::Regex(re) => re.is_match(joined_args),
+            ShimMatcher::Flags(flags) => flags.is_match(joined_args),
         }
     }
 
@@ -394,6 +508,7 @@ impl ShimMatcher {
             ShimMatcher::Literal(s) => format!("literal = {s:?}"),
             ShimMatcher::Prefix(s) => format!("prefix = {s:?}"),
             ShimMatcher::Regex(r) => format!("regex = {:?}", r.as_str()),
+            ShimMatcher::Flags(f) => format!("flags = {:?}", f.flags()),
         }
     }
 
@@ -402,6 +517,7 @@ impl ShimMatcher {
         match self {
             ShimMatcher::Literal(s) | ShimMatcher::Prefix(s) => s.as_str(),
             ShimMatcher::Regex(r) => r.as_str(),
+            ShimMatcher::Flags(f) => f.regex_str(),
         }
     }
 }
@@ -591,6 +707,8 @@ struct RawShimRule {
     prefix: Option<String>,
     #[serde(default)]
     regex: Option<String>,
+    #[serde(default)]
+    flags: Option<Vec<String>>,
     decision: Decision,
     #[serde(default)]
     profile: Option<ProfileRef>,
@@ -602,15 +720,16 @@ impl TryFrom<MapOnly<RawShimRule>> for ShimRule {
     fn try_from(MapOnly(raw): MapOnly<RawShimRule>) -> Result<Self, ValueError> {
         let count = usize::from(raw.literal.is_some())
             + usize::from(raw.prefix.is_some())
-            + usize::from(raw.regex.is_some());
+            + usize::from(raw.regex.is_some())
+            + usize::from(raw.flags.is_some());
         if count == 0 {
             return Err(ValueError::new(
-                "invalid shim rule: must specify one of `literal`, `prefix`, or `regex`",
+                "invalid shim rule: must specify one of `literal`, `prefix`, `regex`, or `flags`",
             ));
         }
         if count > 1 {
             return Err(ValueError::new(
-                "invalid shim rule: `literal`, `prefix`, and `regex` are mutually exclusive",
+                "invalid shim rule: `literal`, `prefix`, `regex`, and `flags` are mutually exclusive",
             ));
         }
         let matcher = if let Some(lit) = raw.literal {
@@ -619,6 +738,8 @@ impl TryFrom<MapOnly<RawShimRule>> for ShimRule {
             ShimMatcher::Prefix(validate_prefix(&pre)?)
         } else if let Some(re) = raw.regex {
             ShimMatcher::Regex(re.parse()?)
+        } else if let Some(flags) = raw.flags {
+            ShimMatcher::Flags(ShimFlags::new(flags)?)
         } else {
             unreachable!("checked count == 1");
         };
@@ -896,12 +1017,6 @@ pub enum ProxyProfile {
     Inline(Box<ContributedProfile>),
 }
 
-impl Default for ProxyProfile {
-    fn default() -> Self {
-        ProxyProfile::Named(ProfileRef::main())
-    }
-}
-
 impl<'de> Deserialize<'de> for ProxyProfile {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = serde_json::Value::deserialize(deserializer)?;
@@ -988,8 +1103,8 @@ pub struct ProxyResponse {
     /// Required when `decision` is `allow` or `ask`.
     pub cmd: Option<ProxyCmd>,
     /// The target profile (existing profile name or inline profile object).
-    /// Defaults to `"main"` when omitted on `allow` or `ask`; `None` when
-    /// `decision` is `deny`.
+    /// Defaults to the caller's profile when omitted on `allow` or `ask`;
+    /// `None` when `decision` is `deny`.
     pub profile: Option<ProxyProfile>,
     /// Optional human-readable reason for `deny` (printed to stderr) or `ask`
     /// (shown in the approval prompt).
@@ -1043,7 +1158,7 @@ impl TryFrom<MapOnly<RawProxyResponse>> for ProxyResponse {
                 Ok(ProxyResponse {
                     decision: raw.decision,
                     cmd: raw.cmd,
-                    profile: Some(raw.profile.unwrap_or_default()),
+                    profile: raw.profile,
                     reason: raw.reason,
                 })
             }
@@ -1323,7 +1438,7 @@ mod tests {
         );
         assert_eq!(resp.profile, Some(ProxyProfile::Named(pr("vcs.local"))));
 
-        // Omitted profile defaults to "main".
+        // Omitted profile stays `None` (resolved to the caller's profile at runtime).
         let resp =
             ProxyResponse::from_json_str(r#"{"decision": "ask", "cmd": "jj", "reason": "push"}"#)
                 .unwrap();
@@ -1335,7 +1450,7 @@ mod tests {
                 args: Vec::new(),
             })
         );
-        assert_eq!(resp.profile, Some(ProxyProfile::Named(pr("main"))));
+        assert_eq!(resp.profile, None);
         assert_eq!(resp.reason.as_deref(), Some("push"));
 
         // Inline profile object.
@@ -1392,6 +1507,21 @@ mod tests {
         assert!(re.matches(b"--no-pager git push --bookmark main"));
         assert!(re.matches(b"git push -m line1\nline2"));
         assert!(!re.matches(b"git fetch"));
+
+        let flags = ShimMatcher::Flags(
+            ShimFlags::new(vec!["-R".to_owned(), "--config-file".to_owned()]).unwrap(),
+        );
+        assert!(flags.matches(b"-R /other status"));
+        assert!(flags.matches(b"-R/other status"));
+        assert!(flags.matches(b"-nR /other"));
+        assert!(flags.matches(b"status --config-file /tmp/x"));
+        assert!(flags.matches(b"status --conf=/tmp/x"));
+        assert!(flags.matches(b"status --co /tmp/x"));
+        assert!(!flags.matches(b"status --no-pager --color=never -n"));
+        assert!(ShimFlags::new(Vec::new()).is_err());
+        assert!(ShimFlags::new(vec!["--".to_owned()]).is_err());
+        assert!(ShimFlags::new(vec!["-ab".to_owned()]).is_err());
+        assert!(ShimFlags::new(vec!["status".to_owned()]).is_err());
     }
 
     #[test]

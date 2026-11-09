@@ -69,6 +69,8 @@ fn default_base_merged_with_a_user_provider_golden() {
         r#"
 [[provider]]
 type = "config"
+name = "user"
+profile = "main"
 [provider.sandbox]
 env.pass = ["RUST_*", "CARGO_*", "NIX_CONFIG", "*_token", "PATH", "HOME", "EDITOR"]
 env.set = { EDITOR = "vi", USER = "agent" }
@@ -102,6 +104,8 @@ fn system_user_updates_user_logname_and_default_home() {
         r#"
 [[provider]]
 type = "config"
+name = "user"
+profile = "main"
 [provider.sandbox]
 system.user = { username = "alice" }
 "#,

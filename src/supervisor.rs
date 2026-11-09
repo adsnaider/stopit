@@ -57,20 +57,19 @@ use thiserror::Error;
 
 use crate::bwrap::{BwrapCommand, BwrapError, TerminalSession, working_dir};
 use crate::config::{
-    Base, ClipboardWrite, Config, ConfigError, ConfigLayer, LayeredConfig, ProfileRef,
-    ProviderEntry, ProviderKind, ProviderName, ProviderOrigin,
+    ClipboardWrite, Config, ConfigError, ConfigLayer, LayeredConfig, ProfileRef, ProviderEntry,
+    ProviderKind, ProviderName,
 };
 use crate::escape::{escape_message, shell_quote};
-use crate::expand::{ExpandError, ExpansionContext, ResolveWarning};
+use crate::expand::{ExpandError, ExpansionContext};
 use crate::filter::{ClipboardPolicy, OutputFilter};
-use crate::manifest::{Grants, Manifest, SandboxHome};
+use crate::manifest::SandboxHome;
 use crate::provider::{
-    BASE_PROVIDER_NAME, ProtectedSource, ProviderContext, ProviderError, ProviderOutput,
-    SUPERVISOR_PROVIDER_NAME, layered_session_providers, protected_sources, static_outputs,
+    ProtectedSource, ProviderContext, ProviderError, ProviderOutput, SUPERVISOR_PROVIDER_NAME,
+    layered_session_providers, protected_sources, static_outputs,
 };
 use crate::provision::{ProvisionError, Provisioned, provision_self};
 use crate::pty::{HostTerminal, Pty, PtyRelay, RawMode};
-use crate::resolve::{PlanWarning, PlanWarningKind};
 use crate::session::{SessionDir, SessionError};
 use crate::spec::{
     CompileError, CompiledProfile, CompiledSession, ScriptPathError, SpecWarning, UntrustedRoot,
@@ -264,7 +263,7 @@ pub enum RunError {
     Compile(#[from] CompileError),
 
     /// `--profile` names no profile of the session.
-    #[error("there is no profile {name:?}; the profiles are: {available}")]
+    #[error("{}", unknown_profile_message(name, available))]
     UnknownProfile {
         /// The profile asked for.
         name: String,
@@ -438,11 +437,15 @@ pub enum RunError {
     #[error("cannot check that stopit is in the foreground of its terminal: {0}")]
     Foreground(#[source] io::Error),
 
-    /// Effective `base = "default"` has no user provider granting tools.
-    #[error("{}", no_tools_configured_message(global_config))]
-    NoToolsConfigured {
+    /// Neither `--profile` nor `default_profile` is set, or no configuration exists.
+    #[error("{}", no_default_profile_message(global_config, *has_any_config, available))]
+    NoDefaultProfile {
         /// Active user-global configuration file path.
         global_config: PathBuf,
+        /// Whether any configuration file (`config.toml` or `.stopit.toml`) existed.
+        has_any_config: bool,
+        /// Every profile of the session, comma-separated.
+        available: String,
     },
 }
 
@@ -673,8 +676,10 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     for line in loaded.warning_lines() {
         eprintln!("{line}");
     }
-    let compiled = loaded.compiled();
-    let (profile_name, profile) = profile_in(&compiled, invocation.profile.as_deref())?;
+    let policy = loaded.current_policy();
+    let compiled = policy.compiled.clone();
+    let (profile_name, profile) =
+        loaded.profile_in(&policy, &compiled, invocation.profile.as_deref())?;
     for line in loaded.profile_warning_lines(profile) {
         eprintln!("{line}");
     }
@@ -737,34 +742,74 @@ fn supervise(invocation: Invocation) -> Result<ExitCode, RunError> {
     Ok(ExitCode::from(status?))
 }
 
-/// `--profile` `name` parsed (`main` if `None`).
-pub(crate) fn parse_profile(name: Option<&str>) -> Result<ProfileRef, RunError> {
+/// `--profile` `name` parsed, if given.
+pub(crate) fn parse_profile(name: Option<&str>) -> Result<Option<ProfileRef>, RunError> {
     match name {
-        None => Ok(ProfileRef::main()),
-        Some(name) => name.parse().map_err(|e| RunError::ProfileName {
+        None => Ok(None),
+        Some(name) => name.parse().map(Some).map_err(|e| RunError::ProfileName {
             name: name.to_owned(),
             reason: format!("{e}"),
         }),
     }
 }
 
-/// The profile `name` (`main` if `None`) of `compiled`, with its name.
-pub(crate) fn profile_in<'a>(
+/// Looks up `profile` in `compiled`.
+pub(crate) fn named_profile_in<'a>(
     compiled: &'a CompiledSession,
-    name: Option<&str>,
+    profile: &ProfileRef,
 ) -> Result<(ProfileRef, &'a CompiledProfile), RunError> {
-    let profile = parse_profile(name)?;
-    match compiled.get(&profile) {
-        Some(found) => Ok((profile, found)),
+    match compiled.get(profile) {
+        Some(found) => Ok((profile.clone(), found)),
         None => Err(RunError::UnknownProfile {
             name: profile.as_str().to_owned(),
-            available: compiled
-                .order()
-                .iter()
-                .map(ProfileRef::as_str)
-                .collect::<Vec<_>>()
-                .join(", "),
+            available: available_profiles(compiled),
         }),
+    }
+}
+
+fn available_profiles(compiled: &CompiledSession) -> String {
+    compiled
+        .order()
+        .iter()
+        .map(ProfileRef::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn unknown_profile_message(name: &str, available: &str) -> String {
+    if available.is_empty() {
+        format!("there is no profile {name:?}; no profiles are defined in the configuration")
+    } else {
+        format!("there is no profile {name:?}; the profiles are: {available}")
+    }
+}
+
+fn no_default_profile_message(
+    global_config: &Path,
+    has_any_config: bool,
+    available: &str,
+) -> String {
+    if !has_any_config {
+        let dir = global_config
+            .parent()
+            .unwrap_or_else(|| Path::new("~/.config/stopit"));
+        return format!(
+            "no configuration file was found at {global_config:?} or {CONFIG_FILE}; \
+             run `mkdir -p {} && stopit default-config > {}` to create one",
+            quote_path(dir),
+            quote_path(global_config),
+        );
+    }
+    if available.is_empty() {
+        "no profile was given with `--profile` and `default_profile` is not set \
+         (no profiles are defined in the configuration)"
+            .to_owned()
+    } else {
+        format!(
+            "no profile was given with `--profile` and `default_profile` is not set; \
+             set `default_profile` in the configuration or pass `--profile <name>` \
+             from [{available}]"
+        )
     }
 }
 
@@ -776,6 +821,7 @@ pub(crate) struct SessionPolicy {
     /// replaces the policy.
     pub(crate) generation: u64,
     config: Config,
+    has_any_config: bool,
     /// The session compiled when the policy was loaded.
     compiled: Arc<CompiledSession>,
     /// Warnings found before compiling, without the `stopit: warning:`
@@ -795,7 +841,7 @@ impl SessionPolicy {
         self.ctx.workspace_sandbox()
     }
 
-    fn warning_lines_with(&self, compile_warnings: &[String]) -> Vec<String> {
+    pub(crate) fn warning_lines_with(&self, compile_warnings: &[String]) -> Vec<String> {
         self.load_warnings
             .iter()
             .chain(compile_warnings)
@@ -884,7 +930,7 @@ fn load_policy<S>(
         }
     };
     // Read, checked and parsed even when `.stopit.toml` sets
-    // `base = "none"` and the layer goes unused: its target and its
+    // `inherit_global = false` and the layer goes unused: its target and its
     // script sources are protected in every session, or a sandbox of
     // this one could plant what every other workspace runs (§3, The
     // user-global configuration).
@@ -893,6 +939,7 @@ fn load_policy<S>(
         Some(gf) => Some(gf.parse_layer()?),
         None => None,
     };
+    let has_any_config = file.is_some() || global_file.is_some();
     let global_entries = global_layer
         .as_ref()
         .map(|layer| layer.providers.clone())
@@ -900,24 +947,12 @@ fn load_policy<S>(
     let LayeredConfig {
         config,
         providers: layered_entries,
-        replaced,
+        replaced: _,
     } = ConfigLayer::layer(
         global_layer.map(|layer| (layer, config_dirs.active.path.as_path())),
         project_layer.map(|layer| (layer, ws.dir.as_path())),
     );
     let mut warnings = Vec::new();
-    if let Some(gf) = &global_file {
-        for name in replaced
-            .iter()
-            .filter(|n| should_warn_unnamed_replacement(n, &global_entries, &config.providers))
-        {
-            warnings.push(format!(
-                "the [[provider]] named \"{name}\" in {CONFIG_FILE} replaces the one of that \
-                 name in {:?}; give one of them another `name` to keep both",
-                gf.path
-            ));
-        }
-    }
     let home = host_home(std::env::var_os("HOME"))?;
     let mount = config.workspace.mount.clone();
     let ctx = ExpansionContext::new(
@@ -928,7 +963,7 @@ fn load_policy<S>(
     )?;
 
     let (carry, session_dir, runtime) = init_session(&config.limits, &mut warnings)?;
-    let providers = layered_session_providers(config.base, &layered_entries)?;
+    let providers = layered_session_providers(&layered_entries)?;
     // Script paths must not run through links in these (§3.6), nor the
     // way to the global configuration and its scripts.
     let rw_grants = static_rw_roots(&static_outputs(&providers), &ctx);
@@ -955,11 +990,8 @@ fn load_policy<S>(
         .iter()
         .map(|p| Ok((p.name().clone(), p.manifest(&pctx)?)))
         .collect::<Result<Vec<_>, ProviderError>>()?;
-    let has_user_tools = outputs.iter().any(|(_, out)| {
-        out.origin != ProviderOrigin::Builtin && manifest_grants_tools(&out.manifest)
-    });
     // The script providers' sources, and the configuration files
-    // themselves, protected in every profile whatever the base and rules
+    // themselves, protected in every profile whatever the rules
     // (§3, §3.6), the latter attributed to the name reserved for
     // stopit's own rules.
     let mut protected = protected_sources(&providers)?;
@@ -980,7 +1012,6 @@ fn load_policy<S>(
             });
         }
     }
-    let global_config_path = config_dirs.active.path.join(GLOBAL_CONFIG_FILE);
     let state = StateDirs {
         runtime,
         data: data_dirs,
@@ -994,15 +1025,11 @@ fn load_policy<S>(
         &ctx,
         granted,
     )?;
-    if config.base == Base::Default && !has_user_tools {
-        return Err(RunError::NoToolsConfigured {
-            global_config: global_config_path,
-        });
-    }
-    let compile_warnings = warning_lines(&compiled, config.base);
+    let compile_warnings = warning_lines(&compiled);
     let policy = SessionPolicy {
         generation,
         config,
+        has_any_config,
         compiled: Arc::new(compiled),
         load_warnings: warnings,
         compile_warnings,
@@ -1076,11 +1103,6 @@ impl LoadedSession {
     /// The session's current policy snapshot.
     pub(crate) fn current_policy(&self) -> Arc<SessionPolicy> {
         self.policy()
-    }
-
-    /// The session's current compiled profiles.
-    pub(crate) fn compiled(&self) -> Arc<CompiledSession> {
-        self.policy().compiled.clone()
     }
 
     /// Returns the policy and compiled session a broker in an already-running
@@ -1223,12 +1245,38 @@ impl LoadedSession {
         )?)
     }
 
+    /// Resolves `name` (`--profile`, falling back to `policy.config.default_profile`)
+    /// in `compiled`.
+    pub(crate) fn profile_in<'a>(
+        &self,
+        policy: &SessionPolicy,
+        compiled: &'a CompiledSession,
+        name: Option<&str>,
+    ) -> Result<(ProfileRef, &'a CompiledProfile), RunError> {
+        let profile = match parse_profile(name)? {
+            Some(profile) => profile,
+            None => match &policy.config.default_profile {
+                Some(profile) => profile.clone(),
+                None => {
+                    return Err(RunError::NoDefaultProfile {
+                        global_config: self.state.config.active.path.join(GLOBAL_CONFIG_FILE),
+                        has_any_config: policy.has_any_config,
+                        available: available_profiles(compiled),
+                    });
+                }
+            },
+        };
+        named_profile_in(compiled, &profile)
+    }
+
     /// Compiles every profile again from the providers' outputs of the
     /// current policy, against the filesystem as it is now, with the
     /// compile warnings. A server does this for every run, so globs, masks
     /// and missing paths are decided when the sandbox starts, as for a
     /// standalone run. Script providers are not run again.
-    pub(crate) fn recompile(&self) -> Result<(CompiledSession, Vec<String>), RunError> {
+    pub(crate) fn recompile(
+        &self,
+    ) -> Result<(Arc<SessionPolicy>, CompiledSession, Vec<String>), RunError> {
         let policy = self.policy();
         let granted = self.granted().paths.clone();
         let compiled = crate::spec::compile_session_granted_lazy_with_cache(
@@ -1240,8 +1288,8 @@ impl LoadedSession {
             &granted,
             policy.compiled.scan_cache(),
         )?;
-        let warnings = warning_lines(&compiled, policy.config.base);
-        Ok((compiled, warnings))
+        let warnings = warning_lines(&compiled);
+        Ok((policy, compiled, warnings))
     }
 
     /// Compiles every profile again in `policy` with `extra` after the
@@ -1343,6 +1391,7 @@ impl LoadedSession {
                     *guard = Arc::new(SessionPolicy {
                         generation: prev.generation + 1,
                         config: prev.config.clone(),
+                        has_any_config: prev.has_any_config,
                         compiled: Arc::new(recompiled),
                         load_warnings: prev.load_warnings.clone(),
                         compile_warnings: prev.compile_warnings.clone(),
@@ -1383,12 +1432,6 @@ impl LoadedSession {
         &self.home
     }
 
-    /// The warnings of loading and of `compile_warnings`, as printed,
-    /// `stopit: warning: …` and escaped.
-    pub(crate) fn warning_lines_with(&self, compile_warnings: &[String]) -> Vec<String> {
-        self.policy().warning_lines_with(compile_warnings)
-    }
-
     /// The warnings of loading and compiling, as printed.
     pub(crate) fn warning_lines(&self) -> Vec<String> {
         self.policy().warning_lines()
@@ -1398,7 +1441,7 @@ impl LoadedSession {
     /// formatted as `stopit: warning: …` and escaped.
     pub(crate) fn profile_warning_lines(&self, profile: &CompiledProfile) -> Vec<String> {
         let policy = self.policy();
-        distinct_messages(profile.socket_scan_warnings(), policy.config.base)
+        distinct_messages(profile.socket_scan_warnings())
             .into_iter()
             .filter(|w| !policy.compile_warnings.contains(w))
             .map(|w| format!("stopit: warning: {}", escape_message(&w)))
@@ -1419,7 +1462,6 @@ impl LoadedSession {
             workspace: &self.workspace.dir,
             workspace_mount: policy.ctx.workspace_sandbox(),
             home: &self.home,
-            base: policy.config.base,
             unprotected: &unprotected,
         };
         summary_lines(profile.resolved_spec(), &ctx)
@@ -2349,13 +2391,13 @@ pub struct GlobalConfigFile {
 }
 
 impl GlobalConfigFile {
-    /// Parses the file as a [`ConfigLayer`] keeping explicit field presence.
+    /// Parses the file as a user-global [`ConfigLayer`] keeping explicit field presence.
     pub fn parse_layer(&self) -> Result<ConfigLayer, RunError> {
-        parse_layer(&self.path, &self.bytes)
+        parse_global_layer(&self.path, &self.bytes)
     }
 }
 
-/// Parses `bytes`, read from `path`, as a [`ConfigLayer`].
+/// Parses `bytes`, read from `path`, as a workspace [`ConfigLayer`].
 fn parse_layer(path: &Path, bytes: &[u8]) -> Result<ConfigLayer, RunError> {
     let text = std::str::from_utf8(bytes).map_err(|e| RunError::ReadConfig {
         path: path.to_owned(),
@@ -2367,31 +2409,16 @@ fn parse_layer(path: &Path, bytes: &[u8]) -> Result<ConfigLayer, RunError> {
     })
 }
 
-/// Whether `manifest` grants tools in its top-level grants or any contributed profile.
-pub fn manifest_grants_tools(manifest: &Manifest) -> bool {
-    grants_tools(&manifest.grants) || manifest.profiles.values().any(|p| grants_tools(&p.grants))
-}
-
-fn grants_tools(grants: &Grants) -> bool {
-    !grants.fs.ro.is_empty()
-        || !grants.fs.rw.is_empty()
-        || !grants.fs.bind.is_empty()
-        || !grants.env.path_prepend.is_empty()
-}
-
-fn no_tools_configured_message(global_config: &Path) -> String {
-    format!(
-        "base = \"default\" mounts no tools, and no provider in {global_config:?} or {CONFIG_FILE} \
-         grants any; configure a tool provider in {global_config:?} for every workspace or in \
-         {CONFIG_FILE} for this workspace, for example:\n\
-         \n\
-         [[provider]]\n\
-         type = \"config\"\n\
-         name = \"tools\"\n\
-         [provider.sandbox]\n\
-         fs.ro = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
-         env.path_prepend = [\"/usr/bin\", \"/bin\"]"
-    )
+/// Parses `bytes`, read from `path`, as a user-global [`ConfigLayer`].
+fn parse_global_layer(path: &Path, bytes: &[u8]) -> Result<ConfigLayer, RunError> {
+    let text = std::str::from_utf8(bytes).map_err(|e| RunError::ReadConfig {
+        path: path.to_owned(),
+        source: io::Error::new(io::ErrorKind::InvalidData, e),
+    })?;
+    ConfigLayer::from_global_toml_str(text).map_err(|source| RunError::Config {
+        path: path.to_owned(),
+        source,
+    })
 }
 
 /// Refuses `file` unless `allowed` (the trust store) allows its path with
@@ -2809,77 +2836,12 @@ pub fn check_config_trust(file: Ownership, dir: Ownership, uid: u32) -> Result<(
     Ok(())
 }
 
-/// Whether `name` is the name a `[[provider]]` gets without `name`, its
-/// type.
-fn is_default_provider_name(name: &ProviderName) -> bool {
-    matches!(name.as_str(), "config" | "script" | "vcs" | "nix")
-}
-
-/// Whether replacing a global provider named `name` with the workspace entry in
-/// `effective_providers` should emit the unnamed-collision warning.
-///
-/// Suppresses the warning when the workspace entry disables the global one
-/// (`enabled = false`), or when an unnamed workspace-scoped `nix` entry
-/// overrides a workspace-scoped global `nix` entry targeting the same profile
-/// (for example setting `shell = "agent"`), since two `nix` devShells in one
-/// profile cannot both be kept without `env.set` conflicts. Replacing a global
-/// `nix` entry that points at a non-workspace `file` or `flake` still warns.
-fn should_warn_unnamed_replacement(
-    name: &ProviderName,
-    global_entries: &[ProviderEntry],
-    effective_providers: &[ProviderEntry],
-) -> bool {
-    if !is_default_provider_name(name) {
-        return false;
-    }
-    let Some(project_entry) = effective_providers.iter().find(|p| &p.name == name) else {
-        return true;
-    };
-    if !project_entry.enabled {
-        return false;
-    }
-    if name.as_str() == "nix"
-        && let Some(global_entry) = global_entries.iter().find(|p| &p.name == name)
-        && let (
-            ProviderKind::Nix {
-                profile: g_prof,
-                file: g_file,
-                flake: g_flake,
-                ..
-            },
-            ProviderKind::Nix {
-                profile: p_prof,
-                file: p_file,
-                flake: p_flake,
-                ..
-            },
-        ) = (&global_entry.kind, &project_entry.kind)
-    {
-        let global_is_workspace = g_file
-            .as_ref()
-            .is_none_or(|s| s.uses_workspace_placeholder())
-            && g_flake
-                .as_ref()
-                .is_none_or(|s| s.uses_workspace_placeholder());
-        let project_is_workspace = p_file
-            .as_ref()
-            .is_none_or(|s| s.uses_workspace_placeholder())
-            && p_flake
-                .as_ref()
-                .is_none_or(|s| s.uses_workspace_placeholder());
-        if global_is_workspace && project_is_workspace && g_prof == p_prof {
-            return false;
-        }
-    }
-    true
-}
-
 /// The paths to protect for the global configuration `file`, whose
 /// `[[provider]]` entries are `entries`, declared in `config_dir`: its
 /// canonical path, the canonical source of every protected `script` entry,
-/// every protected `config` proxy shim, and every non-workspace `nix` `file`
-/// or `flake` directory (plus its `flake.nix` and `flake.lock`), used in this
-/// session or not.
+/// every protected `config` or `vcs` proxy shim, and every non-workspace `nix`
+/// `file` or `flake` directory (plus its `flake.nix` and `flake.lock`), used in
+/// this session or not.
 ///
 /// Each is resolved from its declared path and refused if the way runs
 /// through a symbolic link inside `workspace` or one of `rw_grants`, which
@@ -2919,6 +2881,35 @@ fn guard_global_config(
         )));
     }
     paths.push(resolved);
+    let guard_proxy_shims = |paths: &mut Vec<PathBuf>,
+                             provider_name: &str,
+                             shims: &mut dyn Iterator<
+        Item = (&crate::manifest::ShimName, &crate::manifest::ShimSpec),
+    >|
+     -> Result<(), RunError> {
+        for (shim_name, spec) in shims {
+            if let crate::manifest::ShimKind::Proxy {
+                proxy,
+                protect: true,
+                ..
+            } = &spec.kind
+            {
+                let declared = proxy.expand(config_dir, home);
+                let proxy_path = resolve(
+                    &declared,
+                    &format!(
+                        "proxy shim {:?} of provider {:?}",
+                        shim_name.as_str(),
+                        provider_name
+                    ),
+                )?;
+                if !paths.contains(&proxy_path) {
+                    paths.push(proxy_path);
+                }
+            }
+        }
+        Ok(())
+    };
     for entry in entries {
         if !entry.enabled {
             continue;
@@ -2939,33 +2930,17 @@ fn guard_global_config(
                 }
             }
             ProviderKind::Config { sandbox, .. } => {
-                let shims = sandbox.grants.shims.iter().chain(
+                let mut shims = sandbox.grants.shims.iter().chain(
                     sandbox
                         .profiles
                         .values()
                         .flat_map(|p| p.grants.shims.iter()),
                 );
-                for (shim_name, spec) in shims {
-                    if let crate::manifest::ShimKind::Proxy {
-                        proxy,
-                        protect: true,
-                        ..
-                    } = &spec.kind
-                    {
-                        let declared = proxy.expand(config_dir, home);
-                        let proxy_path = resolve(
-                            &declared,
-                            &format!(
-                                "proxy shim {:?} of provider {:?}",
-                                shim_name.as_str(),
-                                entry.name.as_str()
-                            ),
-                        )?;
-                        if !paths.contains(&proxy_path) {
-                            paths.push(proxy_path);
-                        }
-                    }
-                }
+                guard_proxy_shims(&mut paths, entry.name.as_str(), &mut shims)?;
+            }
+            ProviderKind::Vcs { shims, .. } => {
+                let mut iter = shims.iter();
+                guard_proxy_shims(&mut paths, entry.name.as_str(), &mut iter)?;
             }
             ProviderKind::Nix { file, flake, .. } => {
                 if let Some(file) = file
@@ -3401,42 +3376,19 @@ fn config_in(dir: &Path) -> Result<Option<PathBuf>, RunError> {
 
 /// The session's warnings to print, in order: every profile's, each
 /// distinct message once (an inherited rule is planned again in every
-/// profile inheriting it, and warns again there), without the missing
-/// paths of the built-in base's own rules ([`is_quiet`]).
-pub fn warning_lines(session: &CompiledSession, base: Base) -> Vec<String> {
-    distinct_messages(session.warnings().map(|(_, w)| w), base)
+/// profile inheriting it, and warns again there).
+pub fn warning_lines(session: &CompiledSession) -> Vec<String> {
+    distinct_messages(session.warnings().map(|(_, w)| w))
 }
 
-/// The messages of `warnings` not [`is_quiet`] under `base`, each distinct
-/// one once, in order.
-fn distinct_messages<'a>(
-    warnings: impl IntoIterator<Item = &'a SpecWarning>,
-    base: Base,
-) -> Vec<String> {
+/// The messages of `warnings`, each distinct one once, in order.
+fn distinct_messages<'a>(warnings: impl IntoIterator<Item = &'a SpecWarning>) -> Vec<String> {
     let mut seen = HashSet::new();
     warnings
         .into_iter()
-        .filter(|w| !is_quiet(w, base))
         .map(ToString::to_string)
         .filter(|m| seen.insert(m.clone()))
         .collect()
-}
-
-/// Whether `warning` is not worth printing: a path missing for a rule of
-/// the built-in `base` provider of `base = "default"`. Its rules name files
-/// many workspaces lack (`.envrc`, `flake.lock`, `.vscode`, …), so these
-/// would warn in nearly every workspace. Under `base = "none"` a user
-/// provider may be named `base`, and is not quiet.
-pub fn is_quiet(warning: &SpecWarning, base: Base) -> bool {
-    base == Base::Default
-        && matches!(
-            warning,
-            SpecWarning::Mount(PlanWarning {
-                provider,
-                kind: PlanWarningKind::Resolve(ResolveWarning::Missing { .. }),
-                ..
-            }) if provider.as_str() == BASE_PROVIDER_NAME
-        )
 }
 
 #[cfg(test)]
@@ -3446,7 +3398,6 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::policy::NetworkMode;
 
     // --- Workspace discovery ---
 
@@ -3667,7 +3618,7 @@ mod tests {
             config: None,
         };
         assert_eq!(load(&none).unwrap(), Config::default());
-        assert_eq!(Config::default().base, Base::Default);
+        assert_eq!(Config::default().default_profile, None);
         let path = root.join(CONFIG_FILE);
         let with = Workspace {
             dir: root.clone(),
@@ -3676,16 +3627,16 @@ mod tests {
         // An empty file is the default configuration too.
         write_config(&path, "", 0o644);
         assert_eq!(load(&with).unwrap(), Config::default());
-        write_config(&path, "base = \"none\"", 0o644);
+        write_config(&path, "inherit_global = false", 0o644);
         let file = with.read_config().unwrap().unwrap();
         assert_eq!(file.path, path);
-        assert_eq!(file.bytes, b"base = \"none\"");
-        assert_eq!(file.parse().unwrap().base, Base::None);
+        assert_eq!(file.bytes, b"inherit_global = false");
+        assert!(file.parse_layer().unwrap().ignores_global());
         write_config(&path, "bogus = 1", 0o644);
         let e = load(&with).unwrap_err();
         assert!(matches!(e, RunError::Config { .. }), "{e}");
         assert!(e.to_string().contains(".stopit.toml"), "{e}");
-        fs::write(&path, b"base = \"\xff\"").unwrap();
+        fs::write(&path, b"default_profile = \"\xff\"").unwrap();
         let e = load(&with).unwrap_err();
         assert!(matches!(e, RunError::ReadConfig { .. }), "{e}");
         assert!(e.to_string().contains("utf-8"), "{e}");
@@ -3971,7 +3922,7 @@ mod tests {
         assert!(matches!(e, RunError::UntrustedConfig { .. }), "{e}");
         // Through the real path, it reads.
         let real = root.join("up/ws").join(CONFIG_FILE);
-        assert_eq!(read_trusted(&real).unwrap(), b"base = \"none\"");
+        assert_eq!(read_trusted(&real).unwrap(), b"inherit_global = false");
     }
 
     #[test]
@@ -4007,7 +3958,7 @@ mod tests {
         let dir = root.join("ws");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(CONFIG_FILE);
-        write_config(&path, "base = \"none\"", file_mode);
+        write_config(&path, "inherit_global = false", file_mode);
         fs::set_permissions(&dir, fs::Permissions::from_mode(dir_mode)).unwrap();
         Workspace {
             dir,
@@ -4070,7 +4021,7 @@ mod tests {
         let (_d, root) = tmp();
         let ws = workspace_with_modes(&root, 0o755, 0o644);
         let real = root.join("real.toml");
-        write_config(&real, "base = \"none\"", 0o644);
+        write_config(&real, "inherit_global = false", 0o644);
         let path = ws.config.clone().unwrap();
         fs::remove_file(&path).unwrap();
         symlink(&real, &path).unwrap();
@@ -4221,20 +4172,22 @@ mod tests {
     // --- Warnings ---
 
     fn missing(provider: &str, pattern: &str) -> SpecWarning {
-        SpecWarning::Mount(PlanWarning {
+        SpecWarning::Mount(crate::resolve::PlanWarning {
             provider: provider.parse().unwrap(),
             pattern: pattern.into(),
-            kind: PlanWarningKind::Resolve(ResolveWarning::Missing {
-                path: PathBuf::from(pattern),
-            }),
+            kind: crate::resolve::PlanWarningKind::Resolve(
+                crate::expand::ResolveWarning::Missing {
+                    path: PathBuf::from(pattern),
+                },
+            ),
         })
     }
 
     fn unreadable(provider: &str, pattern: &str) -> SpecWarning {
-        SpecWarning::Mount(PlanWarning {
+        SpecWarning::Mount(crate::resolve::PlanWarning {
             provider: provider.parse().unwrap(),
             pattern: pattern.into(),
-            kind: PlanWarningKind::Resolve(ResolveWarning::Io {
+            kind: crate::resolve::PlanWarningKind::Resolve(crate::expand::ResolveWarning::Io {
                 path: PathBuf::from(pattern),
                 error: io::Error::from_raw_os_error(libc::EACCES),
             }),
@@ -4242,23 +4195,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_paths_of_the_default_base_are_quiet() {
-        assert!(is_quiet(&missing("base", "/w/.envrc"), Base::Default));
-        // Not under `base = "none"`, where `base` is a user's provider.
-        assert!(!is_quiet(&missing("base", "/w/.envrc"), Base::None));
-        // Not another provider's.
-        assert!(!is_quiet(&missing("config", "/w/.envrc"), Base::Default));
-        // Not another problem with a base rule.
-        assert!(!is_quiet(&unreadable("base", "/w/.envrc"), Base::Default));
+    fn warnings_are_printed_once_each_in_order() {
         let domains = SpecWarning::DomainsIgnored {
-            mode: NetworkMode::Loopback,
+            mode: crate::policy::NetworkMode::Loopback,
             domains: ["example.com".parse().unwrap()].into_iter().collect(),
         };
-        assert!(!is_quiet(&domains, Base::Default));
-    }
-
-    #[test]
-    fn warnings_are_printed_once_each_in_order_without_quiet_ones() {
         let warnings = [
             missing("config", "/b"),
             missing("base", "/w/.envrc"),
@@ -4267,19 +4208,20 @@ mod tests {
             missing("config", "/b"),
             unreadable("base", "/w/x"),
             missing("config", "/a"),
+            domains.clone(),
         ];
-        let lines = distinct_messages(&warnings, Base::Default);
+        let lines = distinct_messages(&warnings);
         assert_eq!(
             lines,
             [
                 warnings[0].to_string(),
+                warnings[1].to_string(),
                 warnings[2].to_string(),
-                warnings[4].to_string()
+                warnings[4].to_string(),
+                domains.to_string(),
             ]
         );
         assert!(lines[0].contains("\"/b\" does not exist"), "{lines:?}");
-        // Under `base = "none"` nothing is quiet.
-        assert_eq!(distinct_messages(&warnings, Base::None).len(), 4);
     }
 
     #[test]
@@ -4378,7 +4320,7 @@ mod tests {
         let (_d, root) = tmp();
         let dirs = global_dir(&root);
         let path = dirs.active.path.join(GLOBAL_CONFIG_FILE);
-        fs::write(&path, "base = \"none\"\n").unwrap();
+        fs::write(&path, "default_profile = \"main\"\n").unwrap();
         for mode in [0o644, 0o600, 0o400] {
             chmod(&path, mode);
             let file = read_global(&dirs).unwrap().unwrap();
@@ -4387,11 +4329,27 @@ mod tests {
                 GlobalConfigFile {
                     path: path.clone(),
                     canonical_path: path.clone(),
-                    bytes: b"base = \"none\"\n".to_vec(),
+                    bytes: b"default_profile = \"main\"\n".to_vec(),
                 }
             );
-            assert!(file.parse_layer().unwrap().sets_base_none());
+            assert_eq!(
+                file.parse_layer()
+                    .unwrap()
+                    .into_config()
+                    .default_profile
+                    .as_ref()
+                    .map(ProfileRef::as_str),
+                Some("main")
+            );
         }
+        // `inherit_global` is rejected in the user-global configuration.
+        chmod(&path, 0o644);
+        fs::write(&path, "inherit_global = false\n").unwrap();
+        assert!(matches!(
+            read_global(&dirs).unwrap().unwrap().parse_layer(),
+            Err(RunError::Config { .. })
+        ));
+        fs::write(&path, "default_profile = \"main\"\n").unwrap();
         // A sticky world-writable directory is fine, as for `/nix/store`.
         chmod(&dirs.active.path, 0o1777);
         assert!(read_global(&dirs).unwrap().is_some());
@@ -4438,7 +4396,7 @@ mod tests {
             file.parse_layer(),
             Err(RunError::ReadConfig { .. })
         ));
-        fs::write(&path, "base = 1").unwrap();
+        fs::write(&path, "default_profile = 1").unwrap();
         let file = read_global(&dirs).unwrap().unwrap();
         assert!(matches!(file.parse_layer(), Err(RunError::Config { .. })));
     }
@@ -4614,8 +4572,8 @@ mod tests {
         let script = dots.join("v1/tools.sh");
         fs::write(&script, "#!/bin/sh\n").unwrap();
         let entries = ConfigLayer::from_toml_str(&format!(
-            "[[provider]]\ntype = \"script\"\nname = \"a\"\nsource = {:?}\n\
-             [[provider]]\ntype = \"script\"\nname = \"off\"\nsource = \"/nonexistent\"\n\
+            "[[provider]]\ntype = \"script\"\nname = \"a\"\nprofile = \"main\"\nsource = {:?}\n\
+             [[provider]]\ntype = \"script\"\nname = \"off\"\nprofile = \"main\"\nsource = \"/nonexistent\"\n\
              protect = false\n\
              [[provider]]\ntype = \"script\"\nname = \"disabled\"\nsource = \"/nonexistent\"\n\
              enabled = false\n",
@@ -4684,7 +4642,7 @@ mod tests {
         // Disabled script providers with `protect = false` are not listed as
         // running unprotected in the startup summary.
         let cfg = Config::from_toml_str(
-            "[[provider]]\ntype = \"script\"\nname = \"active\"\nsource = \"a.sh\"\nprotect = false\n\
+            "[[provider]]\ntype = \"script\"\nname = \"active\"\nprofile = \"main\"\nsource = \"a.sh\"\nprotect = false\n\
              [[provider]]\ntype = \"script\"\nname = \"disabled\"\nsource = \"b.sh\"\nprotect = false\nenabled = false\n",
         )
         .unwrap();
@@ -4696,7 +4654,7 @@ mod tests {
     }
 
     #[test]
-    fn global_nix_providers_are_guarded_and_unnamed_replacements_checked() {
+    fn global_nix_and_vcs_proxy_providers_are_guarded() {
         let (_d, root) = tmp();
         let ws = root.join("ws");
         fs::create_dir(&ws).unwrap();
@@ -4706,8 +4664,9 @@ mod tests {
         chmod(&cfg_path, 0o600);
         let file = read_ok(&dirs);
 
-        // Non-workspace `file` and `flake` (with and without `flake.lock`), plus
-        // `{workspace}` entries which are skipped for global guarding.
+        // Non-workspace `file` and `flake` (with and without `flake.lock`),
+        // `{workspace}` entries which are skipped for global guarding, and a
+        // `vcs` provider with a protected proxy shim.
         let nix_file = root.join("shell.nix");
         fs::write(&nix_file, "{}").unwrap();
         let flake_a = root.join("flake-a");
@@ -4717,15 +4676,19 @@ mod tests {
         let flake_b = root.join("flake-b");
         fs::create_dir(&flake_b).unwrap();
         fs::write(flake_b.join("flake.nix"), "{}").unwrap();
+        let git_proxy = root.join("git-proxy.sh");
+        fs::write(&git_proxy, "#!/bin/sh\n").unwrap();
 
         let entries = ConfigLayer::from_toml_str(&format!(
-            "[[provider]]\ntype = \"nix\"\nname = \"f\"\nfile = {:?}\n\
-             [[provider]]\ntype = \"nix\"\nname = \"fa\"\nflake = {:?}\n\
-             [[provider]]\ntype = \"nix\"\nname = \"fb\"\nflake = {:?}\n\
-             [[provider]]\ntype = \"nix\"\nname = \"ws-auto\"\n\
-             [[provider]]\ntype = \"nix\"\nname = \"ws-file\"\nfile = \"{{workspace}}/shell.nix\"\n\
-             [[provider]]\ntype = \"nix\"\nname = \"ws-flake\"\nflake = \"{{workspace}}/sub\"\n",
-            nix_file, flake_a, flake_b
+            "[[provider]]\ntype = \"nix\"\nname = \"f\"\nprofile = \"main\"\nfile = {:?}\n\
+             [[provider]]\ntype = \"nix\"\nname = \"fa\"\nprofile = \"main\"\nflake = {:?}\n\
+             [[provider]]\ntype = \"nix\"\nname = \"fb\"\nprofile = \"main\"\nflake = {:?}\n\
+             [[provider]]\ntype = \"nix\"\nname = \"ws-auto\"\nprofile = \"main\"\n\
+             [[provider]]\ntype = \"nix\"\nname = \"ws-file\"\nprofile = \"main\"\nfile = \"{{workspace}}/shell.nix\"\n\
+             [[provider]]\ntype = \"nix\"\nname = \"ws-flake\"\nprofile = \"main\"\nflake = \"{{workspace}}/sub\"\n\
+             [[provider]]\ntype = \"vcs\"\nname = \"vcs\"\nprofile = \"main\"\n\
+             [provider.shims.git]\nproxy = {:?}\n",
+            nix_file, flake_a, flake_b, git_proxy
         ))
         .unwrap()
         .providers;
@@ -4742,6 +4705,7 @@ mod tests {
                 flake_a.join("flake.lock"),
                 flake_b.clone(),
                 flake_b.join("flake.nix"),
+                git_proxy.clone(),
             ]
         );
 
@@ -4761,7 +4725,7 @@ mod tests {
         fs::create_dir(&rw).unwrap();
         symlink(&flake_a, rw.join("linked-flake")).unwrap();
         let linked_entries = ConfigLayer::from_toml_str(&format!(
-            "[[provider]]\ntype = \"nix\"\nflake = {:?}\n",
+            "[[provider]]\ntype = \"nix\"\nname = \"nx\"\nprofile = \"main\"\nflake = {:?}\n",
             rw.join("linked-flake")
         ))
         .unwrap()
@@ -4779,27 +4743,6 @@ mod tests {
             err.to_string().contains("runs through the symbolic link"),
             "{err}"
         );
-
-        // `is_default_provider_name` includes `"nix"`, and unnamed replacement
-        // warns when clobbering a global non-workspace flake or changing type,
-        // while staying quiet on workspace-to-workspace shell overrides and
-        // `enabled = false`.
-        let nix_name: ProviderName = "nix".parse().unwrap();
-        assert!(is_default_provider_name(&nix_name));
-        let parse_entries = |src: &str| ConfigLayer::from_toml_str(src).unwrap().providers;
-        let g_ws = parse_entries("[[provider]]\ntype = \"nix\"\n");
-        let p_shell = parse_entries("[[provider]]\ntype = \"nix\"\nshell = \"agent\"\n");
-        let p_disabled = parse_entries("[[provider]]\nname = \"nix\"\nenabled = false\n");
-        let p_cfg = parse_entries("[[provider]]\ntype = \"config\"\nname = \"nix\"\n");
-        let g_ext = parse_entries("[[provider]]\ntype = \"nix\"\nflake = \"~/global-tools\"\n");
-        assert!(!should_warn_unnamed_replacement(&nix_name, &g_ws, &p_shell));
-        assert!(!should_warn_unnamed_replacement(
-            &nix_name,
-            &g_ws,
-            &p_disabled
-        ));
-        assert!(should_warn_unnamed_replacement(&nix_name, &g_ws, &p_cfg));
-        assert!(should_warn_unnamed_replacement(&nix_name, &g_ext, &p_shell));
     }
 
     #[test]
@@ -4834,27 +4777,24 @@ mod tests {
     }
 
     #[test]
-    fn tool_grants_are_paths_or_a_search_path() {
-        let grants = |src: &str| -> bool {
-            manifest_grants_tools(&toml::from_str::<Manifest>(src).unwrap())
-        };
-        assert!(!grants(""));
-        assert!(!grants(
-            "fs.masked = [\"/x\"]\nenv.set = { EDITOR = \"vi\" }"
-        ));
-        assert!(!grants("fs.protected = [\"/x\"]\nnetwork.mode = \"full\""));
-        // The host's `PATH` never reaches the sandbox, so passing it grants
-        // nothing.
-        assert!(!grants("env.pass = [\"PATH\", \"*\"]"));
-        for src in [
-            "fs.ro = [\"/usr\"]",
-            "fs.rw = [\"~/data\"]",
-            "fs.bind = [{ host = \"/opt/a\", sandbox = \"/opt/b\", mode = \"ro\" }]",
-            "env.path_prepend = [\"/bin\"]",
-            "[profiles.p]\nfs.ro = [\"/usr\"]",
-        ] {
-            assert!(grants(src), "{src}");
-        }
+    fn no_default_profile_hints_default_config_when_unconfigured() {
+        let msg =
+            no_default_profile_message(Path::new("/home/u/.config/stopit/config.toml"), false, "");
+        assert!(
+            msg.contains("stopit default-config > /home/u/.config/stopit/config.toml"),
+            "{msg}"
+        );
+
+        let msg_configured = no_default_profile_message(
+            Path::new("/home/u/.config/stopit/config.toml"),
+            true,
+            "main, dev",
+        );
+        assert!(
+            msg_configured.contains("`default_profile` is not set"),
+            "{msg_configured}"
+        );
+        assert!(msg_configured.contains("[main, dev]"), "{msg_configured}");
     }
 
     #[test]

@@ -1043,11 +1043,7 @@ fn pick<'a>(
     // two candidates tied at that layer's strictest mode with different sources
     // conflict, even if a higher layer also contributes a rule here (matching
     // `env.set`).
-    for origin in [
-        ProviderOrigin::Builtin,
-        ProviderOrigin::Global,
-        ProviderOrigin::Workspace,
-    ] {
+    for origin in [ProviderOrigin::Global, ProviderOrigin::Workspace] {
         let Some(layer_mode) = at_spec
             .iter()
             .filter(|c| c.rule.origin == origin)
@@ -1073,39 +1069,7 @@ fn pick<'a>(
         }
     }
 
-    // Built-in rules outrank user layers by mode and never lose a source tie to
-    // a user rule (until built-in bases are removed).
-    if let Some(builtin_mode) = at_spec
-        .iter()
-        .filter(|c| c.rule.origin == ProviderOrigin::Builtin)
-        .map(|c| c.mode)
-        .max()
-    {
-        let max_mode = at_spec
-            .iter()
-            .map(|c| c.mode)
-            .max()
-            .expect("at_spec is non-empty");
-        if builtin_mode == max_mode {
-            let builtin_idx = at_spec
-                .iter()
-                .position(|c| c.rule.origin == ProviderOrigin::Builtin && c.mode == builtin_mode)
-                .expect("builtin_mode is attained");
-            if builtin_mode != PathMode::Ephemeral
-                && let Some(other) = at_spec.iter().find(|c| {
-                    c.mode == builtin_mode
-                        && c.rule.origin != ProviderOrigin::Builtin
-                        && !c.source.interchangeable(&at_spec[builtin_idx].source)
-                })
-            {
-                return Err(conflict(&at_spec[builtin_idx], other));
-            }
-            let mut at_spec = at_spec;
-            return Ok(at_spec.swap_remove(builtin_idx));
-        }
-    }
-
-    // Across user layers (`Workspace > Global`), the higher layer wins at equal
+    // Across layers (`Workspace > Global`), the higher layer wins at equal
     // `(literal, depth)` specificity regardless of mode; within that layer, the
     // strictest mode wins, keeping the first rule on ties.
     let best_layer_mode = at_spec
@@ -1763,7 +1727,7 @@ mod tests {
 
     #[test]
     fn a_higher_layer_bind_replaces_a_lower_one_at_the_same_rank() {
-        use crate::config::ProviderOrigin::{Builtin, Global, Workspace};
+        use crate::config::ProviderOrigin::{Global, Workspace};
 
         let at = |mut r: FsRule, origin| {
             r.origin = origin;
@@ -1847,38 +1811,6 @@ mod tests {
         assert_eq!(
             (c.first_provider.as_str(), c.second_provider.as_str()),
             ("g1", "g2")
-        );
-        // A built-in rule is never replaced by layer: a user rule of the
-        // same rank with another source conflicts with it.
-        let e = f.plan_err(&[
-            at(bind("~/a", "/opt/x", BindMode::Ro, "base", 0), Builtin),
-            at(bind("~/c", "/opt/x", BindMode::Ro, "g", 0), Global),
-        ]);
-        assert!(matches!(e, PathPlanError::Conflict(_)), "{e:?}");
-        f.mkdir("ws/.git");
-        f.mkdir("home/git");
-        let e = f.plan_err(&[
-            at(rule(Protected, "{workspace}/.git", "base", 0), Builtin),
-            at(
-                bind("~/git", "/workspace/.git", BindMode::Protected, "w", 0),
-                Workspace,
-            ),
-        ]);
-        let PathPlanError::Conflict(c) = e else {
-            panic!("expected a conflict, got {e:?}");
-        };
-        assert_eq!(
-            (c.first_provider.as_str(), c.second_provider.as_str()),
-            ("base", "w")
-        );
-        // The same source from a built-in and a user rule is no conflict.
-        let mounts = f.clean(&[
-            at(rule(Protected, "{workspace}/.git", "base", 0), Builtin),
-            at(rule(Protected, "{workspace}/.git", "w", 0), Workspace),
-        ]);
-        assert_eq!(
-            summary(&mounts),
-            [row("/workspace/.git", Protected, "base")]
         );
         // Two binds within the winning layer still conflict.
         let e = f.plan_err(&[

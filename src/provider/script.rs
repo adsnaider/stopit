@@ -71,6 +71,7 @@ pub const STDERR_LIMIT: usize = 64 * 1024;
 #[derive(Debug, Clone)]
 pub struct ScriptProvider {
     name: ProviderName,
+    profile: ProfileRef,
     /// `source` joined to `base_dir`, as declared; used in error messages.
     source: PathBuf,
     /// The canonical form of `source`: both the executed and the protected
@@ -95,6 +96,7 @@ impl ScriptProvider {
     /// here: the path is canonicalized on first use.
     pub fn new(
         name: ProviderName,
+        profile: ProfileRef,
         source: &ScriptSource,
         base_dir: &Path,
         protect: bool,
@@ -102,6 +104,7 @@ impl ScriptProvider {
     ) -> Self {
         Self::with_origin(
             name,
+            profile,
             source,
             base_dir,
             protect,
@@ -113,6 +116,7 @@ impl ScriptProvider {
     /// Creates a provider for `source` in `base_dir` tagged with `origin`.
     pub fn with_origin(
         name: ProviderName,
+        profile: ProfileRef,
         source: &ScriptSource,
         base_dir: &Path,
         protect: bool,
@@ -121,6 +125,7 @@ impl ScriptProvider {
     ) -> Self {
         ScriptProvider {
             name,
+            profile,
             source: base_dir.join(source.as_path()),
             canonical: OnceLock::new(),
             protected_proxies: OnceLock::new(),
@@ -254,7 +259,7 @@ impl ScriptProvider {
         context.insert("session_dir".into(), path("session_dir", &ctx.session_dir)?);
         context.insert(
             "profile".into(),
-            Value::String(ProfileRef::main().as_str().to_owned()),
+            Value::String(self.profile.as_str().to_owned()),
         );
         context.insert("name".into(), Value::String(self.name.as_str().to_owned()));
 
@@ -523,7 +528,7 @@ impl Provider for ScriptProvider {
             super::resolve_manifest_proxies(&self.name, &self.base_dir, &mut manifest, ctx)?;
         let _ = self.protected_proxies.set(protected);
         Ok(ProviderOutput {
-            profile: ProfileRef::main(),
+            profile: self.profile.clone(),
             manifest,
             origin: self.origin,
         })
@@ -740,9 +745,14 @@ mod tests {
         }
     }
 
+    fn pref(s: &str) -> ProfileRef {
+        s.parse().unwrap()
+    }
+
     fn provider(name: &str, source: &str, base_dir: &Path) -> ScriptProvider {
         ScriptProvider::new(
             name.parse().unwrap(),
+            pref("main"),
             &source.parse().unwrap(),
             base_dir,
             true,
@@ -776,7 +786,7 @@ mod tests {
              \"env\": {\"set\": {\"LANG\": \"C.UTF-8\"}}, \"profiles\": {\"local\": {}}}'\n",
         );
         let out = run(&p).unwrap();
-        assert_eq!(out.profile, ProfileRef::main());
+        assert_eq!(out.profile, pref("main"));
         let expected = Manifest::from_json_str(
             r#"{"version": 1, "fs": {"ro": ["/etc/ssl/certs"]},
                 "env": {"set": {"LANG": "C.UTF-8"}}, "profiles": {"local": {}}}"#,
@@ -800,6 +810,7 @@ mod tests {
             [[provider]]
             type = "script"
             name = "agent-env"
+            profile = "harness"
             source = "run.sh"
             [provider.config]
             s = "str \"quoted\" ünï"
@@ -822,6 +833,7 @@ mod tests {
         .unwrap();
         let e = &cfg.providers[0];
         let ProviderKind::Script {
+            profile,
             source,
             protect,
             config,
@@ -829,8 +841,16 @@ mod tests {
         else {
             panic!("{:?}", e.kind);
         };
-        let p = ScriptProvider::new(e.name.clone(), source, dir.path(), *protect, config.clone());
-        run(&p).unwrap();
+        let p = ScriptProvider::new(
+            e.name.clone(),
+            profile.clone(),
+            source,
+            dir.path(),
+            *protect,
+            config.clone(),
+        );
+        let out = run(&p).unwrap();
+        assert_eq!(out.profile, pref("harness"));
         let got: Value =
             serde_json::from_slice(&fs::read(dir.path().join("stdin.json")).unwrap()).unwrap();
         assert_eq!(
@@ -857,7 +877,7 @@ mod tests {
                     "workspace_mount": "/workspace",
                     "home": "/home/u",
                     "session_dir": "/run/s",
-                    "profile": "main",
+                    "profile": "harness",
                     "name": "agent-env",
                 },
             })
@@ -896,6 +916,7 @@ mod tests {
             let config: toml::Table = src.parse().unwrap();
             let p = ScriptProvider::new(
                 "s".parse().unwrap(),
+                pref("main"),
                 &"/nonexistent/x.sh".parse().unwrap(),
                 Path::new("/"),
                 true,
@@ -1074,7 +1095,7 @@ mod tests {
             path: root.join("cache"),
             kind: crate::spec::UntrustedKind::RwGrant {
                 provider: "tools".parse().unwrap(),
-                profile: Some(ProfileRef::main()),
+                profile: Some(pref("main")),
                 host: root.join("cache"),
             },
         };
@@ -1123,6 +1144,7 @@ mod tests {
         // Not protected, it is not checked.
         let unprotected = ScriptProvider::new(
             "env".parse().unwrap(),
+            pref("main"),
             &"a.sh".parse().unwrap(),
             &root,
             false,
@@ -1302,6 +1324,7 @@ mod tests {
         config.insert("pad".into(), "y".repeat(4 << 20).into());
         let p = ScriptProvider::new(
             "env".parse().unwrap(),
+            pref("main"),
             &"run.sh".parse().unwrap(),
             dir.path(),
             true,
@@ -1409,6 +1432,7 @@ mod tests {
         // `protect = false`: nothing, and the path is not even resolved.
         let p = ScriptProvider::new(
             "s".parse().unwrap(),
+            pref("main"),
             &"/nonexistent/a.sh".parse().unwrap(),
             dir.path(),
             false,

@@ -21,9 +21,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use stopit::bwrap::{BwrapCommand, TerminalSession, working_dir};
-use stopit::config::{Config, ProfileRef};
+use stopit::config::{ConfigLayer, DEFAULT_CONFIG_TOML, ProfileRef};
 use stopit::expand::ExpansionContext;
-use stopit::provider::{ProviderContext, protected_sources, session_providers, static_outputs};
+use stopit::provider::{
+    ProviderContext, layered_session_providers, protected_sources, static_outputs,
+};
 use stopit::provision::{Provisioned, provision};
 use stopit::session::SessionDir;
 use stopit::spec::{SandboxSpec, compile_session, static_rw_roots};
@@ -468,7 +470,13 @@ impl SpecFixture {
     /// Like [`compile`](Self::compile), but returns the warnings instead of
     /// panicking on them.
     pub fn compile_with_warnings(&self, toml: &str) -> (SandboxSpec, Vec<String>) {
-        let config = Config::from_toml_str(toml).unwrap();
+        let global = ConfigLayer::from_global_toml_str(DEFAULT_CONFIG_TOML).unwrap();
+        let project = ConfigLayer::from_toml_str(toml).unwrap();
+        let layered = ConfigLayer::layer(
+            Some((global, &self.home().join(".config/stopit"))),
+            Some((project, &self.root)),
+        );
+        let config = layered.config;
         let ctx = ExpansionContext::new(
             self.workspace(),
             WORKSPACE_MOUNT.parse().unwrap(),
@@ -476,7 +484,7 @@ impl SpecFixture {
             SANDBOX_HOME.parse().unwrap(),
         )
         .unwrap();
-        let providers = session_providers(&config, &self.root).unwrap();
+        let providers = layered_session_providers(&layered.providers).unwrap();
         let pctx = ProviderContext {
             workspace: self.workspace(),
             workspace_mount: WORKSPACE_MOUNT.parse().unwrap(),
@@ -499,7 +507,8 @@ impl SpecFixture {
         };
         let session = compile_session(&config, outputs, &protected, &state, &ctx)
             .unwrap_or_else(|e| panic!("the configuration does not compile: {e}"));
-        let main = session.get(&ProfileRef::main()).expect("main exists");
+        let main_ref: ProfileRef = "main".parse().unwrap();
+        let main = session.get(&main_ref).expect("main exists");
         let warnings = main.warnings.iter().map(|w| w.to_string()).collect();
         (main.spec.clone(), warnings)
     }
@@ -637,11 +646,14 @@ impl ProbeSession {
     }
 }
 
-/// A configuration with `base = "none"` and one `config` provider whose
-/// `[provider.sandbox]` table holds `body` (dotted keys such as
-/// `fs.rw = ["{workspace}"]`).
+/// An isolated configuration (`inherit_global = false`) declaring `[profiles.main]`
+/// and one `config` provider whose `[provider.sandbox]` table holds `body`
+/// (dotted keys such as `fs.rw = ["{workspace}"]`).
 pub fn config_none(body: &str) -> String {
-    format!("base = \"none\"\n[[provider]]\ntype = \"config\"\n[provider.sandbox]\n{body}\n")
+    format!(
+        "inherit_global = false\n[profiles.main]\n[[provider]]\ntype = \"config\"\n\
+         name = \"config\"\nprofile = \"main\"\n[provider.sandbox]\n{body}\n"
+    )
 }
 
 // --- Building operations ---------------------------------------------------

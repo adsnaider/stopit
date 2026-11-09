@@ -58,6 +58,10 @@ fn main() -> ExitCode {
             return supervisor::revoke(workspace.workspace, config);
         }
         CliCommand::Allowed => return supervisor::allowed(),
+        CliCommand::DefaultConfig => {
+            print!("{}", stopit::config::DEFAULT_CONFIG_TOML);
+            return ExitCode::SUCCESS;
+        }
         CliCommand::Server { workspace, quiet } => {
             return stopit::server::serve(workspace.workspace, quiet);
         }

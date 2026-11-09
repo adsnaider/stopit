@@ -13,8 +13,6 @@ use super::ProviderName;
 use crate::error::ValueError;
 use crate::serde_util::MapOnly;
 
-/// Name of the implicit main profile.
-pub(super) const MAIN: &str = "main";
 /// The `inherit` keyword that starts from the empty sandbox.
 pub(super) const NONE: &str = "none";
 
@@ -34,25 +32,18 @@ pub(super) fn check_segment(seg: &str) -> Result<(), &'static str> {
     }
 }
 
-/// A single-segment profile name: `main` or a user-declared profile.
+/// A single-segment user-declared or provider-contributed profile name.
 ///
 /// Non-empty, ASCII lowercase letters, digits, `-` and `_`, starting with a
 /// letter. Dots are not allowed: they separate the provider name from the
 /// profile name in provider-contributed profiles such as `vcs.local`, which
-/// therefore cannot be declared; they are configured through their provider.
-/// Parsing rejects the names `main` and `none`: `main` is implicit (obtain it
-/// with [`ProfileName::main`], the only way to get one) and `none` is the
-/// `inherit` keyword.
+/// therefore cannot be declared at top level. Parsing rejects `none`, which is
+/// the `inherit` keyword.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 #[serde(try_from = "String")]
 pub struct ProfileName(String);
 
 impl ProfileName {
-    /// The implicit `main` profile. This is the only way to obtain it.
-    pub fn main() -> Self {
-        ProfileName(MAIN.to_owned())
-    }
-
     /// The name as a string.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -64,11 +55,6 @@ impl FromStr for ProfileName {
 
     fn from_str(s: &str) -> Result<Self, ValueError> {
         let bad = |why: &str| ValueError::new(format!("invalid profile name {s:?}: {why}"));
-        if s == MAIN {
-            return Err(bad(
-                "`main` is reserved (it is implicit and inherits from the base)",
-            ));
-        }
         if s == NONE {
             return Err(bad("`none` is reserved (it is the `inherit` keyword)"));
         }
@@ -96,8 +82,7 @@ impl fmt::Display for ProfileName {
     }
 }
 
-/// A reference to any profile: user-declared, `main`, or contributed by a
-/// provider.
+/// A reference to any profile: user-declared or contributed by a provider.
 ///
 /// One or more `.`-separated segments, each following the [`ProfileName`]
 /// character rules (so `main`, `harness` and `vcs.local` are valid; `vcs.`,
@@ -110,11 +95,6 @@ impl fmt::Display for ProfileName {
 pub struct ProfileRef(String);
 
 impl ProfileRef {
-    /// A reference to the implicit `main` profile.
-    pub fn main() -> Self {
-        ProfileRef(MAIN.to_owned())
-    }
-
     /// The full name `<provider>.<profile>` of a profile contributed by a
     /// provider. Always valid: both parts are valid segments.
     pub fn contributed(provider: &ProviderName, profile: &ProfileName) -> Self {
@@ -171,19 +151,14 @@ impl fmt::Display for ProfileRef {
 }
 
 /// Where a profile starts from (DESIGN.md §3.3).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
 pub enum Inherit {
     /// Start from the parent profile's fully merged grants.
     Profile(ProfileRef),
-    /// Start from the empty sandbox, ignoring the base (`"none"`).
+    /// Start from the empty sandbox (`"none"`, or omitted).
+    #[default]
     None,
-}
-
-impl Default for Inherit {
-    fn default() -> Self {
-        Inherit::Profile(ProfileRef::main())
-    }
 }
 
 impl FromStr for Inherit {
@@ -211,7 +186,7 @@ impl TryFrom<String> for Inherit {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(from = "MapOnly<RawProfileDecl>")]
 pub struct ProfileDecl {
-    /// Parent profile; defaults to `main`.
+    /// Optional parent profile; defaults to [`Inherit::None`] (empty sandbox).
     pub inherit: Inherit,
 }
 
@@ -252,10 +227,6 @@ mod tests {
         }
     }
 
-    fn inherit_main() -> Inherit {
-        Inherit::Profile(ProfileRef::main())
-    }
-
     #[test]
     fn no_profiles_table_is_empty_map() {
         assert!(profiles("").is_empty());
@@ -263,11 +234,15 @@ mod tests {
     }
 
     #[test]
-    fn empty_profile_inherits_main() {
-        let p = profiles("[profiles.harness]");
-        assert_eq!(p.len(), 1);
-        assert_eq!(p[&name("harness")].inherit, inherit_main());
-        assert_eq!(p[&name("harness")], ProfileDecl::default());
+    fn empty_profile_starts_without_parent_and_main_is_declaraable() {
+        let p = profiles("[profiles.main]\n[profiles.harness]\ninherit = \"main\"");
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[&name("main")].inherit, Inherit::None);
+        assert_eq!(p[&name("main")], ProfileDecl::default());
+        assert_eq!(
+            p[&name("harness")].inherit,
+            Inherit::Profile("main".parse().unwrap())
+        );
     }
 
     #[test]
@@ -283,33 +258,40 @@ mod tests {
             p[&name("a")].inherit,
             Inherit::Profile("vcs.local".parse().unwrap())
         );
-        assert_eq!(p[&name("b")].inherit, inherit_main());
+        assert_eq!(
+            p[&name("b")].inherit,
+            Inherit::Profile("main".parse().unwrap())
+        );
     }
 
     #[test]
     fn several_profiles_in_one_document() {
         let p = profiles(
             r#"
+            [profiles.main]
             [profiles.harness]
+            inherit = "main"
             [profiles.bare]
-            inherit = "none"
             [profiles.child]
             inherit = "harness"
             "#,
         );
         let keys: Vec<&str> = p.keys().map(ProfileName::as_str).collect();
-        assert_eq!(keys, ["bare", "child", "harness"]);
+        assert_eq!(keys, ["bare", "child", "harness", "main"]);
+        assert_eq!(p[&name("main")].inherit, Inherit::None);
         assert_eq!(p[&name("bare")].inherit, Inherit::None);
         assert_eq!(
             p[&name("child")].inherit,
             Inherit::Profile("harness".parse().unwrap())
         );
-        assert_eq!(p[&name("harness")].inherit, inherit_main());
+        assert_eq!(
+            p[&name("harness")].inherit,
+            Inherit::Profile("main".parse().unwrap())
+        );
     }
 
     #[test]
     fn references_are_not_resolved() {
-        // Unknown targets are a later commit's concern.
         let p = profiles("[profiles.a]\ninherit = \"does-not-exist\"");
         assert_eq!(
             p[&name("a")].inherit,
@@ -319,7 +301,15 @@ mod tests {
 
     #[test]
     fn valid_declared_names() {
-        for good in ["harness", "a", "my-profile", "my_profile", "a1", "x-1_y"] {
+        for good in [
+            "main",
+            "harness",
+            "a",
+            "my-profile",
+            "my_profile",
+            "a1",
+            "x-1_y",
+        ] {
             let n = name(good);
             assert_eq!(n.as_str(), good);
             assert_eq!(n.to_string(), good);
@@ -331,7 +321,6 @@ mod tests {
     #[test]
     fn invalid_declared_names_are_rejected() {
         for bad in [
-            "main",
             "none",
             "vcs.local",
             "Harness",
@@ -345,7 +334,6 @@ mod tests {
         ] {
             let own = bad.parse::<ProfileName>().unwrap_err().to_string();
             assert!(own.contains(&format!("{bad:?}")), "{bad:?}: {own}");
-            // As a (quoted) TOML table key.
             let msg = err(&format!("[profiles.\"{bad}\"]"));
             assert!(msg.contains("profile name"), "{bad:?}: {msg}");
         }
@@ -353,7 +341,6 @@ mod tests {
 
     #[test]
     fn dotted_table_header_cannot_declare_contributed_profile() {
-        // Unquoted, this is the nested table `profiles.vcs` with key `local`.
         let msg = err("[profiles.vcs.local]");
         assert!(msg.contains("local"), "{msg}");
     }
@@ -370,12 +357,9 @@ mod tests {
     }
 
     #[test]
-    fn reserved_names_explain_why() {
-        let main = "main".parse::<ProfileName>().unwrap_err().to_string();
-        assert!(main.contains("reserved"), "{main}");
+    fn reserved_none_explains_why() {
         let none = "none".parse::<ProfileName>().unwrap_err().to_string();
         assert!(none.contains("reserved"), "{none}");
-        assert_eq!(ProfileName::main().as_str(), "main");
     }
 
     #[test]
@@ -386,7 +370,6 @@ mod tests {
             "vcs.local",
             "a.b.c",
             "my-profile",
-            // `none` is only the keyword as a whole value.
             "main.none",
             "none.x",
         ] {

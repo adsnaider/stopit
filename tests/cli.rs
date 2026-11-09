@@ -42,7 +42,7 @@ fn help_prints_to_stdout_and_exits_zero() {
     let out = stopit().arg("--help").output().unwrap();
     assert_eq!(out.status.code(), Some(0));
     let help = String::from_utf8(out.stdout).unwrap();
-    for word in ["run", "shell", "--version"] {
+    for word in ["run", "shell", "default-config", "--version"] {
         assert!(help.contains(word), "{help}");
     }
     // The internal init helper is not advertised.
@@ -92,4 +92,14 @@ fn shell_without_shell_fails_clearly() {
         stderr(&out),
         "stopit: error: SHELL is not set; run a shell explicitly with `stopit run <shell>`\n"
     );
+}
+
+#[test]
+fn default_config_prints_valid_global_toml() {
+    let out = stopit().arg("default-config").output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(out.stderr.is_empty(), "{out:?}");
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(text, stopit::config::DEFAULT_CONFIG_TOML);
+    stopit::config::ConfigLayer::from_global_toml_str(&text).unwrap();
 }

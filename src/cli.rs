@@ -81,6 +81,8 @@ pub enum CliCommand {
     },
     /// List the configurations you allowed.
     Allowed,
+    /// Print the default configuration template (`~/.config/stopit/config.toml`).
+    DefaultConfig,
 }
 
 /// The options `run` and `shell` share.
@@ -91,7 +93,7 @@ pub struct SessionArgs {
     /// directory].
     #[arg(long, value_name = "DIR")]
     pub workspace: Option<PathBuf>,
-    /// The profile to run in [default: main].
+    /// The profile to run in [default: `default_profile` in configuration].
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
     /// Do not print the startup summary of what the sandbox is granted

@@ -188,13 +188,27 @@ impl Setup {
     }
 }
 
-/// A `.stopit.toml` under the default base with one more provider granting
-/// the probe's directory `ro` at its host path, then `extra`.
+/// A `.stopit.toml` built on [`stopit::config::DEFAULT_CONFIG_TOML`] with one
+/// more provider granting the probe's directory `ro` at its host path, then
+/// `extra`.
 fn probe_config(extra: &str) -> String {
     let (probe_dir, _) = probe_at_host_path();
     format!(
-        "[[provider]]\ntype = \"config\"\nname = \"tools\"\n[provider.sandbox]\n\
-         fs.ro = [\"{}\"]\n{extra}\n",
+        "{}\n[[provider]]\ntype = \"config\"\nname = \"tools\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nfs.ro = [\"{}\"]\n{extra}\n",
+        stopit::config::DEFAULT_CONFIG_TOML,
+        probe_dir.to_str().unwrap()
+    )
+}
+
+/// An isolated `.stopit.toml` (`inherit_global = false`) declaring only `main`
+/// and the probe's directory `ro`, plus `extra`.
+fn probe_isolated(extra: &str) -> String {
+    let (probe_dir, _) = probe_at_host_path();
+    format!(
+        "inherit_global = false\ndefault_profile = \"main\"\n[profiles.main]\n\
+         [[provider]]\ntype = \"config\"\nname = \"tools\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nfs.ro = [\"{}\"]\n{extra}\n",
         probe_dir.to_str().unwrap()
     )
 }
@@ -277,9 +291,10 @@ fn arguments_after_the_command_are_the_commands() {
 
 #[test]
 fn a_missing_command_is_127_with_an_escaped_message() {
-    // Without `stopit-grant`, the default base grants no `PATH`.
+    // Without `stopit-grant`, the default config grants no `PATH`.
     let s = Setup::with_config(
-        "[[provider]]\ntype = \"config\"\n[provider.sandbox]\nsandbox.grant = false\n",
+        "[[provider]]\ntype = \"config\"\nname = \"nogrant\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nsandbox.grant = false\n",
     );
     let out = output(s.stopit(&["run", "--quiet", "no\x1b[31msuch"]), b"");
     assert_eq!(code(&out), 127, "{out:?}");
@@ -302,7 +317,7 @@ fn summary_header(s: &Setup) -> String {
 }
 
 #[test]
-fn the_summary_lists_what_the_profile_grants_beyond_the_default_base() {
+fn the_summary_lists_what_the_profile_grants() {
     let s = Setup::with_config(
         "fs.rw = [\"~/data\"]\nnetwork = { mode = \"proxy\", allow_domains = [\"example.org\"] }",
     );
@@ -315,7 +330,8 @@ fn the_summary_lists_what_the_profile_grants_beyond_the_default_base() {
         format!(
             "{}stopit:   rw       ~/data  (provider \"tools\")\n\
              stopit:   ro       {}  (provider \"tools\")\n\
-             stopit:   network  proxy to example.org\n",
+             stopit:   network  proxy to example.org\n\
+             stopit:   env pass COLORTERM, LANG, TERM\n",
             summary_header(&s),
             probe_dir.display()
         )
@@ -340,9 +356,9 @@ fn quiet_suppresses_the_summary_but_not_warnings() {
 }
 
 #[test]
-fn the_default_configuration_prints_only_the_header() {
+fn the_default_configuration_prints_the_uniform_summary() {
     let s = Setup::new();
-    s.write_global_config(GLOBAL_SEARCH_PATH);
+    s.write_global_config(&global_search_config());
     s.write_raw_config("");
     let out = output(s.stopit(&["run", "true"]), b"");
     assert_eq!(code(&out), 127, "{out:?}");
@@ -351,7 +367,8 @@ fn the_default_configuration_prints_only_the_header() {
     assert_eq!(
         stderr(&out),
         format!(
-            "{}stopit __init: true: not found in PATH\n",
+            "{}stopit:   env pass COLORTERM, LANG, TERM\n\
+             stopit __init: true: not found in PATH\n",
             summary_header(&s)
         )
     );
@@ -408,7 +425,7 @@ fn the_environment_is_filtered() {
 fn profile_selects_another_profile() {
     let s = Setup::with_config(
         "env.set = { WHICH = \"main\" }\n\
-         [profiles.other]\n\
+         [profiles.other]\ninherit = \"main\"\n\
          [[provider]]\ntype = \"config\"\nname = \"other\"\nprofile = \"other\"\n\
          [provider.sandbox]\nenv.set = { WHICH = \"other\" }\n",
     );
@@ -482,17 +499,17 @@ fn assert_default_base_ran(out: &Output) {
 }
 
 #[test]
-fn no_configuration_runs_the_default_base_in_the_cwd() {
-    // Without a `.stopit.toml` the default base applies, with nothing to
-    // allow.
+fn no_workspace_configuration_runs_the_global_configuration_in_the_cwd() {
+    // Without a `.stopit.toml` the user-global configuration applies, with
+    // nothing to allow.
     let s = Setup::new();
-    s.write_global_config(GLOBAL_SEARCH_PATH);
+    s.write_global_config(&global_search_config());
     let out = output(s.run_probe_command(&[]), b"[]");
     assert_default_base_ran(&out);
     assert!(s.no_session_left());
     // `--workspace` does not look up: `sub` has none of its own, though the
     // directory above it has one, which is not allowed.
-    s.write_unallowed("base = \"none\"\n");
+    s.write_unallowed("inherit_global = false\n");
     fs::create_dir(s.ws().join("sub")).unwrap();
     let out = output(s.run_probe_command(&["--workspace", "sub"]), b"[]");
     assert_default_base_ran(&out);
@@ -500,10 +517,9 @@ fn no_configuration_runs_the_default_base_in_the_cwd() {
 }
 
 #[test]
-fn an_empty_configuration_runs_the_default_base() {
-    // The default base grants nothing for the probe, so it is not found.
+fn an_empty_configuration_runs_the_global_configuration() {
     let s = Setup::new();
-    s.write_global_config(GLOBAL_SEARCH_PATH);
+    s.write_global_config(&global_search_config());
     s.write_raw_config("");
     let out = output(s.run_probe_command(&[]), b"[]");
     assert_default_base_ran(&out);
@@ -512,55 +528,47 @@ fn an_empty_configuration_runs_the_default_base() {
 
 // --- The user-global configuration ---
 
-/// A user-global configuration whose only tool grant is a search path
-/// naming a directory nothing mounts, so the default base runs and finds
-/// nothing.
-const GLOBAL_SEARCH_PATH: &str = "[[provider]]\ntype = \"config\"\nname = \"search\"\n\
-                                  [provider.sandbox]\nenv.path_prepend = [\"/nowhere/bin\"]\n";
-
-/// The refusal of a default base without tools, for a global configuration
-/// at `global`.
-fn no_tools_refusal(global: &Path) -> String {
+/// A user-global configuration built on [`stopit::config::DEFAULT_CONFIG_TOML`]
+/// whose only extra grant is a search path naming a directory nothing mounts.
+fn global_search_config() -> String {
     format!(
-        "stopit: error: base = \"default\" mounts no tools, and no provider in {global:?} or \
-         .stopit.toml grants any; configure a tool provider in {global:?} for every workspace or \
-         in .stopit.toml for this workspace, for example:\n\
-         \n\
-         [[provider]]\n\
-         type = \"config\"\n\
-         name = \"tools\"\n\
-         [provider.sandbox]\n\
-         fs.ro = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
-         env.path_prepend = [\"/usr/bin\", \"/bin\"]\n"
+        "{}\n[[provider]]\ntype = \"config\"\nname = \"search\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nenv.path_prepend = [\"/nowhere/bin\"]\n",
+        stopit::config::DEFAULT_CONFIG_TOML
     )
 }
 
 #[test]
-fn a_default_base_without_tools_is_refused() {
+fn missing_configuration_or_default_profile_is_refused_with_a_clear_hint() {
     let s = Setup::new();
     let global = s.config_dir().join("config.toml");
-    let refused = no_tools_refusal(&global);
-    let check = |what: &str| {
-        let out = output(s.run_probe_command(&[]), b"[]");
-        assert_eq!(code(&out), 125, "{what}: {out:?}");
-        assert_eq!(stderr(&out), refused, "{what}");
-        assert!(out.stdout.is_empty(), "{what}: {out:?}");
-        assert!(s.no_session_left(), "{what}");
-    };
-    // No configuration at all, then an empty workspace configuration.
-    check("no configuration");
-    s.write_raw_config("");
-    check("an empty .stopit.toml");
-    // Restrictions and settings are not tools.
-    s.write_raw_config(
-        "[[provider]]\ntype = \"config\"\n[provider.sandbox]\n\
-         fs.masked = [\"{workspace}/secret\"]\nenv.set = { EDITOR = \"vi\" }\n",
+
+    // 1. Neither `config.toml` nor `.stopit.toml` exists: hints `stopit default-config`.
+    let out = output(s.run_probe_command(&[]), b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    let err = stderr(&out);
+    assert!(err.contains("stopit default-config >"), "{err}");
+    assert!(err.contains(&global.display().to_string()), "{err}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert!(s.no_session_left());
+
+    // 2. A configuration file exists without `default_profile`: asks for
+    // `default_profile` or `--profile`.
+    s.write_raw_config("[profiles.main]\n[profiles.dev]\n");
+    let out = output(s.run_probe_command(&[]), b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    let err = stderr(&out);
+    assert!(err.contains("`default_profile` is not set"), "{err}");
+    assert!(err.contains("[dev, main]"), "{err}");
+
+    // 3. Explicit `--profile main` or `default_profile = "main"` runs the empty sandbox.
+    let out = output(
+        s.stopit(&["run", "--quiet", "--profile", "main", "/nothing"]),
+        b"",
     );
-    check("a provider granting no tools");
-    s.write_global_config("[approval]\ntimeout = \"30s\"\n");
-    check("a global configuration granting no tools");
-    // `base = "none"` asks for an empty sandbox, so nothing is refused.
-    s.write_raw_config("base = \"none\"\n");
+    assert_eq!(code(&out), 127, "{out:?}");
+
+    s.write_raw_config("default_profile = \"main\"\n[profiles.main]\n");
     let out = output(s.stopit(&["run", "--quiet", "/nothing"]), b"");
     assert_eq!(code(&out), 127, "{out:?}");
 }
@@ -582,8 +590,8 @@ fn the_global_configuration_grants_tools_to_every_workspace() {
     assert_eq!(which(&s).as_deref(), Some("global"));
     // A workspace provider overrides a global `env.set` variable.
     s.write_raw_config(
-        "[[provider]]\ntype = \"config\"\nname = \"mine\"\n[provider.sandbox]\n\
-         env.set = { WHICH = \"project\" }\n",
+        "[[provider]]\ntype = \"config\"\nname = \"mine\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nenv.set = { WHICH = \"project\" }\n",
     );
     assert_eq!(which(&s).as_deref(), Some("project"));
     // A workspace provider with the global provider's name replaces it.
@@ -596,7 +604,7 @@ fn the_global_configuration_grants_tools_to_every_workspace() {
 fn project_settings_override_global_settings() {
     let s = Setup::new();
     s.write_global_config(&format!(
-        "[workspace]\nmount = \"/global-ws\"\n{}",
+        "{}\n[workspace]\nmount = \"/global-ws\"\n",
         probe_config("")
     ));
     let cwd = |s: &Setup| {
@@ -612,13 +620,14 @@ fn project_settings_override_global_settings() {
 }
 
 #[test]
-fn base_none_in_the_project_ignores_the_global_layer_but_still_checks_it() {
+fn inherit_global_false_in_the_project_ignores_the_global_layer_but_still_checks_it() {
     let s = Setup::new();
     let (probe_dir, _) = probe_at_host_path();
     s.write_global_config(&probe_config("env.set = { WHICH = \"global\" }"));
     s.write_raw_config(&format!(
-        "base = \"none\"\n[[provider]]\ntype = \"config\"\n[provider.sandbox]\n\
-         fs.ro = [\"{}\"]\n",
+        "inherit_global = false\ndefault_profile = \"main\"\n[profiles.main]\n\
+         [[provider]]\ntype = \"config\"\nname = \"probe\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nfs.ro = [\"{}\"]\n",
         probe_dir.display()
     ));
     // Nothing of the global layer applies: no `WHICH`, no workspace mount.
@@ -664,12 +673,12 @@ fn dotfiles_global_config(s: &Setup, contents: &str) -> (PathBuf, PathBuf) {
 #[test]
 fn an_unused_global_configuration_stays_protected() {
     // The workspace grants `rw` on the tree holding the global
-    // configuration and its script, and uses neither: `base = "none"`, then
-    // a provider replacing the global one by name.
+    // configuration and its script, and uses neither: `inherit_global = false`,
+    // then a provider replacing the global one by name.
     let s = Setup::new();
     let global_body = |script: &Path| {
         format!(
-            "[[provider]]\ntype = \"script\"\nname = \"tools\"\nsource = {script:?}\n{}",
+            "{}\n[[provider]]\ntype = \"script\"\nname = \"tools\"\nprofile = \"main\"\nsource = {script:?}\n",
             probe_config("").replace("name = \"tools\"", "name = \"probe\"")
         )
     };
@@ -677,16 +686,17 @@ fn an_unused_global_configuration_stays_protected() {
     let body = global_body(&script);
     fs::write(&target, &body).unwrap();
     let (probe_dir, _) = probe_at_host_path();
-    let rw_src = "[[provider]]\ntype = \"config\"\nname = \"src\"\n[provider.sandbox]\n\
-                  fs.rw = [\"~/src\"]\n";
+    let rw_src = "[[provider]]\ntype = \"config\"\nname = \"src\"\nprofile = \"main\"\n\
+                  [provider.sandbox]\nfs.rw = [\"~/src\"]\n";
     for project in [
         format!(
-            "base = \"none\"\n{rw_src}[[provider]]\ntype = \"config\"\nname = \"probe\"\n\
+            "inherit_global = false\ndefault_profile = \"main\"\n[profiles.main]\n\
+             {rw_src}[[provider]]\ntype = \"config\"\nname = \"probe\"\nprofile = \"main\"\n\
              [provider.sandbox]\nfs.ro = [\"{}\"]\n",
             probe_dir.display()
         ),
         format!(
-            "{rw_src}[[provider]]\ntype = \"config\"\nname = \"tools\"\n\
+            "{rw_src}[[provider]]\ntype = \"config\"\nname = \"tools\"\nprofile = \"main\"\n\
              [provider.sandbox]\nfs.ro = [\"{}\"]\n",
             probe_dir.display()
         ),
@@ -727,8 +737,8 @@ fn a_global_configuration_reached_through_a_writable_link_is_refused() {
     let results = s.probe(&[], &[Op::Cwd]);
     assert_eq!(ok(&results[0]), &Data::Cwd("/workspace".into()));
     s.write_raw_config(
-        "[[provider]]\ntype = \"config\"\nname = \"src\"\n[provider.sandbox]\n\
-         fs.rw = [\"~/src\"]\n",
+        "[[provider]]\ntype = \"config\"\nname = \"src\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nfs.rw = [\"~/src\"]\n",
     );
     let out = output(s.run_probe_command(&[]), b"[]");
     assert_eq!(code(&out), 125, "{out:?}");
@@ -745,18 +755,23 @@ fn a_global_configuration_reached_through_a_writable_link_is_refused() {
 }
 
 #[test]
-fn an_unnamed_provider_replacing_an_unnamed_global_one_warns() {
+fn a_workspace_provider_replacing_a_global_one_by_name_is_quiet_and_protect_nix_can_be_disabled() {
     let s = Setup::new();
-    let global = s.write_global_config(&probe_config("").replace("name = \"tools\"\n", ""));
-    s.write_raw_config(&probe_config("").replace("name = \"tools\"\n", ""));
-    let out = output(s.run_probe_command(&[]), b"[]");
-    assert_eq!(code(&out), 0, "{out:?}");
+    s.write_global_config(&probe_config(""));
+    fs::write(s.ws().join("flake.nix"), "# original\n").unwrap();
+
+    // By default, `protect-nix` in `DEFAULT_CONFIG_TOML` protects `*.nix`.
+    let results = s.probe(&[], &[write("/workspace/flake.nix", "# modified\n")]);
+    assert_eq!(errno(&results[0]), "EROFS", "{results:?}");
+
+    // Disabling `protect-nix` in `.stopit.toml` suppresses the global provider
+    // cleanly without warnings and makes `*.nix` writable directly in `main`.
+    s.write_raw_config("[[provider]]\nname = \"protect-nix\"\nenabled = false\n");
+    let results = s.probe(&[], &[write("/workspace/flake.nix", "# modified\n")]);
+    assert_eq!(ok(&results[0]), &Data::Done, "{results:?}");
     assert_eq!(
-        stderr(&out),
-        format!(
-            "stopit: warning: the [[provider]] named \"config\" in .stopit.toml replaces the one \
-             of that name in {global:?}; give one of them another `name` to keep both\n"
-        )
+        fs::read_to_string(s.ws().join("flake.nix")).unwrap(),
+        "# modified\n"
     );
 }
 
@@ -801,8 +816,8 @@ fn a_symlinked_global_configuration_is_protected_at_its_target() {
     fs::remove_file(&global).unwrap();
     symlink(&target, &global).unwrap();
     s.write_raw_config(
-        "[[provider]]\ntype = \"config\"\nname = \"src\"\n[provider.sandbox]\n\
-         fs.rw = [\"~/src\"]\n",
+        "[[provider]]\ntype = \"config\"\nname = \"src\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nfs.rw = [\"~/src\"]\n",
     );
     let results = s.probe(
         &[],
@@ -830,9 +845,10 @@ fn a_relative_global_script_provider_runs_from_the_configuration_directory() {
     let s = Setup::new();
     let dir = s.config_dir();
     let (probe_dir, _) = probe_at_host_path();
-    s.write_global_config(
-        "[[provider]]\ntype = \"script\"\nname = \"tools\"\nsource = \"providers/tools.sh\"\n",
-    );
+    s.write_global_config(&format!(
+        "{}\n[[provider]]\ntype = \"script\"\nname = \"tools\"\nprofile = \"main\"\nsource = \"providers/tools.sh\"\n",
+        stopit::config::DEFAULT_CONFIG_TOML
+    ));
     fs::create_dir(dir.join("providers")).unwrap();
     let script = dir.join("providers/tools.sh");
     fs::write(
@@ -864,8 +880,8 @@ fn the_configuration_directory_is_reserved() {
     let parent = s.config_dir().parent().unwrap().to_owned();
     for rw in [parent.clone(), s.config_dir()] {
         s.write_raw_config(&format!(
-            "[[provider]]\ntype = \"config\"\nname = \"cfg\"\n[provider.sandbox]\n\
-             fs.rw = [\"{}\"]\n",
+            "[[provider]]\ntype = \"config\"\nname = \"cfg\"\nprofile = \"main\"\n\
+             [provider.sandbox]\nfs.rw = [\"{}\"]\n",
             rw.display()
         ));
         let out = output(s.run_probe_command(&[]), b"[]");
@@ -878,8 +894,8 @@ fn the_configuration_directory_is_reserved() {
     }
     // Shown read-only with its parent, it is masked quietly.
     s.write_raw_config(&format!(
-        "[[provider]]\ntype = \"config\"\nname = \"cfg\"\n[provider.sandbox]\n\
-         fs.ro = [\"{}\"]\n",
+        "[[provider]]\ntype = \"config\"\nname = \"cfg\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nfs.ro = [\"{}\"]\n",
         parent.display()
     ));
     let inside = s.config_dir().join("config.toml");
@@ -902,7 +918,7 @@ fn marking_script(script: &Path, marker: &Path) -> String {
     .unwrap();
     fs::set_permissions(script, fs::Permissions::from_mode(0o755)).unwrap();
     format!(
-        "[[provider]]\ntype = \"script\"\nname = \"mark\"\nsource = \"{}\"\n",
+        "[[provider]]\ntype = \"script\"\nname = \"mark\"\nprofile = \"main\"\nsource = \"{}\"\n",
         script.display()
     )
 }
@@ -1113,7 +1129,7 @@ fn a_deleted_allowed_configuration_is_not_replaced_by_the_defaults() {
     // The user's configuration may grant less than the default one: once
     // allowed, its absence is refused until the user says otherwise.
     let s = Setup::with_config("");
-    s.write_global_config(GLOBAL_SEARCH_PATH);
+    s.write_global_config(&global_search_config());
     let config = s.config_path();
     fs::create_dir(s.ws().join("sub")).unwrap();
     fs::remove_file(&config).unwrap();
@@ -1168,7 +1184,7 @@ fn a_link_swapped_in_for_an_allowed_workspace_does_not_run_the_defaults() {
     // workspace away and puts a link to a directory without configuration
     // in its place: discovery resolves the link, and finds none.
     let s = Setup::with_config("");
-    s.write_global_config(GLOBAL_SEARCH_PATH);
+    s.write_global_config(&global_search_config());
     let config = s.config_path();
     let ws = s.ws();
     let elsewhere = s.root.join("elsewhere");
@@ -1261,8 +1277,8 @@ fn a_read_only_grant_containing_the_trust_store_masks_it_silently() {
     let state = s.state_dir().parent().unwrap().to_path_buf();
     fs::create_dir(&state).unwrap();
     s.write_config(&format!(
-        "[[provider]]\ntype = \"config\"\nname = \"state\"\n[provider.sandbox]\n\
-         fs.ro = [{state:?}]"
+        "[[provider]]\ntype = \"config\"\nname = \"state\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nfs.ro = [{state:?}]"
     ));
     assert!(s.store_file().exists());
     let store = s.state_dir();
@@ -1305,7 +1321,7 @@ fn a_script_provider_in_the_workspace_cannot_be_rewritten_by_the_sandbox() {
     fs::write(&path, script).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     s.write_config(
-        "[[provider]]\ntype = \"script\"\nname = \"env\"\nsource = \"scripts/env.sh\"\n",
+        "[[provider]]\ntype = \"script\"\nname = \"env\"\nprofile = \"main\"\nsource = \"scripts/env.sh\"\n",
     );
     let results = s.probe(
         &[],
@@ -1347,7 +1363,7 @@ fn a_script_provider_reached_through_a_workspace_link_is_refused() {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     symlink(s.root.join("real"), s.ws().join("scripts")).unwrap();
     s.write_config(
-        "[[provider]]\ntype = \"script\"\nname = \"env\"\nsource = \"scripts/env.sh\"\n",
+        "[[provider]]\ntype = \"script\"\nname = \"env\"\nprofile = \"main\"\nsource = \"scripts/env.sh\"\n",
     );
     let out = output(s.run_probe_command(&[]), b"[]");
     assert_eq!(code(&out), 125, "{out:?}");
@@ -1395,10 +1411,7 @@ fn the_loaded_configuration_is_protected_without_the_default_base() {
     // No base rule protects it, and the workspace is granted `rw`: the
     // supervisor protects it anyway.
     let s = Setup::new();
-    let config = format!(
-        "base = \"none\"\n{}",
-        probe_config("fs.rw = [\"{workspace}\"]")
-    );
+    let config = probe_isolated("fs.rw = [\"{workspace}\"]");
     s.write_raw_config(&config);
     let results = s.probe(
         &[],
@@ -1427,7 +1440,9 @@ fn a_hard_linked_script_provider_is_refused() {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     // Another name for it, which the sandbox could have written through.
     fs::hard_link(&path, s.ws().join("other.sh")).unwrap();
-    s.write_config("[[provider]]\ntype = \"script\"\nname = \"env\"\nsource = \"env.sh\"\n");
+    s.write_config(
+        "[[provider]]\ntype = \"script\"\nname = \"env\"\nprofile = \"main\"\nsource = \"env.sh\"\n",
+    );
     let out = output(s.run_probe_command(&[]), b"[]");
     assert_eq!(code(&out), 125, "{out:?}");
     let err = stderr(&out);
@@ -1563,10 +1578,7 @@ fn a_writable_grant_containing_the_data_directory_is_refused_and_nothing_runs() 
     // `~` is fine: the data directory is never taken from `HOME`. (The
     // default base's ephemeral `~` would win over it, so without it.)
     let home = s.root.join("home");
-    s.write_raw_config(&format!(
-        "base = \"none\"\n{}",
-        probe_config("fs.rw = [\"~\"]")
-    ));
+    s.write_raw_config(&probe_isolated("fs.rw = [\"~\"]"));
     let results = s.probe(&[], &[write("/home/stopit/file", "x")]);
     assert!(matches!(ok(&results[0]), Data::Done), "{results:?}");
     assert_eq!(fs::read_to_string(home.join("file")).unwrap(), "x");
@@ -1597,8 +1609,8 @@ fn a_read_only_grant_containing_the_runtime_directory_masks_it() {
     let s = Setup::new();
     let runtime = s.runtime();
     s.write_config(&format!(
-        "[[provider]]\ntype = \"config\"\nname = \"run\"\n[provider.sandbox]\n\
-         fs.ro = [{runtime:?}]"
+        "[[provider]]\ntype = \"config\"\nname = \"run\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nfs.ro = [{runtime:?}]"
     ));
     let ops = [list(&runtime), list(runtime.join("stopit"))];
     let command = s.run_probe_command(&[]);
@@ -1631,7 +1643,7 @@ fn a_warning_is_printed_once_and_base_missing_paths_not_at_all() {
     // which warns about nothing when it matches nothing.
     let missing = s.root.join("missing\x1bc\x07");
     s.write_config(&format!(
-        "fs.rw = [\"{}\"]\n[profiles.other]\n",
+        "fs.rw = [\"{}\"]\n[profiles.other]\ninherit = \"main\"\n",
         missing
             .to_str()
             .unwrap()
@@ -2040,8 +2052,8 @@ fn shell_config() -> Option<String> {
     .map(|d| format!("{d:?}"))
     .collect();
     Some(format!(
-        "[[provider]]\ntype = \"config\"\nname = \"sh\"\n[provider.sandbox]\n\
-         fs.ro = [{}]\nenv.path_prepend = [\"/usr/bin\", \"/bin\"]\n\
+        "[[provider]]\ntype = \"config\"\nname = \"sh\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nfs.ro = [{}]\nenv.path_prepend = [\"/usr/bin\", \"/bin\"]\n\
          env.set = {{ PS1 = \"sandbox$ \" }}\n",
         dirs.join(", ")
     ))
@@ -2534,8 +2546,8 @@ fn shell_runs_the_hosts_shell() {
     let extra = match &loader {
         None => String::new(),
         Some(loader) => format!(
-            "[[provider]]\ntype = \"config\"\nname = \"loader\"\n[provider.sandbox]\n\
-             fs.ro = [\"{}\"]\nenv.set = {{ LD_LIBRARY_PATH = \"{}\" }}\n",
+            "[[provider]]\ntype = \"config\"\nname = \"loader\"\nprofile = \"main\"\n\
+             [provider.sandbox]\nfs.ro = [\"{}\"]\nenv.set = {{ LD_LIBRARY_PATH = \"{}\" }}\n",
             loader.to_str().unwrap(),
             probe_dir.join("lib").to_str().unwrap()
         ),
@@ -2555,8 +2567,8 @@ fn shell_runs_the_hosts_shell() {
 #[test]
 fn bwrap_setup_failure_exits_125_while_target_failure_keeps_its_code() {
     let s = Setup::with_config(
-        "[[provider]]\ntype = \"config\"\nname = \"bad_mount\"\n[provider.sandbox]\n\
-         fs.ephemeral = [\"{workspace}/not_a_dir/sub\"]\n",
+        "[[provider]]\ntype = \"config\"\nname = \"bad_mount\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nfs.ephemeral = [\"{workspace}/not_a_dir/sub\"]\n",
     );
     fs::write(s.ws().join("not_a_dir"), "regular file").unwrap();
 
@@ -2605,7 +2617,7 @@ fn signal_during_script_provider_kills_its_process_group_and_cleans_up() {
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
 
         s.write_config(&format!(
-            "[[provider]]\ntype = \"script\"\nsource = \"{}\"\n",
+            "[[provider]]\ntype = \"script\"\nname = \"slow\"\nprofile = \"main\"\nsource = \"{}\"\n",
             script.display()
         ));
 
@@ -2999,7 +3011,8 @@ fn a_server_compiles_every_run_against_the_filesystem_as_it_is() {
 fn a_sandbox_cannot_reach_the_servers_control_socket() {
     let s = Setup::new();
     let config = probe_config(&format!(
-        "[[provider]]\ntype = \"config\"\nname = \"rt\"\n[provider.sandbox]\nfs.ro = [{:?}]\n",
+        "[[provider]]\ntype = \"config\"\nname = \"rt\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nfs.ro = [{:?}]\n",
         s.runtime()
     ));
     s.write_raw_config(&config);
@@ -3489,8 +3502,8 @@ fn a_shared_network_namespace_keeps_the_hosts_resolver() {
     // No pasta needed: the sandbox is in the host's network namespace.
     let s = Setup::with_config(&format!(
         "{config}network.mode = \"full\"\nsandbox.share = [\"net\"]\n\
-         [[provider]]\ntype = \"config\"\nname = \"dns\"\n[provider.sandbox]\n\
-         fs.ro = [\"/etc/resolv.conf\"]\n"
+         [[provider]]\ntype = \"config\"\nname = \"dns\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nfs.ro = [\"/etc/resolv.conf\"]\n"
     ));
     let out = output(
         s.stopit(&["run", "--quiet", "/bin/sh", "-c", "cat /etc/resolv.conf"]),
@@ -3749,8 +3762,8 @@ fn proxy_mode_reaches_allowed_sites_where_the_host_does() {
         .map(|d| format!("{d:?}"))
         .collect();
     let s = Setup::with_config(&format!(
-        "{config}[[provider]]\ntype = \"config\"\nname = \"certs\"\n[provider.sandbox]\n\
-         fs.ro = [{}]\n",
+        "{config}[[provider]]\ntype = \"config\"\nname = \"certs\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nfs.ro = [{}]\n",
         certs.join(", ")
     ));
     let script = format!(
@@ -3795,10 +3808,10 @@ fn an_attached_run_gets_the_proxy_and_the_server_logs_refusals() {
 fn harness_config() -> Option<String> {
     let config = shell_config()?;
     Some(format!(
-        "{config}[[provider]]\ntype = \"config\"\nname = \"which\"\n\
+        "{config}[[provider]]\ntype = \"config\"\nname = \"which\"\nprofile = \"main\"\n\
          [provider.sandbox]\nenv.set = {{ WHICH = \"main\" }}\n\
          shims.cat = {{ cmd = \"cat\", default = {{ decision = \"allow\", profile = \"main\" }} }}\n\
-         [profiles.harness]\n\
+         [profiles.harness]\ninherit = \"main\"\n\
          [[provider]]\ntype = \"config\"\nname = \"harness\"\nprofile = \"harness\"\n\
          [provider.sandbox]\nenv.set = {{ WHICH = \"harness\" }}\n\
          shims.sh-main = {{ cmd = \"sh\", default = {{ decision = \"allow\", profile = \"main\" }} }}\n\
@@ -3852,7 +3865,7 @@ fn shims_calling_shims_stop_four_deep() {
         return;
     };
     let s = Setup::with_config(&format!(
-        "{config}[[provider]]\ntype = \"config\"\nname = \"deep\"\n\
+        "{config}[[provider]]\ntype = \"config\"\nname = \"deep\"\nprofile = \"main\"\n\
          [provider.sandbox]\n\
          shims.deep = {{ cmd = \"sh\", default = {{ decision = \"allow\", profile = \"main\" }} }}\n"
     ));
@@ -3884,8 +3897,8 @@ fn a_profile_without_shims_or_grants_sees_an_empty_bin() {
         return;
     };
     let s = Setup::with_config(&format!(
-        "{config}[[provider]]\ntype = \"config\"\nname = \"nogrant\"\n[provider.sandbox]\n\
-         sandbox.grant = false\n"
+        "{config}[[provider]]\ntype = \"config\"\nname = \"nogrant\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nsandbox.grant = false\n"
     ));
     let out = output(
         s.stopit(&[
@@ -4295,10 +4308,10 @@ fn grants_the_host_refuses_say_why_only_on_the_server_terminal() {
     // through cargo.
     s.write_config(&format!(
         "{config}[approval]\ntimeout = \"20s\"\n\
-         [[provider]]\ntype = \"config\"\nname = \"mask\"\n[provider.sandbox]\n\
+         [[provider]]\ntype = \"config\"\nname = \"mask\"\nprofile = \"main\"\n[provider.sandbox]\n\
          fs.ro = [\"{x}\", \"{rw}/keep\"]\nfs.masked = [\"{x}/hidden\"]\nfs.rw = [\"{rw}\"]\n\
          fs.ephemeral = [\"{rw}/scratch\"]\n\
-         [profiles.publish]\n\
+         [profiles.publish]\ninherit = \"main\"\n\
          [[provider]]\ntype = \"config\"\nname = \"pub\"\nprofile = \"publish\"\n\
          [provider.sandbox]\nfs.ro = [\"{cfg}/f\", \"{cargo}\"]\n\
          fs.bind = [{{ host = \"{tok}\", sandbox = \"{cargo}/registry/tok\", mode = \"ro\" }}]\n\
@@ -4459,7 +4472,7 @@ fn a_refused_grant_leaves_later_runs_alone() {
     // A rule through a link, as home-manager makes them.
     s.write_config(&format!(
         "{config}[approval]\ntimeout = \"20s\"\n\
-         [[provider]]\ntype = \"config\"\nname = \"hm\"\n[provider.sandbox]\n\
+         [[provider]]\ntype = \"config\"\nname = \"hm\"\nprofile = \"main\"\n[provider.sandbox]\n\
          fs.ro = [\"{}/cfg/nvim\"]\n",
         root.display()
     ));
@@ -4658,8 +4671,8 @@ fn a_sandbox_sharing_the_host_network_gets_no_network_grant() {
         return;
     };
     let s = Setup::with_config(&format!(
-        "{config}[[provider]]\ntype = \"config\"\nname = \"net\"\n[provider.sandbox]\n\
-         sandbox.share = [\"net\"]\n"
+        "{config}[[provider]]\ntype = \"config\"\nname = \"net\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nsandbox.share = [\"net\"]\n"
     ));
     for grant in ["+net:crates.io", "+net:full"] {
         let out = output(
@@ -4692,8 +4705,8 @@ fn a_network_grant_puts_the_command_behind_the_proxy() {
     // once the grant turns it on, so the prompt lists them too.
     let s = Setup::with_config(&format!(
         "{config}[approval]\ntimeout = \"20s\"\n\
-         [[provider]]\ntype = \"config\"\nname = \"net\"\n[provider.sandbox]\n\
-         network.allow_domains = [\"example.org\"]\n"
+         [[provider]]\ntype = \"config\"\nname = \"net\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nnetwork.allow_domains = [\"example.org\"]\n"
     ));
     let server = Server::start_on_terminal(&s, &server_master, server_slave);
     let script = "echo \"before [${HTTPS_PROXY:-}]\"; \
@@ -4767,8 +4780,8 @@ fn sandbox_grant_false_leaves_no_stopit_grant() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "stopit-grant\n");
     let s = Setup::with_config(&format!(
-        "{config}[[provider]]\ntype = \"config\"\nname = \"off\"\n[provider.sandbox]\n\
-         sandbox.grant = false\n"
+        "{config}[[provider]]\ntype = \"config\"\nname = \"off\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nsandbox.grant = false\n"
     ));
     let out = output(
         s.stopit(&[
@@ -4843,8 +4856,8 @@ fn a_tty_shim_gets_its_own_pty_resizes_and_restores_modes() {
     };
     rustix::termios::tcsetwinsize(&slave, size(24, 80)).unwrap();
     let s = Setup::with_config(&format!(
-        "{config}[profiles.tui]\n\
-         [[provider]]\ntype = \"config\"\nname = \"tui-shim\"\n[provider.sandbox]\n\
+        "{config}[profiles.tui]\ninherit = \"main\"\n\
+         [[provider]]\ntype = \"config\"\nname = \"tui-shim\"\nprofile = \"main\"\n[provider.sandbox]\n\
          shims.tui = {{ cmd = \"sh\", tty = true, default = {{ decision = \"allow\", profile = \"tui\" }} }}\n\
          shims.plain = {{ cmd = \"sh\", default = {{ decision = \"allow\", profile = \"main\" }} }}\n\
          [[provider]]\ntype = \"config\"\nname = \"tui-env\"\nprofile = \"tui\"\n[provider.sandbox]\n\
@@ -4940,8 +4953,8 @@ fn a_tty_shim_asking_approval_survives_a_window_resize() {
     };
     rustix::termios::tcsetwinsize(&client_slave, size(24, 80)).unwrap();
     let s = Setup::with_config(&format!(
-        "{config}[approval]\ntimeout = \"20s\"\n[profiles.tui]\n\
-         [[provider]]\ntype = \"config\"\nname = \"tui-shim\"\n[provider.sandbox]\n\
+        "{config}[approval]\ntimeout = \"20s\"\n[profiles.tui]\ninherit = \"main\"\n\
+         [[provider]]\ntype = \"config\"\nname = \"tui-shim\"\nprofile = \"main\"\n[provider.sandbox]\n\
          shims.ask-tui = {{ cmd = \"sh\", tty = true, default = {{ decision = \"ask\", profile = \"tui\" }} }}\n"
     ));
     let server = Server::start_on_terminal(&s, &server_master, server_slave);
@@ -4976,8 +4989,8 @@ fn ctrl_z_during_tty_shim_approval_keeps_the_shell_usable() {
         return;
     };
     let s = Setup::with_config(&format!(
-        "{config}[approval]\ntimeout = \"20s\"\n[profiles.tui]\n\
-         [[provider]]\ntype = \"config\"\nname = \"tui-shim\"\n[provider.sandbox]\n\
+        "{config}[approval]\ntimeout = \"20s\"\n[profiles.tui]\ninherit = \"main\"\n\
+         [[provider]]\ntype = \"config\"\nname = \"tui-shim\"\nprofile = \"main\"\n[provider.sandbox]\n\
          shims.ask-tui = {{ cmd = \"sh\", tty = true, default = {{ decision = \"ask\", profile = \"tui\" }} }}\n"
     ));
     let server = Server::start_on_terminal(&s, &server_master, server_slave);
@@ -5038,8 +5051,8 @@ fn dev_tty_passed_to_the_broker_never_reaches_the_servers_terminal() {
         return;
     };
     let s = Setup::with_config(&format!(
-        "{config}[profiles.tui]\n\
-         [[provider]]\ntype = \"config\"\nname = \"tui-shim\"\n[provider.sandbox]\n\
+        "{config}[profiles.tui]\ninherit = \"main\"\n\
+         [[provider]]\ntype = \"config\"\nname = \"tui-shim\"\nprofile = \"main\"\n[provider.sandbox]\n\
          shims.tui = {{ cmd = \"sh\", tty = true, default = {{ decision = \"allow\", profile = \"tui\" }} }}\n\
          shims.nope = {{ cmd = \"sh\", default = {{ decision = \"deny\" }} }}\n"
     ));
@@ -5238,8 +5251,8 @@ fn extra_group_names_reach_the_group_file() {
         return;
     };
     let s = Setup::with_config(&format!(
-        "{config}[[provider]]\ntype = \"config\"\nname = \"groups\"\n[provider.sandbox]\n\
-         system.groups = [\"nobody\", \"audio\"]\n"
+        "{config}[[provider]]\ntype = \"config\"\nname = \"groups\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nsystem.groups = [\"nobody\", \"audio\"]\n"
     ));
     let out = output(
         s.stopit(&[
@@ -5270,8 +5283,8 @@ fn the_vcs_profiles_have_a_home_main_cannot_write() {
     // A shim of the test's own into vcs.local, to look around there, and a
     // grant of `~/.config` in main.
     let s = Setup::with_config(&format!(
-        "{config}[[provider]]\ntype = \"config\"\nname = \"look\"\n[provider.sandbox]\n\
-         fs.rw = [\"~/.config\"]\n\
+        "{config}[[provider]]\ntype = \"config\"\nname = \"look\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nfs.rw = [\"~/.config\"]\n\
          shims.in-vcs = {{ cmd = \"sh\", default = {{ decision = \"allow\", profile = \"vcs.local\" }} }}\n"
     ));
     let host_config = s.root.join("home/.config");
@@ -5310,7 +5323,8 @@ fn vcs_remote_mounts_ssh_agent_and_known_hosts_read_only_while_main_sees_neither
         return;
     }
     let s = Setup::with_config(&format!(
-        "{config}[[provider]]\ntype = \"config\"\nname = \"look\"\n[provider.sandbox]\n\
+        "{config}[[provider]]\ntype = \"config\"\nname = \"look\"\nprofile = \"main\"\n\
+         [provider.sandbox]\n\
          shims.in-remote = {{ cmd = \"sh\", default = {{ decision = \"allow\", profile = \"vcs.remote\" }} }}\n"
     ));
     let host_ssh = s.root.join("home/.ssh");
@@ -5377,8 +5391,8 @@ fn jj_runs_through_the_broker_while_main_sees_no_metadata() {
     // Some builds of jj read the CPU count from `/sys` and look up a group
     // named `nobody`.
     let s = Setup::with_config(&format!(
-        "{config}[[provider]]\ntype = \"config\"\nname = \"cpus\"\n[provider.sandbox]\n\
-         fs.ro = [\"/sys/devices/system/cpu\"]\nsystem.groups = [\"nobody\"]\n"
+        "{config}[[provider]]\ntype = \"config\"\nname = \"cpus\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nfs.ro = [\"/sys/devices/system/cpu\"]\nsystem.groups = [\"nobody\"]\n"
     ));
     // jj must run in a sandbox at all. Outside a repository, `jj root`
     // exits with 1.
@@ -5693,11 +5707,12 @@ fn workspace_mount_host_places_workspace_under_ephemeral_home_and_expands_shim_a
     fs::write(ws.join("a.txt"), "hello\n").unwrap();
 
     s.write_global_config(&format!(
-        "[workspace]\nmount = \"host\"\n{config}\
-         [[provider]]\ntype = \"config\"\nname = \"home-and-shims\"\n[provider.sandbox]\n\
-         system.home = {:?}\n\
+        "{}\n[workspace]\nmount = \"host\"\n{config}\
+         [[provider]]\ntype = \"config\"\nname = \"home-and-shims\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nsystem.home = {:?}\n\
          shims.echo-ws = {{ cmd = [\"sh\", \"-c\", \"printf '%s|%s\\\\n' \\\"$1\\\" \\\"$2\\\"\", \"sh\", \"{{workspace}}\", \"{{workspace}}/a.txt\"], default = {{ decision = \"allow\", profile = \"main\" }} }}\n\
          shims.ask-ws = {{ cmd = [\"sh\", \"-c\", \"printf 'asked:%s\\\\n' \\\"$1\\\"\", \"sh\", \"{{workspace}}/sub\"], default = {{ decision = \"ask\", profile = \"main\" }} }}\n",
+        stopit::config::DEFAULT_CONFIG_TOML,
         home.to_str().unwrap()
     ));
 
@@ -5787,7 +5802,10 @@ fn workspace_mount_host_with_default_home_and_stopit_grant() {
     fs::write(home.join("note.txt"), "granted-note\n").unwrap();
     fs::write(ws.join("a.txt"), "in-ws\n").unwrap();
 
-    s.write_global_config(&format!("[workspace]\nmount = \"host\"\n{config}"));
+    s.write_global_config(&format!(
+        "{}\n[workspace]\nmount = \"host\"\n{config}",
+        stopit::config::DEFAULT_CONFIG_TOML
+    ));
 
     let ws_arg = ws.to_str().unwrap();
     let mut server_cmd = s.stopit(&["server", "--workspace", ws_arg]);
@@ -5858,9 +5876,10 @@ fn workspace_mount_host_at_home_itself_is_refused() {
     let home = s.root.join("home");
     fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
     s.write_global_config(&format!(
-        "[workspace]\nmount = \"host\"\n{config}\
-         [[provider]]\ntype = \"config\"\nname = \"same-home\"\n[provider.sandbox]\n\
-         system.home = {:?}\n",
+        "{}\n[workspace]\nmount = \"host\"\n{config}\
+         [[provider]]\ntype = \"config\"\nname = \"same-home\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nsystem.home = {:?}\n",
+        stopit::config::DEFAULT_CONFIG_TOML,
         home.to_str().unwrap()
     ));
     let out = output(
@@ -5882,7 +5901,10 @@ fn workspace_mount_host_at_home_itself_is_refused() {
     // With default `system.home` (`/home/stopit`), `--workspace /tmp` is refused
     // by `check_reserved_paths`, and `--workspace <s.root>` is refused because
     // the writable workspace would contain stopit's config/state directories.
-    s.write_global_config(&format!("[workspace]\nmount = \"host\"\n{config}"));
+    s.write_global_config(&format!(
+        "{}\n[workspace]\nmount = \"host\"\n{config}",
+        stopit::config::DEFAULT_CONFIG_TOML
+    ));
     let out_tmp = output(
         s.stopit(&[
             "run",
@@ -5941,8 +5963,8 @@ fn server_reloads_configuration_on_r_key_and_keeps_ephemeral_state() {
     // immediate "reloading configuration..." feedback.
     s.write_config(&format!(
         "{config}\
-         [[provider]]\ntype = \"config\"\nname = \"extra\"\n[provider.sandbox]\n\
-         env.set = {{ RELOADED = \"yes\" }}\n"
+         [[provider]]\ntype = \"config\"\nname = \"extra\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nenv.set = {{ RELOADED = \"yes\" }}\n"
     ));
     server.log.lock().unwrap().clear();
     (&server_master).write_all(b"rrrr").unwrap();
@@ -6001,7 +6023,8 @@ fn persisting_approvals_updates_stopit_toml_allows_it_and_reloads_live_session()
     };
     let s = Setup::with_config(&format!(
         "{config}[terminal]\nclipboard_write = \"ask\"\n[approval]\ntimeout = \"20s\"\n\
-         [[provider]]\ntype = \"config\"\nname = \"ask-echo\"\n[provider.sandbox]\n\
+         [[provider]]\ntype = \"config\"\nname = \"ask-echo\"\nprofile = \"main\"\n\
+         [provider.sandbox]\n\
          shims.myecho = {{ cmd = \"echo\", default = {{ decision = \"ask\", profile = \"main\" }}, rules = [\
            {{ prefix = \"hello\", decision = \"ask\", profile = \"main\" }}\
          ] }}\n"
@@ -6102,8 +6125,8 @@ fn proxy_shims_protect_their_script_and_support_named_inline_and_deny_decisions(
     fs::set_permissions(&proxy_path, fs::Permissions::from_mode(0o755)).unwrap();
 
     s.write_config(&format!(
-        "{config}[[provider]]\ntype = \"config\"\nname = \"proxy-test\"\n[provider.sandbox]\n\
-         shims.pcli = {{ proxy = \"./my-proxy.sh\" }}\n"
+        "{config}[[provider]]\ntype = \"config\"\nname = \"proxy-test\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nshims.pcli = {{ proxy = \"./my-proxy.sh\" }}\n"
     ));
 
     let script = "echo tampered >> /workspace/my-proxy.sh 2>/dev/null && echo wrote-proxy || echo proxy-protected; \
@@ -6233,18 +6256,26 @@ fi
             .unwrap_or(0)
     };
 
-    // Configure `[[provider]] type = "nix"` in the global config alone.
-    s.write_global_config("[[provider]]\ntype = \"nix\"\n");
+    // Configure `[[provider]] type = "nix"` in the global config over `DEFAULT_CONFIG_TOML`.
+    s.write_global_config(&format!(
+        "{}\n[[provider]]\ntype = \"nix\"\nname = \"nix\"\nprofile = \"main\"\n",
+        stopit::config::DEFAULT_CONFIG_TOML
+    ));
 
-    // 1. Without `flake.nix` or `shell.nix`, the nix provider is a no-op, so `base = "default"`
-    // reports that no tools were configured.
-    let no_flake_out = output(make_cmd(), b"[]");
-    assert_ne!(code(&no_flake_out), 0, "{no_flake_out:?}");
-    assert!(
-        stderr(&no_flake_out).contains("no tools"),
-        "{}",
-        stderr(&no_flake_out)
+    // 1. Without `flake.nix` or `shell.nix`, the nix provider is a no-op (0 `nix`
+    // calls) and grants neither `NIX_DEV_VAR` nor the store `PATH`.
+    let no_flake_ops = [Op::Env];
+    let no_flake_input = serde_json::to_vec(&no_flake_ops).unwrap();
+    let no_flake_out = output(make_cmd(), &no_flake_input);
+    let no_flake_results = probe_results("nix run 0", &no_flake_out, &no_flake_ops);
+    let Data::Env(no_flake_env) = ok(&no_flake_results[0]) else {
+        panic!("expected env map");
+    };
+    assert_eq!(
+        no_flake_env.get("PATH").map(String::as_str),
+        Some("/run/stopit/bin")
     );
+    assert!(!no_flake_env.contains_key("NIX_DEV_VAR"));
     assert_eq!(calls(), 0);
 
     // 2. Add `flake.nix` and `flake.lock` (without needing `stopit allow`).
@@ -6296,8 +6327,10 @@ fi
     }
 
     // 4. Overriding `shell = "agent"` in `.stopit.toml` replaces the global `nix` provider cleanly
-    // without an unnamed-replacement warning and passes `#agent` to `nix print-dev-env`.
-    s.write_raw_config("[[provider]]\ntype = \"nix\"\nshell = \"agent\"\n");
+    // without any warning and passes `#agent` to `nix print-dev-env`.
+    s.write_raw_config(
+        "[[provider]]\ntype = \"nix\"\nname = \"nix\"\nprofile = \"main\"\nshell = \"agent\"\n",
+    );
     let run3 = output(make_cmd(), b"[]");
     let _ = probe_results("nix run 3", &run3, &[]);
     assert!(
@@ -6338,7 +6371,9 @@ fn signal_during_nix_provider_kills_its_process_group_and_exits_cleanly() {
     .unwrap();
     fs::set_permissions(&nix_bin, fs::Permissions::from_mode(0o755)).unwrap();
 
-    s.write_config("[[provider]]\ntype = \"nix\"\ncache = false\n");
+    s.write_config(
+        "[[provider]]\ntype = \"nix\"\nname = \"nix\"\nprofile = \"main\"\ncache = false\n",
+    );
 
     let host_path = std::env::var_os("PATH").unwrap_or_default();
     let mut path_with_nix = OsString::from(&nix_bin_dir);
@@ -6378,4 +6413,66 @@ fn signal_during_nix_provider_kills_its_process_group_and_exits_cleanly() {
     for pid in pids {
         wait_gone(pid);
     }
+}
+
+#[test]
+fn workspace_can_disable_protect_nix_or_override_nix_files_in_main() {
+    let s = Setup::new();
+    let (probe_dir, _) = probe_at_host_path();
+    s.write_global_config(&format!(
+        "{}\n[[provider]]\ntype = \"config\"\nname = \"tools\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nfs.ro = [\"{}\"]\n",
+        stopit::config::DEFAULT_CONFIG_TOML,
+        probe_dir.to_str().unwrap()
+    ));
+    fs::write(s.ws().join("configuration.nix"), "{ }").unwrap();
+    fs::write(s.ws().join("flake.lock"), "{}").unwrap();
+
+    // 1. Default global config protects `*.nix` and `flake.lock` in `main`.
+    let r = s.probe(
+        &[],
+        &[
+            write("/workspace/configuration.nix", "edited"),
+            write("/workspace/flake.lock", "edited"),
+        ],
+    );
+    assert_eq!(errno(&r[0]), "EROFS", "{r:?}");
+    assert_eq!(errno(&r[1]), "EROFS", "{r:?}");
+
+    // 2. Disabling `protect-nix` in `.stopit.toml` leaves `main` free to edit both.
+    s.write_raw_config("[[provider]]\nname = \"protect-nix\"\nenabled = false\n");
+    let r = s.probe(
+        &[],
+        &[
+            write("/workspace/configuration.nix", "by-disable"),
+            write("/workspace/flake.lock", "by-disable"),
+        ],
+    );
+    ok(&r[0]);
+    ok(&r[1]);
+    assert_eq!(
+        fs::read_to_string(s.ws().join("configuration.nix")).unwrap(),
+        "by-disable"
+    );
+
+    // 3. Alternatively, keeping `protect-nix` enabled and overriding `fs.rw` in a
+    // workspace provider wins over the global `fs.ro` at equal specificity.
+    s.write_raw_config(
+        "[[provider]]\ntype = \"config\"\nname = \"allow-nix\"\nprofile = \"main\"\n\
+         [provider.sandbox]\nfs.rw = [\"{workspace}/**/*.nix\", \"{workspace}/flake.lock\"]\n",
+    );
+    let r = s.probe(
+        &[],
+        &[
+            write("/workspace/configuration.nix", "by-override"),
+            write("/workspace/flake.lock", "by-override"),
+        ],
+    );
+    ok(&r[0]);
+    ok(&r[1]);
+    assert_eq!(
+        fs::read_to_string(s.ws().join("configuration.nix")).unwrap(),
+        "by-override"
+    );
+    assert!(s.no_session_left());
 }

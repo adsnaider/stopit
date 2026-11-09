@@ -1,9 +1,10 @@
 //! Session-wide top-level configuration settings (DESIGN.md §3.1).
 //!
-//! Only the settings that are not grants live here: `base`, `[workspace]`,
-//! `[limits]`, `[approval]` and `[terminal]`, plus the structure of
-//! `[profiles.<name>]` declarations and the syntax of `[[provider]]` entries.
-//! Providers are only parsed and validated here, never run or merged.
+//! Only the settings that are not grants live here: `default_profile`,
+//! `inherit_global`, `[workspace]`, `[limits]`, `[approval]` and `[terminal]`,
+//! plus the structure of `[profiles.<name>]` declarations and the syntax of
+//! `[[provider]]` entries. Providers are only parsed and validated here, never
+//! run or merged.
 //!
 //! This is security configuration, so every table rejects unknown keys:
 //! a typo must fail loudly instead of silently falling back to a default.
@@ -13,11 +14,11 @@ mod provider;
 
 pub use profile::{Inherit, ProfileDecl, ProfileName, ProfileRef};
 pub use provider::{
-    NixShell, NixSource, ProviderEntry, ProviderKind, ProviderName, ScriptSource, VcsTool, VcsView,
+    NixShell, NixSource, ProviderEntry, ProviderKind, ProviderName, ScriptSource, VcsView,
 };
 
-#[cfg(test)]
-pub(crate) use provider::APPENDIX_A_WITHOUT_VCS;
+/// Embedded TOML template printed by `stopit default-config`.
+pub const DEFAULT_CONFIG_TOML: &str = include_str!("../default_config.toml");
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::{IntErrorKind, NonZeroU32};
@@ -39,6 +40,9 @@ pub enum ConfigError {
     /// underlying message includes the line and column.
     #[error("invalid configuration: {0}")]
     Toml(#[from] toml::de::Error),
+    /// A workspace-only setting was used in the user-global configuration.
+    #[error("invalid configuration: {0}")]
+    GlobalOnly(&'static str),
 }
 
 /// Layer that declared a provider, ordered from lowest to highest precedence.
@@ -47,8 +51,6 @@ pub enum ConfigError {
 /// never gets the highest precedence by accident.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ProviderOrigin {
-    /// Built-in provider supplied by `base = "default"`.
-    Builtin,
     /// Provider declared in `<config_dir>/config.toml`.
     Global,
     /// Provider declared in workspace `.stopit.toml`.
@@ -63,8 +65,10 @@ pub enum ProviderOrigin {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(try_from = "MapOnly<RawConfig>")]
 pub struct ConfigLayer {
-    /// Explicit `base`, if written.
-    pub base: Option<Base>,
+    /// Explicit `default_profile`, if written.
+    pub default_profile: Option<ProfileRef>,
+    /// Explicit `inherit_global`, if written (workspace `.stopit.toml` only).
+    pub inherit_global: Option<bool>,
     /// Explicit `workspace.mount`, if written.
     pub workspace_mount: Option<WorkspaceMount>,
     /// Explicit `[limits]` values.
@@ -75,8 +79,7 @@ pub struct ConfigLayer {
     pub terminal_clipboard_write: Option<ClipboardWrite>,
     /// User-declared profiles in this file.
     pub profiles: BTreeMap<ProfileName, ProfileDecl>,
-    /// `[[provider]]` entries in file order, unique by effective name within
-    /// this file.
+    /// `[[provider]]` entries in file order, unique by `name` within this file.
     pub providers: Vec<ProviderEntry>,
 }
 
@@ -88,7 +91,7 @@ pub struct LayeredProviderEntry {
     pub origin: ProviderOrigin,
     /// Directory of the declaring configuration file, used to resolve relative
     /// `script` provider `source` paths (and set their working directory),
-    /// `config` proxy shim paths, and relative `nix` `file` or `flake` paths.
+    /// proxy shim paths, and relative `nix` `file` or `flake` paths.
     pub base_dir: PathBuf,
     /// Parsed provider entry.
     pub entry: ProviderEntry,
@@ -109,16 +112,20 @@ pub struct LayeredConfig {
 
 /// The session-wide top-level settings (DESIGN.md §3.1).
 ///
-/// Every field has the default given in the design, so an empty document is
-/// valid.
+/// Every field has a default, so an empty document is valid and defines no
+/// profiles or providers.
 ///
 /// Not `Eq`: script providers carry free-form TOML values, which may be
 /// floats.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(try_from = "MapOnly<RawConfig>")]
 pub struct Config {
-    /// Starting set of built-in providers (§3.2).
-    pub base: Base,
+    /// Profile used by `stopit run` and `stopit shell` when `--profile` is
+    /// omitted.
+    pub default_profile: Option<ProfileRef>,
+    /// Whether workspace configuration layers over user-global `config.toml`
+    /// (default `true`).
+    pub inherit_global: bool,
     /// Workspace identity and mount point.
     pub workspace: WorkspaceSettings,
     /// Resource limits (§10).
@@ -127,18 +134,33 @@ pub struct Config {
     pub approval: Approval,
     /// Terminal settings (§5).
     pub terminal: Terminal,
-    /// User-declared profiles (§3.3). `main` is implicit and cannot be
-    /// declared.
+    /// User-declared profiles (§3.3).
     pub profiles: BTreeMap<ProfileName, ProfileDecl>,
-    /// `[[provider]]` entries in file order. Effective names are unique.
+    /// `[[provider]]` entries in file order. Names are unique.
     pub providers: Vec<ProviderEntry>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            default_profile: None,
+            inherit_global: true,
+            workspace: WorkspaceSettings::default(),
+            limits: Limits::default(),
+            approval: Approval::default(),
+            terminal: Terminal::default(),
+            profiles: BTreeMap::new(),
+            providers: Vec::new(),
+        }
+    }
 }
 
 /// Deserialization shape of [`ConfigLayer`] and [`Config`]; see [`MapOnly`].
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct RawConfig {
-    base: Option<Base>,
+    default_profile: Option<ProfileRef>,
+    inherit_global: Option<bool>,
     workspace: MapOnly<RawWorkspaceSettings>,
     limits: Limits,
     approval: MapOnly<RawApproval>,
@@ -156,8 +178,7 @@ impl TryFrom<MapOnly<RawConfig>> for ConfigLayer {
             if let Some(first) = seen.insert(p.name.as_str(), i) {
                 return Err(ValueError::new(format!(
                     "duplicate provider name {:?} ([[provider]] entries {} and {}): \
-                     provider names must be unique (the default name is the type); \
-                     set `name` on each entry",
+                     provider names must be unique",
                     p.name.as_str(),
                     first + 1,
                     i + 1
@@ -165,7 +186,8 @@ impl TryFrom<MapOnly<RawConfig>> for ConfigLayer {
             }
         }
         Ok(ConfigLayer {
-            base: raw.base,
+            default_profile: raw.default_profile,
+            inherit_global: raw.inherit_global,
             workspace_mount: raw.workspace.0.mount,
             limits: raw.limits,
             approval_timeout: raw.approval.0.timeout,
@@ -190,15 +212,28 @@ impl ConfigLayer {
         Ok(toml::from_str(s)?)
     }
 
-    /// Returns true when this document explicitly sets `base = "none"`.
-    pub fn sets_base_none(&self) -> bool {
-        self.base == Some(Base::None)
+    /// Parses the user-global `config.toml`, rejecting workspace-only settings
+    /// (`inherit_global`).
+    pub fn from_global_toml_str(s: &str) -> Result<ConfigLayer, ConfigError> {
+        let layer = Self::from_toml_str(s)?;
+        if layer.inherit_global.is_some() {
+            return Err(ConfigError::GlobalOnly(
+                "`inherit_global` is only valid in workspace `.stopit.toml`, not in global `config.toml`",
+            ));
+        }
+        Ok(layer)
+    }
+
+    /// Returns true when this document explicitly sets `inherit_global = false`.
+    pub fn ignores_global(&self) -> bool {
+        self.inherit_global == Some(false)
     }
 
     /// Resolves this layer alone against built-in defaults.
     pub fn into_config(self) -> Config {
         Config {
-            base: self.base.unwrap_or_default(),
+            default_profile: self.default_profile,
+            inherit_global: self.inherit_global.unwrap_or(true),
             workspace: WorkspaceSettings {
                 mount: self.workspace_mount.unwrap_or_default(),
             },
@@ -217,17 +252,17 @@ impl ConfigLayer {
     /// Layers optional global configuration under optional project
     /// configuration.
     ///
-    /// When `project` explicitly sets `base = "none"`, `global` is ignored
-    /// completely. Otherwise `project` fields override `global` fields where
-    /// explicitly set, `[profiles.<name>]` declarations in `project` override
-    /// matching names in `global`, and `[[provider]]` entries in `project`
-    /// replace matching `ProviderName` entries from `global`.
+    /// When `project` explicitly sets `inherit_global = false`, `global` is
+    /// ignored completely. Otherwise `project` fields override `global` fields
+    /// where explicitly set, `[profiles.<name>]` declarations in `project`
+    /// override matching names in `global`, and `[[provider]]` entries in
+    /// `project` replace matching `ProviderName` entries from `global`.
     pub fn layer(
         global: Option<(ConfigLayer, &Path)>,
         project: Option<(ConfigLayer, &Path)>,
     ) -> LayeredConfig {
         if let Some((proj, proj_dir)) = project {
-            if proj.sets_base_none() {
+            if proj.ignores_global() {
                 let providers = proj
                     .providers
                     .iter()
@@ -262,7 +297,8 @@ impl ConfigLayer {
             None => (ConfigLayer::default(), None),
         };
 
-        let base = p_layer.base.or(g_layer.base).unwrap_or_default();
+        let default_profile = p_layer.default_profile.or(g_layer.default_profile);
+        let inherit_global = p_layer.inherit_global.unwrap_or(true);
         let workspace = WorkspaceSettings {
             mount: p_layer
                 .workspace_mount
@@ -299,12 +335,10 @@ impl ConfigLayer {
         let mut layered_providers = Vec::new();
         let mut config_providers = Vec::new();
         let mut replaced = Vec::new();
-        let mut replaced_kinds: HashMap<ProviderName, ProviderKind> = HashMap::new();
         if let Some(dir) = g_dir {
             for entry in g_layer.providers {
                 if project_names.contains_key(entry.name.as_str()) {
                     replaced.push(entry.name.clone());
-                    replaced_kinds.insert(entry.name, entry.kind);
                 } else {
                     config_providers.push(entry.clone());
                     layered_providers.push(LayeredProviderEntry {
@@ -316,14 +350,7 @@ impl ConfigLayer {
             }
         }
         if let Some(dir) = p_dir {
-            for mut entry in p_layer.providers {
-                if !entry.enabled
-                    && matches!(entry.kind, ProviderKind::Config { .. })
-                    && let Some(kind @ (ProviderKind::Vcs { .. } | ProviderKind::Nix { .. })) =
-                        replaced_kinds.get(&entry.name)
-                {
-                    entry.kind = kind.clone();
-                }
+            for entry in p_layer.providers {
                 config_providers.push(entry.clone());
                 layered_providers.push(LayeredProviderEntry {
                     origin: ProviderOrigin::Workspace,
@@ -335,7 +362,8 @@ impl ConfigLayer {
 
         LayeredConfig {
             config: Config {
-                base,
+                default_profile,
+                inherit_global,
                 workspace,
                 limits,
                 approval,
@@ -354,17 +382,6 @@ impl Config {
     pub fn from_toml_str(s: &str) -> Result<Config, ConfigError> {
         Ok(toml::from_str(s)?)
     }
-}
-
-/// The starting set of providers (DESIGN.md §3.2).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Base {
-    /// Built-in default providers.
-    #[default]
-    Default,
-    /// No built-in providers at all.
-    None,
 }
 
 /// `[workspace]` table (DESIGN.md §3.1).
@@ -716,7 +733,8 @@ mod tests {
 
     fn expected_defaults() -> Config {
         Config {
-            base: Base::Default,
+            default_profile: None,
+            inherit_global: true,
             workspace: WorkspaceSettings {
                 mount: "/workspace".parse().unwrap(),
             },
@@ -759,7 +777,8 @@ mod tests {
     #[test]
     fn full_document_parses() {
         let src = r#"
-            base = "none"
+            default_profile = "main"
+            inherit_global = false
 
             [workspace]
             mount = "/workspace"
@@ -776,7 +795,8 @@ mod tests {
             clipboard_write = "ask"
         "#;
         let expected = Config {
-            base: Base::None,
+            default_profile: Some("main".parse().unwrap()),
+            inherit_global: false,
             workspace: WorkspaceSettings {
                 mount: "/workspace".parse().unwrap(),
             },
@@ -798,32 +818,14 @@ mod tests {
     }
 
     #[test]
-    fn appendix_a_top_level_values_parse() {
-        let src = r#"
-            base = "none"
-            [workspace]
-            mount = "/workspace"
-            [approval]
-            timeout = "off"
-            [terminal]
-            clipboard_write = "block"
-        "#;
-        let cfg = Config::from_toml_str(src).unwrap();
-        assert_eq!(
-            cfg,
-            Config {
-                base: Base::None,
-                ..expected_defaults()
-            }
-        );
+    fn default_config_template_parses_as_global_config() {
+        let layer = ConfigLayer::from_global_toml_str(DEFAULT_CONFIG_TOML).unwrap();
+        assert_eq!(layer.default_profile, Some("main".parse().unwrap()));
+        assert_eq!(layer.inherit_global, None);
     }
 
     #[test]
     fn enum_values_parse() {
-        for (s, v) in [("default", Base::Default), ("none", Base::None)] {
-            let cfg = Config::from_toml_str(&format!("base = \"{s}\"")).unwrap();
-            assert_eq!(cfg.base, v);
-        }
         for (s, v) in [
             ("block", ClipboardWrite::Block),
             ("allow", ClipboardWrite::Allow),
@@ -843,8 +845,8 @@ mod tests {
     #[test]
     fn unknown_enum_values_are_rejected() {
         for src in [
-            "base = \"all\"",
-            "base = \"Default\"",
+            "base = \"default\"",
+            "base = \"none\"",
             "[terminal]\nclipboard_write = \"yes\"",
             "[terminal]\nclipboard_write = \"BLOCK\"",
         ] {
@@ -1102,7 +1104,7 @@ mod tests {
 
     #[test]
     fn toml_errors_keep_line_and_column() {
-        let msg = err("base = \"default\"\n[approval]\ntimeout = \"0s\"\n");
+        let msg = err("default_profile = \"main\"\n[approval]\ntimeout = \"0s\"\n");
         assert!(msg.contains("line 3"), "{msg}");
         let msg = err("this is not toml");
         assert!(msg.contains("line 1"), "{msg}");
@@ -1123,7 +1125,7 @@ mod tests {
         )
     }
 
-    const PROVIDER_A: &str = "[[provider]]\ntype = \"config\"\nname = \"a\"\n";
+    const PROVIDER_A: &str = "[[provider]]\ntype = \"config\"\nname = \"a\"\nprofile = \"main\"\n";
 
     /// Each provider as `(name, origin, base_dir)`.
     fn origins(l: &LayeredConfig) -> Vec<(String, ProviderOrigin, PathBuf)> {
@@ -1141,19 +1143,23 @@ mod tests {
             ConfigLayer::default()
         );
         let l = layer("[approval]\ntimeout = \"off\"\n[terminal]\nclipboard_write = \"block\"\n");
-        // Written defaults count as written, so they override a lower layer.
         assert_eq!(l.approval_timeout, Some(ApprovalTimeout::Off));
         assert_eq!(l.terminal_clipboard_write, Some(ClipboardWrite::Block));
-        assert_eq!(l.base, None);
-        assert!(layer("base = \"none\"").sets_base_none());
-        assert!(!layer("base = \"default\"").sets_base_none());
-        assert!(!layer("").sets_base_none());
+        assert_eq!(l.inherit_global, None);
+        assert!(layer("inherit_global = false").ignores_global());
+        assert!(!layer("inherit_global = true").ignores_global());
+        assert!(!layer("").ignores_global());
         assert_eq!(layer("").into_config(), expected_defaults());
+        let g_err = ConfigLayer::from_global_toml_str("inherit_global = false")
+            .unwrap_err()
+            .to_string();
+        assert!(g_err.contains("inherit_global"), "{g_err}");
     }
 
     #[test]
     fn project_fields_override_global_fields_field_by_field() {
-        let global = "[workspace]\nmount = \"/global\"\n\
+        let global = "default_profile = \"main\"\n\
+                      [workspace]\nmount = \"/global\"\n\
                       [limits]\npids = 10\nmemory = \"1G\"\n\
                       [approval]\ntimeout = \"30s\"\n\
                       [terminal]\nclipboard_write = \"allow\"\n";
@@ -1161,98 +1167,49 @@ mod tests {
         let l = layered(Some(global), Some(""));
         let want = Config::from_toml_str(global).unwrap();
         assert_eq!(l.config, want);
-        // Set in the project, including to the built-in defaults.
-        let project = "[workspace]\nmount = \"/workspace\"\n\
+        // Set in the project, including overriding `default_profile`.
+        let project = "default_profile = \"agent\"\n\
+                       [workspace]\nmount = \"/workspace\"\n\
                        [limits]\npids = 20\n\
                        [terminal]\nclipboard_write = \"block\"\n";
         let l = layered(Some(global), Some(project));
+        assert_eq!(l.config.default_profile, Some("agent".parse().unwrap()));
         assert_eq!(l.config.workspace.mount, "/workspace".parse().unwrap());
         assert_eq!(l.config.limits.pids, std::num::NonZeroU32::new(20));
         assert_eq!(l.config.limits.memory, want.limits.memory);
         assert_eq!(l.config.limits.cpu, None);
         assert_eq!(l.config.approval.timeout, want.approval.timeout);
         assert_eq!(l.config.terminal.clipboard_write, ClipboardWrite::Block);
-        // Neither layer sets a field: the built-in default.
         assert_eq!(layered(Some(""), Some("")).config, expected_defaults());
         assert_eq!(layered(None, None).config, expected_defaults());
-        // Without a project file, the global layer alone.
         assert_eq!(layered(Some(global), None).config, want);
-        // `mount = "host"` layers in either direction.
-        assert_eq!(
-            layered(Some("[workspace]\nmount = \"host\""), Some(""))
-                .config
-                .workspace
-                .mount,
-            WorkspaceMount::Host
-        );
-        assert_eq!(
-            layered(
-                Some("[workspace]\nmount = \"host\""),
-                Some("[workspace]\nmount = \"/workspace\"")
-            )
-            .config
-            .workspace
-            .mount,
-            "/workspace".parse().unwrap()
-        );
-        assert_eq!(
-            layered(
-                Some("[workspace]\nmount = \"/global\""),
-                Some("[workspace]\nmount = \"host\"")
-            )
-            .config
-            .workspace
-            .mount,
-            WorkspaceMount::Host
-        );
     }
 
     #[test]
-    fn base_none_in_the_project_ignores_the_global_layer() {
+    fn inherit_global_false_in_the_project_ignores_the_global_layer() {
         let global = format!(
-            "[limits]\npids = 10\n[profiles.g]\n{PROVIDER_A}[provider.sandbox]\nfs.ro = [\"/usr\"]\n"
+            "default_profile = \"main\"\n[limits]\npids = 10\n[profiles.g]\n{PROVIDER_A}[provider.sandbox]\nfs.ro = [\"/usr\"]\n"
         );
-        let l = layered(Some(&global), Some("base = \"none\""));
-        assert_eq!(l.config.base, Base::None);
+        let l = layered(Some(&global), Some("inherit_global = false"));
+        assert!(!l.config.inherit_global);
+        assert_eq!(l.config.default_profile, None);
         assert_eq!(l.config.limits.pids, None);
         assert!(l.config.profiles.is_empty());
         assert!(l.providers.is_empty() && l.config.providers.is_empty());
-        // `base` itself layers like any other field otherwise.
-        assert_eq!(
-            layered(Some("base = \"none\""), Some("")).config.base,
-            Base::None
-        );
-        assert_eq!(
-            layered(Some("base = \"none\""), Some("base = \"default\""))
-                .config
-                .base,
-            Base::Default
-        );
-        // A global `base = "none"` does not drop the global layer's own
-        // providers.
-        let l = layered(Some(&format!("base = \"none\"\n{PROVIDER_A}")), None);
-        assert_eq!(
-            origins(&l),
-            [(
-                "a".to_owned(),
-                ProviderOrigin::Global,
-                PathBuf::from("/cfg")
-            )]
-        );
     }
 
     #[test]
     fn project_profiles_and_providers_replace_global_ones_by_name() {
         let global = format!(
-            "[profiles.shared]\ninherit = \"none\"\n[profiles.g]\n\
+            "[profiles.shared]\ninherit = \"g\"\n[profiles.g]\n\
              {PROVIDER_A}\
-             [[provider]]\ntype = \"config\"\nname = \"g-only\"\n\
-             [[provider]]\ntype = \"config\"\n"
+             [[provider]]\ntype = \"config\"\nname = \"g-only\"\nprofile = \"g\"\n\
+             [[provider]]\ntype = \"config\"\nname = \"common\"\nprofile = \"g\"\n"
         );
         let project = format!(
             "[profiles.shared]\n[profiles.p]\n\
-             [[provider]]\ntype = \"config\"\n\
-             [[provider]]\ntype = \"config\"\nname = \"p-only\"\n\
+             [[provider]]\ntype = \"config\"\nname = \"common\"\nprofile = \"p\"\n\
+             [[provider]]\ntype = \"config\"\nname = \"p-only\"\nprofile = \"p\"\n\
              {PROVIDER_A}"
         );
         let l = layered(Some(&global), Some(&project));
@@ -1266,10 +1223,8 @@ mod tests {
         );
         assert_eq!(
             l.config.profiles[&"shared".parse::<ProfileName>().unwrap()].inherit,
-            Inherit::default()
+            Inherit::None
         );
-        // The implicit `config` name collides like an explicit one, and the
-        // surviving global providers stay first, in file order.
         assert_eq!(
             origins(&l),
             [
@@ -1279,7 +1234,7 @@ mod tests {
                     PathBuf::from("/cfg")
                 ),
                 (
-                    "config".to_owned(),
+                    "common".to_owned(),
                     ProviderOrigin::Workspace,
                     PathBuf::from("/w")
                 ),
@@ -1296,42 +1251,31 @@ mod tests {
             ]
         );
         assert_eq!(
-            l.config.providers,
-            l.providers
-                .iter()
-                .map(|e| e.entry.clone())
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(
             l.replaced.iter().map(|n| n.as_str()).collect::<Vec<_>>(),
-            ["a", "config"]
+            ["a", "common"]
         );
-        // Nothing is replaced without a project file, or under its
-        // `base = "none"`.
         assert!(layered(Some(&global), None).replaced.is_empty());
         assert!(
             layered(
                 Some(&global),
-                Some(&format!("base = \"none\"\n{PROVIDER_A}"))
+                Some(&format!("inherit_global = false\n{PROVIDER_A}"))
             )
             .replaced
             .is_empty()
         );
-        // A duplicate within one file is still an error.
         let msg = ConfigLayer::from_toml_str(&format!("{PROVIDER_A}{PROVIDER_A}"))
             .unwrap_err()
             .to_string();
         assert!(msg.contains("duplicate provider name \"a\""), "{msg}");
 
-        // Disabling a named global `nix` provider in `.stopit.toml` without
-        // setting `type` preserves `ProviderKind::Nix` and marks it disabled.
         let l = layered(
-            Some("[[provider]]\ntype = \"nix\"\nname = \"custom-nix\"\nshell = \"agent\"\n"),
+            Some(
+                "[[provider]]\ntype = \"nix\"\nname = \"custom-nix\"\nprofile = \"main\"\nshell = \"agent\"\n",
+            ),
             Some("[[provider]]\nname = \"custom-nix\"\nenabled = false\n"),
         );
         assert_eq!(l.providers.len(), 1);
         assert_eq!(l.providers[0].entry.name.as_str(), "custom-nix");
         assert!(!l.providers[0].entry.enabled);
-        assert_eq!(l.providers[0].entry.kind.type_name(), "nix");
     }
 }

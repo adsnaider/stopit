@@ -52,7 +52,8 @@ use crate::policy::{Decision, PathMode};
 use crate::shim::{BrokerMessage, HELLO, PROTOCOL_VERSION, ShimMessage};
 use crate::spec::CompiledSession;
 use crate::supervisor::{
-    LoadedSession, RunError, SessionPolicy, bwrap_exit_code, profile_in, read_nonblocking_status,
+    LoadedSession, RunError, SessionPolicy, bwrap_exit_code, named_profile_in,
+    read_nonblocking_status,
 };
 
 /// Status of a command the broker refused.
@@ -426,8 +427,7 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
     } else {
         base_ctx
     };
-    let (_, caller) =
-        profile_in(&ctx.compiled, Some(shared.caller.as_str())).map_err(|e| e.to_string())?;
+    let (_, caller) = named_profile_in(&ctx.compiled, &shared.caller).map_err(|e| e.to_string())?;
     let grant = shim == GRANT_SHIM && caller.spec.grant;
     let spec = if grant {
         None
@@ -652,11 +652,11 @@ fn run_proxy_shim(
 
     let (resolved_target, scope_profile_label) = match resp.profile {
         None => (
-            ResolvedTarget::Static(ctx.clone(), ProfileRef::main()),
-            "main".to_owned(),
+            ResolvedTarget::Static(ctx.clone(), shared.caller.clone()),
+            shared.caller.as_str().to_owned(),
         ),
         Some(ProxyProfile::Named(p)) => {
-            if let Err(e) = profile_in(&ctx.compiled, Some(p.as_str())) {
+            if let Err(e) = named_profile_in(&ctx.compiled, &p) {
                 say(&e.to_string());
                 return Ok(EXIT_DENIED);
             }
@@ -1005,7 +1005,7 @@ fn compile_inline_proxy_profile(
     let mut manifest = Manifest::default();
     manifest.profiles.insert(local, inline);
     let output = crate::provider::ProviderOutput {
-        profile: ProfileRef::main(),
+        profile: caller.clone(),
         manifest,
         origin: crate::config::ProviderOrigin::Workspace,
     };
@@ -1880,7 +1880,7 @@ fn launch(
     use_pty: bool,
 ) -> Result<Launched, RunError> {
     let loaded = &ctx.loaded;
-    let (name, compiled) = profile_in(&ctx.compiled, Some(profile.as_str()))?;
+    let (name, compiled) = named_profile_in(&ctx.compiled, profile)?;
     let label = format!("t{}", NEXT_COMMAND.fetch_add(1, Ordering::SeqCst));
     let proxy = loaded.start_proxy(compiled, &label)?;
     let deeper = Arc::new(RunContext {

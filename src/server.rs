@@ -43,7 +43,7 @@ use crate::session::{CONTROL_SOCKET, LiveServer, ServerRecord, live_servers};
 use crate::supervisor::{
     BlockedSignals, EXIT_SUPERVISOR_FAILED, Invocation, LoadedSession, RunError, SandboxTerminal,
     blocked_writes, bwrap_exit_code, catch_signals, catch_winch, check_foreground,
-    discover_workspace, ignore_job_control, print_error, profile_in, read_nonblocking_status,
+    discover_workspace, ignore_job_control, print_error, read_nonblocking_status,
     readable_unless_signal, relay_until, signal_exit_code, stdio_terminals, take_signal,
 };
 
@@ -532,10 +532,10 @@ fn run_for_client(
         .map(|(k, v)| (OsString::from_vec(k), OsString::from_vec(v)))
         .collect();
     // Compiled for this run, against the filesystem as it is now.
-    let (compiled, compile_warnings) = loaded.recompile()?;
+    let (policy, compiled, compile_warnings) = loaded.recompile()?;
     let compiled = Arc::new(compiled);
-    let (profile_name, profile) = profile_in(&compiled, profile.as_deref())?;
-    let mut lines = loaded.warning_lines_with(&compile_warnings);
+    let (profile_name, profile) = loaded.profile_in(&policy, &compiled, profile.as_deref())?;
+    let mut lines = policy.warning_lines_with(&compile_warnings);
     lines.extend(loaded.profile_warning_lines(profile));
     if !client_quiet {
         lines.extend(loaded.summary_lines(&profile_name, profile));

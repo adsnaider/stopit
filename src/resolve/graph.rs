@@ -76,12 +76,12 @@ impl ProfileGraph {
         self.order.iter().map(|p| (p, &self.profiles[p]))
     }
 
-    /// The number of profiles, including `main`.
+    /// The number of profiles in the graph.
     pub fn len(&self) -> usize {
         self.profiles.len()
     }
 
-    /// Always false: `main` always exists.
+    /// Whether the graph contains no profiles.
     pub fn is_empty(&self) -> bool {
         self.profiles.is_empty()
     }
@@ -308,7 +308,6 @@ pub fn build_profile_graph(
     // Every profile first, so that references may point forward: a provider
     // can target or reference a profile contributed by a later provider.
     let mut profiles = BTreeMap::new();
-    profiles.insert(ProfileRef::main(), empty());
     for name in config.profiles.keys() {
         profiles.insert(name.clone().into(), empty());
     }
@@ -541,8 +540,6 @@ mod tests {
                 }
             }
         }
-        assert!(g.get(&ProfileRef::main()).unwrap().parent.is_none());
-        assert!(!g.is_empty());
     }
 
     fn node<'a>(g: &'a ProfileGraph, p: &str) -> &'a ProfileNode {
@@ -601,9 +598,11 @@ mod tests {
         ]
 
         [profiles.ro]
+        inherit = "main"
         fs.ro = ["{workspace}/.git"]
 
         [profiles.local]
+        inherit = "main"
         fs.rw = ["{workspace}/.git"]
         [profiles.local.shims.jj-remote]
         cmd = "jj"
@@ -626,9 +625,11 @@ mod tests {
         ]
 
         [profiles.ro]
+        inherit = "main"
         fs.ro = ["{workspace}/.git"]
 
         [profiles.local]
+        inherit = "main"
         fs.rw = ["{workspace}/.git"]
         [profiles.local.shims.jj-remote]
         cmd = "jj"
@@ -639,8 +640,12 @@ mod tests {
     "#;
 
     #[test]
-    fn only_main() {
-        let g = build("", vec![]);
+    fn empty_config_has_no_profiles_and_declared_main_has_no_parent() {
+        let empty = build("", vec![]);
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+
+        let g = build("[profiles.main]", vec![]);
         assert_eq!(order(&g), ["main"]);
         assert_eq!(g.len(), 1);
         assert_eq!(
@@ -657,11 +662,12 @@ mod tests {
     fn user_profiles_parents_and_order() {
         let g = build(
             r#"
+            [profiles.main]
             [profiles.a]
+            inherit = "main"
             [profiles.b]
             inherit = "a"
             [profiles.bare]
-            inherit = "none"
             [profiles.child]
             inherit = "zeta"
             [profiles.zeta]
@@ -675,21 +681,17 @@ mod tests {
         assert_eq!(parent(&g, "bare"), None);
         assert_eq!(parent(&g, "child"), Some("zeta"));
         assert_eq!(parent(&g, "zeta"), Some("main"));
-        // `child` sorts before its parent `zeta` but is placed after it.
         assert_eq!(order(&g), ["main", "a", "b", "bare", "zeta", "child"]);
-        // No provider, no contributions.
         assert!(g.iter().all(|(_, n)| n.contributions.is_empty()));
     }
 
     #[test]
     fn contributed_profiles_resolve_plain_references() {
-        let g = build("", vec![out("vcs", "main", VCS_PLAIN)]);
+        let g = build("[profiles.main]", vec![out("vcs", "main", VCS_PLAIN)]);
         assert_eq!(order(&g), ["main", "vcs.local", "vcs.remote", "vcs.ro"]);
         assert_eq!(parent(&g, "vcs.ro"), Some("main"));
         assert_eq!(parent(&g, "vcs.local"), Some("main"));
         assert_eq!(parent(&g, "vcs.remote"), Some("vcs.local"));
-        // Top-level shims are rewritten to full names; `deny` stays empty and
-        // `main` stays `main`.
         assert_eq!(
             shim_targets(&g, "main", "vcs", "jj"),
             [
@@ -700,12 +702,10 @@ mod tests {
                 Some("main")
             ]
         );
-        // So are shims inside contributed profiles.
         assert_eq!(
             shim_targets(&g, "vcs.local", "vcs", "jj-remote"),
             [Some("vcs.remote")]
         );
-        // Each profile gets exactly the provider's grants meant for it.
         assert_eq!(providers(&g, "main"), ["vcs"]);
         let m = manifest(VCS_PLAIN);
         let ro = &node(&g, "vcs.ro").contributions[0].grants;
@@ -717,15 +717,15 @@ mod tests {
 
     #[test]
     fn full_names_inside_a_manifest_resolve_the_same() {
-        let plain = build("", vec![out("vcs", "main", VCS_PLAIN)]);
-        let full = build("", vec![out("vcs", "main", VCS_FULL)]);
+        let plain = build("[profiles.main]", vec![out("vcs", "main", VCS_PLAIN)]);
+        let full = build("[profiles.main]", vec![out("vcs", "main", VCS_FULL)]);
         assert_eq!(plain, full);
     }
 
     #[test]
     fn plain_name_falls_back_to_user_profile() {
         let g = build(
-            "[profiles.harness]",
+            "[profiles.main]\n[profiles.harness]",
             vec![out(
                 "vcs",
                 "main",
@@ -740,19 +740,20 @@ mod tests {
         assert_eq!(parent(&g, "vcs.local"), Some("harness"));
         assert_eq!(shim_targets(&g, "main", "vcs", "h"), [Some("harness")]);
         assert_eq!(shim_targets(&g, "vcs.local", "vcs", "l"), [Some("harness")]);
-        assert_eq!(order(&g), ["main", "harness", "vcs.local"]);
+        assert_eq!(order(&g), ["harness", "main", "vcs.local"]);
     }
 
     #[test]
     fn own_contributed_profile_shadows_user_profile() {
         let g = build(
-            "[profiles.local]\ninherit = \"none\"",
+            "[profiles.main]\n[profiles.local]",
             vec![out(
                 "vcs",
                 "main",
                 r#"
                 shims.a = { cmd = "a", default = { decision = "allow", profile = "local" } }
                 [profiles.local]
+                inherit = "main"
                 [profiles.child]
                 inherit = "local"
                 "#,
@@ -760,14 +761,13 @@ mod tests {
         );
         assert_eq!(parent(&g, "vcs.child"), Some("vcs.local"));
         assert_eq!(shim_targets(&g, "main", "vcs", "a"), [Some("vcs.local")]);
-        // The user profile still exists, separately.
         assert_eq!(parent(&g, "local"), None);
         assert_eq!(parent(&g, "vcs.local"), Some("main"));
     }
 
     #[test]
     fn renamed_provider_resolves_its_own_plain_references() {
-        let g = build("", vec![out("myvcs", "main", VCS_PLAIN)]);
+        let g = build("[profiles.main]", vec![out("myvcs", "main", VCS_PLAIN)]);
         assert_eq!(
             order(&g),
             ["main", "myvcs.local", "myvcs.remote", "myvcs.ro"]
@@ -789,7 +789,7 @@ mod tests {
     #[test]
     fn shims_may_target_profiles_of_later_providers() {
         let g = build(
-            "",
+            "[profiles.main]",
             vec![
                 out(
                     "early",
@@ -813,9 +813,8 @@ mod tests {
 
     #[test]
     fn other_providers_profiles_need_full_names() {
-        // `other` references `vcs.ro` by full name: fine.
         let g = build(
-            "",
+            "[profiles.main]",
             vec![
                 out("vcs", "main", VCS_PLAIN),
                 out(
@@ -826,9 +825,8 @@ mod tests {
             ],
         );
         assert_eq!(shim_targets(&g, "main", "other", "s"), [Some("vcs.ro")]);
-        // A plain `ro` from `other` does not see `vcs.ro`.
         let msg = err(
-            "",
+            "[profiles.main]",
             vec![
                 out("vcs", "main", VCS_PLAIN),
                 out(
@@ -848,6 +846,7 @@ mod tests {
     fn config_provider_routes_grants_to_its_profile() {
         let cfg = config(
             r#"
+            [profiles.main]
             [profiles.harness]
 
             [[provider]]
@@ -867,8 +866,6 @@ mod tests {
             "#,
         );
         let mut outputs = config_outputs(&cfg);
-        // The contributing provider comes after the one targeting its
-        // profile: forward references work.
         outputs.push(out("vcs", "main", VCS_PLAIN));
         let g = build_profile_graph(&cfg, outputs).unwrap();
         check_invariants(&g);
@@ -881,7 +878,6 @@ mod tests {
         assert_eq!(providers(&g, "vcs.local"), ["vcs-extra", "vcs"]);
         let extra = &node(&g, "vcs.local").contributions[0].grants;
         assert_eq!(extra.fs.ro[0].as_str(), "/etc/gitconfig");
-        // `main` gets only the providers that target it.
         assert_eq!(providers(&g, "main"), ["vcs"]);
     }
 
@@ -889,11 +885,13 @@ mod tests {
     fn contributions_keep_merge_order_and_provider_tags() {
         let cfg = config(
             r#"
+            [profiles.main]
             [profiles.harness]
 
             [[provider]]
             type = "config"
             name = "one"
+            profile = "main"
             [provider.sandbox]
             fs.ro = ["/one"]
 
@@ -907,6 +905,7 @@ mod tests {
             [[provider]]
             type = "config"
             name = "three"
+            profile = "main"
             [provider.sandbox]
             fs.ro = ["/three"]
             [provider.sandbox.profiles.p]
@@ -952,7 +951,7 @@ mod tests {
     #[test]
     fn empty_top_level_grants_are_still_recorded() {
         let g = build(
-            "",
+            "[profiles.main]",
             vec![out("a", "main", ""), out("b", "main", "[profiles.p]")],
         );
         assert_eq!(providers(&g, "main"), ["a", "b"]);
@@ -962,8 +961,8 @@ mod tests {
     #[test]
     fn inherit_none_in_a_contributed_profile() {
         let g = build(
-            "",
-            vec![out("vcs", "main", "[profiles.bare]\ninherit = \"none\"")],
+            "[profiles.main]",
+            vec![out("vcs", "main", "[profiles.bare]")],
         );
         assert_eq!(parent(&g, "vcs.bare"), None);
     }
@@ -971,7 +970,7 @@ mod tests {
     #[test]
     fn user_profile_may_inherit_a_contributed_profile() {
         let g = build(
-            "[profiles.agent]\ninherit = \"vcs.remote\"",
+            "[profiles.main]\n[profiles.agent]\ninherit = \"vcs.remote\"",
             vec![out("vcs", "main", VCS_PLAIN)],
         );
         assert_eq!(parent(&g, "agent"), Some("vcs.remote"));
@@ -985,13 +984,9 @@ mod tests {
     fn unknown_user_inherit() {
         for (target, outputs, hint) in [
             ("nope", vec![], ""),
-            // No contributed profile is named `nope`: no suggestion.
             ("nope", vec![out("vcs", "main", VCS_PLAIN)], ""),
-            // A multi-segment name never gets a suggestion.
             ("vcs.nope", vec![out("vcs", "main", VCS_PLAIN)], ""),
             ("x.local", vec![out("vcs", "main", VCS_PLAIN)], ""),
-            // A plain name in the configuration is a full name: it does not
-            // find a contributed profile, but suggests it.
             (
                 "local",
                 vec![out("vcs", "main", VCS_PLAIN)],
@@ -1006,14 +1001,17 @@ mod tests {
                 r#" (did you mean "alt.local", "vcs.local"?)"#,
             ),
         ] {
-            let msg = err(&format!("[profiles.a]\ninherit = \"{target}\""), outputs);
+            let msg = err(
+                &format!("[profiles.main]\n[profiles.a]\ninherit = \"{target}\""),
+                outputs,
+            );
             assert_eq!(
                 msg,
                 format!(r#"profile "a" inherits from unknown profile "{target}"{hint}"#)
             );
         }
         let e = build_profile_graph(
-            &config("[profiles.a]\ninherit = \"ro\""),
+            &config("[profiles.main]\n[profiles.a]\ninherit = \"ro\""),
             vec![out("vcs", "main", VCS_PLAIN)],
         )
         .unwrap_err();
@@ -1037,7 +1035,7 @@ mod tests {
     #[test]
     fn contributed_profile_may_inherit_another_providers_profile() {
         let g = build(
-            "",
+            "[profiles.main]",
             other_and_vcs("[profiles.remote]\ninherit = \"other.local\""),
         );
         assert_eq!(parent(&g, "vcs.remote"), Some("other.local"));
@@ -1045,11 +1043,9 @@ mod tests {
 
     #[test]
     fn unknown_contributed_inherit() {
-        // `local` is only contributed by `other`, so the plain name does not
-        // find it from `vcs`.
         for target in ["nope", "vcs.nope", "local", "main.x"] {
             let msg = err(
-                "",
+                "[profiles.main]",
                 other_and_vcs(&format!("[profiles.remote]\ninherit = \"{target}\"")),
             );
             assert_eq!(
@@ -1069,7 +1065,7 @@ mod tests {
             ("local", r#" (did you mean "vcs.local"?)"#),
         ] {
             let cfg = config(&format!(
-                "[[provider]]\ntype = \"config\"\nname = \"creds\"\nprofile = \"{target}\""
+                "[profiles.main]\n[[provider]]\ntype = \"config\"\nname = \"creds\"\nprofile = \"{target}\""
             ));
             let mut outputs = vec![out("vcs", "main", VCS_PLAIN)];
             outputs.extend(config_outputs(&cfg));
@@ -1081,8 +1077,10 @@ mod tests {
                 )
             );
         }
-        // Through `from_entry` alone, too.
-        let e = build_config("[[provider]]\ntype = \"config\"\nprofile = \"harness\"").unwrap_err();
+        let e = build_config(
+            "[[provider]]\nname = \"config\"\ntype = \"config\"\nprofile = \"harness\"",
+        )
+        .unwrap_err();
         assert_eq!(
             e,
             ProfileError::UnknownTarget {
@@ -1095,8 +1093,6 @@ mod tests {
 
     #[test]
     fn unknown_shim_targets() {
-        // In the default, in a rule (numbered from 1), and in a contributed
-        // profile.
         let cases = [
             (
                 r#"shims.s = { cmd = "s", default = { decision = "allow", profile = "nope" } }"#,
@@ -1123,9 +1119,8 @@ mod tests {
             ),
         ];
         for (src, want) in cases {
-            assert_eq!(err("", vec![out("vcs", "main", src)]), want);
+            assert_eq!(err("[profiles.main]", vec![out("vcs", "main", src)]), want);
         }
-        // The profile a shim is granted to is the provider's target.
         let msg = err(
             "[profiles.harness]",
             vec![out(
@@ -1164,7 +1159,6 @@ mod tests {
             }
         );
 
-        // A profile leading into a cycle is not part of it.
         let msg = err(
             r#"
             [profiles.aa]
@@ -1182,13 +1176,13 @@ mod tests {
     #[test]
     fn cycles_through_contributed_profiles() {
         let msg = err(
-            "[profiles.a]\ninherit = \"vcs.x\"",
+            "[profiles.main]\n[profiles.a]\ninherit = \"vcs.x\"",
             vec![out("vcs", "main", "[profiles.x]\ninherit = \"a\"")],
         );
         assert_eq!(msg, "profile inheritance cycle: a -> vcs.x -> a");
 
         let msg = err(
-            "",
+            "[profiles.main]",
             vec![out(
                 "vcs",
                 "main",
@@ -1198,7 +1192,7 @@ mod tests {
         assert_eq!(msg, "profile inheritance cycle: vcs.p -> vcs.q -> vcs.p");
 
         let msg = err(
-            "",
+            "[profiles.main]",
             vec![out("vcs", "main", "[profiles.p]\ninherit = \"vcs.p\"")],
         );
         assert_eq!(msg, "profile inheritance cycle: vcs.p -> vcs.p");
@@ -1207,7 +1201,7 @@ mod tests {
     #[test]
     fn duplicate_provider_names_in_outputs() {
         let e = build_profile_graph(
-            &config(""),
+            &config("[profiles.main]"),
             vec![
                 out("vcs", "main", ""),
                 out("x", "main", ""),

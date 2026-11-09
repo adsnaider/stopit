@@ -3,7 +3,6 @@
 //! A provider turns its configuration entry into a [`ProviderOutput`] at
 //! session start. Merging the outputs of all providers happens elsewhere.
 
-mod base;
 mod config;
 mod nix;
 mod script;
@@ -17,22 +16,63 @@ use std::string::FromUtf8Error;
 use thiserror::Error;
 
 use crate::config::{
-    LayeredProviderEntry, ProfileRef, ProviderEntry, ProviderKind, ProviderName, ProviderOrigin,
-    WorkspaceMount,
+    Config, LayeredProviderEntry, ProfileRef, ProviderEntry, ProviderKind, ProviderName,
+    ProviderOrigin, WorkspaceMount,
 };
 use crate::manifest::{Manifest, ManifestError, ShimKind};
 use crate::spec::{ScriptPathError, UntrustedRoot, has_rewritable_hard_links, resolve_script_path};
 
-pub use base::{
-    BASE_PROVIDER_NAME, SUPERVISOR_PROVIDER_NAME, default_base_manifest, layered_session_providers,
-    session_providers,
-};
 pub use config::ConfigProvider;
 pub use nix::NixProvider;
 pub use script::{STDERR_LIMIT, STDOUT_LIMIT, ScriptProvider};
-pub use vcs::{
-    Layout as VcsLayout, SshRemote, VCS_PROVIDER_NAME, VcsProvider, discover as discover_vcs,
-};
+pub use vcs::{Layout as VcsLayout, SshRemote, VcsProvider, discover as discover_vcs};
+
+/// The name the supervisor's own rules are attributed to (the protection of
+/// the loaded configuration file, DESIGN.md §3). User providers cannot use it,
+/// so that a message naming it is never about theirs.
+pub const SUPERVISOR_PROVIDER_NAME: &str = "stopit";
+
+/// The ordered providers of a single-layer session: `config.providers` in file
+/// order resolved against `base_dir`.
+pub fn session_providers(
+    config: &Config,
+    base_dir: &Path,
+) -> Result<Vec<Box<dyn Provider>>, ProviderError> {
+    let entries: Vec<LayeredProviderEntry> = config
+        .providers
+        .iter()
+        .cloned()
+        .map(|entry| LayeredProviderEntry {
+            origin: ProviderOrigin::Workspace,
+            base_dir: base_dir.to_path_buf(),
+            entry,
+        })
+        .collect();
+    layered_session_providers(&entries)
+}
+
+/// Builds the ordered providers of a layered session in merge order using each
+/// entry's own declaring directory and [`ProviderOrigin`].
+pub fn layered_session_providers(
+    entries: &[LayeredProviderEntry],
+) -> Result<Vec<Box<dyn Provider>>, ProviderError> {
+    if let Some(entry) = entries
+        .iter()
+        .find(|e| e.entry.name.as_str() == SUPERVISOR_PROVIDER_NAME)
+    {
+        return Err(ProviderError::ReservedForSupervisor {
+            name: entry.entry.name.clone(),
+        });
+    }
+    let mut providers: Vec<Box<dyn Provider>> = Vec::new();
+    for entry in entries {
+        if !entry.entry.enabled {
+            continue;
+        }
+        providers.push(from_layered_entry(entry)?);
+    }
+    Ok(providers)
+}
 
 /// What every provider receives at session start.
 #[derive(Debug, Clone)]
@@ -91,18 +131,6 @@ pub enum ProviderError {
         kind: &'static str,
     },
 
-    /// A user provider is named like the built-in provider of the default
-    /// base.
-    #[error(
-        "provider name {:?} is reserved by the built-in provider of `base = \"default\"`: \
-         choose a different name, or set `base = \"none\"`",
-        .name.as_str()
-    )]
-    ReservedName {
-        /// The offending name.
-        name: ProviderName,
-    },
-
     /// A user provider is named like the supervisor's own rules
     /// ([`SUPERVISOR_PROVIDER_NAME`]).
     #[error(
@@ -136,11 +164,6 @@ pub enum ProviderError {
         /// Its number of hard links.
         links: u64,
     },
-
-    /// The built-in provider of the default base is invalid (its name or
-    /// embedded manifest). A bug in `stopit`, prevented by a unit test.
-    #[error("internal error: the built-in default base is invalid: {0}")]
-    BuiltinBase(String),
 
     /// A script provider's path could not be canonicalized (e.g. it does not
     /// exist).
@@ -566,11 +589,13 @@ pub fn from_entry_with_origin(
             origin,
         ))),
         ProviderKind::Script {
+            profile,
             source,
             protect,
             config,
         } => Ok(Box::new(ScriptProvider::with_origin(
             entry.name.clone(),
+            profile.clone(),
             source,
             base_dir,
             *protect,
@@ -578,18 +603,17 @@ pub fn from_entry_with_origin(
             origin,
         ))),
         ProviderKind::Vcs {
+            profile,
             view,
-            tools,
-            fetch,
-            push,
+            shims,
             signing,
         } => Ok(Box::new(
             VcsProvider::new(
                 entry.name.clone(),
+                profile.clone(),
                 *view,
-                tools.clone(),
-                *fetch,
-                *push,
+                shims.clone(),
+                base_dir,
                 origin,
             )
             .with_signing(*signing),
@@ -657,24 +681,29 @@ mod tests {
 
     #[test]
     fn config_entry_builds_a_provider() {
-        let (name, out) = output("[[provider]]\ntype = \"config\"");
+        let (name, out) =
+            output("[[provider]]\nname = \"config\"\ntype = \"config\"\nprofile = \"main\"");
         assert_eq!(name.as_str(), "config");
-        assert_eq!(out.profile, ProfileRef::main());
+        assert_eq!(out.profile.as_str(), "main");
         assert_eq!(out.manifest, Manifest::default());
     }
 
     #[test]
     fn config_provider_returns_its_sandbox_and_profile_unchanged() {
-        let src = format!("[[provider]]\ntype = \"config\"\n{SANDBOX}");
+        let src = format!(
+            "[[provider]]\nname = \"config\"\ntype = \"config\"\nprofile = \"main\"\n{SANDBOX}"
+        );
         let (_, out) = output(&src);
-        assert_eq!(out.profile, ProfileRef::main());
+        assert_eq!(out.profile.as_str(), "main");
         assert_eq!(out.manifest, inline_sandbox(&src));
         assert_eq!(out.manifest.grants.fs.ro.len(), 1);
         // Contributed profiles stay inside the manifest, unprefixed.
         assert_eq!(out.manifest.profiles.len(), 1);
         assert!(out.manifest.profiles.keys().any(|k| k.as_str() == "local"));
 
-        let src = format!("[[provider]]\ntype = \"config\"\nprofile = \"harness\"\n{SANDBOX}");
+        let src = format!(
+            "[[provider]]\nname = \"config\"\ntype = \"config\"\nprofile = \"harness\"\n{SANDBOX}"
+        );
         let (_, out) = output(&src);
         assert_eq!(out.profile.as_str(), "harness");
         assert_eq!(out.manifest, inline_sandbox(&src));
@@ -683,36 +712,38 @@ mod tests {
     #[test]
     fn from_entry_over_a_mixed_config_in_order() {
         let es = entries(
-            "[[provider]]\ntype = \"config\"\n\
-             [[provider]]\ntype = \"config\"\nname = \"approvals\"\n\
-             [[provider]]\ntype = \"script\"\nsource = \"x.sh\"\n\
-             [[provider]]\ntype = \"vcs\"",
+            "[[provider]]\nname = \"config\"\ntype = \"config\"\nprofile = \"main\"\n\
+             [[provider]]\nname = \"approvals-main\"\ntype = \"config\"\nprofile = \"main\"\n\
+             [[provider]]\nname = \"script\"\ntype = \"script\"\nprofile = \"main\"\nsource = \"x.sh\"\n\
+             [[provider]]\nname = \"vcs\"\ntype = \"vcs\"\nprofile = \"main\"",
         );
         assert_eq!(es.len(), 4);
         let mut built = Vec::new();
-        let mut failure = None;
         for e in &es {
-            match from_entry(e, Path::new("/cfg")) {
-                Ok(p) => built.push(p.name().as_str().to_owned()),
-                Err(err) => {
-                    failure = Some(err.to_string());
-                    break;
-                }
-            }
+            let p = from_entry(e, Path::new("/cfg")).unwrap();
+            built.push(p.name().as_str().to_owned());
         }
-        // Effective names: the default (type) and an explicit one.
-        assert_eq!(built, ["config", "approvals", "script", "vcs"]);
-        assert_eq!(failure, None);
+        assert_eq!(built, ["config", "approvals-main", "script", "vcs"]);
+
+        let reserved = Config::from_toml_str(
+            "[[provider]]\nname = \"stopit\"\ntype = \"config\"\nprofile = \"main\"",
+        )
+        .unwrap();
+        let Err(err) = session_providers(&reserved, Path::new("/cfg")) else {
+            panic!("stopit provider name must be reserved");
+        };
+        assert!(matches!(err, ProviderError::ReservedForSupervisor { .. }));
     }
 
     #[test]
     fn context_is_ignored() {
-        let src = format!("[[provider]]\ntype = \"config\"\n{SANDBOX}");
+        let src = format!(
+            "[[provider]]\nname = \"config\"\ntype = \"config\"\nprofile = \"main\"\n{SANDBOX}"
+        );
         let p = from_entry(&entries(&src)[0], Path::new("/cfg")).unwrap();
         let a = p.manifest(&ctx("a")).unwrap();
         let b = p.manifest(&ctx("b")).unwrap();
         assert_eq!(a, b);
-        // So is the base directory.
         let q = from_entry(&entries(&src)[0], Path::new("/elsewhere")).unwrap();
         assert_eq!(q.manifest(&ctx("a")).unwrap(), a);
     }
@@ -721,11 +752,11 @@ mod tests {
     fn script_entries_build_a_provider() {
         for (src, name) in [
             (
-                "[[provider]]\ntype = \"script\"\nsource = \"x.sh\"",
+                "[[provider]]\nname = \"script\"\ntype = \"script\"\nprofile = \"main\"\nsource = \"x.sh\"",
                 "script",
             ),
             (
-                "[[provider]]\ntype = \"script\"\nsource = \"x.sh\"\nname = \"env\"",
+                "[[provider]]\nname = \"env\"\ntype = \"script\"\nprofile = \"main\"\nsource = \"x.sh\"",
                 "env",
             ),
         ] {
@@ -737,12 +768,10 @@ mod tests {
     #[test]
     fn missing_script_fails_when_run_not_when_built() {
         let p = from_entry(
-            &entries("[[provider]]\ntype = \"script\"\nsource = \"x.sh\"")[0],
+            &entries("[[provider]]\nname = \"script\"\ntype = \"script\"\nprofile = \"main\"\nsource = \"x.sh\"")[0],
             Path::new("/nonexistent-stopit-dir"),
         )
         .unwrap();
-        // The missing directory is blamed, not the script. Nothing is
-        // spawned: resolving the script path already fails.
         for e in [
             p.manifest(&ctx("a")).unwrap_err(),
             p.protected_paths().unwrap_err(),
@@ -764,7 +793,7 @@ mod tests {
     #[test]
     fn config_providers_protect_nothing() {
         let p = from_entry(
-            &entries("[[provider]]\ntype = \"config\"")[0],
+            &entries("[[provider]]\nname = \"config\"\ntype = \"config\"\nprofile = \"main\"")[0],
             Path::new("/cfg"),
         )
         .unwrap();
@@ -779,10 +808,10 @@ mod tests {
             std::fs::write(root.join(f), "").unwrap();
         }
         let es = entries(
-            "[[provider]]\ntype = \"script\"\nname = \"a\"\nsource = \"a.sh\"\n\
-             [[provider]]\ntype = \"config\"\n\
-             [[provider]]\ntype = \"script\"\nname = \"off\"\nsource = \"a.sh\"\nprotect = false\n\
-             [[provider]]\ntype = \"script\"\nname = \"b\"\nsource = \"b.sh\"",
+            "[[provider]]\ntype = \"script\"\nname = \"a\"\nprofile = \"main\"\nsource = \"a.sh\"\n\
+             [[provider]]\ntype = \"config\"\nname = \"cfg\"\nprofile = \"main\"\n\
+             [[provider]]\ntype = \"script\"\nname = \"off\"\nprofile = \"main\"\nsource = \"a.sh\"\nprotect = false\n\
+             [[provider]]\ntype = \"script\"\nname = \"b\"\nprofile = \"main\"\nsource = \"b.sh\"",
         );
         let ps: Vec<_> = es.iter().map(|e| from_entry(e, &root).unwrap()).collect();
         assert_eq!(
@@ -798,8 +827,9 @@ mod tests {
                 },
             ]
         );
-        // A source that cannot be resolved is an error naming its provider.
-        let es = entries("[[provider]]\ntype = \"script\"\nname = \"gone\"\nsource = \"c.sh\"");
+        let es = entries(
+            "[[provider]]\ntype = \"script\"\nname = \"gone\"\nprofile = \"main\"\nsource = \"c.sh\"",
+        );
         let ps = [from_entry(&es[0], &root).unwrap()];
         let e = protected_sources(&ps).unwrap_err();
         assert!(matches!(e, ProviderError::Resolve { .. }), "{e:?}");
@@ -809,16 +839,16 @@ mod tests {
     #[test]
     fn a_vcs_entry_builds_the_vcs_provider() {
         let p = from_entry(
-            &entries("[[provider]]\ntype = \"vcs\"")[0],
+            &entries("[[provider]]\nname = \"vcs\"\ntype = \"vcs\"\nprofile = \"main\"")[0],
             Path::new("/cfg"),
         )
         .unwrap();
         assert_eq!(p.name().as_str(), "vcs");
-        // A workspace without a repository gets nothing from it.
         let ws = tempfile::TempDir::new().unwrap();
         let mut c = ctx("x");
         c.workspace = ws.path().to_owned();
         assert_eq!(p.manifest(&c).unwrap().manifest, Manifest::default());
+        assert!(p.protected_paths().unwrap().is_empty());
     }
 
     #[test]
@@ -829,7 +859,7 @@ mod tests {
         std::fs::write(&proxy_file, "#!/bin/sh\n").unwrap();
 
         let es = entries(
-            "[[provider]]\ntype = \"config\"\nname = \"cfg\"\n[provider.sandbox]\n\
+            "[[provider]]\ntype = \"config\"\nname = \"cfg\"\nprofile = \"main\"\n[provider.sandbox]\n\
              shims.p1 = { proxy = \"./my-proxy.sh\" }\n\
              shims.p2 = { proxy = \"./my-proxy.sh\", protect = false }\n",
         );
@@ -859,11 +889,10 @@ mod tests {
             }]
         );
 
-        // A proxy shim reached through a symlink inside the workspace is refused.
         let link = root.join("link-proxy.sh");
         std::os::unix::fs::symlink(&proxy_file, &link).unwrap();
         let es_link = entries(
-            "[[provider]]\ntype = \"config\"\nname = \"cfg\"\n[provider.sandbox]\n\
+            "[[provider]]\ntype = \"config\"\nname = \"cfg\"\nprofile = \"main\"\n[provider.sandbox]\n\
              shims.p1 = { proxy = \"./link-proxy.sh\" }\n",
         );
         let p_link = from_entry(&es_link[0], &root).unwrap();

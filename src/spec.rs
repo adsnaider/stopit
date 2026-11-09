@@ -1546,6 +1546,7 @@ fn check_host_sources(
     ctx: &ExpansionContext,
     roots: &UntrustedRoots,
     protected: &[SourceToProtect<'_>],
+    vcs_providers: &BTreeSet<ProviderName>,
     state: &StateDirs,
     warnings: &mut Vec<SpecWarning>,
 ) -> Result<
@@ -1709,7 +1710,7 @@ fn check_host_sources(
         .iter()
         .map(|(k, (p, _))| (k.clone(), p.clone()))
         .collect();
-    let mounts = cover_restricted_exposure(kept, &sources, ws_host, warnings);
+    let mounts = cover_restricted_exposure(kept, &sources, ws_host, vcs_providers, warnings);
     let mounts = protect_sources(mounts, &rw_sources, protected, state, warnings);
     let workspace = (ws_host, ctx.workspace_sandbox());
     let mounts = check_state_dirs(mounts, &canonical, workspace, state, warnings)?;
@@ -2630,10 +2631,11 @@ fn cover_restricted_exposure(
     mut mounts: Vec<PlannedMount>,
     sources: &[Option<(PathBuf, EntryKind)>],
     ws_host: &Path,
+    vcs_providers: &BTreeSet<ProviderName>,
     warnings: &mut Vec<SpecWarning>,
 ) -> Vec<PlannedMount> {
     // Every exposure, with the kind of the content it shows.
-    let found = find_restricted_exposure(&mounts, sources, ws_host, warnings);
+    let found = find_restricted_exposure(&mounts, sources, ws_host, vcs_providers, warnings);
     // The mount covering each exposed sandbox path.
     let covers = |found: &[(Exposure, EntryKind)]| {
         let mut covers: BTreeMap<PathBuf, PlannedMount> = BTreeMap::new();
@@ -2710,6 +2712,7 @@ fn find_restricted_exposure(
     mounts: &[PlannedMount],
     sources: &[Option<(PathBuf, EntryKind)>],
     ws_host: &Path,
+    vcs_providers: &BTreeSet<ProviderName>,
     warnings: &mut Vec<SpecWarning>,
 ) -> Vec<(Exposure, EntryKind)> {
     let mut found = Vec::new();
@@ -2768,12 +2771,12 @@ fn find_restricted_exposure(
             if shown_at == r.sandbox || overmounted(&m.sandbox, &shown_at) {
                 continue;
             }
-            // `vcs.remote` binds the host's `SSH_AUTH_SOCK` and
+            // `<vcs>.remote` binds the host's `SSH_AUTH_SOCK` and
             // `known_hosts` into `/home/vcs/.ssh/` on purpose, even when
-            // `main` masked the same file or socket at its own path.
+            // another profile masked the same file or socket at its own path.
             if rel.as_os_str().is_empty()
                 && m.mode == PathMode::Ro
-                && m.provider.as_str() == crate::provider::VCS_PROVIDER_NAME
+                && vcs_providers.contains(&m.provider)
                 && matches!(
                     m.sandbox.to_str(),
                     Some("/home/vcs/.ssh/agent.sock" | "/home/vcs/.ssh/known_hosts")
@@ -3542,6 +3545,7 @@ fn compile_profile(
     let mut roots = UntrustedRoots::new(ctx.workspace_host());
     roots.add_rw_mounts(None, &planned.plan.mounts);
     let scan_cache = Arc::new(SocketScanCache::default());
+    let vcs_providers = BTreeSet::new();
     finish_profile_inner(
         planned,
         grants,
@@ -3549,6 +3553,7 @@ fn compile_profile(
         ctx,
         &roots,
         &[],
+        &vcs_providers,
         state,
         false,
         &scan_cache,
@@ -3618,6 +3623,7 @@ fn finish_profile_inner(
     ctx: &ExpansionContext,
     roots: &UntrustedRoots,
     protected: &[SourceToProtect<'_>],
+    vcs_providers: &BTreeSet<ProviderName>,
     state: &StateDirs,
     defer_socket_scan: bool,
     scan_cache: &Arc<SocketScanCache>,
@@ -3639,6 +3645,7 @@ fn finish_profile_inner(
         &profile_ctx,
         roots,
         protected,
+        vcs_providers,
         state,
         &mut warnings,
     )?;
@@ -3845,6 +3852,7 @@ impl CompiledSession {
         if test_roots.roots.len() != before_len {
             return Ok(None);
         }
+        let vcs_providers = configured_vcs_providers(config);
         let parent = graph
             .get(&target)
             .and_then(|node| node.parent.as_ref())
@@ -3856,6 +3864,7 @@ impl CompiledSession {
             ctx,
             &self.roots,
             &protected,
+            &vcs_providers,
             state,
             true,
             &self.scan_cache,
@@ -4057,6 +4066,15 @@ pub(crate) fn compile_session_granted_lazy_with_cache(
     )
 }
 
+fn configured_vcs_providers(config: &Config) -> BTreeSet<ProviderName> {
+    config
+        .providers
+        .iter()
+        .filter(|e| e.enabled && matches!(e.kind, crate::config::ProviderKind::Vcs { .. }))
+        .map(|e| e.name.clone())
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compile_session_inner(
     config: &Config,
@@ -4071,6 +4089,7 @@ fn compile_session_inner(
     let graph = build_profile_graph(config, outputs)?;
     let merged = merge_profiles(&graph)?;
     let protected = check_protected_sources(protected)?;
+    let vcs_providers = configured_vcs_providers(config);
     let fail = |profile: &ProfileRef| {
         let profile = profile.clone();
         move |error| CompileError::Profile {
@@ -4108,6 +4127,7 @@ fn compile_session_inner(
             ctx,
             &roots,
             &protected,
+            &vcs_providers,
             state,
             defer_socket_scan,
             &scan_cache,
@@ -4213,8 +4233,35 @@ mod tests {
             fs::create_dir_all(self.root.join(rel)).unwrap();
         }
 
-        /// The outputs of the session providers of `src` (the base's, then
-        /// the user's `config` providers).
+        /// Layers `src` as `.stopit.toml` over `DEFAULT_CONFIG_TOML`, returning
+        /// the effective [`Config`] and provider outputs.
+        fn layered(&self, src: &str) -> (Config, Vec<(ProviderName, ProviderOutput)>) {
+            let global = crate::config::ConfigLayer::from_global_toml_str(
+                crate::config::DEFAULT_CONFIG_TOML,
+            )
+            .unwrap();
+            let project = crate::config::ConfigLayer::from_toml_str(src).unwrap();
+            let layered = crate::config::ConfigLayer::layer(
+                Some((global, Path::new("/cfg"))),
+                Some((project, &self.ws())),
+            );
+            let pctx = ProviderContext {
+                workspace: self.ws(),
+                workspace_mount: self.ws_mount.parse().unwrap(),
+                home: self.root.join("home"),
+                session_dir: self.root.join("session"),
+                data_dir: None,
+                rw_grants: Vec::new(),
+            };
+            let outputs = crate::provider::layered_session_providers(&layered.providers)
+                .unwrap()
+                .iter()
+                .map(|p| (p.name().clone(), p.manifest(&pctx).unwrap()))
+                .collect();
+            (layered.config, outputs)
+        }
+
+        /// The outputs of the session providers of `cfg` alone.
         fn outputs(&self, cfg: &Config) -> Vec<(ProviderName, ProviderOutput)> {
             let pctx = ProviderContext {
                 workspace: self.ws(),
@@ -4235,14 +4282,16 @@ mod tests {
             self.try_compile_protecting(src, &[])
         }
 
-        /// Compiles `src` with the paths below the temp root `protected`
-        /// asked to be protected, each by the provider named with it.
+        /// Compiles `src` (layered over `DEFAULT_CONFIG_TOML` unless
+        /// `inherit_global = false`) with the paths below the temp root
+        /// `protected` asked to be protected, each by the provider named with
+        /// it.
         fn try_compile_protecting(
             &self,
             src: &str,
             protected: &[(&str, &str)],
         ) -> Result<CompiledSession, CompileError> {
-            let cfg = Config::from_toml_str(src).unwrap();
+            let (cfg, outputs) = self.layered(src);
             let protected: Vec<ProtectedSource> = protected
                 .iter()
                 .map(|(provider, rel)| ProtectedSource {
@@ -4250,7 +4299,7 @@ mod tests {
                     path: self.root.join(rel),
                 })
                 .collect();
-            compile_session(&cfg, self.outputs(&cfg), &protected, &self.state, &self.ctx)
+            compile_session(&cfg, outputs, &protected, &self.state, &self.ctx)
         }
 
         fn compile(&self, src: &str) -> CompiledSession {
@@ -4315,7 +4364,6 @@ mod tests {
     /// The startup summary of `main` in the session compiled from `src`.
     fn summary_of(f: &Fixture, src: &str) -> Vec<String> {
         use crate::summary::{SummaryContext, summary_lines};
-        let cfg = Config::from_toml_str(src).unwrap();
         let s = f.compile(src);
         let home = f.root.join("home");
         let ctx = SummaryContext {
@@ -4323,24 +4371,26 @@ mod tests {
             workspace: &f.ws(),
             workspace_mount: Path::new(f.ws_mount),
             home: &home,
-            base: cfg.base,
             unprotected: &[],
         };
         summary_lines(spec(&s, "main"), &ctx)
     }
 
     #[test]
-    fn the_default_base_summary_is_only_the_header() {
+    fn the_default_config_summary_is_uniform() {
         let f = Fixture::new();
         f.file("ws/flake.lock");
         f.file("ws/.env");
         f.file("ws/.stopit.toml");
         assert_eq!(
             summary_of(&f, ""),
-            [format!(
-                "profile \"main\" (workspace {} rw at /workspace)",
-                f.ws().display()
-            )]
+            [
+                format!(
+                    "profile \"main\" (workspace {} rw at /workspace)",
+                    f.ws().display()
+                ),
+                "  env pass COLORTERM, LANG, TERM".to_owned(),
+            ]
         );
     }
 
@@ -4353,7 +4403,7 @@ mod tests {
         let ws = ws.display();
         // `ro` workspace with an `rw` part (and sockets not masked).
         let src = format!(
-            "base = \"none\"\n{}",
+            "inherit_global = false\n[profiles.main]\n{}",
             prov(
                 "p",
                 "main",
@@ -4370,7 +4420,7 @@ mod tests {
         );
         // A workspace that is not mounted, with a part of it mounted.
         let src = format!(
-            "base = \"none\"\n{}",
+            "inherit_global = false\n[profiles.main]\n{}",
             prov("p", "main", "fs.ro = [\"{workspace}/secrets\"]")
         );
         assert_eq!(
@@ -4383,10 +4433,10 @@ mod tests {
     }
 
     #[test]
-    fn base_none_is_the_empty_sandbox() {
+    fn empty_profile_is_the_empty_sandbox() {
         let f = Fixture::new();
-        let s = f.compile("base = \"none\"");
-        assert_eq!(s.order(), [ProfileRef::main()]);
+        let s = f.compile("inherit_global = false\n[profiles.main]\n");
+        assert_eq!(s.order(), [pr("main")]);
         assert_eq!(s.len(), 1);
         assert!(!s.is_empty());
         let main = get(&s, "main");
@@ -4410,10 +4460,10 @@ mod tests {
     }
 
     #[test]
-    fn base_default_on_an_empty_workspace() {
+    fn default_config_on_an_empty_workspace() {
         let f = Fixture::new();
         let s = f.compile("");
-        assert_eq!(s.order(), [ProfileRef::main()]);
+        assert_eq!(s.order(), [pr("main")]);
         let main = get(&s, "main");
         let spec = &main.spec;
         assert_eq!(
@@ -4460,46 +4510,13 @@ mod tests {
         assert!(spec.namespaces.shared.is_empty());
         assert!(spec.allow_syscalls.is_empty());
         assert!(spec.shims.is_empty());
-        // The literal protected paths that do not exist are reported, not
-        // dropped silently.
-        let missing: Vec<&str> = main
-            .warnings
-            .iter()
-            .map(|w| match w {
-                SpecWarning::Mount(PlanWarning {
-                    pattern,
-                    kind: PlanWarningKind::Resolve(ResolveWarning::Missing { .. }),
-                    ..
-                }) => pattern.as_str(),
-                other => panic!("unexpected warning {other:?}"),
-            })
-            .collect();
-        assert_eq!(
-            missing,
-            [
-                "{workspace}/flake.lock",
-                "{workspace}/.envrc",
-                "{workspace}/.stopit.toml",
-                "{workspace}/.vscode",
-                "{workspace}/.idea",
-                "{workspace}/.github/workflows",
-                "{workspace}/.gitmodules",
-                "{workspace}/.cargo/config.toml",
-                "{workspace}/.cargo/config",
-                "{workspace}/.bazelrc",
-                "{workspace}/.claude",
-                "{workspace}/.gemini",
-                "{workspace}/.cursor",
-                "{workspace}/.mcp.json",
-                "{workspace}/.zed",
-                "{workspace}/.gdbinit",
-                "{workspace}/.lldbinit",
-            ]
-        );
+        // `warn_missing = false` on `base` and `protect-nix` keeps missing
+        // optional paths quiet on an empty workspace.
+        assert!(main.warnings.is_empty(), "{:?}", main.warnings);
     }
 
     #[test]
-    fn stopit_grant_is_on_under_the_default_base_until_turned_off() {
+    fn stopit_grant_is_on_under_default_config_until_turned_off() {
         let f = Fixture::new();
         let names = |s: &CompiledSession, p: &str| {
             spec(s, p)
@@ -4508,24 +4525,31 @@ mod tests {
                 .map(|n| n.as_str().to_owned())
                 .collect::<Vec<_>>()
         };
-        let s = f.compile("[profiles.child]\n[profiles.bare]\ninherit = \"none\"\n");
+        let s = f
+            .compile("[profiles.child]\ninherit = \"main\"\n[profiles.bare]\ninherit = \"none\"\n");
         assert!(spec(&s, "main").grant && spec(&s, "child").grant);
         assert_eq!(names(&s, "main"), ["stopit-grant"]);
         // `inherit = "none"` starts from the empty sandbox, without it.
         assert!(!spec(&s, "bare").grant);
         assert!(names(&s, "bare").is_empty());
-        // Any provider of a profile turns it off there and below, whatever
-        // the others say, and a profile may turn it on again.
+        // A workspace provider turns `sandbox.grant` off in `main` (overriding
+        // the global `base` provider), and a child profile may turn it on again.
         let s = f.compile(&format!(
-            "[profiles.child]\n[profiles.again]\n{}{}{}",
+            "[profiles.child]\ninherit = \"main\"\n[profiles.again]\ninherit = \"main\"\n{}{}",
             prov("off", "main", "sandbox.grant = false"),
-            prov("on", "main", "sandbox.grant = true"),
             prov("again", "again", "sandbox.grant = true"),
         ));
         assert!(!spec(&s, "main").grant && !spec(&s, "child").grant);
         assert!(spec(&s, "again").grant);
-        // `base = "none"` has no shims at all.
-        let s = f.compile("base = \"none\"\n");
+        // Within the same layer, `false` beats `true`.
+        let s = f.compile(&format!(
+            "inherit_global = false\n[profiles.main]\n{}{}",
+            prov("off", "main", "sandbox.grant = false"),
+            prov("on", "main", "sandbox.grant = true"),
+        ));
+        assert!(!spec(&s, "main").grant);
+        // An empty standalone profile has no shims at all.
+        let s = f.compile("inherit_global = false\n[profiles.main]\n");
         assert!(!spec(&s, "main").grant);
     }
 
@@ -4533,7 +4557,7 @@ mod tests {
     fn extra_group_names_are_a_union_down_the_profiles() {
         let f = Fixture::new();
         let s = f.compile(&format!(
-            "[profiles.child]\n[profiles.bare]\ninherit = \"none\"\n{}{}{}",
+            "[profiles.child]\ninherit = \"main\"\n[profiles.bare]\ninherit = \"none\"\n{}{}{}",
             prov("a", "main", "system.groups = [\"nobody\"]"),
             prov("b", "main", "system.groups = [\"audio\", \"nobody\"]"),
             prov("c", "child", "system.groups = [\"video\"]"),
@@ -4576,7 +4600,7 @@ mod tests {
     }
 
     #[test]
-    fn base_default_masks_and_protects_matching_workspace_files() {
+    fn default_config_masks_and_protects_matching_workspace_files() {
         let f = Fixture::new();
         for file in [
             "ws/.env",
@@ -4601,6 +4625,7 @@ mod tests {
             "ws/.cargo/config",
             "ws/.bazelrc",
             "ws/.mcp.json",
+            "ws/opencode.json",
             "ws/.gdbinit",
             "ws/.lldbinit",
             "ws/.github/workflows/ci.yml",
@@ -4614,6 +4639,8 @@ mod tests {
             "ws/.git",
             "ws/.jj",
             "ws/.claude",
+            "ws/.codex",
+            "ws/.opencode",
             "ws/.gemini",
             "ws/.cursor",
             "ws/.zed",
@@ -4631,6 +4658,7 @@ mod tests {
                 row("/home/stopit", Ephemeral, "base"),
                 row("/workspace/.bazelrc", Protected, "base"),
                 row("/workspace/.claude", Protected, "base"),
+                row("/workspace/.codex", Protected, "base"),
                 row("/workspace/.cursor", Protected, "base"),
                 row("/workspace/.env", Masked, "base"),
                 row("/workspace/.envrc", Protected, "base"),
@@ -4644,16 +4672,18 @@ mod tests {
                 row("/workspace/.lldbinit", Protected, "base"),
                 row("/workspace/.mcp.json", Protected, "base"),
                 row("/workspace/.netrc", Masked, "base"),
+                row("/workspace/.opencode", Protected, "base"),
                 row("/workspace/.stopit.toml", Protected, "base"),
                 row("/workspace/.terraformrc", Masked, "base"),
                 row("/workspace/.vscode", Protected, "base"),
                 row("/workspace/.zed", Protected, "base"),
-                row("/workspace/flake.lock", Protected, "base"),
-                row("/workspace/flake.nix", Protected, "base"),
+                row("/workspace/flake.lock", Protected, "protect-nix"),
+                row("/workspace/flake.nix", Protected, "protect-nix"),
+                row("/workspace/opencode.json", Protected, "base"),
                 row("/workspace/.cargo/config", Protected, "base"),
                 row("/workspace/.cargo/config.toml", Protected, "base"),
                 row("/workspace/.github/workflows", Protected, "base"),
-                row("/workspace/nix/a.nix", Protected, "base"),
+                row("/workspace/nix/a.nix", Protected, "protect-nix"),
                 row("/workspace/sub/.nvim.lua", Protected, "base"),
                 row("/workspace/sub/.stopit.toml", Protected, "base"),
                 row("/workspace/sub/cert.p12", Masked, "base"),
@@ -4670,81 +4700,71 @@ mod tests {
         );
     }
 
-    /// The expressiveness golden test (DESIGN.md §3.2, §12 item 12):
-    /// Appendix A under `base = "none"` compiles to the same spec as
-    /// `base = "default"`, for every profile.
-    ///
-    /// Appendix A's `vcs` provider is left out on both sides: the provider
-    /// itself is Phase 3, and `base = "default"` does not add it implicitly.
     #[test]
-    fn appendix_a_matches_base_default() {
+    fn default_config_compiles_standalone_and_protect_nix_can_be_disabled_or_overridden() {
         let f = Fixture::new();
-        for file in [
-            "ws/.env",
-            "ws/.env.local",
-            "ws/sub/key.pem",
-            "ws/sub/id.key",
-            "ws/.npmrc",
-            "ws/flake.nix",
-            "ws/nix/a.nix",
-            "ws/flake.lock",
-            "ws/.envrc",
-            "ws/.stopit.toml",
-            "ws/sub/.stopit.toml",
-            "ws/.github/workflows/ci.yml",
-            "ws/src/main.rs",
-            "home/.config/tool/x",
-        ] {
-            f.file(file);
-        }
-        f.mkdir("ws/.vscode");
-        // The same user profiles and providers on both sides, so that
-        // inheritance from the base's `main` is compared too.
-        let user = format!(
-            "[profiles.child]\n[profiles.bare]\ninherit = \"none\"\n{}{}",
-            prov(
-                "u",
-                "child",
-                "fs.ro = [\"~/.config\"]\nnetwork = { mode = \"proxy\", allow_domains = [\"crates.io\"] }"
-            ),
-            prov("v", "bare", "fs.ro = [\"{workspace}/src\"]"),
-        );
-        let explicit = f.compile(&format!(
-            "{}\n[[provider]]\ntype = \"vcs\"\n{user}",
-            crate::config::APPENDIX_A_WITHOUT_VCS
-        ));
-        let default = f.compile(&format!("base = \"default\"\n{user}"));
+        f.file("ws/flake.nix");
+        f.file("ws/nix/a.nix");
+        f.file("ws/flake.lock");
 
-        assert_eq!(strs(explicit.order()), ["bare", "main", "child"]);
-        assert_eq!(explicit.order(), default.order());
-        for p in explicit.order() {
-            let (e, d) = (explicit.get(p).unwrap(), default.get(p).unwrap());
-            assert_eq!(e.spec, d.spec, "profile {p}");
-            assert_eq!(strs(&e.warnings), strs(&d.warnings), "profile {p}");
-        }
-        // Not vacuous: the base's masks and protections are in the spec.
-        let main = mounts(spec(&explicit, "main"));
-        for want in [
-            row("/workspace/.env", Masked, "base"),
-            row("/workspace/.env.local", Masked, "base"),
-            row("/workspace/.npmrc", Masked, "base"),
-            row("/workspace/sub/id.key", Masked, "base"),
-            row("/workspace/flake.nix", Protected, "base"),
-            row("/workspace/.vscode", Protected, "base"),
-            row("/workspace/.stopit.toml", Protected, "base"),
-            row("/workspace/sub/.stopit.toml", Protected, "base"),
-        ] {
-            assert!(main.contains(&want), "{want:?} not in {main:?}");
-        }
-        assert!(spec(&explicit, "child").network.allow_domains().is_some());
+        // Standalone `DEFAULT_CONFIG_TOML` compiles directly without layering.
+        let standalone_cfg = Config::from_toml_str(crate::config::DEFAULT_CONFIG_TOML).unwrap();
+        let standalone = compile_session(
+            &standalone_cfg,
+            f.outputs(&standalone_cfg),
+            &[],
+            &f.state,
+            &f.ctx,
+        )
+        .unwrap();
+        let layered = f.compile("");
+        assert_eq!(standalone.order(), layered.order());
+        assert_eq!(
+            standalone.get(&pr("main")).unwrap().spec,
+            layered.get(&pr("main")).unwrap().spec,
+        );
+
+        // Disabling `protect-nix` in `.stopit.toml` leaves `.nix` and `flake.lock`
+        // writable directly in `main`.
+        let disabled = f.compile("[[provider]]\nname = \"protect-nix\"\nenabled = false\n");
+        let disabled_mounts = mounts(spec(&disabled, "main"));
+        assert!(
+            !disabled_mounts
+                .iter()
+                .any(|(p, _, _)| p.contains(".nix") || p.contains("flake.lock")),
+            "{disabled_mounts:?}"
+        );
+
+        // Alternatively, a workspace `fs.rw` rule overrides global `protect-nix`
+        // directly in `main`.
+        let overridden = f.compile(&prov(
+            "allow-nix",
+            "main",
+            "fs.rw = [\"{workspace}/**/*.nix\", \"{workspace}/flake.lock\"]",
+        ));
+        let over_mounts = mounts(spec(&overridden, "main"));
+        assert!(
+            over_mounts.contains(&row("/workspace/flake.nix", Rw, "allow-nix")),
+            "{over_mounts:?}"
+        );
+        assert!(
+            over_mounts.contains(&row("/workspace/nix/a.nix", Rw, "allow-nix")),
+            "{over_mounts:?}"
+        );
+        assert!(
+            over_mounts.contains(&row("/workspace/flake.lock", Rw, "allow-nix")),
+            "{over_mounts:?}"
+        );
     }
 
     #[test]
     fn allow_domains_are_kept_only_in_proxy_mode() {
         let f = Fixture::new();
         let s = f.compile(&format!(
-            "base = \"none\"\n[profiles.lo]\n[profiles.unset]\n[profiles.full]\n[profiles.px]\n\
-             [profiles.own]\n{}{}{}{}{}{}",
+            "inherit_global = false\n[profiles.main]\n\
+             [profiles.lo]\ninherit = \"main\"\n[profiles.unset]\ninherit = \"main\"\n\
+             [profiles.full]\ninherit = \"main\"\n[profiles.px]\ninherit = \"main\"\n\
+             [profiles.own]\ninherit = \"main\"\n{}{}{}{}{}{}",
             prov("a", "main", "network.allow_domains = [\"b.example.com\", \"a.example.com\"]"),
             prov("b", "lo", "network.mode = \"loopback\""),
             prov("c", "full", "network.mode = \"full\""),
@@ -4814,7 +4834,7 @@ mod tests {
         assert_eq!(px.spec.network.allow_domains(), Some(&all));
         // Proxy mode without domains is not a warning.
         let s = f.compile(&format!(
-            "base = \"none\"\n{}",
+            "inherit_global = false\n[profiles.main]\n{}",
             prov("a", "main", "network.mode = \"proxy\"")
         ));
         let main = get(&s, "main");
@@ -4826,7 +4846,10 @@ mod tests {
     fn full_network_gets_a_resolv_conf_in_its_own_namespace_only() {
         let f = Fixture::new();
         let etc = |body: &str| {
-            let s = f.compile(&format!("base = \"none\"\n{}", prov("a", "main", body)));
+            let s = f.compile(&format!(
+                "inherit_global = false\n[profiles.main]\n{}",
+                prov("a", "main", body)
+            ));
             strs(&get(&s, "main").spec.system.etc)
         };
         assert_eq!(etc("network.mode = \"full\""), ["resolv.conf"]);
@@ -4851,7 +4874,7 @@ mod tests {
         // mistake, which the error explains.
         let e = f
             .compile_err(&format!(
-                "base = \"none\"\n{}",
+                "inherit_global = false\n[profiles.main]\n{}",
                 prov("a", "main", &format!("network.mode = \"full\"\n{grant}"))
             ))
             .to_string();
@@ -4871,7 +4894,8 @@ mod tests {
     fn child_narrowing_a_proxy_parent_drops_inherited_domains_silently() {
         let f = Fixture::new();
         let s = f.compile(&format!(
-            "base = \"none\"\n[profiles.offline]\n[profiles.below]\ninherit = \"offline\"\n{}{}",
+            "inherit_global = false\n[profiles.main]\n[profiles.offline]\ninherit = \"main\"\n\
+             [profiles.below]\ninherit = \"offline\"\n{}{}",
             prov(
                 "m",
                 "main",
@@ -4940,7 +4964,8 @@ mod tests {
         let f = Fixture::new();
         f.mkdir("home/.claude");
         let s = f.compile(&format!(
-            "base = \"none\"\n[profiles.harness]\n[profiles.bare]\ninherit = \"none\"\n{}{}{}",
+            "inherit_global = false\n[profiles.main]\n[profiles.harness]\ninherit = \"main\"\n\
+             [profiles.bare]\ninherit = \"none\"\n{}{}{}",
             prov(
                 "m",
                 "main",
@@ -5028,9 +5053,9 @@ mod tests {
         let f = Fixture::new();
         f.mkdir("home/.config");
         let s = f.compile(&format!(
-            "base = \"none\"\n\
-             [profiles.explicit_home]\n\
-             [profiles.child_user]\n\
+            "inherit_global = false\n[profiles.main]\n\
+             [profiles.explicit_home]\ninherit = \"main\"\n\
+             [profiles.child_user]\ninherit = \"main\"\n\
              {}{}{}",
             prov(
                 "m",
@@ -5062,7 +5087,7 @@ mod tests {
         // rejected by the reserved-path check.
         let f_ws = Fixture::with_workspace("ws", "/home/alice");
         let e = f_ws.compile_err(&format!(
-            "base = \"none\"\n{}",
+            "inherit_global = false\n[profiles.main]\n{}",
             prov("m", "main", "system.user = { username = \"alice\" }")
         ));
         assert!(
@@ -5088,7 +5113,7 @@ mod tests {
     fn warnings_are_listed_per_profile() {
         let f = Fixture::new();
         let s = f.compile(&format!(
-            "base = \"none\"\n[profiles.child]\n{}{}",
+            "inherit_global = false\n[profiles.main]\n[profiles.child]\ninherit = \"main\"\n{}{}",
             prov("m", "main", "fs.ro = [\"~/missing\"]"),
             prov("c", "child", "network.allow_domains = [\"crates.io\"]"),
         ));
@@ -5167,7 +5192,13 @@ mod tests {
 
         // (workspace, home, which, path, reason)
         let rejected = [
-            ("/", "/home/stopit", PathRole::Workspace, "/", covers("/proc")),
+            (
+                "/",
+                "/home/stopit",
+                PathRole::Workspace,
+                "/",
+                covers("/proc"),
+            ),
             (
                 "/proc",
                 "/home/stopit",
@@ -5352,17 +5383,20 @@ mod tests {
         }
         // `main` is unaffected by the child's home.
         f.compile(&format!(
-            "[profiles.harness]\n{}",
+            "[profiles.harness]\ninherit = \"main\"\n{}",
             prov("p", "harness", "system.home = \"/tmp/h\""),
         ));
     }
 
-    /// Compiles a `base = "none"` session whose only provider, `p`, targets
-    /// `main` with `body` as its sandbox grants. Creates `~/x` first, as a
-    /// host source for [`bind_at`].
+    /// Compiles an isolated session whose only provider, `p`, targets `main`
+    /// with `body` as its sandbox grants. Creates `~/x` first, as a host
+    /// source for [`bind_at`].
     fn compile_with_rule(f: &Fixture, body: &str) -> Result<CompiledSession, CompileError> {
         f.mkdir("home/x");
-        f.try_compile(&format!("base = \"none\"\n{}", prov("p", "main", body)))
+        f.try_compile(&format!(
+            "inherit_global = false\n[profiles.main]\n{}",
+            prov("p", "main", body)
+        ))
     }
 
     /// A read-only bind of the host's `~/x` at `dest`.
@@ -5468,10 +5502,13 @@ mod tests {
         }
     }
 
-    /// Compiles a `base = "none"` session whose only provider, `p`, targets
-    /// `main` with `body` as its sandbox grants.
+    /// Compiles an isolated session whose only provider, `p`, targets `main`
+    /// with `body` as its sandbox grants.
     fn compile_body(f: &Fixture, body: &str) -> Result<CompiledSession, CompileError> {
-        f.try_compile(&format!("base = \"none\"\n{}", prov("p", "main", body)))
+        f.try_compile(&format!(
+            "inherit_global = false\n[profiles.main]\n{}",
+            prov("p", "main", body)
+        ))
     }
 
     /// The `(mode, host, resolved, sandbox)` of a `WorkspaceExposed` error,
@@ -6113,7 +6150,10 @@ mod tests {
             )
         );
         let s = compile_body(&f, "fs.rw = [\"{workspace}\", \"~/proj/x\"]").unwrap();
-        assert_eq!(mounts(spec(&s, "main")), [row("/home/stopit/proj", Rw, "p")]);
+        assert_eq!(
+            mounts(spec(&s, "main")),
+            [row("/home/stopit/proj", Rw, "p")]
+        );
         assert_eq!(destination_warnings(&s, "main")[0].link, f.ws().join("x"));
         // Without the workspace mount nothing is underneath (bwrap's root
         // tmpfs), and the host-source check refuses the link: an error for
@@ -6363,7 +6403,7 @@ mod tests {
         symlink("nowhere", home.join(".cache/tool/cfg")).unwrap();
         let src = |mode: &str| {
             format!(
-                "base = \"none\"\n[profiles.agent]\ninherit = \"none\"\n{}{}",
+                "inherit_global = false\n[profiles.main]\n[profiles.agent]\ninherit = \"none\"\n{}{}",
                 prov("w", "main", "fs.rw = [\"~/.cache/tool\"]"),
                 prov(
                     "p",
@@ -6518,17 +6558,32 @@ mod tests {
         // entries, none of which can be inspected). The default base's
         // workspace rules then mask it as a whole, once per restrictive
         // rule that could not inspect something there.
-        let globs_masked = 13; // `**/.env`, `**/.env.*`, … in `fs.masked`.
-        let globs_protected = 4; // `**/*.nix`, `**/.stopit.toml`, `**/.nvim.lua`, `**/.exrc`.
-        let literals_protected = 17; // `flake.lock`, `.envrc`, … in `fs.protected`.
-        // Each case: the files, the directory made inaccessible and its
-        // mode, and the rules expected to mask it (by mode, in rule order).
-        let all_globs: Vec<PathMode> =
-            [vec![Masked; globs_masked], vec![Protected; globs_protected]].concat();
-        let globs_and_literals: Vec<PathMode> =
-            [all_globs.clone(), vec![Protected; literals_protected]].concat();
-        let nix_and_literals: Vec<PathMode> = vec![Protected; 1 + literals_protected];
-        let cases: [(&[&str], &str, u32, Vec<PathMode>); 4] = [
+        let base_globs_masked = 13; // `**/.env`, `**/.env.*`, … in `base`.
+        let base_globs_protected = 3; // `**/.stopit.toml`, `**/.nvim.lua`, `**/.exrc` in `base`.
+        let base_literals_protected = 19; // `.envrc`, `.stopit.toml`, … in `base`.
+        let rep = |prov: &'static str, mode: PathMode, n: usize| vec![(prov, mode); n];
+        let all_globs: Vec<(&str, PathMode)> = [
+            rep("base", Masked, base_globs_masked),
+            rep("base", Protected, base_globs_protected),
+            rep("protect-nix", Protected, 1),
+        ]
+        .concat();
+        let globs_and_literals: Vec<(&str, PathMode)> = [
+            rep("base", Masked, base_globs_masked),
+            rep(
+                "base",
+                Protected,
+                base_globs_protected + base_literals_protected,
+            ),
+            rep("protect-nix", Protected, 2),
+        ]
+        .concat();
+        let nix_and_literals: Vec<(&str, PathMode)> = [
+            rep("base", Protected, base_literals_protected),
+            rep("protect-nix", Protected, 2),
+        ]
+        .concat();
+        let cases: [(&[&str], &str, u32, Vec<(&str, PathMode)>); 4] = [
             // Every `**` glob fails to read it.
             (
                 &["ws/locked/.env", "ws/a/.env"],
@@ -6541,7 +6596,7 @@ mod tests {
                 &["ws/d/foo.nix", "ws/a/.env"],
                 "ws/d",
                 0o600,
-                vec![Protected],
+                vec![("protect-nix", Protected)],
             ),
             // The workspace root: every glob and every literal rule below it.
             (
@@ -6615,7 +6670,7 @@ mod tests {
             }
             let want: Vec<_> = want
                 .into_iter()
-                .map(|m| ("base".to_owned(), m, host.clone(), sandbox.clone()))
+                .map(|(prov, m)| (prov.to_owned(), m, host.clone(), sandbox.clone()))
                 .collect();
             assert_eq!(masked, want, "{dir} {mode:o}");
             // Masking the workspace root hides the workspace mount, loudly.
@@ -6661,6 +6716,7 @@ mod tests {
         let Some((under, alone)) = with_mode(std::slice::from_ref(&d), 0o600, || {
             let mut warnings = Vec::new();
             let scan_cache = Arc::new(SocketScanCache::default());
+            let vcs = BTreeSet::new();
             let under = check_host_sources(
                 vec![ws.clone(), mask.clone(), protected.clone()],
                 false,
@@ -6669,6 +6725,7 @@ mod tests {
                 &f.ctx,
                 &roots,
                 &[],
+                &vcs,
                 &f.state,
                 &mut warnings,
             )
@@ -6681,6 +6738,7 @@ mod tests {
                 &f.ctx,
                 &roots,
                 &[],
+                &vcs,
                 &f.state,
                 &mut Vec::new(),
             );
@@ -6748,6 +6806,7 @@ mod tests {
             glob_link: true,
         };
         let roots = UntrustedRoots::new(&f.ws());
+        let vcs = BTreeSet::new();
         let e = check_host_sources(
             vec![m],
             false,
@@ -6756,6 +6815,7 @@ mod tests {
             &f.ctx,
             &roots,
             &[],
+            &vcs,
             &f.state,
             &mut Vec::new(),
         )
@@ -6915,7 +6975,7 @@ mod tests {
         // and checked without the grant but in the same session.
         let e = f
             .try_compile(&format!(
-                "base = \"none\"\n[profiles.agent]\n{}{}",
+                "inherit_global = false\n[profiles.main]\n[profiles.agent]\ninherit = \"main\"\n{}{}",
                 prov("w", "agent", "fs.rw = [\"~/.cache/tool\"]"),
                 prov("r", "main", "fs.ro = [\"~/.cache/tool/cfg\"]"),
             ))
@@ -6928,7 +6988,7 @@ mod tests {
         );
         // The grant in `main`, the rule in an unrelated profile.
         let src = format!(
-            "base = \"none\"\n[profiles.bare]\ninherit = \"none\"\n{}{}",
+            "inherit_global = false\n[profiles.main]\n[profiles.bare]\ninherit = \"none\"\n{}{}",
             prov("w", "main", "fs.rw = [\"~/.cache/tool\"]"),
             prov("r", "bare", "fs.ro = [\"~/.cache/tool/cfg\"]"),
         );
@@ -6980,7 +7040,7 @@ mod tests {
         symlink(f.root.join("store/foo"), f.root.join("home/.config/foo")).unwrap();
         for src in [
             format!(
-                "base = \"none\"\n{}",
+                "inherit_global = false\n[profiles.main]\n{}",
                 prov(
                     "p",
                     "main",
@@ -6988,7 +7048,7 @@ mod tests {
                 )
             ),
             format!(
-                "base = \"none\"\n[profiles.agent]\n{}{}",
+                "inherit_global = false\n[profiles.main]\n[profiles.agent]\ninherit = \"main\"\n{}{}",
                 prov("w", "agent", "fs.rw = [\"~/.cache/tool\"]"),
                 prov(
                     "r",
@@ -7126,7 +7186,7 @@ mod tests {
         for mask in ["~/.cache/tool/cfg", "~/.cache/tool/cfg/id_ed25519"] {
             let e = f
                 .try_compile(&format!(
-                    "base = \"none\"\n[profiles.agent]\ninherit = \"none\"\n{}{}",
+                    "inherit_global = false\n[profiles.main]\n[profiles.agent]\ninherit = \"none\"\n{}{}",
                     prov("w", "agent", "fs.rw = [\"~/.cache/tool\"]"),
                     prov("p", "main", &format!("fs.masked = [\"{mask}\"]")),
                 ))
@@ -7321,7 +7381,10 @@ mod tests {
             let s = compile_body(&f, &format!("fs.ro = [\"~/.config\"]\n{rule}")).unwrap();
             assert_eq!(
                 mounts(spec(&s, "main")),
-                [row("/home/stopit/.config", Ro, "p"), row(sandbox, mode, "p")],
+                [
+                    row("/home/stopit/.config", Ro, "p"),
+                    row(sandbox, mode, "p")
+                ],
                 "{rule}"
             );
         }
@@ -7337,7 +7400,7 @@ mod tests {
         let tool = home.join(".cache/tool");
         let e = f
             .try_compile(&format!(
-                "base = \"none\"\n[profiles.agent]\ninherit = \"none\"\n{}{}",
+                "inherit_global = false\n[profiles.main]\n[profiles.agent]\ninherit = \"none\"\n{}{}",
                 prov("w", "agent", "fs.rw = [\"~/.cache/tool\"]"),
                 prov(
                     "p",
@@ -7501,7 +7564,7 @@ mod tests {
         // the winner is dropped with a warning, and nothing is mounted there.
         // (`main` itself has the masked winner, and fails.)
         let src = format!(
-            "base = \"none\"\n[profiles.child]\n{}{}",
+            "inherit_global = false\n[profiles.main]\n[profiles.child]\ninherit = \"main\"\n{}{}",
             prov(
                 "p",
                 "main",
@@ -7878,7 +7941,7 @@ mod tests {
         );
         let s = f
             .try_compile(&format!(
-                "base = \"none\"\n[profiles.agent]\ninherit = \"none\"\n{}{}",
+                "inherit_global = false\n[profiles.main]\n[profiles.agent]\ninherit = \"none\"\n{}{}",
                 prov("w", "agent", "fs.rw = [\"~/.cache/tool\"]"),
                 prov("p", "main", "fs.ro = [\"~/.cache/*/cfg\"]"),
             ))
@@ -7918,7 +7981,7 @@ mod tests {
         assert_eq!(destination_link(e, "main").link, tool.join("cfg"));
         let e = f
             .try_compile(&format!(
-                "base = \"none\"\n[profiles.agent]\ninherit = \"none\"\n{}{}",
+                "inherit_global = false\n[profiles.main]\n[profiles.agent]\ninherit = \"none\"\n{}{}",
                 prov("w", "agent", "fs.rw = [\"~/.cache/tool\"]"),
                 prov("p", "main", "fs.masked = [\"~/.cache/tool/cfg/a*\"]"),
             ))
@@ -7937,7 +8000,7 @@ mod tests {
         // matched directly).
         let s = f
             .try_compile(&format!(
-                "base = \"none\"\n[profiles.child]\n{}{}",
+                "inherit_global = false\n[profiles.main]\n[profiles.child]\ninherit = \"main\"\n{}{}",
                 prov("parent", "main", "fs.rw = [\"{workspace}/*.env\"]"),
                 prov("own", "child", "fs.masked = [\"{workspace}/*.env\"]"),
             ))
@@ -8111,7 +8174,7 @@ mod tests {
         );
         // The cover is attributed to the masking rule's provider.
         let s = f.compile(&format!(
-            "base = \"none\"\n{}{}",
+            "inherit_global = false\n[profiles.main]\n{}{}",
             prov("m", "main", mask),
             prov("b", "main", elsewhere)
         ));
@@ -8143,7 +8206,10 @@ mod tests {
         let x = exposed(&f, &body);
         assert_eq!(
             (x.resolved, x.shown_at),
-            (cfg.clone(), PathBuf::from("/home/stopit/cfg-link/tool/token"))
+            (
+                cfg.clone(),
+                PathBuf::from("/home/stopit/cfg-link/tool/token")
+            )
         );
         let s = compile_body(&f, &body).unwrap();
         assert_eq!(
@@ -8534,7 +8600,7 @@ mod tests {
         let elsewhere =
             "fs.bind = [{ host = \"~/.config\", sandbox = \"/opt/cfg\", mode = \"ro\" }]";
         let s = f.compile(&format!(
-            "base = \"none\"\n[profiles.agent]\ninherit = \"none\"\n{}{}",
+            "inherit_global = false\n[profiles.main]\n[profiles.agent]\ninherit = \"none\"\n{}{}",
             prov(
                 "p",
                 "main",
@@ -8900,7 +8966,7 @@ mod tests {
         ] {
             let src = |mode: &str| {
                 format!(
-                    "base = \"none\"\n[profiles.agent]\ninherit = \"none\"\n{}{}",
+                    "inherit_global = false\n[profiles.main]\n[profiles.agent]\ninherit = \"none\"\n{}{}",
                     prov("w", "main", "fs.rw = [\"{workspace}\"]"),
                     prov("p", "agent", &rules.replace("{mode}", mode)),
                 )
@@ -9377,11 +9443,11 @@ mod tests {
 
     // --- Providers' protected sources ---
 
-    /// `base = "none"` with the workspace granted `rw` in `main` by
+    /// Isolated session with the workspace granted `rw` in `main` by
     /// provider `u`, then `extra`.
     fn ws_rw(extra: &str) -> String {
         format!(
-            "base = \"none\"\n{}{extra}",
+            "inherit_global = false\n[profiles.main]\n{}{extra}",
             prov("u", "main", "fs.rw = [\"{workspace}\"]")
         )
     }
@@ -9423,7 +9489,7 @@ mod tests {
         // own rule of a profile inheriting it: both would beat a protected
         // rule (§3.5), but not the supervisor's protection.
         let src = ws_rw(&format!(
-            "[profiles.child]\n{}{}",
+            "[profiles.child]\ninherit = \"main\"\n{}{}",
             prov("x", "main", "fs.rw = [\"{workspace}/scripts/env.sh\"]"),
             prov("c", "child", "fs.rw = [\"{workspace}/scripts/env.sh\"]"),
         ));
@@ -9458,7 +9524,7 @@ mod tests {
         f.file("home/bin/env.sh");
         f.mkdir("home/other");
         let src = format!(
-            "base = \"none\"\n[profiles.ro_view]\ninherit = \"none\"\n[profiles.hidden]\n\
+            "inherit_global = false\n[profiles.main]\n[profiles.ro_view]\ninherit = \"none\"\n[profiles.hidden]\n\
              inherit = \"none\"\n{}{}{}",
             prov(
                 "u",
@@ -9530,7 +9596,7 @@ mod tests {
         f.state.config = ConfigDirs::canonical(f.root.join("config/stopit"));
         f.file("home/cfg/env.sh");
         let src = format!(
-            "base = \"none\"\n{}",
+            "inherit_global = false\n[profiles.main]\n{}",
             prov(
                 "u",
                 "main",
@@ -9684,14 +9750,14 @@ mod tests {
         }
         std::os::unix::fs::symlink(f.root.join("home/real"), f.root.join("home/link")).unwrap();
         let src = format!(
-            "base = \"none\"\n[profiles.child]\n{}{}",
+            "inherit_global = false\n[profiles.main]\n[profiles.child]\ninherit = \"main\"\n{}{}",
             prov(
                 "a",
                 "main",
                 "fs.rw = [\"~/cache\", \"~/link\", \"{workspace}/out/*\", \"~/gone\", \"~/cache\"]\n\
                  fs.ro = [\"~/ro\"]\nfs.bind = [{ host = \"~/data\", sandbox = \"/d\", mode = \"rw\" \
                  }, { host = \"~/ro\", sandbox = \"/r\", mode = \"ro\" }]\n\
-                 [provider.sandbox.profiles.extra]\nfs.rw = [\"~/prof\"]"
+                 [provider.sandbox.profiles.extra]\ninherit = \"main\"\nfs.rw = [\"~/prof\"]"
             ),
             prov("b", "child", "fs.rw = [\"{workspace}\"]"),
         );
@@ -9746,7 +9812,7 @@ mod tests {
         );
 
         let e = f.compile_err(&format!(
-            "base = \"none\"\n{}{}",
+            "inherit_global = false\n[profiles.main]\n{}{}",
             prov("a", "main", "system.home = \"/home/a\""),
             prov("b", "main", "system.home = \"/home/b\""),
         ));
@@ -9762,9 +9828,12 @@ mod tests {
 
     // --- Reserved host paths ---
 
-    /// `body` for `main` by provider `u` under `base = "none"`.
+    /// `body` for `main` by provider `u` in an isolated session.
     fn none_with(body: &str) -> String {
-        format!("base = \"none\"\n{}", prov("u", "main", body))
+        format!(
+            "inherit_global = false\n[profiles.main]\n{}",
+            prov("u", "main", body)
+        )
     }
 
     /// The reserved host source `e` is about.
@@ -9948,7 +10017,11 @@ mod tests {
         }
         f.mkdir("home/.local/share/stopit");
         for (body, source, sandbox) in [
-            ("fs.ro = [\"~\"]", home.clone(), PathBuf::from("/home/stopit")),
+            (
+                "fs.ro = [\"~\"]",
+                home.clone(),
+                PathBuf::from("/home/stopit"),
+            ),
             (
                 "fs.bind = [{ host = \"~/.local\", sandbox = \"/opt/local\", mode = \"ro\" }]",
                 home.join(".local"),
@@ -10593,7 +10666,7 @@ fs.masked = [\"{workspace}/hidden\"]
                 row("/workspace/locked_zero", Masked, "stopit"),
             ]
         );
-        let ws_warnings = &compiled.get(&ProfileRef::main()).unwrap().warnings;
+        let ws_warnings = &compiled.get(&pr("main")).unwrap().warnings;
         assert_eq!(ws_warnings.len(), 2, "{ws_warnings:?}");
         assert!(
             matches!(
@@ -10627,7 +10700,7 @@ fs.masked = [\"{workspace}/hidden\"]
             mounts(sp_grant),
             [row("/home/stopit/exec_only", Masked, "stopit")]
         );
-        let grant_warnings = &compiled_grant.get(&ProfileRef::main()).unwrap().warnings;
+        let grant_warnings = &compiled_grant.get(&pr("main")).unwrap().warnings;
         assert!(
             grant_warnings.iter().any(|w| matches!(
                 w,
@@ -10743,28 +10816,22 @@ fs.masked = [\"{workspace}/hidden\"]
         let _other_sock = UnixListener::bind(other_rw.join("nested/other.sock")).unwrap();
 
         let src = format!(
-            "[profiles.other]\n{}",
+            "[profiles.other]\ninherit = \"main\"\n{}",
             prov("p", "other", "fs.rw = [\"~/other_rw\"]")
         );
-        let cfg = Config::from_toml_str(&src).unwrap();
+        let (cfg, outputs) = f.layered(&src);
         let eager = compile_session_granted(
             &cfg,
-            f.outputs(&cfg),
+            outputs.clone(),
             &[],
             &f.state,
             &f.ctx,
             &BTreeSet::new(),
         )
         .unwrap();
-        let lazy = compile_session_granted_lazy(
-            &cfg,
-            f.outputs(&cfg),
-            &[],
-            &f.state,
-            &f.ctx,
-            &BTreeSet::new(),
-        )
-        .unwrap();
+        let lazy =
+            compile_session_granted_lazy(&cfg, outputs, &[], &f.state, &f.ctx, &BTreeSet::new())
+                .unwrap();
 
         // Before `other` is entered, its rw tree has not been scanned for sockets.
         assert!(
@@ -10806,10 +10873,10 @@ fs.masked = [\"{workspace}/hidden\"]
         f.mkdir("home/rw_dir");
         let _sock = UnixListener::bind(f.root.join("home/rw_dir/a.sock")).unwrap();
 
-        let cfg = Config::from_toml_str("").unwrap();
+        let (cfg, base_outputs) = f.layered("");
         let base_session = compile_session_granted_lazy(
             &cfg,
-            f.outputs(&cfg),
+            base_outputs.clone(),
             &[],
             &f.state,
             &f.ctx,
@@ -10836,24 +10903,17 @@ fs.masked = [\"{workspace}/hidden\"]
         let extra = (
             provider,
             ProviderOutput {
-                profile: ProfileRef::main(),
+                profile: pr("main"),
                 manifest: extra_manifest,
                 origin: crate::config::ProviderOrigin::Workspace,
             },
         );
 
         let fast = base_session
-            .compile_extra_profile_lazy(
-                &cfg,
-                &f.outputs(&cfg),
-                extra.clone(),
-                &[],
-                &f.state,
-                &f.ctx,
-            )
+            .compile_extra_profile_lazy(&cfg, &base_outputs, extra.clone(), &[], &f.state, &f.ctx)
             .unwrap()
             .expect("single-leaf extra profile");
-        let mut full_outputs = f.outputs(&cfg);
+        let mut full_outputs = base_outputs;
         full_outputs.push(extra);
         let full = compile_session_granted_lazy(
             &cfg,
@@ -10871,13 +10931,10 @@ fs.masked = [\"{workspace}/hidden\"]
         );
         assert_eq!(
             fast.without_profile(&target)
-                .get(&ProfileRef::main())
+                .get(&pr("main"))
                 .unwrap()
                 .resolved_spec(),
-            base_session
-                .get(&ProfileRef::main())
-                .unwrap()
-                .resolved_spec()
+            base_session.get(&pr("main")).unwrap().resolved_spec()
         );
         assert!(fast.without_profile(&target).get(&target).is_none());
     }

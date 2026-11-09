@@ -278,7 +278,7 @@ impl GrantRequest {
             .expect("the supervisor's name is a valid provider name");
         let full = ProfileRef::contributed(&provider, &local);
         let output = ProviderOutput {
-            profile: ProfileRef::main(),
+            profile: caller.clone(),
             manifest,
             origin: ProviderOrigin::Workspace,
         };
@@ -609,7 +609,7 @@ mod tests {
         let caller: ProfileRef = "vcs.local".parse().unwrap();
         let (output, name) = g.output(&caller, Some(NetworkMode::Proxy)).unwrap();
         assert_eq!(name.as_str(), "stopit.grant");
-        assert_eq!(output.profile, ProfileRef::main());
+        assert_eq!(output.profile, caller);
         assert_eq!(output.origin, ProviderOrigin::Workspace);
         let profile = &output.manifest.profiles[&"grant".parse().unwrap()];
         assert_eq!(

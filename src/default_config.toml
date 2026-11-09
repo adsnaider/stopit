@@ -1,0 +1,177 @@
+# Default stopit configuration (`stopit default-config`).
+# Save to `~/.config/stopit/config.toml` and uncomment a `tools` recipe below.
+
+default_profile = "main"
+
+[profiles.main]
+
+# Baseline sandbox isolation, secret masks, and protected editor/agent configs.
+[[provider]]
+name = "base"
+type = "config"
+profile = "main"
+
+[provider.sandbox]
+system = { proc = true, dev = "minimal", etc = ["passwd", "group", "hosts", "nsswitch.conf"] }
+network = { mode = "loopback" }
+sandbox = { grant = true }
+
+[provider.sandbox.fs]
+warn_missing = false
+mask_sockets = true
+rw = ["{workspace}"]
+masked = [
+  "{workspace}/**/.env",
+  "{workspace}/**/.env.*",
+  "{workspace}/**/*.pem",
+  "{workspace}/**/*.key",
+  "{workspace}/**/.npmrc",
+  "{workspace}/**/.pypirc",
+  "{workspace}/**/.netrc",
+  "{workspace}/**/*.p12",
+  "{workspace}/**/*.pfx",
+  "{workspace}/**/*credentials*.json",
+  "{workspace}/**/id_rsa",
+  "{workspace}/**/id_ed25519",
+  "{workspace}/**/.terraformrc",
+]
+protected = [
+  "{workspace}/.envrc",
+  "{workspace}/.stopit.toml",
+  "{workspace}/**/.stopit.toml",
+  "{workspace}/.vscode",
+  "{workspace}/.idea",
+  "{workspace}/.github/workflows",
+  "{workspace}/.gitmodules",
+  "{workspace}/.cargo/config.toml",
+  "{workspace}/.cargo/config",
+  "{workspace}/.bazelrc",
+  "{workspace}/.claude",
+  "{workspace}/.gemini",
+  "{workspace}/.codex",
+  "{workspace}/opencode.json",
+  "{workspace}/.opencode",
+  "{workspace}/.cursor",
+  "{workspace}/.mcp.json",
+  "{workspace}/.zed",
+  "{workspace}/**/.nvim.lua",
+  "{workspace}/**/.exrc",
+  "{workspace}/.gdbinit",
+  "{workspace}/.lldbinit",
+]
+ephemeral = ["/tmp", "~"]
+
+[provider.sandbox.env]
+pass = ["TERM", "LANG", "COLORTERM"]
+deny = ["*_TOKEN", "*_KEY", "*_SECRET", "*_PASSWORD", "AWS_*", "GITHUB_*", "SSH_AUTH_SOCK", "NIX_CONFIG"]
+
+# Protect Nix files evaluated on the host. In a repository where the sandbox
+# is meant to edit Nix files (such as a NixOS configuration repo), disable this
+# in `.stopit.toml` with `[[provider]]` + `name = "protect-nix"` + `enabled = false`
+# (or override specific paths with `fs.rw`).
+[[provider]]
+name = "protect-nix"
+type = "config"
+profile = "main"
+
+[provider.sandbox.fs]
+warn_missing = false
+protected = ["{workspace}/**/*.nix", "{workspace}/flake.lock"]
+
+# Version control masking and brokered `jj` / `git` shims.
+# Contributed profiles `ro`, `local`, and `remote` are created automatically
+# when the workspace is a Git or Jujutsu repository.
+[[provider]]
+name = "vcs"
+type = "vcs"
+profile = "main"
+view = "masked"
+
+[provider.shims.jj]
+cmd = ["jj", "--no-pager", "-R", "{workspace}"]
+default = { decision = "ask", profile = "local" }
+rules = [
+  { flags = ["--config", "--config-file", "--config-toml", "-R", "--repository", "--tool", "-i", "--interactive"], decision = "deny" },
+  { prefix = "status", decision = "allow", profile = "local" },
+  { prefix = "st", decision = "allow", profile = "local" },
+  { prefix = "diff", decision = "allow", profile = "local" },
+  { prefix = "log", decision = "allow", profile = "local" },
+  { prefix = "show", decision = "allow", profile = "local" },
+  { prefix = "evolog", decision = "allow", profile = "local" },
+  { prefix = "op log", decision = "allow", profile = "local" },
+  { prefix = "file show", decision = "allow", profile = "local" },
+  { prefix = "squash", decision = "ask", profile = "local" },
+  { prefix = "rebase", decision = "ask", profile = "local" },
+  { prefix = "abandon", decision = "ask", profile = "local" },
+  { prefix = "restore", decision = "ask", profile = "local" },
+  { prefix = "undo", decision = "ask", profile = "local" },
+  { regex = '^bookmark [^-][^ ]*(?: |$)', decision = "ask", profile = "local" },
+  { regex = '^op [^-][^ ]*(?: |$)', decision = "ask", profile = "local" },
+  { prefix = "git fetch", decision = "ask", profile = "remote" },
+  { prefix = "git clone", decision = "ask", profile = "remote" },
+  { prefix = "git push", decision = "ask", profile = "remote" },
+  { flags = ["-A", "--insert-after", "--after", "-B", "--insert-before", "--before"], decision = "deny" },
+  { prefix = "new", decision = "allow", profile = "local" },
+  { prefix = "commit", decision = "allow", profile = "local" },
+  { prefix = "ci", decision = "allow", profile = "local" },
+  { prefix = "describe", decision = "allow", profile = "local" },
+  { prefix = "desc", decision = "allow", profile = "local" },
+]
+
+[provider.shims.git]
+cmd = ["git", "--no-pager"]
+default = { decision = "ask", profile = "local" }
+rules = [
+  { flags = ["-c", "--config-env", "--exec-path", "--upload-pack", "--receive-pack", "--exec", "--output", "-C", "--git-dir", "--work-tree", "--namespace"], decision = "deny" },
+  { prefix = "status", decision = "allow", profile = "local" },
+  { prefix = "diff", decision = "allow", profile = "local" },
+  { prefix = "log", decision = "allow", profile = "local" },
+  { prefix = "show", decision = "allow", profile = "local" },
+  { prefix = "add", decision = "allow", profile = "local" },
+  { prefix = "commit", decision = "allow", profile = "local" },
+  { prefix = "reset", decision = "ask", profile = "local" },
+  { prefix = "rebase", decision = "ask", profile = "local" },
+  { prefix = "checkout", decision = "ask", profile = "local" },
+  { prefix = "switch", decision = "ask", profile = "local" },
+  { prefix = "branch", decision = "ask", profile = "local" },
+  { prefix = "tag", decision = "ask", profile = "local" },
+  { prefix = "clean", decision = "ask", profile = "local" },
+  { prefix = "stash", decision = "ask", profile = "local" },
+  { prefix = "fetch", decision = "ask", profile = "remote" },
+  { prefix = "pull", decision = "ask", profile = "remote" },
+  { prefix = "ls-remote", decision = "ask", profile = "remote" },
+  { prefix = "remote update", decision = "ask", profile = "remote" },
+  { prefix = "push", decision = "ask", profile = "remote" },
+  { flags = ["-u", "--template"], decision = "deny" },
+  { prefix = "clone", decision = "ask", profile = "remote" },
+]
+
+# --- Host tools (uncomment the recipe matching your system) ---
+
+# Debian, Ubuntu, Fedora, or Arch:
+# [[provider]]
+# name = "tools"
+# type = "config"
+# profile = "main"
+# [provider.sandbox]
+# fs.warn_missing = false
+# fs.ro = [
+#   "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64", "/usr/libexec", "/usr/share",
+#   "/bin", "/lib", "/lib64", "/etc/alternatives", "/etc/ssl/certs", "/etc/pki",
+# ]
+# env.path_prepend = ["/usr/local/bin", "/usr/bin", "/bin"]
+
+# NixOS (closure-only per project with `nix` below, or `/nix/store` for quick setup):
+# [[provider]]
+# name = "tools"
+# type = "config"
+# profile = "main"
+# [provider.sandbox]
+# fs.ro = ["/nix/store", "/run/current-system/sw", "/usr/bin/env", "/bin/sh", "/etc/ssl/certs"]
+# env.path_prepend = ["/run/current-system/sw/bin"]
+
+# Optional: automatically mount a project's `flake.nix` or `shell.nix` devShell closure:
+# [[provider]]
+# name = "nix"
+# type = "nix"
+# profile = "main"

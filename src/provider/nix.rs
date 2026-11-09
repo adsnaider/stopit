@@ -1718,7 +1718,7 @@ mod tests {
         fn provider(&self, nix_bin: &Path) -> NixProvider {
             NixProvider::new(
                 "nix".parse().unwrap(),
-                ProfileRef::main(),
+                "main".parse::<ProfileRef>().unwrap(),
                 None,
                 None,
                 None,
@@ -1764,7 +1764,7 @@ mod tests {
         // Requesting a specific `shell` without a `flake.nix` or `shell.nix` fails startup.
         let p_named = NixProvider::new(
             "nix".parse().unwrap(),
-            ProfileRef::main(),
+            "main".parse::<ProfileRef>().unwrap(),
             Some("agent".parse().unwrap()),
             None,
             None,
@@ -1962,7 +1962,7 @@ fi
         // 1. Auto-detect falls back to `shell.nix` when `flake.nix` is absent.
         let p_shell = NixProvider::new(
             "nix".parse().unwrap(),
-            ProfileRef::main(),
+            "main".parse::<ProfileRef>().unwrap(),
             None,
             None,
             None,
@@ -1976,7 +1976,7 @@ fi
         // 2. Explicit `file = "default.nix"` with `shell = "ci"`.
         let p_file = NixProvider::new(
             "nix".parse().unwrap(),
-            ProfileRef::main(),
+            "main".parse::<ProfileRef>().unwrap(),
             Some("ci".parse().unwrap()),
             Some("default.nix".parse().unwrap()),
             None,
@@ -1993,7 +1993,7 @@ fi
         // 3. Explicit external `flake` protects both the directory and `flake.nix`.
         let p_ext = NixProvider::new(
             "nix".parse().unwrap(),
-            ProfileRef::main(),
+            "main".parse::<ProfileRef>().unwrap(),
             None,
             None,
             Some(ext_flake.to_str().unwrap().parse().unwrap()),
@@ -2064,13 +2064,13 @@ fi
             path: rw.clone(),
             kind: UntrustedKind::RwGrant {
                 provider: "cfg".parse().unwrap(),
-                profile: Some(ProfileRef::main()),
+                profile: Some("main".parse::<ProfileRef>().unwrap()),
                 host: rw.clone(),
             },
         });
         let p_rw = NixProvider::new(
             "nix".parse().unwrap(),
-            ProfileRef::main(),
+            "main".parse::<ProfileRef>().unwrap(),
             None,
             Some(rw.join("shell.nix").to_str().unwrap().parse().unwrap()),
             None,
@@ -2095,7 +2095,7 @@ fi
         // even when `cache = false`.
         let p_uncached = NixProvider::new(
             "nix".parse().unwrap(),
-            ProfileRef::main(),
+            "main".parse::<ProfileRef>().unwrap(),
             None,
             None,
             None,
@@ -2183,7 +2183,7 @@ fi
             path: rw_dir.clone(),
             kind: UntrustedKind::RwGrant {
                 provider: "cfg".parse().unwrap(),
-                profile: Some(ProfileRef::main()),
+                profile: Some("main".parse::<ProfileRef>().unwrap()),
                 host: rw_dir.clone(),
             },
         });
@@ -2196,7 +2196,7 @@ fi
         );
         let p = NixProvider::new(
             "nix".parse().unwrap(),
-            ProfileRef::main(),
+            "main".parse::<ProfileRef>().unwrap(),
             None,
             None,
             None,
@@ -2251,7 +2251,7 @@ fi
         // running `fs::canonicalize`.
         let fresh_p = NixProvider::new(
             "nix".parse().unwrap(),
-            ProfileRef::main(),
+            "main".parse::<ProfileRef>().unwrap(),
             None,
             Some("shell.nix".parse().unwrap()),
             None,

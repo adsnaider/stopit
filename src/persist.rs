@@ -498,6 +498,12 @@ fn render_rule(rule: &ShimRule) -> String {
         crate::manifest::ShimMatcher::Literal(s) => format!("literal = {}", toml_str(s)),
         crate::manifest::ShimMatcher::Prefix(s) => format!("prefix = {}", toml_str(s)),
         crate::manifest::ShimMatcher::Regex(r) => format!("regex = {}", toml_str(r.as_str())),
+        crate::manifest::ShimMatcher::Flags(f) => {
+            format!(
+                "flags = {}",
+                toml_str_array(f.flags().iter().map(String::as_str))
+            )
+        }
     };
     let mut parts = vec![
         matcher_part,
@@ -537,7 +543,7 @@ mod tests {
     fn persist_grant_into_empty_and_existing_config_preserves_comments() {
         let initial = "# Project comment\n[workspace]\nmount = \"host\"\n";
         let target = PersistTarget::Grant {
-            caller_profile: ProfileRef::main(),
+            caller_profile: "main".parse().unwrap(),
             ro: vec!["/opt/sdk".to_owned()],
             rw: vec!["~/data".to_owned()],
             net_domains: vec!["example.com".parse().unwrap()],
@@ -557,7 +563,7 @@ mod tests {
         // A second grant merges into the same `approvals` provider and upgrades
         // `/opt/sdk` from ro to rw when requested as rw.
         let target2 = PersistTarget::Grant {
-            caller_profile: ProfileRef::main(),
+            caller_profile: "main".parse().unwrap(),
             ro: Vec::new(),
             rw: vec!["/opt/sdk".to_owned()],
             net_domains: Vec::new(),
@@ -602,7 +608,7 @@ mod tests {
         )
         .unwrap();
         let target = PersistTarget::Shim {
-            caller_profile: ProfileRef::main(),
+            caller_profile: "main".parse().unwrap(),
             shim: "jj".parse().unwrap(),
             matched_rule: "prefix = \"squash\"".to_owned(),
             target_profile: "vcs.local".parse().unwrap(),

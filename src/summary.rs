@@ -38,11 +38,11 @@ use std::collections::BTreeSet;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use crate::config::{Base, ProviderName};
+use crate::config::ProviderName;
 use crate::escape::escape_bytes;
 use crate::manifest::{EnvName, EnvPattern};
 use crate::policy::PathMode;
-use crate::provider::{SUPERVISOR_PROVIDER_NAME, default_base_manifest};
+use crate::provider::SUPERVISOR_PROVIDER_NAME;
 use crate::resolve::{MountSource, PlannedMount};
 use crate::spec::{NetworkSpec, SandboxSpec};
 
@@ -61,9 +61,6 @@ pub struct SummaryContext<'a> {
     pub workspace_mount: &'a Path,
     /// The host `HOME`, canonical: paths below it are written with `~`.
     pub home: &'a Path,
-    /// The configuration's base: what its provider already grants is not
-    /// listed.
-    pub base: Base,
     /// The names of the script providers with `protect = false`.
     pub unprotected: &'a [&'a ProviderName],
 }
@@ -126,7 +123,7 @@ pub fn summary_lines(spec: &SandboxSpec, ctx: &SummaryContext<'_>) -> Vec<String
             ),
         ));
     }
-    env_lines(spec, ctx.base, &mut lines);
+    env_lines(spec, &mut lines);
     lines
 }
 
@@ -282,36 +279,13 @@ fn network_line(network: &NetworkSpec, lines: &mut Vec<String>) {
     }
 }
 
-/// The `pass` patterns and `set` names beyond the base's, names only.
-fn env_lines(spec: &SandboxSpec, base: Base, lines: &mut Vec<String>) {
-    let (base_pass, base_set): (BTreeSet<EnvPattern>, BTreeSet<EnvName>) = match base {
-        Base::Default => default_base_manifest()
-            .map(|m| {
-                (
-                    m.grants.env.pass.into_iter().collect(),
-                    m.grants.env.set.into_keys().collect(),
-                )
-            })
-            .unwrap_or_default(),
-        Base::None => Default::default(),
-    };
-    let pass: BTreeSet<&str> = spec
-        .env
-        .pass
-        .iter()
-        .filter(|p| !base_pass.contains(*p))
-        .map(EnvPattern::as_str)
-        .collect();
+/// The `pass` patterns and `set` names, names only.
+fn env_lines(spec: &SandboxSpec, lines: &mut Vec<String>) {
+    let pass: BTreeSet<&str> = spec.env.pass.iter().map(EnvPattern::as_str).collect();
     if !pass.is_empty() {
         lines.push(grant("env pass", &name_list(pass)));
     }
-    let set = spec
-        .env
-        .set
-        .keys()
-        .filter(|k| !base_set.contains(*k))
-        .map(EnvName::as_str);
-    let set: Vec<&str> = set.collect();
+    let set: Vec<&str> = spec.env.set.keys().map(EnvName::as_str).collect();
     if !set.is_empty() {
         lines.push(grant("env set", &name_list(set)));
     }
@@ -336,13 +310,12 @@ mod tests {
         name.parse().unwrap()
     }
 
-    fn ctx<'a>(base: Base, unprotected: &'a [&'a ProviderName]) -> SummaryContext<'a> {
+    fn ctx<'a>(unprotected: &'a [&'a ProviderName]) -> SummaryContext<'a> {
         SummaryContext {
             profile: "main",
             workspace: Path::new(WS),
             workspace_mount: Path::new("/workspace"),
             home: Path::new(HOME),
-            base,
             unprotected,
         }
     }
@@ -361,12 +334,9 @@ mod tests {
     }
 
     fn lines(spec: &SandboxSpec) -> Vec<String> {
-        summary_lines(spec, &ctx(Base::None, &[]))
+        summary_lines(spec, &ctx(&[]))
     }
 
-    // The workspace is under the host home, so written with `~`.
-    // For a spec with nothing at the workspace mount, and with the
-    // workspace mounted `rw`.
     const HEADER: &str = "profile \"main\" (workspace ~/proj, not mounted)";
     const HEADER_RW: &str = "profile \"main\" (workspace ~/proj rw at /workspace)";
 
@@ -376,10 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn the_default_base_has_only_the_header() {
-        // What the default base grants, as `compile_session` plans it:
-        // the workspace and what is inside it, masks, ephemeral
-        // directories, loopback and the base's `pass`.
+    fn workspace_masks_ephemeral_and_loopback_leave_only_header_and_env() {
         let mut spec = SandboxSpec::default();
         spec.mounts = vec![
             mount(WS, "/workspace", PathMode::Rw, "base"),
@@ -412,11 +379,8 @@ mod tests {
             ),
         ];
         spec.network = NetworkSpec::Loopback;
-        let m = default_base_manifest().unwrap();
-        spec.env.pass = m.grants.env.pass.clone();
-        spec.env.deny = m.grants.env.deny.clone();
         spec.mask_sockets = true;
-        assert_eq!(summary_lines(&spec, &ctx(Base::Default, &[])), [HEADER_RW]);
+        assert_eq!(summary_lines(&spec, &ctx(&[])), [HEADER_RW]);
     }
 
     #[test]
@@ -515,7 +479,7 @@ mod tests {
         let mut spec = SandboxSpec::default();
         spec.mask_sockets = true;
         spec.mounts = vec![mount(WS, WS, PathMode::Rw, "base")];
-        let mut c = ctx(Base::Default, &[]);
+        let mut c = ctx(&[]);
         c.workspace_mount = Path::new(WS);
         // Default `system.home` is `/home/stopit`, so `/home/u/proj` inside the
         // sandbox is not abbreviated with `~`.
@@ -612,15 +576,17 @@ mod tests {
     #[test]
     fn namespaces_syscalls_shims_and_unprotected_providers_are_listed() {
         let mut spec = SandboxSpec::default();
-        spec.system.devices = ["/dev/kvm".parse().unwrap(), "/dev/vhost-vsock".parse().unwrap()]
-            .into_iter()
-            .collect();
+        spec.system.devices = [
+            "/dev/kvm".parse().unwrap(),
+            "/dev/vhost-vsock".parse().unwrap(),
+        ]
+        .into_iter()
+        .collect();
         spec.namespaces.shared = [ShareableNamespace::Pid, ShareableNamespace::Net].into();
         spec.allow_syscalls = [OptInSyscall::Ptrace, OptInSyscall::IoUring].into();
-        let shim: ShimSpec = toml::from_str(
-            "cmd = \"git\"\ndefault = { decision = \"allow\", profile = \"main\" }",
-        )
-        .unwrap();
+        let shim: ShimSpec =
+            toml::from_str("cmd = \"git\"\ndefault = { decision = \"allow\", profile = \"main\" }")
+                .unwrap();
         let proxy_shim: ShimSpec =
             toml::from_str("proxy = \"./my-proxy.sh\"\nprotect = false").unwrap();
         spec.shims
@@ -630,7 +596,7 @@ mod tests {
             (proxy_shim, provider("custom")),
         );
         let off = provider("env");
-        let out = summary_lines(&spec, &ctx(Base::None, &[&off]));
+        let out = summary_lines(&spec, &ctx(&[&off]));
         assert_eq!(
             out[1..],
             [
@@ -645,23 +611,22 @@ mod tests {
     }
 
     #[test]
-    fn env_shows_names_beyond_the_base_never_values() {
+    fn env_shows_names_never_values() {
         let mut spec = SandboxSpec::default();
-        let m = default_base_manifest().unwrap();
-        spec.env.pass = m.grants.env.pass.clone();
-        spec.env.pass.push("RUST_*".parse().unwrap());
+        spec.env.pass = vec![
+            "TERM".parse().unwrap(),
+            "LANG".parse().unwrap(),
+            "RUST_*".parse().unwrap(),
+        ];
         spec.env
             .set
             .insert("API".parse().unwrap(), "hunter2".parse().unwrap());
-        let out = summary_lines(&spec, &ctx(Base::Default, &[]));
-        assert_eq!(out[1..], ["  env pass RUST_*", "  env set  API"]);
-        assert!(!out.join("\n").contains("hunter2"));
-        // Under `base = "none"` the base's patterns are the user's.
-        let out = summary_lines(&spec, &ctx(Base::None, &[]));
+        let out = summary_lines(&spec, &ctx(&[]));
         assert_eq!(
-            out[1], "  env pass COLORTERM, LANG, RUST_*, TERM",
-            "{out:#?}"
+            out[1..],
+            ["  env pass LANG, RUST_*, TERM", "  env set  API"]
         );
+        assert!(!out.join("\n").contains("hunter2"));
     }
 
     #[test]
@@ -675,7 +640,7 @@ mod tests {
         )];
         let off = provider("p");
         let unprotected = [&off];
-        let mut c = ctx(Base::None, &unprotected);
+        let mut c = ctx(&unprotected);
         c.profile = "a\u{1b}b";
         let out = summary_lines(&spec, &c);
         let all = out.join("\n");
