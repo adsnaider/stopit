@@ -987,17 +987,10 @@ fn compile_inline_proxy_profile(
         return Err("inline proxy profile may not declare nested proxy shims".to_owned());
     }
     inline.grants.sandbox.grant.get_or_insert(false);
-    let is_proxy_ref = |s: &str| s == "proxy" || s == "stopit.proxy";
-    let local_name = if is_proxy_ref(caller.as_str())
-        || matches!(
-            &inline.inherit,
-            crate::config::Inherit::Profile(p) if is_proxy_ref(p.as_str())
-        ) {
-        "proxy-for-proxy"
-    } else {
-        "proxy"
-    };
-    let local: crate::config::ProfileName = local_name.parse().expect("valid profile name");
+    if let crate::config::Inherit::Profile(p) = &inline.inherit {
+        inline.inherit = crate::config::Inherit::Global(p.clone());
+    }
+    let local: crate::config::ProfileName = "proxy".parse().expect("valid profile name");
     let provider: crate::config::ProviderName = crate::provider::SUPERVISOR_PROVIDER_NAME
         .parse()
         .expect("the supervisor's name is a valid provider name");

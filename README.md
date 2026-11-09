@@ -247,6 +247,8 @@ name = "protect-nix"
 enabled = false
 ```
 
+If you also enabled `name = "nix"` globally in `config.toml`, disable `name = "nix"` in `.stopit.toml` as well so host `nix` evaluation does not import modified `.nix` files on later runs.
+
 To keep `protect-nix` on and make only specific files writable in `main`, override them in a workspace provider (workspace rules beat global rules of equal specificity):
 
 ```toml

@@ -1,18 +1,18 @@
 //! The profile graph: every profile, its parent and its own grant
 //! contributions (DESIGN.md §3.3, §3.5, §3.6).
 //!
-//! Profiles are `main` (implicit), every user-declared profile, and every
+//! Profiles are every user-declared `[profiles.<name>]` entry and every
 //! profile contributed by a provider, registered under its full name
 //! `<provider>.<name>`. User-declared names never contain a dot and
 //! contributed names always do, so the two can never collide; provider names
 //! are unique, so contributed names cannot collide with each other either.
 //!
 //! Reference rule (§3.6): references written in the configuration (a user
-//! profile's `inherit`, a `config` provider's `profile`) are full names.
+//! profile's `inherit`, a provider's `profile`) are full names.
 //! Inside a manifest (a contributed profile's `inherit`, every shim
 //! `profile`), a single-segment name first resolves to the same manifest's
-//! contributed profile of that name, then globally (a user-declared profile,
-//! or `main`); a multi-segment name always resolves globally. Shim profile
+//! contributed profile of that name, then globally to a user-declared
+//! profile; a multi-segment name always resolves globally. Shim profile
 //! references are rewritten to their resolved full names, so later stages
 //! never need to know which provider declared a shim.
 //!
@@ -41,8 +41,8 @@ pub struct Contribution {
 /// One profile of the graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileNode {
-    /// The resolved full name of the parent: `None` for `main` and for
-    /// profiles with `inherit = "none"`.
+    /// The resolved full name of the parent: `None` when `inherit` is omitted
+    /// or `"none"`.
     pub parent: Option<ProfileRef>,
     /// The profile's own contributions (not its parent's), in merge order.
     pub contributions: Vec<Contribution>,
@@ -244,9 +244,8 @@ struct ManifestScope<'a> {
 
 impl ManifestScope<'_> {
     /// Applies the reference rule: a single-segment name that is one of the
-    /// manifest's own profiles resolves to it; anything else resolves
-    /// globally. (`main` never parses as a [`ProfileName`] and is never a
-    /// contributed profile, so it always resolves globally.)
+    /// manifest's own profiles resolves to `<provider>.<name>`; anything else
+    /// resolves globally against `self.known`.
     fn resolve(&self, r: &ProfileRef) -> Option<ProfileRef> {
         if let Ok(name) = r.as_str().parse::<ProfileName>()
             && self.own.contains(&name)
@@ -331,8 +330,10 @@ pub fn build_profile_graph(
     for (name, decl) in &config.profiles {
         let parent = match &decl.inherit {
             Inherit::None => None,
-            Inherit::Profile(target) if known.contains(target) => Some(target.clone()),
-            Inherit::Profile(target) => {
+            Inherit::Profile(target) | Inherit::Global(target) if known.contains(target) => {
+                Some(target.clone())
+            }
+            Inherit::Profile(target) | Inherit::Global(target) => {
                 return Err(ProfileError::UnknownInherit {
                     profile: name.clone(),
                     target: target.clone(),
@@ -360,7 +361,15 @@ pub fn build_profile_graph(
                 target: profile,
             });
         }
-        let own: BTreeSet<ProfileName> = manifest.profiles.keys().cloned().collect();
+        // Synthetic runtime profiles under `SUPERVISOR_PROVIDER_NAME`
+        // (`stopit.grant`, `stopit.proxy`) resolve every reference globally so
+        // user profiles named `grant` or `proxy` are never shadowed.
+        let own: BTreeSet<ProfileName> =
+            if provider.as_str() == crate::provider::SUPERVISOR_PROVIDER_NAME {
+                BTreeSet::new()
+            } else {
+                manifest.profiles.keys().cloned().collect()
+            };
         let scope = ManifestScope {
             provider: &provider,
             own: &own,
@@ -380,6 +389,13 @@ pub fn build_profile_graph(
             let full = ProfileRef::contributed(&provider, &name);
             let parent = match contributed.inherit {
                 Inherit::None => None,
+                Inherit::Global(target) => Some(known.get(&target).cloned().ok_or_else(|| {
+                    ProfileError::UnknownContributedInherit {
+                        provider: provider.clone(),
+                        profile: full.clone(),
+                        target,
+                    }
+                })?),
                 Inherit::Profile(target) => Some(scope.resolve(&target).ok_or_else(|| {
                     ProfileError::UnknownContributedInherit {
                         provider: provider.clone(),
@@ -1219,5 +1235,60 @@ mod tests {
     fn shim_field_display() {
         assert_eq!(ShimField::Default.to_string(), "default");
         assert_eq!(ShimField::Rule(0).to_string(), "rule 1");
+    }
+
+    #[test]
+    fn global_inherit_and_supervisor_profiles_never_self_shadow() {
+        let mut vcs_out = out(
+            "vcs",
+            "local",
+            "[profiles.ro]\n[profiles.local]\n[profiles.remote]\n\
+             [shims.git]\ncmd = \"git\"\ndefault = { decision = \"allow\", profile = \"local\" }",
+        );
+        for contributed in vcs_out.1.manifest.profiles.values_mut() {
+            contributed.inherit = Inherit::Global(pr("local"));
+        }
+        let mut sup_out = out(
+            crate::provider::SUPERVISOR_PROVIDER_NAME,
+            "proxy",
+            "[profiles.proxy]\ninherit = \"proxy\"\n\
+             [profiles.proxy.shims.inner]\ncmd = \"sh\"\n\
+             default = { decision = \"allow\", profile = \"proxy\" }",
+        );
+        if let Some(p) = sup_out
+            .1
+            .manifest
+            .profiles
+            .get_mut(&"proxy".parse().unwrap())
+        {
+            p.inherit = Inherit::Global(pr("proxy"));
+        }
+        let g = build_profile_graph(
+            &config("[profiles.local]\n[profiles.ro]\n[profiles.remote]\n[profiles.proxy]"),
+            vec![vcs_out, sup_out],
+        )
+        .unwrap();
+        assert_eq!(g.get(&pr("vcs.ro")).unwrap().parent, Some(pr("local")));
+        assert_eq!(g.get(&pr("vcs.local")).unwrap().parent, Some(pr("local")));
+        assert_eq!(g.get(&pr("vcs.remote")).unwrap().parent, Some(pr("local")));
+        assert_eq!(
+            g.get(&pr("stopit.proxy")).unwrap().parent,
+            Some(pr("proxy"))
+        );
+        // Within `vcs`, `[provider.shims.git]` still resolves plain `"local"` to `"vcs.local"`.
+        let git_shim = &g.get(&pr("local")).unwrap().contributions[0].grants.shims
+            [&"git".parse::<ShimName>().unwrap()];
+        let crate::manifest::ShimKind::Declarative { default, .. } = &git_shim.kind else {
+            panic!("expected declarative shim");
+        };
+        assert_eq!(default.profile, Some(pr("vcs.local")));
+        // Within `stopit.proxy`, shims resolve `"proxy"` globally to `"proxy"`, not `"stopit.proxy"`.
+        let inner_shim = &g.get(&pr("stopit.proxy")).unwrap().contributions[0]
+            .grants
+            .shims[&"inner".parse::<ShimName>().unwrap()];
+        let crate::manifest::ShimKind::Declarative { default, .. } = &inner_shim.kind else {
+            panic!("expected declarative shim");
+        };
+        assert_eq!(default.profile, Some(pr("proxy")));
     }
 }

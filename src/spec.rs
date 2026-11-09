@@ -3756,12 +3756,12 @@ impl CompiledSession {
             .flat_map(|(p, c)| c.warnings.iter().map(move |w| (p, w)))
     }
 
-    /// The number of profiles, including `main`.
+    /// The number of compiled profiles in the session.
     pub fn len(&self) -> usize {
         self.profiles.len()
     }
 
-    /// Always false: `main` always exists.
+    /// Whether the session has no compiled profiles.
     pub fn is_empty(&self) -> bool {
         self.profiles.is_empty()
     }

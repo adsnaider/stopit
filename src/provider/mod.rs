@@ -108,8 +108,7 @@ impl ProviderContext {
 /// The result of running a provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderOutput {
-    /// The profile the manifest's top-level grants apply to: the `profile`
-    /// of a `config` or `nix` provider, `main` for every other type.
+    /// The profile the manifest's top-level grants apply to (`provider.profile`).
     pub profile: ProfileRef,
     /// The manifest. Contributed profiles stay in `manifest.profiles`,
     /// unprefixed; the provider-name prefix is added during resolution.

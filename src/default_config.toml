@@ -68,7 +68,8 @@ deny = ["*_TOKEN", "*_KEY", "*_SECRET", "*_PASSWORD", "AWS_*", "GITHUB_*", "SSH_
 # Protect Nix files evaluated on the host. In a repository where the sandbox
 # is meant to edit Nix files (such as a NixOS configuration repo), disable this
 # in `.stopit.toml` with `[[provider]]` + `name = "protect-nix"` + `enabled = false`
-# (or override specific paths with `fs.rw`).
+# (and also set `enabled = false` on `name = "nix"` if enabled globally, so
+# transitive `.nix` imports are not evaluated on the host).
 [[provider]]
 name = "protect-nix"
 type = "config"

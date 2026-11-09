@@ -146,7 +146,7 @@ impl From<MapOnly<RawManifest>> for Manifest {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(from = "MapOnly<RawContributedProfile>")]
 pub struct ContributedProfile {
-    /// Parent profile; defaults to `main`.
+    /// Parent profile; defaults to [`Inherit::None`] (empty sandbox).
     pub inherit: Inherit,
     /// The grants for this profile.
     pub grants: Grants,

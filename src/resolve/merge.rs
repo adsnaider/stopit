@@ -1,7 +1,7 @@
 //! Per-profile merging of grant sections (DESIGN.md §3.3, §3.5).
 //!
 //! Each profile's **effective** grants are its parent's effective grants
-//! (or nothing, for `main` and for `inherit = "none"`) combined with its
+//! (or nothing, when `inherit` is omitted or `"none"`) combined with its
 //! **own** contributions, in contribution order. Two levels are
 //! distinguished throughout:
 //!
@@ -173,12 +173,12 @@ impl MergedProfiles {
         self.order.iter().map(|p| (p, &self.profiles[p]))
     }
 
-    /// The number of profiles, including `main`.
+    /// The number of profiles in the session.
     pub fn len(&self) -> usize {
         self.profiles.len()
     }
 
-    /// Always false: `main` always exists.
+    /// Whether the session has no profiles.
     pub fn is_empty(&self) -> bool {
         self.profiles.is_empty()
     }
@@ -297,7 +297,7 @@ pub fn merge_profiles(graph: &ProfileGraph) -> Result<MergedProfiles, MergeError
     let empty = EffectiveGrants::default();
     let mut profiles: BTreeMap<ProfileRef, EffectiveGrants> = BTreeMap::new();
     for (profile, node) in graph.iter() {
-        // `inherit = "none"` (and `main`) start from the empty sandbox.
+        // Profiles with no parent (`inherit` omitted or `"none"`) start from the empty sandbox.
         let inherited = match &node.parent {
             Some(parent) => profiles
                 .get(parent)
@@ -586,25 +586,32 @@ fn union<'a, T: Clone + Ord + 'a>(
 /// approved grants and shim rules (DESIGN.md §4.2).
 pub const APPROVALS_PROVIDER_PREFIX: &str = "approvals-";
 
-/// Provider name used in `.stopit.toml` to persist approvals for `profile`:
-/// `"approvals-<profile>"` (with any `.` replaced by `-`).
+/// Injective provider name used in `.stopit.toml` to persist approvals for
+/// `profile`: `"approvals-<encoded>"`, escaping `_` as `__` and `.` as `_0` so
+/// contributed profiles (`dev.shell`) and user profiles (`dev-shell`,
+/// `dev_shell`) never collide while plain hyphenated/alphanumeric names stay
+/// `"approvals-<profile>"`.
 pub fn approvals_provider_name(profile: &ProfileRef) -> ProviderName {
-    let raw = format!(
-        "{APPROVALS_PROVIDER_PREFIX}{}",
-        profile.as_str().replace('.', "-")
-    );
+    let mut raw = String::from(APPROVALS_PROVIDER_PREFIX);
+    for ch in profile.as_str().chars() {
+        match ch {
+            '_' => raw.push_str("__"),
+            '.' => raw.push_str("_0"),
+            other => raw.push(other),
+        }
+    }
     raw.parse()
         .expect("approvals provider name constructed from a valid ProfileRef is valid")
 }
 
-/// Whether `name` is an approvals provider name (`"approvals-…"`).
+/// Whether `name` has the [`APPROVALS_PROVIDER_PREFIX`].
 pub fn is_approvals_provider(name: &ProviderName) -> bool {
     name.as_str().starts_with(APPROVALS_PROVIDER_PREFIX)
 }
 
 /// `shims` (§3.5): higher [`ProviderOrigin`] replaces lower for the same shim
-/// name within a profile, and within [`ProviderOrigin::Workspace`] a persisted
-/// `approvals` provider ([`is_approvals_provider`]) replaces an earlier
+/// name within a profile, and within [`ProviderOrigin::Workspace`] the
+/// persisted [`approvals_provider_name`] for `profile` replaces an earlier
 /// workspace provider's shim; a tombstone (`shims.<name> = false` /
 /// [`crate::manifest::ShimKind::Disabled`]) removes an inherited or
 /// lower/same-rank shim of the same name. Otherwise the same shim name from
@@ -616,10 +623,11 @@ fn merge_shims(
     inherited: &BTreeMap<ShimName, (ShimSpec, ProviderName)>,
     own: &[Contribution],
 ) -> Result<BTreeMap<ShimName, (ShimSpec, ProviderName)>, MergeError> {
+    let approvals_name = approvals_provider_name(profile);
     let rank = |c: &Contribution| {
         (
             c.origin,
-            c.origin == ProviderOrigin::Workspace && is_approvals_provider(&c.provider),
+            c.origin == ProviderOrigin::Workspace && c.provider == approvals_name,
         )
     };
     let mut found: BTreeMap<&ShimName, (&ShimSpec, &ProviderName, (ProviderOrigin, bool))> =
@@ -1791,7 +1799,27 @@ mod tests {
         );
         assert_eq!(
             approvals_provider_name(&pr("vcs.local")).as_str(),
-            "approvals-vcs-local"
+            "approvals-vcs_0local"
+        );
+        assert_eq!(
+            approvals_provider_name(&pr("dev-shell")).as_str(),
+            "approvals-dev-shell"
+        );
+        assert_eq!(
+            approvals_provider_name(&pr("dev_shell")).as_str(),
+            "approvals-dev__shell"
+        );
+        assert_eq!(
+            approvals_provider_name(&pr("dev.shell")).as_str(),
+            "approvals-dev_0shell"
+        );
+        assert_ne!(
+            approvals_provider_name(&pr("dev.shell")),
+            approvals_provider_name(&pr("dev-shell"))
+        );
+        assert_ne!(
+            approvals_provider_name(&pr("dev.shell")),
+            approvals_provider_name(&pr("dev_0shell"))
         );
         assert!(!is_approvals_provider(&pn("approvals")));
         assert!(is_approvals_provider(&pn("approvals-main")));

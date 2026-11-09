@@ -5,24 +5,22 @@
 //! ([`discover`]), reading only files it validates, never running a VCS
 //! tool on the workspace. It then contributes:
 //!
-//! * to `main`, a mask (or, with `view = "ro"`, a read-only view) of the
-//!   workspace's `.git` and `.jj`;
-//! * the profiles `ro`, `local` and (unless both `fetch` and `push` are
-//!   `"deny"`) `remote`, which appear as `vcs.ro`, `vcs.local` and
-//!   `vcs.remote`: the metadata and its backing storage read-only, or
-//!   writable with the git config files and `.jj/repo/config.toml` that
-//!   exist at session start read-only and the hooks directories that exist
-//!   then masked. `vcs.ro` and `vcs.local` are offline, while `vcs.remote`
-//!   has `network = { mode = "full" }`, binds the host's `SSH_AUTH_SOCK`
-//!   and `~/.ssh/known_hosts` read-only when present, and sets
-//!   `GIT_SSH_COMMAND` with `-F /dev/null` and `StrictHostKeyChecking=yes`.
-//!   git gets no system or user configuration, no hooks, filesystem monitor,
-//!   pager or editor, and the repository found here rather than one found
-//!   from the caller's directory. jj gets no user configuration, editor or
-//!   pager;
-//! * the shims `jj` and `git` (per `tools`), with the policy of §7.4 written
-//!   as declarative rules, routing remote fetch and push commands to
-//!   `vcs.remote` according to `fetch` and `push`.
+//! * to the provider's target `profile`, a mask (or, with `view = "ro"`, a
+//!   read-only view) of the workspace's `.git` and `.jj`;
+//! * the profiles `ro`, `local` and `remote`, which appear as `<name>.ro`,
+//!   `<name>.local` and `<name>.remote`: the metadata and its backing storage
+//!   read-only, or writable with the git config files and
+//!   `.jj/repo/config.toml` that exist at session start read-only and the
+//!   hooks directories that exist then masked. `<name>.ro` and `<name>.local`
+//!   are offline, while `<name>.remote` has `network = { mode = "full" }`,
+//!   binds the host's `SSH_AUTH_SOCK` and `~/.ssh/known_hosts` read-only when
+//!   present, and sets `GIT_SSH_COMMAND` with `-F /dev/null` and
+//!   `StrictHostKeyChecking=yes`. git gets no system or user configuration,
+//!   no hooks, filesystem monitor, pager or editor, and the repository found
+//!   here rather than one found from the caller's directory. jj gets no user
+//!   configuration, editor or pager;
+//! * the explicit `[provider.shims.<name>]` shims configured on the entry,
+//!   omitting `jj` when the workspace has no valid jj repository.
 //!
 //! Layouts it supports: a plain `.git` directory, a `.jj` directory with or
 //! without a colocated `.git`, a `jj` secondary workspace (`jj workspace
@@ -921,7 +919,6 @@ impl VcsProvider {
         // of these profiles would mount host paths beside the metadata.
         let no_grant = || Value::Table(table([("grant", false.into())]));
         let mut ro = toml::Table::new();
-        ro.insert("inherit".into(), self.profile.as_str().into());
         ro.insert("network".into(), offline());
         ro.insert("system".into(), system());
         ro.insert("sandbox".into(), no_grant());
@@ -945,7 +942,6 @@ impl VcsProvider {
             local_fs.insert("masked".into(), list(masked));
         }
         let mut local = toml::Table::new();
-        local.insert("inherit".into(), self.profile.as_str().into());
         local.insert("network".into(), offline());
         local.insert("system".into(), system());
         local.insert("sandbox".into(), no_grant());
@@ -998,7 +994,6 @@ impl VcsProvider {
             .into(),
         );
         let mut remote = toml::Table::new();
-        remote.insert("inherit".into(), self.profile.as_str().into());
         remote.insert(
             "network".into(),
             Value::Table(table([("mode", "full".into())])),
@@ -1013,6 +1008,9 @@ impl VcsProvider {
         profiles.insert("remote".into(), Value::Table(remote));
         root.insert("profiles".into(), Value::Table(profiles));
         let mut manifest = manifest_from(root)?;
+        for contributed in manifest.profiles.values_mut() {
+            contributed.inherit = crate::config::Inherit::Global(self.profile.clone());
+        }
         for (shim_name, shim_spec) in &self.shims {
             let include = match shim_name.as_str() {
                 "jj" => jj,
@@ -1029,13 +1027,13 @@ impl VcsProvider {
         Ok(manifest)
     }
 
-    /// The view of the workspace's own metadata in `main`, which every
-    /// layout gets: masked, or read-only with `view = "ro"`.
+    /// The view of the workspace's own metadata in the target `profile`,
+    /// which every layout gets: masked, or read-only with `view = "ro"`.
     ///
     /// A worktree's admin and common directories and a jj secondary
     /// workspace's primary repository directories get the same view, so a
-    /// grant of `main` that covers them does not expose them either. One
-    /// whose path no rule can name is left out.
+    /// grant on the target `profile` that covers them does not expose them
+    /// either. One whose path no rule can name is left out.
     fn main_view(&self, workspace: &Path, layout: &Layout) -> Result<toml::Table, String> {
         let mut metadata: Vec<toml::Value> = [&layout.dot_git, &layout.dot_jj]
             .into_iter()
@@ -2027,5 +2025,76 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.contains("whose sandbox path is not UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn target_profile_named_local_ro_or_remote_never_cycles_or_leaks_rw_into_vcs_ro() {
+        let (_d, ws) = workspace();
+        git_init(&ws);
+        for target_name in ["local", "ro", "remote"] {
+            let entry: crate::config::ProviderEntry = toml::from_str(&format!(
+                "name = \"vcs\"\ntype = \"vcs\"\nprofile = {target_name:?}\n\
+                 [shims.git]\ncmd = \"git\"\ndefault = {{ decision = \"allow\", profile = \"local\" }}"
+            ))
+            .unwrap();
+            let crate::config::ProviderKind::Vcs {
+                profile,
+                view,
+                shims,
+                ..
+            } = entry.kind
+            else {
+                panic!("expected vcs provider");
+            };
+            let vcs = VcsProvider::new(
+                entry.name,
+                profile.clone(),
+                view,
+                shims,
+                &ws,
+                crate::config::ProviderOrigin::Global,
+            );
+            let m = vcs
+                .manifest_for(
+                    &ws,
+                    Path::new("/workspace"),
+                    &discover(&ws),
+                    &[],
+                    &SshRemote::default(),
+                )
+                .unwrap();
+            let cfg = crate::config::Config::from_toml_str(&format!(
+                "default_profile = {target_name:?}\n[profiles.local]\n[profiles.ro]\n[profiles.remote]\n"
+            ))
+            .unwrap();
+            let out = crate::provider::ProviderOutput {
+                profile: profile.clone(),
+                manifest: m,
+                origin: crate::config::ProviderOrigin::Global,
+            };
+            let graph =
+                crate::resolve::build_profile_graph(&cfg, vec![("vcs".parse().unwrap(), out)])
+                    .unwrap();
+            for sub in ["vcs.ro", "vcs.local", "vcs.remote"] {
+                assert_eq!(
+                    graph.get(&sub.parse().unwrap()).unwrap().parent,
+                    Some(profile.clone()),
+                    "sub={sub}, target={target_name}"
+                );
+            }
+            let merged = crate::resolve::merge_profiles(&graph).unwrap();
+            let ro_grants = merged.get(&"vcs.ro".parse().unwrap()).unwrap();
+            assert!(
+                !ro_grants.fs.iter().any(|r| matches!(
+                    &r.kind,
+                    crate::resolve::FsRuleKind::Path {
+                        mode: crate::policy::PathMode::Rw,
+                        ..
+                    }
+                )),
+                "vcs.ro must not inherit writable git storage: {:?}",
+                ro_grants.fs
+            );
+        }
     }
 }

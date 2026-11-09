@@ -17,7 +17,7 @@ use crate::manifest::{
     Domain, Manifest, PathPattern, ShimAction, ShimKind, ShimName, ShimRule, ShimSpec,
 };
 use crate::policy::{Decision, NetworkMode};
-use crate::resolve::{approvals_provider_name, is_approvals_provider};
+use crate::resolve::approvals_provider_name;
 
 /// Marker comment separating hand-written `.stopit.toml` content from the
 /// `[[provider]]` entries managed by `[p] allow and persist`.
@@ -59,18 +59,13 @@ pub enum PersistTarget {
 /// Applies `target` to the `.stopit.toml` document `existing` and returns the
 /// updated TOML text, validated with [`ConfigLayer::from_toml_str`].
 pub fn update_config_toml(existing: &str, target: &PersistTarget) -> Result<String, String> {
-    let mut layer = ConfigLayer::from_toml_str(existing).map_err(|e| e.to_string())?;
-    let (user_part, _) = split_persisted_section(existing);
+    ConfigLayer::from_toml_str(existing).map_err(|e| e.to_string())?;
+    let (user_part, persisted_part) = split_persisted_section(existing);
 
     match target {
         PersistTarget::ClipboardWrite => {
             let updated_user = set_clipboard_write_allow(user_part)?;
-            let approvals: Vec<&ProviderEntry> = layer
-                .providers
-                .iter()
-                .filter(|p| is_approvals_provider(&p.name))
-                .collect();
-            let out = join_sections(&updated_user, &approvals);
+            let out = join_raw_sections(&updated_user, persisted_part);
             ConfigLayer::from_toml_str(&out).map_err(|e| e.to_string())?;
             Ok(out)
         }
@@ -81,7 +76,13 @@ pub fn update_config_toml(existing: &str, target: &PersistTarget) -> Result<Stri
             net_domains,
             net_full,
         } => {
-            let sandbox = ensure_approvals_manifest(&mut layer, caller_profile)?;
+            let user_layer = ConfigLayer::from_toml_str(user_part).map_err(|e| e.to_string())?;
+            let mut managed_layer = match persisted_part {
+                Some(p) => ConfigLayer::from_toml_str(p).map_err(|e| e.to_string())?,
+                None => ConfigLayer::default(),
+            };
+            let sandbox =
+                ensure_approvals_manifest(&user_layer, &mut managed_layer, caller_profile)?;
             for raw in ro {
                 let pat: PathPattern = raw.parse().map_err(|e| format!("{e}"))?;
                 sandbox.grants.fs.masked.retain(|p| p != &pat);
@@ -110,13 +111,7 @@ pub fn update_config_toml(existing: &str, target: &PersistTarget) -> Result<Stri
             if *net_full {
                 sandbox.grants.network.mode = Some(NetworkMode::Full);
             }
-            let cleaned_user = strip_approvals_from_user_part(user_part)?;
-            let approvals: Vec<&ProviderEntry> = layer
-                .providers
-                .iter()
-                .filter(|p| is_approvals_provider(&p.name))
-                .collect();
-            let out = join_sections(&cleaned_user, &approvals);
+            let out = join_sections(user_part, &managed_layer.providers)?;
             ConfigLayer::from_toml_str(&out).map_err(|e| e.to_string())?;
             Ok(out)
         }
@@ -127,7 +122,13 @@ pub fn update_config_toml(existing: &str, target: &PersistTarget) -> Result<Stri
             target_profile,
             spec,
         } => {
-            let sandbox = ensure_approvals_manifest(&mut layer, caller_profile)?;
+            let user_layer = ConfigLayer::from_toml_str(user_part).map_err(|e| e.to_string())?;
+            let mut managed_layer = match persisted_part {
+                Some(p) => ConfigLayer::from_toml_str(p).map_err(|e| e.to_string())?,
+                None => ConfigLayer::default(),
+            };
+            let sandbox =
+                ensure_approvals_manifest(&user_layer, &mut managed_layer, caller_profile)?;
             let mut updated_spec = sandbox
                 .grants
                 .shims
@@ -137,13 +138,7 @@ pub fn update_config_toml(existing: &str, target: &PersistTarget) -> Result<Stri
             allow_shim_rule(&mut updated_spec, matched_rule, target_profile)?;
             sandbox.grants.shims.insert(shim.clone(), updated_spec);
 
-            let cleaned_user = strip_approvals_from_user_part(user_part)?;
-            let approvals: Vec<&ProviderEntry> = layer
-                .providers
-                .iter()
-                .filter(|p| is_approvals_provider(&p.name))
-                .collect();
-            let out = join_sections(&cleaned_user, &approvals);
+            let out = join_sections(user_part, &managed_layer.providers)?;
             ConfigLayer::from_toml_str(&out).map_err(|e| e.to_string())?;
             Ok(out)
         }
@@ -162,17 +157,27 @@ fn split_persisted_section(existing: &str) -> (&str, Option<&str>) {
 }
 
 /// Returns a mutable reference to the `[provider.sandbox]` manifest of the
-/// approvals `config` provider for `caller_profile` in `layer`, creating the
-/// provider entry if absent.
+/// approvals `config` provider for `caller_profile` in `managed_layer` (after
+/// [`PERSIST_HEADER`]), creating the provider entry if absent and refusing to
+/// clobber a hand-written entry of the same name in `user_layer`.
 fn ensure_approvals_manifest<'a>(
-    layer: &'a mut ConfigLayer,
+    user_layer: &ConfigLayer,
+    managed_layer: &'a mut ConfigLayer,
     caller_profile: &ProfileRef,
 ) -> Result<&'a mut Manifest, String> {
     let name = approvals_provider_name(caller_profile);
-    let idx = match layer.providers.iter().position(|p| p.name == name) {
+    if user_layer.providers.iter().any(|p| p.name == name) {
+        return Err(format!(
+            "provider {:?} is already defined above {PERSIST_HEADER:?} in .stopit.toml; \
+             rename or remove that hand-written entry to persist approvals for profile {:?}",
+            name.as_str(),
+            caller_profile.as_str()
+        ));
+    }
+    let idx = match managed_layer.providers.iter().position(|p| p.name == name) {
         Some(idx) => idx,
         None => {
-            layer.providers.push(ProviderEntry {
+            managed_layer.providers.push(ProviderEntry {
                 name: name.clone(),
                 enabled: true,
                 kind: ProviderKind::Config {
@@ -180,10 +185,18 @@ fn ensure_approvals_manifest<'a>(
                     sandbox: Box::new(Manifest::default()),
                 },
             });
-            layer.providers.len() - 1
+            managed_layer.providers.len() - 1
         }
     };
-    match &layer.providers[idx].kind {
+    if !managed_layer.providers[idx].enabled {
+        return Err(format!(
+            "provider {:?} in .stopit.toml is disabled (`enabled = false`); \
+             re-enable or remove it to persist approvals for profile {:?}",
+            name.as_str(),
+            caller_profile.as_str()
+        ));
+    }
+    match &managed_layer.providers[idx].kind {
         ProviderKind::Config { profile, .. } if profile == caller_profile => {}
         ProviderKind::Config { profile, .. } => {
             return Err(format!(
@@ -201,8 +214,11 @@ fn ensure_approvals_manifest<'a>(
             ));
         }
     }
-    let ProviderKind::Config { sandbox, .. } = &mut layer.providers[idx].kind else {
-        unreachable!("checked above");
+    let ProviderKind::Config { sandbox, .. } = &mut managed_layer.providers[idx].kind else {
+        return Err(format!(
+            "provider {:?} in .stopit.toml is not a config provider",
+            name.as_str()
+        ));
     };
     Ok(sandbox)
 }
@@ -320,44 +336,37 @@ fn try_edit_clipboard_in_place(user_part: &str) -> Option<String> {
     Some(out)
 }
 
-/// If `user_part` manually defined a `[[provider]]` with an approvals name
-/// before [`PERSIST_HEADER`], removes that entry from `user_part` so it is not
-/// duplicated when the managed approvals section is appended. Otherwise returns
-/// `user_part` unchanged.
-fn strip_approvals_from_user_part(user_part: &str) -> Result<String, String> {
-    let user_layer = ConfigLayer::from_toml_str(user_part).map_err(|e| e.to_string())?;
-    if !user_layer
-        .providers
-        .iter()
-        .any(|p| is_approvals_provider(&p.name))
-    {
-        return Ok(user_part.to_owned());
-    }
-    let mut root: toml::Table = toml::from_str(user_part).map_err(|e| e.to_string())?;
-    if let Some(toml::Value::Array(providers)) = root.get_mut("provider") {
-        providers.retain(|v| {
-            let name = v
-                .as_table()
-                .and_then(|t| t.get("name"))
-                .and_then(toml::Value::as_str);
-            !name.is_some_and(|n| n.starts_with(crate::resolve::APPROVALS_PROVIDER_PREFIX))
-        });
-        if providers.is_empty() {
-            root.remove("provider");
+/// Joins `updated_user` and an untouched `persisted_part` (starting at
+/// [`PERSIST_HEADER`]).
+fn join_raw_sections(updated_user: &str, persisted_part: Option<&str>) -> String {
+    let mut out = updated_user.trim_end().to_owned();
+    match persisted_part {
+        None => {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out
+        }
+        Some(persisted) => {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(persisted.trim_end());
+            out.push('\n');
+            out
         }
     }
-    toml::to_string_pretty(&root).map_err(|e| e.to_string())
 }
 
-/// Joins `user_part` and the rendered `approvals` providers with
+/// Joins `user_part` and the rendered managed `approvals` providers with
 /// [`PERSIST_HEADER`].
-fn join_sections(user_part: &str, approvals: &[&ProviderEntry]) -> String {
+fn join_sections(user_part: &str, approvals: &[ProviderEntry]) -> Result<String, String> {
     let mut out = user_part.trim_end().to_owned();
     if approvals.is_empty() {
         if !out.is_empty() {
             out.push('\n');
         }
-        return out;
+        return Ok(out);
     }
     if !out.is_empty() {
         out.push_str("\n\n");
@@ -368,15 +377,27 @@ fn join_sections(user_part: &str, approvals: &[&ProviderEntry]) -> String {
         if i > 0 {
             out.push('\n');
         }
-        out.push_str(&render_approvals_provider(entry));
+        out.push_str(&render_approvals_provider(entry)?);
     }
-    out
+    Ok(out)
 }
 
-/// Renders an approvals `config` provider entry as clean TOML.
-fn render_approvals_provider(entry: &ProviderEntry) -> String {
+/// Renders an approvals `config` provider entry as clean TOML without panicking
+/// if the section below [`PERSIST_HEADER`] was hand-edited to hold a disabled
+/// or non-`config` entry.
+fn render_approvals_provider(entry: &ProviderEntry) -> Result<String, String> {
+    if !entry.enabled {
+        return Err(format!(
+            "provider {:?} under {PERSIST_HEADER:?} has `enabled = false`",
+            entry.name.as_str()
+        ));
+    }
     let ProviderKind::Config { profile, sandbox } = &entry.kind else {
-        unreachable!("approvals provider is always a config provider");
+        return Err(format!(
+            "provider {:?} under {PERSIST_HEADER:?} has type {:?}, not \"config\"",
+            entry.name.as_str(),
+            entry.kind.type_name()
+        ));
     };
     let mut out = String::new();
     out.push_str("[[provider]]\n");
@@ -479,7 +500,7 @@ fn render_approvals_provider(entry: &ProviderEntry) -> String {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 fn render_action(action: &ShimAction) -> String {
@@ -651,5 +672,75 @@ mod tests {
             layer2.terminal_clipboard_write,
             Some(crate::config::ClipboardWrite::Allow)
         );
+    }
+
+    #[test]
+    fn persist_injective_profile_names_and_non_config_or_disabled_entries_never_panic() {
+        let initial = concat!(
+            "[[provider]]\nname = \"approvals-helper\"\ntype = \"nix\"\nprofile = \"main\"\n\n",
+            "[[provider]]\nname = \"approvals-disabled\"\nenabled = false\n",
+        );
+
+        // 1. `ClipboardWrite` preserves non-`config` and disabled `approvals-*`
+        // providers in `user_part` without duplicating, re-enabling, or panicking.
+        let after_clip = update_config_toml(initial, &PersistTarget::ClipboardWrite).unwrap();
+        let clip_layer = ConfigLayer::from_toml_str(&after_clip).unwrap();
+        assert_eq!(clip_layer.providers.len(), 2, "{after_clip}");
+        assert!(matches!(
+            clip_layer.providers[0].kind,
+            ProviderKind::Nix { .. }
+        ));
+        assert!(!clip_layer.providers[1].enabled);
+
+        // 2. `dev.shell`, `dev-shell`, and `dev_shell` persist into distinct
+        // managed providers without colliding or disturbing `user_part`.
+        let mut doc = after_clip.clone();
+        for prof in ["dev.shell", "dev-shell", "dev_shell"] {
+            doc = update_config_toml(
+                &doc,
+                &PersistTarget::Grant {
+                    caller_profile: prof.parse().unwrap(),
+                    ro: vec![format!("/opt/{}", prof.replace('.', "-"))],
+                    rw: Vec::new(),
+                    net_domains: Vec::new(),
+                    net_full: false,
+                },
+            )
+            .unwrap();
+        }
+        let parsed = ConfigLayer::from_toml_str(&doc).unwrap();
+        let names: Vec<&str> = parsed.providers.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "approvals-helper",
+                "approvals-disabled",
+                "approvals-dev_0shell",
+                "approvals-dev-shell",
+                "approvals-dev__shell",
+            ]
+        );
+
+        // 3. Another `ClipboardWrite` with existing managed approvals keeps both
+        // sections intact without duplicating any provider.
+        let clip_again = update_config_toml(&doc, &PersistTarget::ClipboardWrite).unwrap();
+        let parsed_again = ConfigLayer::from_toml_str(&clip_again).unwrap();
+        assert_eq!(parsed_again.providers.len(), 5, "{clip_again}");
+
+        // 4. Attempting to persist for profile `"disabled"` when `user_part`
+        // explicitly defined `name = "approvals-disabled"` with `enabled = false`
+        // fails cleanly without panicking or losing `enabled = false`.
+        let err = update_config_toml(
+            &doc,
+            &PersistTarget::Grant {
+                caller_profile: "disabled".parse().unwrap(),
+                ro: vec!["/opt/x".to_owned()],
+                rw: Vec::new(),
+                net_domains: Vec::new(),
+                net_full: false,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("approvals-disabled"), "{err}");
     }
 }

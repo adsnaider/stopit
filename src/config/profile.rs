@@ -154,8 +154,12 @@ impl fmt::Display for ProfileRef {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
 pub enum Inherit {
-    /// Start from the parent profile's fully merged grants.
+    /// Start from the parent profile's fully merged grants (resolved in
+    /// manifest scope when written inside a manifest).
     Profile(ProfileRef),
+    /// Start from an outer session profile's fully merged grants, bypassing
+    /// manifest-local contributed profile shadowing.
+    Global(ProfileRef),
     /// Start from the empty sandbox (`"none"`, or omitted).
     #[default]
     None,
