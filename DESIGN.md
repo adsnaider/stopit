@@ -580,7 +580,7 @@ Approval prompts appear on the terminal of `stopit server`, which no sandbox can
 * **Rate limiting:** after the user denies a request, requests in the same scope are denied without a prompt for five seconds, so a sandbox cannot bury the user in prompts. For `stopit-grant`, the scope is every grant from the profile (§7.5). A timeout or a cancel does not start this quiet period.
 * **Client-side memory:** the server's answer says whether it covers the session or starts a quiet period, and the client remembers that for its run. Later writes it covers cost no connection to the server.
 * **Unforgeable by construction:** the sandbox draws only on its own PTY, and the prompt is in another window, so the prompt needs no secret marker.
-* **Precise session and persisted rules:** "Allow for this session" (`s`) matches exactly the displayed scope, which is clipboard writes from that profile, a brokered command's shim and rule, or a grant's grants and scope. Planned remote rules narrow that to this remote *and* this bookmark. Session answers live in the server's memory and end with it. "Allow and persist" (`p`) also remembers the scope for the session and writes the approval to `.stopit.toml` under `# --- stopit persisted approvals ---` in a `config` provider named `approvals-<profile>` (escaping `_` as `__` and `.` as `_0`, and always setting `name`, `type = "config"`, and `profile = "<profile>"`): clipboard writes set `[terminal] clipboard_write = "allow"`, brokered commands copy the shim with the matched rule or default set to `decision = "allow"`, and `stopit-grant` appends the requested `fs.ro`, `fs.rw`, and `network` grants to the caller profile's `approvals-<profile>` provider. Before writing, the server checks the on-disk `.stopit.toml` against the trust store (`check_allowed` or `check_missing`), refusing to persist if the file was modified or planted outside `stopit allow`. It writes existing files in place with `O_NOFOLLOW` so read-only bind mounts in running sandboxes keep the same inode, creates a missing `.stopit.toml` with `O_CREAT | O_EXCL | O_NOFOLLOW` mode `0644`, records the new SHA-256 hash in the trust store, and reloads the session policy immediately. If persisting fails, the server prints the reason and still allows the scope for the session.
+* **Precise session and persisted rules:** "Allow for this session" (`s`) matches exactly the displayed scope, which is clipboard writes from that profile, a brokered command's shim and rule, or a grant's grants and scope. Planned remote rules narrow that to this remote *and* this bookmark. Session answers live in the server's memory and end with it. "Allow and persist" (`p`) also remembers the scope for the session and writes the approval to `.stopit.toml`. Clipboard writes set top-level `[terminal] clipboard_write = "allow"` in the user section of `.stopit.toml`, while brokered commands and `stopit-grant` write under `# --- stopit persisted approvals ---` in a `config` provider named `approvals-<profile>` (escaping `_` as `__` and `.` as `_0`, and always setting `name`, `type = "config"`, and `profile = "<profile>"`), either copying the shim with the matched rule or default set to `decision = "allow"` or appending the requested `fs.ro`, `fs.rw`, and `network` grants. Before writing, the server checks the on-disk `.stopit.toml` against the trust store (`check_allowed` or `check_missing`), refusing to persist if the file was modified or planted outside `stopit allow`. It writes existing files in place with `O_NOFOLLOW` so read-only bind mounts in running sandboxes keep the same inode, creates a missing `.stopit.toml` with `O_CREAT | O_EXCL | O_NOFOLLOW` mode `0644`, records the new SHA-256 hash in the trust store, and reloads the session policy immediately. If persisting fails, the server prints the reason and still allows the scope for the session.
 * **Deny feedback:** a denied clipboard write is dropped. A denied brokered command exits with `126` and `[stopit: <shim>: denied by user]` on its stderr.
 
 ### 5.5 `stopit server`
@@ -1062,7 +1062,6 @@ Session-wide, so not a provider setting. Off unless configured. Mitigates forkbo
 **Future:**
 * **`WorkspaceBackend` abstraction** with `BindBackend` (v1) and `FuseBackend`: full-workspace FUSE using FUSE passthrough (Linux 6.9+), likely built on `fuse-backend-rs`. Gains: renames handled natively (no seccomp hook), nested-`.git` control, live policy changes, a write log. Costs: the daemon becomes a security boundary (requires `O_PATH`-per-inode, `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` discipline), and every lookup/stat still goes through the supervisor. Benchmark on a cargo build and an `npm install` before adopting; keep kernel bind mounts for `.git` stubs and masks on top, and allow large low-risk directories (`target/`, `node_modules/`) to bypass FUSE.
 * **`cow` mode** with session-end diff review.
-* **Additional bases** between `none` and `default`.
 * **More providers:** `buck2` (host-daemon delegation, §3.6), script-based broker handlers.
 * **Other engines** behind `SandboxEngine` (e.g. macOS).
 
@@ -1074,8 +1073,8 @@ Where the phases stand:
 
 * Phase 1 is done.
 * Phase 2 has the PTY proxy, the output filter and window-size forwarding. Prompts appear on the terminal of `stopit server` instead of an overlay (§5.4, §5.5).
-* Phase 3 has the broker, declarative shims with `args`, and the `vcs` provider for local work (§7.3, Implemented so far). `stopit-grant` is built with `+net` and `+rw`/`+ro` (§7.5). Handlers, `vcs.remote` with remote access and signing, and `stopit-grant`'s `+secret` and `+ssh-agent` are not built.
-* Phase 4 is not built. Protected files are read-only.
+* Phase 3 has the broker, declarative shims (`cmd` plus `literal`, `prefix`, `regex`, and `flags` rules), host `proxy` shims (§7.1), the `vcs` provider with `vcs.ro`, `vcs.local`, and `vcs.remote` (`network = { mode = "full" }` plus read-only `$SSH_AUTH_SOCK` and `~/.ssh/known_hosts`, §7.3), and `stopit-grant` with `+net` and `+rw`/`+ro` (§7.5). Per-remote `__connect` tunneling, the filtered SSH agent proxy, commit `signing`, and `stopit-grant`'s `+secret` and `+ssh-agent` are not built.
+* Phase 4 has persist-to-config (`p` writing `approvals-<profile>` in `.stopit.toml`) and the agent skill (`skills/stopit-sandbox/SKILL.md`). Protected files remain read-only (`EROFS`), without the FUSE shadow, seccomp rename user-notify, or `stopit log`.
 * Phase 5 has the proxy (SNI matching, an uploads list in the startup summary), `[limits]` (§10), and the `nix` provider (§3.6).
 
 ### Phase 1. Scaffold, configuration, providers, `BwrapEngine`
@@ -1110,7 +1109,7 @@ Where the phases stand:
 1. `umount` / `mount -o remount,rw` on masked and RO paths → `EPERM`.
 2. `mv`/`rm -rf` on masked `/workspace/.git` → `EBUSY`/`EROFS`.
 3. `unshare -U -m` → fails; `clone3` → `ENOSYS`; `io_uring_setup` → `EPERM`; `socket(AF_VSOCK, …)` → fails.
-4. Read `/workspace/.env` → empty; read `~/.ssh` → `ENOENT`.
+4. Read `/workspace/.env` → `EACCES` (0-byte mode `0000` on `stat`); read `~/.ssh` → `ENOENT`.
 5. FDs ≥ 3 other than the preserved set → `EBADF`.
 6. Connect to `/run/user/$UID/bus` → `ENOENT`; connect to a masked workspace socket → `ECONNREFUSED`.
 7. Network `none`: no interfaces, `lo` down. Network `loopback`: `lo` works, `1.1.1.1` unreachable.
@@ -1128,7 +1127,7 @@ Where the phases stand:
 
 ## Appendix A. `stopit default-config`
 
-`stopit default-config` prints `src/default_config.toml` verbatim so `~/.config/stopit/config.toml` starts from explicit, editable providers (`base`, `protect-nix`, and `vcs`):
+`stopit default-config` prints `src/default_config.toml` so `~/.config/stopit/config.toml` starts from explicit, editable providers (`base`, `protect-nix`, and `vcs`; comments and the commented-out `tools` and `nix` recipes at the bottom of `src/default_config.toml` are omitted below for brevity):
 
 ```toml
 default_profile = "main"
@@ -1255,12 +1254,16 @@ masked = ["{workspace}/.git", "{workspace}/.jj"]
 
 [provider.sandbox.profiles.ro]             # appears as "vcs.ro"
 inherit = "main"
+system.home = "/home/vcs"
 fs.ro = ["{workspace}/.git", "{workspace}/.jj"]
+fs.ephemeral = ["/home/vcs"]
 network.mode = "none"
 sandbox.grant = false
+# plus safe GIT_* / JJ_* / XDG_CONFIG_HOME / GNUPGHOME env.set variables (§7.3)
 
 [provider.sandbox.profiles.local]          # appears as "vcs.local"
 inherit = "main"
+system.home = "/home/vcs"
 fs.rw = ["{workspace}/.git", "{workspace}/.jj"]
 fs.ro = [
   "{workspace}/.git/config", "{workspace}/.git/config.worktree", "{workspace}/.git/info/attributes",
@@ -1268,12 +1271,28 @@ fs.ro = [
   "{workspace}/.jj/repo/config.toml", "{workspace}/.jj/repo/store/git_target",
 ]
 fs.masked = ["{workspace}/.git/hooks", "{workspace}/.git/modules/*/hooks"]
+fs.ephemeral = ["/home/vcs"]
 network.mode = "none"
 sandbox.grant = false
 
 [provider.sandbox.profiles.remote]         # appears as "vcs.remote"
-inherit = "local"
+inherit = "main"
+system.home = "/home/vcs"
+fs.rw = ["{workspace}/.git", "{workspace}/.jj"]
+fs.ro = [
+  "{workspace}/.git/config", "{workspace}/.git/config.worktree", "{workspace}/.git/info/attributes",
+  "{workspace}/.git/modules/*/config", "{workspace}/.git/worktrees/*/config.worktree",
+  "{workspace}/.jj/repo/config.toml", "{workspace}/.jj/repo/store/git_target",
+]
+fs.masked = ["{workspace}/.git/hooks", "{workspace}/.git/modules/*/hooks"]
+fs.ephemeral = ["/home/vcs", "/home/vcs/.ssh"]
+fs.bind = [
+  { host = "<$SSH_AUTH_SOCK>", sandbox = "/home/vcs/.ssh/agent.sock", mode = "ro" },
+  { host = "~/.ssh/known_hosts", sandbox = "/home/vcs/.ssh/known_hosts", mode = "ro" },
+]
 network.mode = "full"
+sandbox.grant = false
+# plus SSH_AUTH_SOCK and GIT_SSH_COMMAND in env.set (§7.3)
 ```
 
 ---
