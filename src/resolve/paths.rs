@@ -503,18 +503,10 @@ struct Candidate<'a> {
 }
 
 impl Candidate<'_> {
-    /// Precedence; greater wins (§3.5 rules 1–3 at one sandbox path).
-    ///
-    /// A synthesized mask outranks everything: it stands in for restrictive
-    /// rules below its path that cannot be applied, so a less strict
-    /// candidate winning there would lift them.
-    fn rank(&self) -> (bool, bool, Reverse<u32>, PathMode) {
-        (
-            self.synthesized,
-            self.literal,
-            Reverse(self.rule.depth),
-            self.mode,
-        )
+    /// Specificity at one sandbox path before layer and mode: literal rules
+    /// beat globs, and a profile's own rules beat inherited ones.
+    fn specificity(&self) -> (bool, Reverse<u32>) {
+        (self.literal, Reverse(self.rule.depth))
     }
 
     fn into_mount(self) -> PlannedMount {
@@ -867,7 +859,9 @@ fn resolve_host(
                 )),
             },
             other @ ResolveWarning::Missing { .. } => {
-                warnings.push(plan_warning(rule, other.into()))
+                if rule.warn_missing {
+                    warnings.push(plan_warning(rule, other.into()));
+                }
             }
         }
     }
@@ -883,10 +877,14 @@ fn resolve_host(
         for p in paths {
             match cache.symlink_metadata(&p.host) {
                 Ok(_) => kept.push(p),
-                Err(error) if is_missing(error.kind()) => warnings.push(plan_warning(
-                    rule,
-                    ResolveWarning::Missing { path: p.host }.into(),
-                )),
+                Err(error) if is_missing(error.kind()) => {
+                    if rule.warn_missing {
+                        warnings.push(plan_warning(
+                            rule,
+                            ResolveWarning::Missing { path: p.host }.into(),
+                        ));
+                    }
+                }
                 Err(error) => mask(mode, p.host, error, warnings)?,
             }
         }
@@ -980,25 +978,27 @@ fn pick<'a>(
     ctx: &ExpansionContext,
     warnings: &mut Vec<PlanWarning>,
 ) -> Result<Candidate<'a>, PathPlanError> {
-    let best = candidates
+    // Synthesized masks outrank everything and show an empty directory whatever
+    // their source (two anchors may name different host paths at one sandbox
+    // path), so they never conflict: the first stands for all.
+    if let Some(best_synth) = candidates
         .iter()
-        .map(Candidate::rank)
+        .filter(|c| c.synthesized)
+        .map(|c| (c.literal, Reverse(c.rule.depth), c.rule.origin, c.mode))
         .max()
-        .expect("every sandbox path has at least one candidate");
-    // Synthesized masks show an empty directory whatever their source (two
-    // anchors may name different host paths at one sandbox path), so they
-    // never conflict: the first of the best stands for all.
-    if best.0 {
+    {
         let mut winner = None;
         let mut hidden = Vec::new();
         for c in candidates {
-            if c.rank() == best {
+            if c.synthesized
+                && (c.literal, Reverse(c.rule.depth), c.rule.origin, c.mode) == best_synth
+            {
                 winner.get_or_insert(c);
             } else if !c.synthesized && c.mode != PathMode::Masked {
                 hidden.push(c);
             }
         }
-        let winner = winner.expect("the best rank is attained");
+        let winner = winner.expect("at least one synthesized candidate exists");
         let MountSource::Host { path: dir, .. } = &winner.source else {
             unreachable!("a synthesized mask has a host source");
         };
@@ -1016,24 +1016,17 @@ fn pick<'a>(
         }
         return Ok(winner);
     }
-    // Ephemeral ties (`~` and `/home/user`) never conflict: the first wins.
-    let top: Vec<Candidate<'a>> = candidates
+
+    let best_spec = candidates
+        .iter()
+        .map(Candidate::specificity)
+        .max()
+        .expect("every sandbox path has at least one candidate");
+    let at_spec: Vec<Candidate<'a>> = candidates
         .into_iter()
-        .filter(|c| c.rank() == best)
+        .filter(|c| c.specificity() == best_spec)
         .collect();
-    if best.3 == PathMode::Ephemeral {
-        return Ok(top.into_iter().next().expect("the best rank is attained"));
-    }
-    let first_source = &top.first().expect("the best rank is attained").source;
-    if top.iter().all(|c| c.source.interchangeable(first_source)) {
-        return Ok(top.into_iter().next().expect("the best rank is attained"));
-    }
-    // Sources that differ at the same `(synthesized, literal, depth, mode)`
-    // go to the highest `ProviderOrigin`, so a workspace `fs.bind` can
-    // replace a global one at the same destination and mode. As for
-    // `env.set`, two different sources within any one layer conflict even
-    // when a higher layer also has one, and a built-in rule never loses to
-    // a user rule by layer: it conflicts with a different winner instead.
+
     let conflict = |a: &Candidate<'_>, b: &Candidate<'_>| {
         PathPlanError::Conflict(Box::new(MountConflict {
             sandbox: a.sandbox.clone(),
@@ -1045,31 +1038,87 @@ fn pick<'a>(
             second: b.source.clone(),
         }))
     };
-    for (i, a) in top.iter().enumerate() {
-        if let Some(b) = top[i + 1..]
+
+    // Within any single layer at the winning `(literal, depth)` specificity,
+    // two candidates tied at that layer's strictest mode with different sources
+    // conflict, even if a higher layer also contributes a rule here (matching
+    // `env.set`).
+    for origin in [
+        ProviderOrigin::Builtin,
+        ProviderOrigin::Global,
+        ProviderOrigin::Workspace,
+    ] {
+        let Some(layer_mode) = at_spec
             .iter()
-            .find(|b| b.rule.origin == a.rule.origin && !b.source.interchangeable(&a.source))
-        {
-            return Err(conflict(a, b));
+            .filter(|c| c.rule.origin == origin)
+            .map(|c| c.mode)
+            .max()
+        else {
+            continue;
+        };
+        if layer_mode == PathMode::Ephemeral {
+            continue;
+        }
+        let layer_top: Vec<&Candidate<'a>> = at_spec
+            .iter()
+            .filter(|c| c.rule.origin == origin && c.mode == layer_mode)
+            .collect();
+        for (i, a) in layer_top.iter().enumerate() {
+            if let Some(b) = layer_top[i + 1..]
+                .iter()
+                .find(|b| !b.source.interchangeable(&a.source))
+            {
+                return Err(conflict(a, b));
+            }
         }
     }
-    let max_origin = top
+
+    // Built-in rules outrank user layers by mode and never lose a source tie to
+    // a user rule (until built-in bases are removed).
+    if let Some(builtin_mode) = at_spec
         .iter()
-        .map(|c| c.rule.origin)
+        .filter(|c| c.rule.origin == ProviderOrigin::Builtin)
+        .map(|c| c.mode)
         .max()
-        .expect("the best rank is attained");
-    let winner_index = top
-        .iter()
-        .position(|c| c.rule.origin == max_origin)
-        .expect("max_origin is attained");
-    if let Some(builtin) = top.iter().find(|c| {
-        c.rule.origin == ProviderOrigin::Builtin
-            && !c.source.interchangeable(&top[winner_index].source)
-    }) {
-        return Err(conflict(builtin, &top[winner_index]));
+    {
+        let max_mode = at_spec
+            .iter()
+            .map(|c| c.mode)
+            .max()
+            .expect("at_spec is non-empty");
+        if builtin_mode == max_mode {
+            let builtin_idx = at_spec
+                .iter()
+                .position(|c| c.rule.origin == ProviderOrigin::Builtin && c.mode == builtin_mode)
+                .expect("builtin_mode is attained");
+            if builtin_mode != PathMode::Ephemeral
+                && let Some(other) = at_spec.iter().find(|c| {
+                    c.mode == builtin_mode
+                        && c.rule.origin != ProviderOrigin::Builtin
+                        && !c.source.interchangeable(&at_spec[builtin_idx].source)
+                })
+            {
+                return Err(conflict(&at_spec[builtin_idx], other));
+            }
+            let mut at_spec = at_spec;
+            return Ok(at_spec.swap_remove(builtin_idx));
+        }
     }
-    let mut top = top;
-    Ok(top.swap_remove(winner_index))
+
+    // Across user layers (`Workspace > Global`), the higher layer wins at equal
+    // `(literal, depth)` specificity regardless of mode; within that layer, the
+    // strictest mode wins, keeping the first rule on ties.
+    let best_layer_mode = at_spec
+        .iter()
+        .map(|c| (c.rule.origin, c.mode))
+        .max()
+        .expect("at_spec is non-empty");
+    let winner_index = at_spec
+        .iter()
+        .position(|c| (c.rule.origin, c.mode) == best_layer_mode)
+        .expect("best_layer_mode is attained");
+    let mut at_spec = at_spec;
+    Ok(at_spec.swap_remove(winner_index))
 }
 
 #[cfg(test)]
@@ -1177,6 +1226,7 @@ mod tests {
             provider: pn(provider),
             origin: crate::config::ProviderOrigin::Workspace,
             depth,
+            warn_missing: true,
         }
     }
 
@@ -1190,6 +1240,7 @@ mod tests {
             provider: pn(provider),
             origin: crate::config::ProviderOrigin::Workspace,
             depth,
+            warn_missing: true,
         }
     }
 
@@ -1739,15 +1790,45 @@ mod tests {
                 [host("/opt/x", f.home().join("b"), EntryKind::File, Ro, "w")]
             );
         }
-        // The global layer beats nothing but itself: a built-in rule
-        // conflicts instead (below).
-        // The layer only breaks ties: a stricter mode from a lower layer
-        // still wins, and so does a profile's own rule over an inherited one.
+        // A workspace rule beats a global rule at the same `(literal, depth)`
+        // specificity even when loosening the mode (e.g. `protected` -> `ro` or
+        // `rw`), while a profile's own rule still beats an inherited one.
         let mounts = f.clean(&[
             at(bind("~/a", "/opt/x", BindMode::Protected, "g", 0), Global),
             at(bind("~/b", "/opt/x", BindMode::Ro, "w", 0), Workspace),
         ]);
-        assert_eq!(summary(&mounts), [row("/opt/x", Protected, "g")]);
+        assert_eq!(
+            mounts,
+            [host("/opt/x", f.home().join("b"), EntryKind::File, Ro, "w")]
+        );
+        f.file("ws/configuration.nix");
+        let mounts = f.clean(&[
+            at(rule(Protected, "{workspace}/**/*.nix", "g", 0), Global),
+            at(rule(Rw, "{workspace}/**/*.nix", "w", 0), Workspace),
+        ]);
+        assert_eq!(
+            mounts,
+            [host(
+                "/workspace/configuration.nix",
+                f.ws().join("configuration.nix"),
+                EntryKind::File,
+                Rw,
+                "w"
+            )]
+        );
+        // A literal global rule still beats a workspace glob rule.
+        f.file("ws/flake.lock");
+        let mounts = f.clean(&[
+            at(rule(Protected, "{workspace}/flake.lock", "g", 0), Global),
+            at(rule(Rw, "{workspace}/*", "w", 0), Workspace),
+        ]);
+        assert_eq!(
+            summary(&mounts),
+            [
+                row("/workspace/configuration.nix", Rw, "w"),
+                row("/workspace/flake.lock", Protected, "g"),
+            ]
+        );
         let mounts = f.clean(&[
             at(bind("~/a", "/opt/x", BindMode::Ro, "g", 0), Global),
             at(bind("~/b", "/opt/x", BindMode::Ro, "w", 1), Workspace),
@@ -2722,6 +2803,7 @@ mod tests {
             provider: pn("p"),
             origin: crate::config::ProviderOrigin::Workspace,
             depth: 0,
+            warn_missing: true,
         };
         let e = f.plan_err(&[unchecked(Ephemeral, "{workspace}/*.tmp")]);
         assert!(matches!(e, PathPlanError::EphemeralGlob { .. }), "{e:?}");
@@ -2741,5 +2823,17 @@ mod tests {
         );
         let msg = e.to_string();
         assert!(msg.contains(r#""p""#) && msg.contains("[a.nix"), "{msg}");
+    }
+
+    #[test]
+    fn warn_missing_false_suppresses_missing_warnings_only() {
+        let f = Fixture::new();
+        let mut quiet = rule(Protected, "{workspace}/.envrc", "base", 0);
+        quiet.warn_missing = false;
+        let noisy = rule(Ro, "{workspace}/missing-tool", "tools", 0);
+        let plan = f.plan(&[quiet, noisy]);
+        assert!(plan.mounts.is_empty());
+        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        assert_eq!(plan.warnings[0].provider.as_str(), "tools");
     }
 }

@@ -21,9 +21,9 @@ use thiserror::Error;
 use super::graph::{Contribution, ProfileGraph};
 use crate::config::{ProfileRef, ProviderName, ProviderOrigin};
 use crate::manifest::{
-    Bind, DevMode, DevicePath, Domain, EnvName, EnvPattern, EnvValue, EtcFile, FsGrants,
-    GroupName, OptInSyscall, PathPattern, SandboxHome, SandboxUser, SearchPathEntry,
-    ShareableNamespace, ShimName, ShimSpec,
+    Bind, DevMode, DevicePath, Domain, EnvName, EnvPattern, EnvValue, EtcFile, FsGrants, GroupName,
+    OptInSyscall, PathPattern, SandboxHome, SandboxUser, SearchPathEntry, ShareableNamespace,
+    ShimName, ShimSpec,
 };
 use crate::policy::{NetworkMode, PathMode};
 
@@ -56,6 +56,8 @@ pub struct FsRule {
     /// grandparent's, and so on. Used for "a profile's own rules beat
     /// inherited rules" (§3.5 rule 2) at any distance.
     pub depth: u32,
+    /// Whether missing host paths for this rule emit a startup warning.
+    pub warn_missing: bool,
 }
 
 /// The effective `system` section.
@@ -364,33 +366,43 @@ fn merge_profile(
     })
 }
 
-/// Combines the explicit values of a profile's own contributions with
-/// `combine`; `None` when no contribution sets one.
-fn within_profile<T: Copy>(
-    values: impl IntoIterator<Item = Option<T>>,
+/// Combines the explicit values of a profile's own contributions by selecting
+/// the highest [`ProviderOrigin`] that sets a value and combining entries
+/// within that layer with `combine`; `None` when no contribution sets one.
+fn within_profile_layered<T: Copy>(
+    own: &[Contribution],
+    extract: impl Fn(&Contribution) -> Option<T>,
     combine: impl Fn(T, T) -> T,
 ) -> Option<T> {
-    values.into_iter().flatten().reduce(combine)
+    let max_origin = own
+        .iter()
+        .filter_map(|c| extract(c).map(|_| c.origin))
+        .max()?;
+    own.iter()
+        .filter(|c| c.origin == max_origin)
+        .filter_map(extract)
+        .reduce(combine)
 }
 
-/// `system.proc` (§3.5): logical OR within a profile; a profile's own
-/// explicit value (even `false`) overrides the inherited one. Default false.
+/// `system.proc` (§3.5): higher [`ProviderOrigin`] overrides lower within a
+/// profile, logical OR within the same layer; a profile's own explicit value
+/// (even `false`) overrides the inherited one. Default false.
 fn merge_proc(inherited: bool, own: &[Contribution]) -> bool {
-    within_profile(own.iter().map(|c| c.grants.system.proc), |a, b| a || b).unwrap_or(inherited)
+    within_profile_layered(own, |c| c.grants.system.proc, |a, b| a || b).unwrap_or(inherited)
 }
 
-/// `system.dev` (§3.5): logical OR within a profile (any `minimal` wins); a
-/// profile's own explicit value overrides the inherited one. Default none.
+/// `system.dev` (§3.5): higher [`ProviderOrigin`] overrides lower within a
+/// profile, logical OR within the same layer (any `minimal` wins); a profile's
+/// own explicit value overrides the inherited one. Default none.
 fn merge_dev(inherited: Option<DevMode>, own: &[Contribution]) -> Option<DevMode> {
-    // `minimal` is the only mode, so OR is "any explicit value".
-    within_profile(own.iter().map(|c| c.grants.system.dev), |a, _| a).or(inherited)
+    within_profile_layered(own, |c| c.grants.system.dev, |a, _| a).or(inherited)
 }
 
-/// `sandbox.grant` (§3.5): within a profile `false` wins, so any provider
-/// can turn `stopit-grant` off; a profile's own explicit value overrides
-/// the inherited one. Default off, which the default base turns on.
+/// `sandbox.grant` (§3.5): higher [`ProviderOrigin`] overrides lower within a
+/// profile, and within a layer `false` wins; a profile's own explicit value
+/// overrides the inherited one. Default off.
 fn merge_grant(inherited: bool, own: &[Contribution]) -> bool {
-    within_profile(own.iter().map(|c| c.grants.sandbox.grant), |a, b| a && b).unwrap_or(inherited)
+    within_profile_layered(own, |c| c.grants.sandbox.grant, |a, b| a && b).unwrap_or(inherited)
 }
 
 /// `system.etc` (§3.5): union with the inherited files.
@@ -550,15 +562,13 @@ fn merge_path_prepend(inherited: &[SearchPathEntry], own: &[Contribution]) -> Ve
     out
 }
 
-/// `network.mode` (§3.5, §8): within a profile the most permissive explicit
-/// mode; a profile's own explicit value overrides the inherited one, even
-/// when it is less permissive. Default `none`.
+/// `network.mode` (§3.5, §8): higher [`ProviderOrigin`] overrides lower within
+/// a profile, and within a layer the most permissive explicit mode wins; a
+/// profile's own explicit value overrides the inherited one, even when it is
+/// less permissive. Default `none`.
 fn merge_network_mode(inherited: NetworkMode, own: &[Contribution]) -> NetworkMode {
-    within_profile(
-        own.iter().map(|c| c.grants.network.mode),
-        NetworkMode::more_permissive,
-    )
-    .unwrap_or(inherited)
+    within_profile_layered(own, |c| c.grants.network.mode, NetworkMode::more_permissive)
+        .unwrap_or(inherited)
 }
 
 /// `network.allow_domains`, `sandbox.share`, `sandbox.allow_syscalls` and
@@ -572,28 +582,24 @@ fn union<'a, T: Clone + Ord + 'a>(
     out
 }
 
-/// Base name of the `config` provider in `.stopit.toml` where `[p]` persists
+/// Prefix of the `config` provider in `.stopit.toml` where `[p]` persists
 /// approved grants and shim rules (DESIGN.md §4.2).
-pub const APPROVALS_PROVIDER_NAME: &str = "approvals";
+pub const APPROVALS_PROVIDER_PREFIX: &str = "approvals-";
 
 /// Provider name used in `.stopit.toml` to persist approvals for `profile`:
-/// `"approvals"` for `main`, or `"approvals-<profile>"` (with any `.` replaced
-/// by `-`) for another profile.
+/// `"approvals-<profile>"` (with any `.` replaced by `-`).
 pub fn approvals_provider_name(profile: &ProfileRef) -> ProviderName {
-    let raw = if *profile == ProfileRef::main() {
-        APPROVALS_PROVIDER_NAME.to_owned()
-    } else {
-        format!("{APPROVALS_PROVIDER_NAME}-{}", profile.as_str().replace('.', "-"))
-    };
+    let raw = format!(
+        "{APPROVALS_PROVIDER_PREFIX}{}",
+        profile.as_str().replace('.', "-")
+    );
     raw.parse()
         .expect("approvals provider name constructed from a valid ProfileRef is valid")
 }
 
-/// Whether `name` is an approvals provider name (`"approvals"` or
-/// `"approvals-…"`).
+/// Whether `name` is an approvals provider name (`"approvals-…"`).
 pub fn is_approvals_provider(name: &ProviderName) -> bool {
-    let s = name.as_str();
-    s == APPROVALS_PROVIDER_NAME || s.starts_with("approvals-")
+    name.as_str().starts_with(APPROVALS_PROVIDER_PREFIX)
 }
 
 /// `shims` (§3.5): higher [`ProviderOrigin`] replaces lower for the same shim
@@ -657,11 +663,12 @@ fn merge_shims(
     Ok(out)
 }
 
-/// `fs.mask_sockets` (§3.5): within a profile `true` wins over `false`
-/// (strictest wins); a profile's own explicit value (even `false`)
-/// overrides the inherited one. Default false.
+/// `fs.mask_sockets` (§3.5): higher [`ProviderOrigin`] overrides lower within
+/// a profile, and within a layer `true` wins over `false` (strictest wins); a
+/// profile's own explicit value (even `false`) overrides the inherited one.
+/// Default false.
 fn merge_mask_sockets(inherited: bool, own: &[Contribution]) -> bool {
-    within_profile(own.iter().map(|c| c.grants.fs.mask_sockets), |a, b| a || b).unwrap_or(inherited)
+    within_profile_layered(own, |c| c.grants.fs.mask_sockets, |a, b| a || b).unwrap_or(inherited)
 }
 
 /// Path rules and binds (§3.5): not merged here, only collected. Inherited
@@ -677,11 +684,13 @@ fn merge_fs_rules(inherited: &[FsRule], own: &[Contribution]) -> Vec<FsRule> {
         })
         .collect();
     for c in own {
+        let warn_missing = c.grants.fs.warn_missing.unwrap_or(true);
         out.extend(fs_rules(&c.grants.fs).map(|kind| FsRule {
             kind,
             provider: c.provider.clone(),
             origin: c.origin,
             depth: 0,
+            warn_missing,
         }));
     }
     out
@@ -948,7 +957,11 @@ mod tests {
     fn devices_is_a_union() {
         let m = merged(&format!(
             "[profiles.child]\n[profiles.bare]\ninherit = \"none\"\n{}{}{}{}",
-            prov("a", "main", "system.devices = [\"/dev/vhost-vsock\", \"/dev/kvm\"]"),
+            prov(
+                "a",
+                "main",
+                "system.devices = [\"/dev/vhost-vsock\", \"/dev/kvm\"]"
+            ),
             prov("b", "main", "system.devices = [\"/dev/kvm\", \"/dev/dri\"]"),
             prov("c", "child", "system.devices = [\"/dev/bus/usb\"]"),
             prov("d", "bare", "system.devices = [\"/dev/kvm\"]"),
@@ -1248,7 +1261,11 @@ mod tests {
     fn disabled_shim_tombstone_removes_inherited_and_lower_or_same_rank_shims() {
         let m = merged(&format!(
             "[profiles.child]\n{}{}{}{}",
-            prov("a", "main", &format!("{}\n{}", shim("jj", "jj"), shim("git", "git"))),
+            prov(
+                "a",
+                "main",
+                &format!("{}\n{}", shim("jj", "jj"), shim("git", "git"))
+            ),
             prov("b", "main", "shims.git = false"),
             prov("c", "child", "shims.jj = { enabled = false }"),
             prov("d", "child", &shim("gh", "gh")),
@@ -1352,6 +1369,7 @@ mod tests {
                 provider: pn("b"),
                 origin: ProviderOrigin::Workspace,
                 depth: 0,
+                warn_missing: true,
             }],
             env: EffectiveEnv {
                 set: BTreeMap::from([("B".parse().unwrap(), "2".parse().unwrap())]),
@@ -1717,5 +1735,40 @@ mod tests {
             e.to_string(),
             r#"profile "main": shim "jj" is granted by both provider "a" and provider "b""#
         );
+    }
+
+    #[test]
+    fn workspace_layer_overrides_global_scalar_grants_in_either_direction() {
+        let m = layered(
+            &prov(
+                "g",
+                "main",
+                "fs.mask_sockets = true\nsystem.proc = true\n\
+                 network.mode = \"full\"\nsandbox.grant = false",
+            ),
+            &prov(
+                "w",
+                "main",
+                "fs.mask_sockets = false\nsystem.proc = false\n\
+                 network.mode = \"loopback\"\nsandbox.grant = true",
+            ),
+        )
+        .unwrap();
+        let main = eff(&m, "main");
+        assert!(!main.mask_sockets);
+        assert!(!main.system.proc);
+        assert_eq!(main.network.mode, NetworkMode::Loopback);
+        assert!(main.sandbox.grant);
+
+        assert_eq!(
+            approvals_provider_name(&pr("main")).as_str(),
+            "approvals-main"
+        );
+        assert_eq!(
+            approvals_provider_name(&pr("vcs.local")).as_str(),
+            "approvals-vcs-local"
+        );
+        assert!(!is_approvals_provider(&pn("approvals")));
+        assert!(is_approvals_provider(&pn("approvals-main")));
     }
 }

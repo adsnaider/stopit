@@ -273,6 +273,9 @@ pub struct FsGrants {
     /// Mask sockets found in RW grants at startup. `None` means unset, so
     /// that merging can tell it apart from an explicit `false`.
     pub mask_sockets: Option<bool>,
+    /// Emit warnings when a rule's path does not exist on the host. `None`
+    /// defaults to `true`.
+    pub warn_missing: Option<bool>,
 }
 
 #[derive(Default, Deserialize)]
@@ -285,6 +288,7 @@ struct RawFsGrants {
     ephemeral: Vec<PathPattern>,
     bind: Vec<Bind>,
     mask_sockets: Option<bool>,
+    warn_missing: Option<bool>,
 }
 
 impl TryFrom<MapOnly<RawFsGrants>> for FsGrants {
@@ -308,6 +312,7 @@ impl TryFrom<MapOnly<RawFsGrants>> for FsGrants {
             ephemeral: raw.ephemeral,
             bind: raw.bind,
             mask_sockets: raw.mask_sockets,
+            warn_missing: raw.warn_missing,
         })
     }
 }
@@ -1103,6 +1108,7 @@ mod tests {
                 ephemeral: pps(&["/tmp", "~"]),
                 bind: vec![],
                 mask_sockets: Some(true),
+                warn_missing: None,
             }
         );
         assert_eq!(m.version, ManifestVersion::V1);
@@ -1124,6 +1130,7 @@ mod tests {
                         mode: BindMode::Ro,
                     }],
                     mask_sockets: Some(true),
+                    warn_missing: None,
                 },
                 ..Grants::default()
             },

@@ -875,8 +875,7 @@ impl<'de> Deserialize<'de> for ShimSpec {
             }
 
             fn visit_map<A: de::MapAccess<'de>>(self, map: A) -> Result<ShimSpec, A::Error> {
-                let raw =
-                    RawShimSpec::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                let raw = RawShimSpec::deserialize(de::value::MapAccessDeserializer::new(map))?;
                 ShimSpec::try_from(MapOnly(raw)).map_err(de::Error::custom)
             }
         }
@@ -1147,9 +1146,8 @@ mod tests {
         );
         assert_eq!(j, m);
         for bad in [r#"tty = "yes""#, r#"tty = 1"#, r#"tty = []"#, r#"tty = {}"#] {
-            let text = format!(
-                "[shims.tui]\ncmd = \"tui\"\n{bad}\ndefault = {{ decision = \"deny\" }}\n"
-            );
+            let text =
+                format!("[shims.tui]\ncmd = \"tui\"\n{bad}\ndefault = {{ decision = \"deny\" }}\n");
             assert!(toml::from_str::<Manifest>(&text).is_err(), "{bad}");
         }
         for bad in [r#""yes""#, "1", "[]", "{}", "null"] {
@@ -1398,7 +1396,9 @@ mod tests {
 
     #[test]
     fn profile_is_forbidden_with_deny_and_required_otherwise() {
-        let msg = toml_err("[shims.x]\ncmd = \"x\"\ndefault = { decision = \"deny\", profile = \"main\" }");
+        let msg = toml_err(
+            "[shims.x]\ncmd = \"x\"\ndefault = { decision = \"deny\", profile = \"main\" }",
+        );
         assert!(msg.contains("deny"), "{msg}");
         for d in ["allow", "ask"] {
             let msg = toml_err(&format!(

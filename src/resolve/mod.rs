@@ -16,7 +16,7 @@ pub use graph::{
     Contribution, ProfileError, ProfileGraph, ProfileNode, ShimField, build_profile_graph,
 };
 pub use merge::{
-    APPROVALS_PROVIDER_NAME, EffectiveEnv, EffectiveGrants, EffectiveNetwork, EffectiveSandbox,
+    APPROVALS_PROVIDER_PREFIX, EffectiveEnv, EffectiveGrants, EffectiveNetwork, EffectiveSandbox,
     EffectiveSystem, EnvSetConflict, FsRule, FsRuleKind, MergeError, MergedProfiles, UserConflict,
     approvals_provider_name, is_approvals_provider, merge_profiles,
 };

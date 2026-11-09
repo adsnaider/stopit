@@ -265,8 +265,7 @@ impl<'de> Deserialize<'de> for SandboxUser {
             where
                 A: MapAccess<'de>,
             {
-                let raw =
-                    RawCustomUser::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                let raw = RawCustomUser::deserialize(de::value::MapAccessDeserializer::new(map))?;
                 Ok(SandboxUser::Custom(raw.username))
             }
         }

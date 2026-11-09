@@ -7,11 +7,10 @@
 //!   `[terminal] clipboard_write = "allow"`.
 //! * **`stopit-grant` requests (`Grant`):** adds the requested `fs.ro`,
 //!   `fs.rw`, and `network` (`mode` / `allow_domains`) grants to a `config`
-//!   provider named `"approvals"` (or `"approvals-<profile>"` for a non-`main`
-//!   caller profile).
-//! * **Brokered shim commands (`Shim`):** writes the shim into the `"approvals"`
-//!   `config` provider for the caller profile with the matched rule (or
-//!   `default`) changed to `decision = "allow"`.
+//!   provider named `"approvals-<profile>"`.
+//! * **Brokered shim commands (`Shim`):** writes the shim into the
+//!   `"approvals-<profile>"` `config` provider for the caller profile with the
+//!   matched rule (or `default`) changed to `decision = "allow"`.
 
 use crate::config::{ConfigLayer, ProfileRef, ProviderEntry, ProviderKind};
 use crate::manifest::{
@@ -341,7 +340,7 @@ fn strip_approvals_from_user_part(user_part: &str) -> Result<String, String> {
                 .as_table()
                 .and_then(|t| t.get("name"))
                 .and_then(toml::Value::as_str);
-            !name.is_some_and(|n| n == "approvals" || n.starts_with("approvals-"))
+            !name.is_some_and(|n| n.starts_with(crate::resolve::APPROVALS_PROVIDER_PREFIX))
         });
         if providers.is_empty() {
             root.remove("provider");
@@ -383,9 +382,7 @@ fn render_approvals_provider(entry: &ProviderEntry) -> String {
     out.push_str("[[provider]]\n");
     out.push_str(&format!("name = {}\n", toml_str(entry.name.as_str())));
     out.push_str("type = \"config\"\n");
-    if *profile != ProfileRef::main() {
-        out.push_str(&format!("profile = {}\n", toml_str(profile.as_str())));
-    }
+    out.push_str(&format!("profile = {}\n", toml_str(profile.as_str())));
     let fs = &sandbox.grants.fs;
     if !fs.ro.is_empty()
         || !fs.rw.is_empty()
@@ -552,7 +549,10 @@ mod tests {
         assert!(step1.contains("ro = [\"/opt/sdk\"]"), "{step1}");
         assert!(step1.contains("rw = [\"~/data\"]"), "{step1}");
         assert!(step1.contains("mode = \"proxy\""), "{step1}");
-        assert!(step1.contains("allow_domains = [\"example.com\"]"), "{step1}");
+        assert!(
+            step1.contains("allow_domains = [\"example.com\"]"),
+            "{step1}"
+        );
 
         // A second grant merges into the same `approvals` provider and upgrades
         // `/opt/sdk` from ro to rw when requested as rw.
@@ -614,14 +614,12 @@ mod tests {
             panic!("expected config provider");
         };
         let persisted_jj = &sandbox.grants.shims[&"jj".parse::<ShimName>().unwrap()];
-        let (squash_outcome, _) =
-            crate::broker::decide(persisted_jj, &[b"squash".to_vec()]);
+        let (squash_outcome, _) = crate::broker::decide(persisted_jj, &[b"squash".to_vec()]);
         assert_eq!(
             squash_outcome,
             crate::broker::Outcome::Allow("vcs.local".parse().unwrap())
         );
-        let (abandon_outcome, _) =
-            crate::broker::decide(persisted_jj, &[b"abandon".to_vec()]);
+        let (abandon_outcome, _) = crate::broker::decide(persisted_jj, &[b"abandon".to_vec()]);
         assert_eq!(
             abandon_outcome,
             crate::broker::Outcome::Ask("vcs.local".parse().unwrap())
