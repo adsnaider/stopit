@@ -122,8 +122,8 @@ stopit-grant --scope 'cargo test' +ro:/nix/store -- cargo test --lib
 ```
 
 If the user answers `[p] allow and persist` on the `stopit server` terminal, the
-grants are written into `.stopit.toml` under `[[provider]] name = "approvals"`
-and the server reloads its configuration immediately.
+grants are written into `.stopit.toml` under `[[provider]] name = "approvals-<profile>"`
+(such as `approvals-main`) and the server reloads its configuration immediately.
 
 ### `stopit-grant` Rules and Pitfalls
 

@@ -6,21 +6,23 @@ It is a single Rust binary built on [bubblewrap](https://github.com/containers/b
 
 > **Status: usable, still young.** These work and are tested against real sandboxes: the sandbox itself, the configuration and its trust checks, the terminal proxy, `stopit server` with its prompts, live configuration reload and saved approvals, the `full` and `proxy` network modes, brokered `git` and `jj` (including remote fetch and push via `vcs.remote` and `ssh-agent`), the `nix` development-shell provider, and resource limits. `stopit-grant` works for network and paths. Prompts for writes to protected files are not built yet. stopit has had no outside security review. [DESIGN.md](DESIGN.md) describes the design, and its section 11 lists the known gaps.
 
-## What the sandbox gets by default
+## Starting configuration (`stopit default-config`)
 
-With an empty `.stopit.toml` (or none), a sandbox has:
+stopit bakes no implicit sandbox rules into its binary. Every profile, mount, environment filter, and shim comes from explicit TOML configuration in `~/.config/stopit/config.toml` and per-project `.stopit.toml`.
+
+`stopit default-config` prints a ready-to-edit starting configuration for `~/.config/stopit/config.toml` that sets `default_profile = "main"`, declares `[profiles.main]`, and configures three providers (`base`, `protect-nix`, and `vcs`):
 
 - your project, read-write, at `/workspace`, which is also the working directory;
-- secrets in the project masked: `.env`, `.env.*`, `*.pem`, `*.key`, `.npmrc`, `.pypirc`, `.netrc`, SSH keys and others show up empty and unreadable;
-- files that exist when the session starts and would let it escape on your next run made read-only: `.stopit.toml`, `*.nix`, `flake.lock`, `.envrc`, `.vscode`, `.idea`, `.github/workflows`, the project settings of Claude Code, Gemini CLI and some editors (`.claude`, `.gemini`, `.cursor`, `.mcp.json`, `.zed`), and others (DESIGN.md, Appendix A);
-- the repository's `.git` and `.jj` masked, with `git` and `jj` brokered instead (see [Version control](#version-control));
+- secrets in the project masked (`fs.warn_missing = false`): `.env`, `.env.*`, `*.pem`, `*.key`, `.npmrc`, `.pypirc`, `.netrc`, SSH keys and others show up empty and unreadable;
+- files that exist when the session starts and would execute on the host made read-only: `.stopit.toml`, `.envrc`, `.vscode`, `.idea`, `.github/workflows`, `.claude`, `.gemini`, `.codex`, `opencode.json`, `.opencode`, `.cursor`, `.mcp.json`, `.zed`, and others in `base`, plus `*.nix` and `flake.lock` in `protect-nix` (DESIGN.md, Appendix A);
+- the repository's `.git` and `.jj` masked when the workspace is a repository, with `git` and `jj` brokered through explicit `[provider.shims.*]` rules (see [Version control](#version-control));
 - an empty home directory at `/home/stopit` and an empty `/tmp`, both deleted when the session ends;
 - its own `/proc`, a minimal `/dev`, and `/var/run` linked to `/run`;
 - generated `/etc/passwd`, `/etc/group`, `/etc/hosts` and `/etc/nsswitch.conf` naming the user `stopit` and the host `stopit`;
-- loopback networking only;
+- loopback networking only, and `stopit-grant` enabled (`sandbox.grant = true`);
 - an environment holding `HOME`, `USER`, `LOGNAME`, plus `TERM`, `LANG` and `COLORTERM` from yours. Variables matching `*_TOKEN`, `*_KEY`, `*_SECRET`, `*_PASSWORD`, `AWS_*`, `GITHUB_*`, `SSH_AUTH_SOCK` or `NIX_CONFIG` are never passed, in any letter case.
 
-It gets no programs. `/usr`, `/bin` and `/nix/store` are not mounted, so the first thing a configuration does is grant your tools (see below).
+`/usr`, `/bin` and `/nix/store` are not mounted until you uncomment or add a `tools` (or `nix`) provider in `~/.config/stopit/config.toml`.
 
 ## Requirements
 
@@ -45,18 +47,28 @@ imports = [ stopit.homeModules.default ];   # adds stopit to home.packages
 
 ## Quick start
 
-1. Grant your tools once for every project, in `~/.config/stopit/config.toml`. On Debian, Ubuntu or Fedora:
+1. Generate `~/.config/stopit/config.toml` from `stopit default-config` and grant your host tools for every project:
+
+   ```sh
+   mkdir -p ~/.config/stopit
+   stopit default-config > ~/.config/stopit/config.toml
+   ```
+
+   Then uncomment one of the `tools` recipes at the bottom of `~/.config/stopit/config.toml` (or add your own). On Debian, Ubuntu, Fedora or Arch:
 
    ```toml
    [[provider]]
    name = "tools"
    type = "config"
+   profile = "main"
    [provider.sandbox]
-   fs.ro = ["/usr", "/bin", "/lib", "/lib64", "/etc/alternatives", "/etc/ssl/certs"]
+   fs.warn_missing = false
+   fs.ro = [
+     "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64", "/usr/libexec", "/usr/share",
+     "/bin", "/lib", "/lib64", "/etc/alternatives", "/etc/ssl/certs", "/etc/pki",
+   ]
    env.path_prepend = ["/usr/local/bin", "/usr/bin", "/bin"]
    ```
-
-   On Fedora, add `"/etc/pki"`, where `/etc/ssl/certs` points.
 
    On NixOS:
 
@@ -64,12 +76,13 @@ imports = [ stopit.homeModules.default ];   # adds stopit to home.packages
    [[provider]]
    name = "tools"
    type = "config"
+   profile = "main"
    [provider.sandbox]
    fs.ro = ["/nix/store", "/run/current-system/sw", "/usr/bin/env", "/bin/sh", "/etc/ssl/certs"]
    env.path_prepend = ["/run/current-system/sw/bin"]
    ```
 
-   `/usr/bin/env` and `/bin/sh` are there for scripts that start with `#!/usr/bin/env`. For packages from Home Manager, add your profile (`/etc/profiles/per-user/<you>`, or `~/.nix-profile`) to `fs.ro`, and its `bin` as the sandbox sees it (`/etc/profiles/per-user/<you>/bin` or `/home/stopit/.nix-profile/bin`) to `env.path_prepend`. Granting all of `/nix/store` is fine for trying stopit out. On NixOS the store can hold rendered secrets, so a careful setup grants only `/usr/bin/env`, `/bin/sh`, and `/etc/ssl/certs` globally and adds `[[provider]] type = "nix"` to mount each project's development shell closure (see [Use a Nix development shell](#use-a-nix-development-shell)).
+   `/usr/bin/env` and `/bin/sh` are there for scripts that start with `#!/usr/bin/env`. For packages from Home Manager, add your profile (`/etc/profiles/per-user/<you>`, or `~/.nix-profile`) to `fs.ro`, and its `bin` as the sandbox sees it (`/etc/profiles/per-user/<you>/bin` or `/home/stopit/.nix-profile/bin`) to `env.path_prepend`. Granting all of `/nix/store` is fine for trying stopit out. On NixOS the store can hold rendered secrets, so a careful setup grants only `/usr/bin/env`, `/bin/sh`, and `/etc/ssl/certs` globally and adds `[[provider]] name = "nix" type = "nix" profile = "main"` to mount each project's development shell closure (see [Use a Nix development shell](#use-a-nix-development-shell)).
 
    This file needs no `stopit allow`. stopit trusts it because only you can write it, and it checks that no sandbox can.
 
@@ -107,7 +120,7 @@ stopit run --profile claude claude    # terminal 2
 
 ### Profiles for agents
 
-A profile is a complete sandbox description. `main` is used unless you pass `--profile`. Put an agent's profile in `~/.config/stopit/config.toml` next to the tools, so every project has it.
+A profile is a complete sandbox description. `default_profile` selects the profile used when `--profile` is omitted (`"main"` in `stopit default-config`). Omitting `inherit` on `[profiles.<name>]` starts from an empty sandbox, so set `inherit = "main"` to build an agent profile on top of `main`. Put an agent's profile in `~/.config/stopit/config.toml` next to the tools, so every project has it.
 
 Each recipe below gives the agent a state directory of its own on the host, `~/.stopit-agents/<agent>`, which appears in the sandbox where the agent looks for its state. Do not grant the agent's usual directory (`~/.claude`, `~/.gemini`, `~/.codex`, `~/.config/opencode`) instead if you also run the agent outside stopit. The agent could rewrite its own settings there, such as hooks, MCP servers and plugins, which then run unsandboxed the next time you start it on the host, and it could read every past session you had with it. Create each directory first, since stopit skips a rule whose path is missing, with a warning. Then log in from inside the sandbox if the agent lets you paste a code. Copying the credentials file of a host login into the new directory works too, but a provider that rotates its refresh tokens can then log one of the two copies out. The agent can still change its settings in its own directory, and the change applies in every project where you run it in stopit. Login flows that open a browser and wait on a local port cannot reach a sandbox.
 
@@ -119,6 +132,7 @@ The agent's program must be visible in the sandbox too. If you installed it thro
 
 ```toml
 [profiles.claude]
+inherit = "main"
 
 [[provider]]
 name = "claude"
@@ -138,6 +152,7 @@ network = { mode = "proxy", allow_domains = ["api.anthropic.com", "console.anthr
 
 ```toml
 [profiles.gemini]
+inherit = "main"
 
 [[provider]]
 name = "gemini"
@@ -156,6 +171,7 @@ network = { mode = "proxy", allow_domains = ["generativelanguage.googleapis.com"
 
 ```toml
 [profiles.codex]
+inherit = "main"
 
 [[provider]]
 name = "codex"
@@ -168,12 +184,13 @@ network = { mode = "proxy", allow_domains = ["api.openai.com", "chatgpt.com", "a
 
 Codex has a sandbox of its own. If Codex cannot start it inside stopit, `--sandbox danger-full-access` turns it off. stopit then still limits what Codex's commands can do, but Codex no longer keeps them out of `~/.codex` or off the network, so they can rewrite its configuration and reach the allowed names.
 
-Codex reads project settings from `.codex/` in the project, which the default rules do not protect. In a project that has one, add `fs.protected = ["{workspace}/.codex"]` to its `.stopit.toml`. A rule in `config.toml` would warn in every project without one. The agent can also create the directory in a project that has none.
+`stopit default-config` protects `.codex/` when it already exists at session start (`fs.warn_missing = false`). The agent can still create `.codex/` in a project that had none.
 
 **OpenCode**
 
 ```toml
 [profiles.opencode]
+inherit = "main"
 
 [[provider]]
 name = "opencode"
@@ -187,7 +204,7 @@ fs.bind = [
 network = { mode = "proxy", allow_domains = ["models.dev", "registry.npmjs.org", "api.anthropic.com", "api.openai.com"] }
 ```
 
-List the API of each model provider you use with it. `registry.npmjs.org` is there because OpenCode installs packages at run time, which it then runs, and the proxy lets it upload there too. Its cache stays in the session's home. OpenCode also reads `opencode.json` and `.opencode/` from the project, whose plugins run when you start it on the host, and the default rules do not protect them. In a project that has them, add `fs.protected = ["{workspace}/opencode.json", "{workspace}/.opencode"]` to its `.stopit.toml`. The agent can also create them in a project that has none.
+List the API of each model provider you use with it. `registry.npmjs.org` is there because OpenCode installs packages at run time, which it then runs, and the proxy lets it upload there too. Its cache stays in the session's home. `stopit default-config` protects existing `opencode.json` and `.opencode/` entries at session start, though the agent can still create them in a project that had none.
 
 ### What an agent sees
 
@@ -199,12 +216,14 @@ An agent skill at `skills/stopit-sandbox/SKILL.md` teaches agents how the sandbo
 
 ## Version control
 
-The `vcs` provider, on by default, masks the project's `.git` and `.jj` in the sandbox. In their place, `git` and `jj` on the sandbox's `PATH` ask stopit's broker to run the real tools, in a sandbox that can write the repository but has no network.
+The `vcs` provider in `stopit default-config` (`type = "vcs"`, `name = "vcs"`, `profile = "main"`) masks the project's `.git` and `.jj` in `main`, contributes `vcs.ro`, `vcs.local`, and `vcs.remote` when the workspace is a repository, and attaches explicit `[provider.shims.jj]` and `[provider.shims.git]` rules. In non-repository directories it is a quiet no-op.
 
-- Reading and committing run at once: `git status`, `diff`, `log`, `show`, `add`, `commit`; `jj status`, `diff`, `log`, `show`, `new`, `commit`, `describe`, `op log`.
+With the rules in `stopit default-config`:
+
+- Reading and committing run at once: `git status`, `diff`, `log`, `show`, `add`, `commit`; `jj status`/`st`, `diff`, `log`, `show`, `evolog`, `op log`, `file show`, `new`, `commit`/`ci`, `describe`/`desc`.
 - Commands that move or discard work ask you in the server's terminal: `git reset`, `rebase`, `checkout`, `switch`, `branch`, `tag`, `clean`, `stash`; `jj squash`, `rebase`, `abandon`, `restore`, `undo`, `bookmark`, `op`. So does anything not listed, and any call with a flag before the subcommand (`git --no-pager log` asks). Approve only commands you understand, since an approved command can write `.git`.
-- Fetch and push (`git fetch`, `pull`, `ls-remote`, `remote update`, `clone`, `push`; `jj git fetch`, `git clone`, `git push`) run in `vcs.remote` according to `fetch` and `push` (both `"ask"` by default), with `network = { mode = "full" }` and read-only binds of the host's `$SSH_AUTH_SOCK` and `~/.ssh/known_hosts`.
-- Options that add configuration, name another repository or run other programs are refused (`git -c`, `-C`, `--git-dir`; `jj --config`, `-R`, `--tool`).
+- Fetch and push (`git fetch`, `pull`, `ls-remote`, `remote update`, `clone`, `push`; `jj git fetch`, `git clone`, `git push`) run in `vcs.remote` (`decision = "ask"` in `default-config`; edit the rule in `config.toml` or `.stopit.toml` to `"allow"` or `"deny"` as you prefer), with `network = { mode = "full" }` and read-only binds of the host's `$SSH_AUTH_SOCK` and `~/.ssh/known_hosts`.
+- Options that add configuration, name another repository or run other programs are refused via `flags = [...]` rules (`git -c`, `-C`, `--git-dir`; `jj --config`, `-R`, `--tool`, including short-flag clusters and unambiguous long-flag abbreviations).
 - git and jj start no editor, pager or signing program, so `git commit` and `jj describe` need `-m`, and commits are not signed.
 - The commands work only from inside the project. A `git` run from `/tmp` gets an error.
 
@@ -212,17 +231,34 @@ A refused command exits with 126 and says why on its stderr, as `[stopit: git: .
 
 The broker supports a plain git repository, a jj repository (colocated or not), a git worktree, and a jj secondary workspace (`jj workspace add`, with `[workspace] mount = "host"` when `.jj/repo` uses a relative path). A project below a checkout's root gets the mask without the broker, with a warning.
 
-For projects whose build reads `.git` itself, show it read-only instead. This shows `.git/config` too, including any credentials in remote URLs.
-
-```toml
-[[provider]]
-type = "vcs"
-view = "ro"
-```
+For projects whose build reads `.git` itself, edit `view = "ro"` on the `vcs` provider in `config.toml` (or replace `[[provider]] name = "vcs"` in `.stopit.toml`, copying `[provider.shims.*]` if you still want brokered shims). Showing `.git` read-only exposes `.git/config` too, including any credentials in remote URLs.
 
 ## More configuration
 
-Each snippet below is a provider of its own. Give each a different `name`, or merge them into one, when you put several in one file.
+Each snippet below is a provider of its own. Every `[[provider]]` names `name`, `type`, and `profile` (only `name` is needed when `enabled = false`). Give each provider in one file a distinct `name`, or merge them into one.
+
+### Edit Nix files in a NixOS or module repository
+
+`stopit default-config` keeps `{workspace}/**/*.nix` and `{workspace}/flake.lock` in a separate `protect-nix` provider so projects that evaluate Nix on the host stay read-only while a NixOS configuration or Nix library repository can turn that off in `.stopit.toml` and edit Nix files directly in `main`:
+
+```toml
+[[provider]]
+name = "protect-nix"
+enabled = false
+```
+
+To keep `protect-nix` on and make only specific files writable in `main`, override them in a workspace provider (workspace rules beat global rules of equal specificity):
+
+```toml
+[[provider]]
+name = "allow-modules"
+type = "config"
+profile = "main"
+[provider.sandbox]
+fs.rw = ["{workspace}/modules/**/*.nix"]
+```
+
+To ignore `~/.config/stopit/config.toml` altogether in a self-contained project configuration, set `inherit_global = false` at the top of `.stopit.toml`.
 
 ### Let a build reach the internet
 
@@ -230,6 +266,7 @@ Each snippet below is a provider of its own. Give each a different `name`, or me
 [[provider]]
 name = "crates"
 type = "config"
+profile = "main"
 [provider.sandbox]
 network = { mode = "proxy", allow_domains = ["index.crates.io", "static.crates.io"] }
 ```
@@ -244,6 +281,7 @@ Tools find the proxy through `HTTPS_PROXY` and the other proxy variables, which 
 [[provider]]
 name = "cargo-cache"
 type = "config"
+profile = "main"
 [provider.sandbox]
 fs.rw = ["~/.cargo/registry"]
 env.set = { CARGO_HOME = "/home/stopit/.cargo" }
@@ -259,6 +297,7 @@ Tools that derive credential paths from your username or `/etc/passwd`, or emula
 [[provider]]
 name = "host-identity-and-devices"
 type = "config"
+profile = "main"
 [provider.sandbox]
 system.user = "host"   # or { username = "builder" }; sets default home to /home/<username>
 system.devices = ["/dev/kvm", "/dev/net/tun"]
@@ -270,6 +309,7 @@ system.devices = ["/dev/kvm", "/dev/net/tun"]
 [[provider]]
 name = "rules"
 type = "config"
+profile = "main"
 [provider.sandbox]
 fs.masked = ["{workspace}/config/credentials.yml"]
 fs.protected = ["{workspace}/Makefile", "{workspace}/scripts/**"]
@@ -279,8 +319,9 @@ fs.ephemeral = ["{workspace}/target"]
 - `masked` shows the path empty and unreadable.
 - `protected` is read-only for now. A later version will ask you to approve each write.
 - `ephemeral` gives a writable, empty directory that is discarded at the end of the session, here so build output never lands in your project.
+- `fs.warn_missing = false` suppresses startup warnings when rules in a shared provider name files not every project has.
 
-The most specific rule wins. An exact path beats a glob, and between rules for the same path the stricter mode wins.
+The most specific rule wins. An exact path beats a glob, a workspace rule beats a global rule of the same specificity, and within one layer the stricter mode wins.
 
 ### Brokered commands of your own
 
@@ -288,13 +329,15 @@ A shim runs a command in a fresh sandbox of another profile. Its rules pick the 
 
 ```toml
 [profiles.publish]
+inherit = "main"
 
 [[provider]]
 name = "cargo-shim"
 type = "config"
+profile = "main"
 [provider.sandbox]
 shims.cargo = { cmd = "cargo", default = { decision = "allow", profile = "main" }, rules = [
-  { regex = '(?:^| )--config(?:=.*)?(?: |$)', decision = "deny" },
+  { flags = ["--config"], decision = "deny" },
   { prefix = "publish", decision = "ask", profile = "publish" },
 ] }
 
@@ -306,7 +349,7 @@ profile = "publish"
 network = { mode = "proxy", allow_domains = ["crates.io", "index.crates.io", "static.crates.io"] }
 ```
 
-The publish profile still has no registry token, since the default filter drops `CARGO_REGISTRY_TOKEN`. In `cmd = ["binary", ...args]`, standalone `"{workspace}"` and `"{workspace}/..."` arguments expand to the sandbox workspace mount (pass flags and paths as separate arguments, such as `cmd = ["jj", "-R", "{workspace}"]`). Rules are evaluated in first-match-wins order against the caller's space-joined arguments (`literal`, `prefix`, or `regex`). For full custom argument parsing or dynamic per-invocation profiles, set `proxy = "./my-proxy.sh"` on a shim instead. Set `tty = true` on a shim for a full-screen TUI or interactive shell so foreground terminal calls get a pseudo-terminal and window-size updates of their own. Set `shims.<name> = false` (or `{ enabled = false }`) to disable a shim inherited from a parent profile or lower layer, and `enabled = false` on a `[[provider]]` to disable a provider by name. DESIGN.md section 7.1 describes the rules.
+The publish profile still has no registry token, since the default filter drops `CARGO_REGISTRY_TOKEN`. In `cmd = ["binary", ...args]`, standalone `"{workspace}"` and `"{workspace}/..."` arguments expand to the sandbox workspace mount (pass flags and paths as separate arguments, such as `cmd = ["jj", "-R", "{workspace}"]`). Rules are evaluated in first-match-wins order against the caller's arguments (`literal`, `prefix`, `regex`, or `flags` for short-flag clusters and long-flag prefix abbreviations). For full custom argument parsing or dynamic per-invocation profiles, set `proxy = "./my-proxy.sh"` on a shim instead. Set `tty = true` on a shim for a full-screen TUI or interactive shell so foreground terminal calls get a pseudo-terminal and window-size updates of their own. Set `shims.<name> = false` (or `{ enabled = false }`) to disable a shim inherited from a parent profile or lower layer, and `enabled = false` on a `[[provider]]` to disable a provider by name. DESIGN.md section 7.1 describes the rules.
 
 ### Mount the project at its host path
 
@@ -350,18 +393,21 @@ Add `[[provider]] type = "nix"` in `~/.config/stopit/config.toml` or `.stopit.to
 
 ```toml
 [[provider]]
+name = "nix"
 type = "nix"
+profile = "main"
 ```
 
-When placed after fallback host tool providers in `config.toml`, the development shell's `PATH` entries precede host tools in projects that have a `flake.nix` or `shell.nix`, and the provider does nothing in projects that have neither. In `.stopit.toml`, customize it per project:
+When placed after fallback host tool providers in `config.toml`, the development shell's `PATH` entries precede host tools in projects that have a `flake.nix` or `shell.nix`, and the provider does nothing in projects that have neither. In `.stopit.toml`, customize it per project (matching `name = "nix"` replaces the global entry cleanly):
 
 ```toml
 [[provider]]
+name = "nix"
 type = "nix"
+profile = "main"
 shell = "agent"            # devShells.<system>.agent on flakes, or attribute agent on shell.nix
 # file = "nix/ci.nix"      # evaluate a specific classic Nix file (mutually exclusive with flake)
 # flake = "nix"            # evaluate a flake in another directory
-# profile = "main"         # target sandbox profile (default "main")
 # cache = true             # cache resolved closures + GC roots in ~/.local/share/stopit/nix
 ```
 
@@ -375,6 +421,7 @@ A script provider runs on your host at every start and prints a manifest as JSON
 [[provider]]
 name = "env-script"
 type = "script"
+profile = "main"
 source = "scripts/stopit-env.sh"
 ```
 
@@ -393,13 +440,13 @@ stopit revoke                     # remove the current one
 stopit revoke PATH                # remove an entry by path, even if the project is gone
 ```
 
-Allowed configurations are recorded by path and content hash in `~/.local/share/stopit`. No sandbox can write there. If an allowed `.stopit.toml` disappears, stopit refuses to fall back to the defaults until you restore it or revoke it.
+Allowed configurations are recorded by path and content hash in `~/.local/share/stopit`. No sandbox can write there. If an allowed `.stopit.toml` disappears, stopit refuses to fall back to the global configuration until you restore it or revoke it.
 
 `stopit allow` trusts the file as it is when you run it, so read it first, especially after an agent has worked in the project.
 
 ## Startup summary
 
-Before the sandbox starts, `stopit run` and `stopit shell` print to stderr what the profile grants beyond the default base: mounts of host content outside the workspace or wider than the workspace's own mount, unmasked sockets, network access, passed-through host devices, shared namespaces, re-enabled syscalls, brokered commands, script providers with `protect = false`, and extra environment variable names (never values). `-q` / `--quiet` leaves the summary out (warnings and errors are still printed). Give it before the command, since after it `-q` is the command's own.
+Before the sandbox starts, `stopit run` and `stopit shell` print to stderr what the profile grants: mounts of host content outside the workspace or wider than the workspace's own mount, unmasked sockets, network access (`proxy` or `full`), passed-through host devices, shared namespaces, re-enabled syscalls, brokered commands, script providers with `protect = false`, and environment variable `pass` patterns and `set` names (never values). `-q` / `--quiet` leaves the summary out (warnings and errors are still printed). Give it before the command, since after it `-q` is the command's own.
 
 ## Current limitations
 

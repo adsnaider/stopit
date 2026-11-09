@@ -28,13 +28,13 @@
 
 ### 1.3 Core security invariants
 
-These are the guarantees of `base = "default"`. Under `base = "none"` the same mechanisms exist but every grant must be added explicitly (§3.2).
+These invariants hold across every profile; `stopit default-config` expresses the baseline policy explicitly in TOML (§3.2, Appendix A).
 
 * **I1. Allowlist-first visibility.** The sandbox filesystem starts as an empty `tmpfs` root. Nothing from the host, `HOME` and `/run/user/$UID` included, exists unless a grant names it.
 * **I2. Irreversible privilege drop.** Every sandboxed process runs with all capabilities dropped, `PR_SET_NO_NEW_PRIVS` set, user-namespace creation disabled, and a seccomp filter installed. A sandboxed process cannot unmount, remount, or otherwise alter its mount table.
-* **I3. No deferred host execution without approval.** Files that host tools execute *automatically* (on `cd`, on a VCS operation, on opening an editor) are **masked** or **protected** (§3.4). They change only with explicit user approval.
-* **I4. Trusted terminal ownership.** The sandbox never holds the host terminal. The supervisor owns it, filters sandbox output through an escape-sequence allowlist (§5.3), and renders approval prompts the sandbox cannot forge.
-* **I5. Explicit, additive policy.** `base = "none"` grants nothing. Every grant comes from a **provider** (§3.6), and everything `base = "default"` grants can be written out manually as providers (Appendix A).
+* **I3. No deferred host execution without approval.** Files that host tools execute *automatically* (on `cd`, on a VCS operation, on opening an editor) are **masked** or **protected** (§3.4) by the `base` and `protect-nix` providers in `stopit default-config`. They change only with explicit user approval or explicit configuration overrides.
+* **I4. Trusted terminal ownership.** The supervisor owns the host terminal, filters sandbox output through an escape-sequence allowlist (§5.3), and renders approval prompts the sandbox cannot forge.
+* **I5. Explicit, uniform policy.** No sandbox rules are hidden inside the binary. An empty profile grants nothing, every grant comes from an explicit **provider** (§3.6), and `stopit default-config` prints the starting policy as ordinary TOML configuration (Appendix A).
 
 ### 1.4 Attacker capabilities in scope
 
@@ -145,9 +145,9 @@ flowchart TB
 
 Configuration lives in `.stopit.toml` at the workspace root, layered over the user-global `config.toml` described below. It is read **only** when the supervisor starts or is explicitly asked to reload. It is the user's responsibility to verify it before use; it does not take effect on `cd`.
 
-Since it decides what the sandbox may do and which script providers run on the host as the user, `.stopit.toml` (found by walking up from the current directory, §3.1, or the one in `--workspace`) is only read if no one else could have written it: it must be a regular file owned by the user, without the group or other write bit, and its directory must be owned by the user or root and not writable by group or others unless it is sticky (as `/tmp` is). The directory is opened, the file opened in it without following a symlink, and both checked with `fstat` on those descriptors, so the file read is the file checked. The configuration's path is canonical (discovery resolves the workspace) and is its key in the trust store (below), so the directory is opened with `openat2(RESOLVE_NO_SYMLINKS)`: a link swapped in on the way since discovery is refused, naming the directory, rather than followed to a file the key does not name (`openat2` needs Linux 5.6, older than the 5.13 Landlock needs; without it, or under a seccomp profile that blocks it with `EPERM`, the run fails with an error saying so). A `.stopit.toml` that is a symlink is refused, whatever it points to. A file that fails these checks is an error naming the file and the reason, never skipped: walking up from `/tmp/proj` would otherwise find a `/tmp/.stopit.toml` that any user can create. These checks do not cover a `.stopit.toml` the sandbox itself writes in the workspace: it is the user's own file. Instead, **the supervisor protects the loaded configuration file** in every profile of its session, wherever the profile would let the sandbox write it, like a script provider's source (§3.6: the supervisor's rule, not a grant, attributed to `stopit`, a provider name reserved for this, §3.2), so neither `base = "none"` nor a loosening rule leaves it writable. The default base also protects every other existing `.stopit.toml` in the workspace (`{workspace}/.stopit.toml` and `{workspace}/**/.stopit.toml`, Appendix A), so the sandbox cannot change one; but a glob only protects what exists at the start (§3.4), so the sandbox can still create `sub/.stopit.toml`, which a later `stopit run` from `sub/` would find first. So **nested configurations are refused when found by walking up**: once a `.stopit.toml` is found, the directories above it are checked too, and if one of them has a `.stopit.toml` owned by the user (any entry of that name, whatever its mode or its directory's), stopit refuses to start, naming both files and suggesting `--workspace` with the inner directory (to use a nested configuration on purpose) and, if the outer one passes the checks above, with the outer directory (to use it); otherwise the error says the outer one fails them. Ownership alone decides because a sandbox can change modes in the workspace but not owners: with `chmod 0777` on the workspace root, which it owns, it could otherwise make the outer configuration fail the checks and so switch the rule off (that configuration is then refused when loaded too, the safe direction). One owned by someone else (a `/tmp/.stopit.toml` anyone could have created) is skipped: it is never loaded, so it protects nothing. The rule's soundness rests on the supervisor's protection of the loaded configuration, not on the default base: every session of the outer workspace protected the outer file, so a sandbox cannot have created or changed it, and a planted inner one is never used without the user naming its directory. `--workspace` does not look up, so it is how a nested configuration is used deliberately. Since trust on first use (below) refuses a planted configuration anyway, this rule is now defence in depth.
+Since it decides what the sandbox may do and which script providers run on the host as the user, `.stopit.toml` (found by walking up from the current directory, §3.1, or the one in `--workspace`) is only read if no one else could have written it: it must be a regular file owned by the user, without the group or other write bit, and its directory must be owned by the user or root and not writable by group or others unless it is sticky (as `/tmp` is). The directory is opened, the file opened in it without following a symlink, and both checked with `fstat` on those descriptors, so the file read is the file checked. The configuration's path is canonical (discovery resolves the workspace) and is its key in the trust store (below), so the directory is opened with `openat2(RESOLVE_NO_SYMLINKS)`: a link swapped in on the way since discovery is refused, naming the directory, rather than followed to a file the key does not name (`openat2` needs Linux 5.6, older than the 5.13 Landlock needs; without it, or under a seccomp profile that blocks it with `EPERM`, the run fails with an error saying so). A `.stopit.toml` that is a symlink is refused, whatever it points to. A file that fails these checks is an error naming the file and the reason, never skipped: walking up from `/tmp/proj` would otherwise find a `/tmp/.stopit.toml` that any user can create. These checks do not cover a `.stopit.toml` the sandbox itself writes in the workspace: it is the user's own file. Instead, **the supervisor protects the loaded configuration file** in every profile of its session, wherever the profile would let the sandbox write it, like a script provider's source (§3.6, attributed to `stopit`, a provider name reserved for the supervisor, §3.2), so no loosening rule leaves it writable. `stopit default-config` also protects every other existing `.stopit.toml` in the workspace (`{workspace}/.stopit.toml` and `{workspace}/**/.stopit.toml`, Appendix A), so the sandbox cannot change one; but a glob only protects what exists at the start (§3.4), so the sandbox can still create `sub/.stopit.toml`, which a later `stopit run` from `sub/` would find first. So **nested configurations are refused when found by walking up**: once a `.stopit.toml` is found, the directories above it are checked too, and if one of them has a `.stopit.toml` owned by the user (any entry of that name, whatever its mode or its directory's), stopit refuses to start, naming both files and suggesting `--workspace` with the inner directory (to use a nested configuration on purpose) and, if the outer one passes the checks above, with the outer directory (to use it); otherwise the error says the outer one fails them. Ownership alone decides because a sandbox can change modes in the workspace but not owners: with `chmod 0777` on the workspace root, which it owns, it could otherwise make the outer configuration fail the checks and so switch the rule off (that configuration is then refused when loaded too, the safe direction). One owned by someone else (a `/tmp/.stopit.toml` anyone could have created) is skipped: it is never loaded, so it protects nothing. The rule's soundness rests on the supervisor's protection of the loaded configuration, not on `default-config`: every session of the outer workspace protected the outer file, so a sandbox cannot have created or changed it, and a planted inner one is never used without the user naming its directory. `--workspace` does not look up, so it is how a nested configuration is used deliberately. Since trust on first use (below) refuses a planted configuration anyway, this rule is now defence in depth.
 
-**Trust on first use.** Like direnv, stopit only uses a `.stopit.toml` the user has allowed, in its exact current content. `stopit allow [--workspace DIR]` finds the configuration exactly as `stopit run` does (the same walk-up, trust checks and nested-configuration rule), reads it through the same checked descriptor, parses it to catch mistakes (no provider runs, no sandbox starts), and records its canonical path with the SHA-256 of the bytes read in the trust store, replacing any earlier entry for that path; it prints the path, the file's size in bytes and the whole SHA-256 of what it read, so that the user can check (with `sha256sum`) that the version they reviewed is the one allowed (exit 0, or 125 on an error). `stopit revoke [--workspace DIR]` finds the configuration as `allow` does and removes its entry (without reading the file, which may be gone or fail the checks; nothing to remove is not an error). `stopit revoke PATH` removes the entry of the configuration file `PATH` (as `stopit allowed` lists it, or relative to the current directory) without looking for a workspace, so that the entry of a workspace that is gone can be removed too: `PATH` is matched as written (made absolute), and if no entry has that path, its directory is resolved as far as it exists (following the links on the way, as discovery would have) and joined with its file name, as `allow` would have recorded it; a directory is refused, and `PATH` and `--workspace` cannot be given together. `stopit allowed` lists the entries, each with the start of its hash, marking `(missing)` those whose file is gone. `stopit run` and `stopit shell` read the configuration once and then, **before any provider runs and before the session directory is created**, look its canonical path up in the store and hash the bytes read: a missing entry or a different hash is refused (exit 125) with a message saying the configuration is new (never allowed, or revoked) or changed since it was last allowed, and to review it, then run `stopit allow` (with `--workspace` and the workspace, if `--workspace` was given). The same bytes are then parsed, so the file cannot be swapped between the check and its use. A workspace without a `.stopit.toml` runs the default configuration (`base = "default"`), with nothing to allow: the workspace is then the current directory, or the directory given to `--workspace`. **Unless an allowed configuration is missing there**: if the store has an entry for a `.stopit.toml` where discovery looked (in the directory given to `--workspace`; otherwise in the current directory or any directory above it, the nearest named), that configuration was allowed and is gone (deleted, or moved away with a directory on its path), and the default configuration may grant what it did not, so the run is refused too (exit 125), naming the file and saying to restore it, or to run `stopit revoke <path>` to use the defaults there. The same holds for an entry at or below a symbolic link on the way to the workspace as the user named it: the directory given to `--workspace` (against the current directory), or else `$PWD`, the current directory as the shell tracks it, if it is absolute and is the current directory (the kernel's current directory has its links resolved already); its path is resolved one link at a time, and the links followed collected. Entries are canonical, so that path was a directory when the entry was recorded: a sandbox with `rw` on the directory holding a workspace can move the workspace away and put a link to a directory without configuration in its place, which discovery, resolving links, would otherwise run with the defaults. The message names the link. A stale entry (the user moved the project and left a link behind) is refused alike, the safe direction: the user allows the configuration again at its new path, or revokes the old entry. Deleting a configuration nested below an allowed outer one is not refused: walking up then finds the outer one, which runs, since the user allowed it. A command that a message suggests quotes its paths for bash and zsh (not POSIX sh or fish), so that it can be pasted as printed: a path of plain characters (`A-Za-z0-9` and `_@%+=:,./-`, not starting with `=`, which zsh expands) as it is, any other in single quotes (a `'` as `'\''`), and one with control characters, deceptive ones (bidi overrides, zero-width spaces) or bytes that are not UTF-8 in ANSI-C quotes (`$'…'`, those as `\xHH`), so that the terminal never sees them. A sandbox can still create a `.stopit.toml` there, below a workspace, or in any directory it can write, but a later run that finds it refuses it until the user allows it. `allow` trusts whatever the file holds at that moment, so review it first. What allowing does not cover is in §11 (What trust on first use does not cover).
+**Trust on first use.** Like direnv, stopit only uses a `.stopit.toml` the user has allowed, in its exact current content. `stopit allow [--workspace DIR]` finds the configuration exactly as `stopit run` does (the same walk-up, trust checks and nested-configuration rule), reads it through the same checked descriptor, parses it to catch mistakes (no provider runs, no sandbox starts), and records its canonical path with the SHA-256 of the bytes read in the trust store, replacing any earlier entry for that path; it prints the path, the file's size in bytes and the whole SHA-256 of what it read, so that the user can check (with `sha256sum`) that the version they reviewed is the one allowed (exit 0, or 125 on an error). `stopit revoke [--workspace DIR]` finds the configuration as `allow` does and removes its entry (without reading the file, which may be gone or fail the checks; nothing to remove is not an error). `stopit revoke PATH` removes the entry of the configuration file `PATH` (as `stopit allowed` lists it, or relative to the current directory) without looking for a workspace, so that the entry of a workspace that is gone can be removed too: `PATH` is matched as written (made absolute), and if no entry has that path, its directory is resolved as far as it exists (following the links on the way, as discovery would have) and joined with its file name, as `allow` would have recorded it; a directory is refused, and `PATH` and `--workspace` cannot be given together. `stopit allowed` lists the entries, each with the start of its hash, marking `(missing)` those whose file is gone. `stopit run` and `stopit shell` read the configuration once and then, **before any provider runs and before the session directory is created**, look its canonical path up in the store and hash the bytes read: a missing entry or a different hash is refused (exit 125) with a message saying the configuration is new (never allowed, or revoked) or changed since it was last allowed, and to review it, then run `stopit allow` (with `--workspace` and the workspace, if `--workspace` was given). The same bytes are then parsed, so the file cannot be swapped between the check and its use. A workspace without a `.stopit.toml` runs the user-global `config.toml` alone, with nothing to allow: the workspace is then the current directory, or the directory given to `--workspace`. When neither `config.toml` nor `.stopit.toml` exists, `stopit run`, `stopit shell`, and `stopit server` exit 125 with a bootstrap hint showing `mkdir -p <config_dir> && stopit default-config > <config_dir>/config.toml`. **Unless an allowed configuration is missing there**: if the store has an entry for a `.stopit.toml` where discovery looked (in the directory given to `--workspace`; otherwise in the current directory or any directory above it, the nearest named), that configuration was allowed and is gone (deleted, or moved away with a directory on its path), and the global configuration may grant what it did not, so the run is refused too (exit 125), naming the file and saying to restore it, or to run `stopit revoke <path>` to run without it there. The same holds for an entry at or below a symbolic link on the way to the workspace as the user named it: the directory given to `--workspace` (against the current directory), or else `$PWD`, the current directory as the shell tracks it, if it is absolute and is the current directory (the kernel's current directory has its links resolved already); its path is resolved one link at a time, and the links followed collected. Entries are canonical, so that path was a directory when the entry was recorded: a sandbox with `rw` on the directory holding a workspace can move the workspace away and put a link to a directory without configuration in its place, which discovery, resolving links, would otherwise run with the defaults. The message names the link. A stale entry (the user moved the project and left a link behind) is refused alike, the safe direction: the user allows the configuration again at its new path, or revokes the old entry. Deleting a configuration nested below an allowed outer one is not refused: walking up then finds the outer one, which runs, since the user allowed it. A command that a message suggests quotes its paths for bash and zsh (not POSIX sh or fish), so that it can be pasted as printed: a path of plain characters (`A-Za-z0-9` and `_@%+=:,./-`, not starting with `=`, which zsh expands) as it is, any other in single quotes (a `'` as `'\''`), and one with control characters, deceptive ones (bidi overrides, zero-width spaces) or bytes that are not UTF-8 in ANSI-C quotes (`$'…'`, those as `\xHH`), so that the terminal never sees them. A sandbox can still create a `.stopit.toml` there, below a workspace, or in any directory it can write, but a later run that finds it refuses it until the user allows it. `allow` trusts whatever the file holds at that moment, so review it first. What allowing does not cover is in §11 (What trust on first use does not cover).
 
 **The trust store** is the file `allowed.json` in stopit's data directory (§6.2, Reserved host paths: `<home>/.local/share/stopit` from the password database, or `STOPIT_STATE_DIR`). `run`, `shell`, `allow`, `revoke` and `allowed` all create the directory if it is missing (its parents with `create_dir_all`, itself with mode 0700; with a home directory in the password database that is missing or not the user's to write, such as `/nonexistent` or `/var/empty`, that fails, and the error says to set `STOPIT_STATE_DIR` to a directory the user owns), then require it to be a real directory (not a link) owned by the user with no group or other access, as `stopit/` is in §2.1, open it without following a link, and check that the descriptor is the directory checked. The store file is opened relative to that descriptor without following a link, and must be a regular file owned by the user with no group or other access (0600), checked with `fstat` on the descriptor read: others able to write it could allow configurations for the user, and others able to read it learn the user's projects. A missing file is an empty store; one that does not parse is an error naming it, never an empty store. It is JSON, `{"version": 1, "allowed": {"<path>": "<sha256>"}}`, each path the lowercase hex of its bytes (a path may hold any byte but NUL, which a JSON string cannot carry) and each hash lowercase hex; it is not meant to be edited by hand. An update holds an exclusive `flock` on the directory while it reads the store, writes the new one to a temporary file in the directory (`O_EXCL`, 0600; one a crashed update left behind is removed first), `fsync`s it, renames it over the store and `fsync`s the directory: concurrent `allow`s lose no entry, and a reader, which takes no lock, sees the old store or the new one, never part of one. No mount may show the store from inside, a read-only view containing it masks it (silently, so `ro ~` does not warn on every run), and no `rw` mount may contain it (§6.2, Reserved host paths).
 
@@ -161,15 +161,15 @@ A symbolic link is accepted too, since Home Manager and dotfile managers install
 
 A file or target with more than one hard link is refused when the user could write it, since a sandbox could rewrite it through the other name. Nix store files that `auto-optimise-store` hard-links pass, as for script sources (§3.6). Every failure names the file and the reason. A missing directory or a missing `config.toml` means no global configuration.
 
-The target and the scripts of the global configuration often live outside the reserved directory, so the supervisor guards them in every session. Before any provider runs, it resolves `config.toml`, the source of every protected global `script` provider, every protected global `config` proxy shim, and every non-workspace `file` or `flake` directory (along with its `flake.nix` and `flake.lock` when present) of a global `nix` provider from their declared paths. A symbolic link on the way inside the workspace or a `config` provider's `rw` grant is refused, since a sandbox could re-point it, as for script providers (§3.6). The canonical paths are then protected in every profile, like the workspace's `.stopit.toml`. A workspace granting `rw` on a dotfiles repository therefore cannot change the file a link names, rename it, rename a directory above it, or give it a second name. This holds for global providers the session does not run too, such as one a workspace provider replaced by name or disabled with `enabled = false`.
+The target and the scripts of the global configuration often live outside the reserved directory, so the supervisor guards them in every session. Before any provider runs, it resolves `config.toml`, the source of every protected global `script` provider, every protected global `config` or `vcs` proxy shim, and every non-workspace `file` or `flake` directory (along with its `flake.nix` and `flake.lock` when present) of a global `nix` provider from their declared paths. A symbolic link on the way inside the workspace or a `config` provider's `rw` grant is refused, since a sandbox could re-point it, as for script providers (§3.6). The canonical paths are then protected in every profile, like the workspace's `.stopit.toml`. A workspace granting `rw` on a dotfiles repository therefore cannot change the file a link names, rename it, rename a directory above it, or give it a second name. This holds for global providers the session does not run too, such as one a workspace provider replaced by name or disabled with `enabled = false`.
 
-Relative `script` provider sources and `nix` provider `file` and `flake` paths in `config.toml` resolve against the configuration directory, which is also a global script provider's working directory.
+Relative `script` provider sources, proxy shim executables, and `nix` provider `file` and `flake` paths in `config.toml` resolve against the configuration directory, which is also a global script provider's working directory.
 
-When the workspace's `.stopit.toml` sets `base = "none"`, the global layer does not apply. stopit still reads, checks and parses `config.toml` to guard its target and scripts, so a broken or untrusted one stops that workspace too. Otherwise the two layer as described in §3.5.
+When the workspace's `.stopit.toml` sets `inherit_global = false` (default `true`; rejected in `config.toml`), the global layer does not apply. stopit still reads, checks and parses `config.toml` to guard its target and scripts, so a broken or untrusted one stops that workspace too. Otherwise the two layer as described in §3.5.
 
-At startup the supervisor prints a short summary of every grant that **widens** access beyond the default base (binds, especially under `$HOME` or `/etc`; network domains; brokered commands; sockets that delegate to host daemons; providers with `protect = false`). This is informational and does not block.
+At startup the supervisor prints a short, uniform summary of the profile's grants (binds outside the workspace or wider than its mount; network domains; brokered commands; unmasked sockets; providers with `protect = false`; environment pass patterns and set names). This is informational and does not block.
 
-`stopit run` and `stopit shell` print it to stderr, one `stopit: `-prefixed line each, after the warnings and right before the sandbox starts, for the profile that runs (not for the session's other profiles). The first line names the profile, the workspace and the mode of the workspace mount (`stopit: profile "main" (workspace ~/proj rw at /workspace)`, or `(workspace ~/proj, not mounted)` when no mount is at the workspace mount point); each further line is one grant beyond what the default base gives, so under the default configuration there is only the header, plus a `broker` line each for `jj` and `git` when the workspace is a repository the `vcs` provider supports (§7.3):
+`stopit run` and `stopit shell` print it to stderr, one `stopit: `-prefixed line each, after the warnings and right before the sandbox starts, for the profile that runs (not for the session's other profiles). The first line names the profile, the workspace and the mode of the workspace mount (`stopit: profile "main" (workspace ~/proj rw at /workspace)`, or `(workspace ~/proj, not mounted)` when no mount is at the workspace mount point), followed by one line per grant category:
 
 ```
 stopit: profile "main" (workspace ~/proj rw at /workspace)
@@ -178,11 +178,11 @@ stopit:   ro       /nix/store  (provider "tools")
 stopit:   sockets  not masked in rw grants
 stopit:   network  full
 stopit:   script   provider "env" runs unprotected (protect = false)
-stopit:   env pass RUST_*
+stopit:   env pass COLORTERM, LANG, RUST_*, TERM
 stopit:   env set  API_URL
 ```
 
-What is listed: host content mounted `rw`, `protected` (`prot`) or `ro` outside the workspace, or inside it with a mode wider than the workspace mount's (`rw` over `protected` over `ro`: an `rw` `{workspace}/out` under an `ro` workspace is listed, a `ro` part of an `rw` workspace is not; with the workspace not mounted, every mount of its content is), one line per mount with its provider, `rw` first, then `prot`, then `ro` (`host -> sandbox` when the sandbox path differs; the sandbox `HOME` is written `~` like the host's, so a `~` rule shows as one path); `sockets  not masked in rw grants` when `fs.mask_sockets` is off and any host content is mounted `rw` (§3.4; sockets that delegate to host daemons get their own flag once such grants exist, below); the network if its mode is not `none` or `loopback` (`full`, or `proxy to` the domains); passed-through host devices (`devices`), shared namespaces (`share`), re-enabled syscalls (`syscalls`), brokered commands (`broker`, with their provider), script providers with `protect = false` (`script`), and environment `pass` patterns and `set` names the default base does not already have (`env pass`, `env set`: names only, never values). Left out, as they widen nothing: the workspace's own mount and anything inside it no wider than that mount, masked and ephemeral mounts, and the supervisor's own rules (the protected configuration file). A provider with more than 10 mounts of one mode (a Nix closure can have thousands) gets one line with their count instead (`ro       4312 mounts  (provider "tools")`), and a name list is cut after 10 names with `and N more`. Paths under the host `HOME` are written with `~`, and every value is escaped like the rest of what stopit prints (§5). `--quiet` (`-q`) on `run` and `shell` leaves the summary out; warnings and errors are still printed. Like every stopit option it must come before the command: after it, `-q` is the command's own.
+What is listed: host content mounted `rw`, `protected` (`prot`) or `ro` outside the workspace, or inside it with a mode wider than the workspace mount's (`rw` over `protected` over `ro`; an `rw` `{workspace}/out` under an `ro` workspace is listed, while an `ro` part of an `rw` workspace is not; with the workspace not mounted, every mount of its content is), one line per mount with its provider, `rw` first, then `prot`, then `ro` (`host -> sandbox` when the sandbox path differs; the sandbox `HOME` is written `~` like the host's, so a `~` rule shows as one path); `sockets  not masked in rw grants` when `fs.mask_sockets` is off and any host content is mounted `rw` (§3.4; sockets that delegate to host daemons get their own flag once such grants exist, below); the network if its mode is not `none` or `loopback` (`full`, or `proxy to` the domains); passed-through host devices (`devices`), shared namespaces (`share`), re-enabled syscalls (`syscalls`), brokered commands (`broker`, with their provider), script providers with `protect = false` (`script`), and every environment `pass` pattern and `set` variable name (`env pass`, `env set`; names only, never values). Left out, as they widen nothing: the workspace's own mount and anything inside it no wider than that mount, masked and ephemeral mounts, and the supervisor's own rules (the protected configuration file). A provider with more than 10 mounts of one mode (a Nix closure can have thousands) gets one line with their count instead (`ro       4312 mounts  (provider "tools")`), and a name list is cut after 10 names with `and N more`. Paths under the host `HOME` are written with `~`, and every value is escaped like the rest of what stopit prints (§5). `--quiet` (`-q`) on `run` and `shell` leaves the summary out; warnings and errors are still printed. Like every stopit option it must come before the command; after it, `-q` is the command's own.
 
 ### 3.1 Structure of top-level settings and providers
 
@@ -190,16 +190,16 @@ The configuration has a single way of granting resources: **providers**. Only se
 
 | Top level | Providers, `[[provider]]` |
 | :--- | :--- |
-| `base`, starting set of providers, see §3.2 | Filesystem rules and path modes |
-| `[workspace]`, workspace identity and mount point | System mounts for `/proc`, `/dev`, synthesized `/etc`, and `HOME` |
-| `[limits]`, resource limits, see §10 | Environment pass, deny, set, and `PATH` |
-| `[approval]`, approval timeout, see §4.3 | Network |
-| `[terminal]`, output-filter options, see §5 | Brokered shims and their policy |
-| `[profiles.<name>]`, which sandboxes exist, see §3.3 | Hardening opt-outs for namespace sharing and syscalls |
-| | Contributed profiles |
+| `default_profile`, fallback profile when `--profile` is omitted, see §3.3 | Filesystem rules and path modes |
+| `inherit_global`, whether `.stopit.toml` layers over `config.toml` (default `true`), see §3.2 | System mounts for `/proc`, `/dev`, synthesized `/etc`, and `HOME` |
+| `[workspace]`, workspace identity and mount point | Environment pass, deny, set, and `PATH` |
+| `[limits]`, resource limits, see §10 | Network |
+| `[approval]`, approval timeout, see §4.3 | Brokered shims and their policy |
+| `[terminal]`, output-filter options, see §5 | Hardening opt-outs for namespace sharing and syscalls |
+| `[profiles.<name>]`, which sandboxes exist, see §3.3 | Contributed profiles |
 
 ```toml
-base = "default"
+default_profile = "main"
 
 [workspace]
 mount = "/workspace"          # where {workspace} appears inside the sandbox, or "host"
@@ -210,49 +210,47 @@ memory = "8G"
 [approval]
 timeout = "off"
 
+[profiles.main]
+
 [[provider]]
+name = "agent-env"
 type = "script"
+profile = "main"
 source = "scripts/agent-env.sh"
 
 [[provider]]
+name = "certs-and-crates"
 type = "config"
+profile = "main"
 [provider.sandbox]
 fs.ro = ["/etc/ssl/certs"]
 network = { mode = "proxy", allow_domains = ["static.crates.io", "index.crates.io"] }
 ```
 
-**Workspace.** The workspace is the host directory the session is about: by default the directory with the nearest `.stopit.toml`, walking up from the current directory (§3), else the current directory, overridable with `stopit run --workspace <dir>`. Its identity is session-wide because the supervisor depends on it (socket and hard-link scans, protected-file shadows, repository resolution, broker cwd checks) and every provider's `{workspace}` paths are relative to it. `[workspace] mount` sets where it appears inside the sandbox: a plain absolute path (default `"/workspace"`) or `"host"`, which mounts the workspace at its canonical host directory so tools and saved sessions see the same path inside and outside the sandbox. *Access* to it is still a grant: under `base = "none"` the workspace is defined but not mounted until a provider grants it. The workspace mount point (like `system.home`) is subject to the reserved-path rules in §6.2. Otherwise `{workspace}` rules are resolved and checked like `~` and absolute ones (§3.4, §6.2); the workspace is special in exactly three ways: (1) it is the session's identity, whose path comes from `.stopit.toml` or `--workspace` and which the supervisor relies on, so it must appear in the sandbox only at its mount (§6.2, Workspace exposure); (2) it is always an untrusted root for symlinks, even when no profile of the session grants it `rw` (§3.4, Symlinks); (3) the default base grants it `rw` (§3.2).
+**Workspace.** The workspace is the host directory the session is about: by default the directory with the nearest `.stopit.toml`, walking up from the current directory (§3), else the current directory, overridable with `stopit run --workspace <dir>`. Its identity is session-wide because the supervisor depends on it (socket and hard-link scans, protected-file shadows, repository resolution, broker cwd checks) and every provider's `{workspace}` paths are relative to it. `[workspace] mount` sets where it appears inside the sandbox: a plain absolute path (default `"/workspace"`) or `"host"`, which mounts the workspace at its canonical host directory so tools and saved sessions see the same path inside and outside the sandbox. *Access* to it is still a grant: an empty profile defines the workspace identity without mounting it until a provider grants `{workspace}`. The workspace mount point (like `system.home`) is subject to the reserved-path rules in §6.2. Otherwise `{workspace}` rules are resolved and checked like `~` and absolute ones (§3.4, §6.2); the workspace is special in two ways: (1) it is the session's identity, whose path comes from `.stopit.toml` or `--workspace` and which the supervisor relies on, so it must appear in the sandbox only at its mount (§6.2, Workspace exposure); (2) it is always an untrusted root for symlinks, even when no profile of the session grants it `rw` (§3.4, Symlinks).
 
-### 3.2 Bases
+### 3.2 Explicit configuration and `stopit default-config`
 
-```toml
-base = "default"   # "default" (the default) | "none"
-```
+The design rule is that **restrictions and grants are written out explicitly in TOML; nothing is built implicitly into the binary.**
 
-The design rule is: **restrictions default on, grants default off.** A base is a set of built-in providers placed **before** the user's providers.
+* An empty profile (one with `inherit = "none"`, or with `inherit` omitted) starts as an empty sandbox: nothing mounted (no `/proc`, no `/dev`), an environment of only `HOME`, `USER` and `LOGNAME` (§9), no network at all (not even `lo`), full hardening, and no shims. `stopit run /bin/sh` fails because `/bin/sh` does not exist.
+* `stopit default-config` prints the recommended starting configuration (`src/default_config.toml`, Appendix A) to stdout for `~/.config/stopit/config.toml`. It sets `default_profile = "main"`, declares `[profiles.main]`, and defines three explicit providers on `main`: `base` (`type = "config"` with system mounts, workspace `rw`, secret masks, editor/agent config protections, ephemeral `/tmp` and `~`, loopback network, `sandbox.grant = true`, and environment filters), `protect-nix` (`type = "config"` protecting `{workspace}/**/*.nix` and `{workspace}/flake.lock`, separated so NixOS configuration or Nix library repos can disable or override it cleanly), and `vcs` (`type = "vcs"` with explicit `[provider.shims.jj]` and `[provider.shims.git]` rules), followed by commented `tools` and `nix` recipes.
+* The provider name `stopit` is the only reserved provider name, since it names the supervisor's own rules (the protection of loaded configurations, scripts, proxy shims, and `stopit.grant` / `stopit.proxy`, §3). Every other valid identifier, including `main`, `base`, and `vcs`, is ordinary user configuration.
+* In `.stopit.toml`, `inherit_global = true` (the default) layers the workspace configuration over `~/.config/stopit/config.toml` (§3.5). Setting `inherit_global = false` in `.stopit.toml` ignores `config.toml` (while still checking and guarding `config.toml` on disk, §3). Setting `inherit_global` in `config.toml` is rejected as an error.
 
-* `base = "none"` has no built-in providers. The sandbox is empty: nothing mounted (no `/proc`, no `/dev`), an environment of only `HOME`, `USER` and `LOGNAME` (§9), no network at all (not even `lo`), full hardening, no shims. `stopit run /bin/sh` fails because `/bin/sh` does not exist. That is intended.
-* `base = "default"` has a built-in `config` provider named `base` with the defaults below, plus the `vcs` provider (§7.3) named `vcs`. A user provider cannot be named `base` under this base. A user provider of type `vcs` replaces the built-in one, so its options apply, and otherwise the name `vcs` is reserved as well. Under every base, the provider name `stopit` is reserved too, since it names the supervisor's own rules (the protection of the loaded configuration, §3), so a user provider cannot use it.
-
-| Aspect | `base = "none"` | `base = "default"` |
+| Aspect | Empty profile (`inherit` omitted or `"none"`) | `[profiles.main]` in `stopit default-config` |
 | :--- | :--- | :--- |
-| Filesystem | Empty `tmpfs` root | `/proc` (masked subset), minimal `/dev`, synthesized `/etc`, workspace RW + default path rules (§3.4), ephemeral `/tmp` and `HOME`, tool binds from user providers |
+| Filesystem | Empty `tmpfs` root | `/proc` (masked subset), minimal `/dev`, synthesized `/etc`, workspace RW + explicit `base` and `protect-nix` path rules (§3.4, Appendix A), ephemeral `/tmp` and `~`, tool binds from user providers |
 | Environment | `HOME`, `USER`, `LOGNAME` only (§9) | Identity (`HOME`, `USER`, `LOGNAME`); `TERM`, `LANG`, `COLORTERM` passed through; secret patterns denied (§9) |
 | Namespaces | All unshared (user, mount, pid, net, ipc, uts, cgroup) | Same |
 | Network | **None**, no interfaces up | Loopback only |
 | Hardening (seccomp, Landlock, `nosuid`/`nodev`, no caps, `NO_NEW_PRIVS`, no nested userns) | On | On |
 | Terminal output filter | On | On |
-| Brokered tools | None | `jj`, `git` via the `vcs` provider (§7.4) |
-
-Notes:
-* Standard I/O is always connected (through the PTY proxy or pipes); it is the channel back to the user, not a host capability.
-* `base = "default"` does not include tools. At least one provider from the global `config.toml` or `.stopit.toml` must grant `fs.ro`, `fs.rw`, `fs.bind`, or `env.path_prepend` in some profile, or `stopit run` exits 125 before the sandbox starts. The message names both files and prints an example tool provider. Restrictions such as `fs.masked`, and `env.set` or `env.pass`, do not count, since the host `PATH` never reaches the sandbox (§9). Under `base = "none"` nothing is refused, because an empty sandbox is what was asked for.
-* Intermediate bases may be added later; they are just alternative built-in provider sets.
-* A golden test asserts that Appendix A (everything written out under `base = "none"`) produces the same `SandboxSpec` as `base = "default"` (§12).
+| Brokered tools | None | `jj`, `git` via the `vcs` provider (§7.3) and `stopit-grant` |
 
 ### 3.3 Profiles
 
-A **profile** is a complete sandbox description: mounts, network, environment, shims. `stopit run` / `stopit shell` start the program in profile **`main`** unless `--profile <name>` is given. After that, the **only** way into another profile is a shim: each brokered command runs in a *fresh* sandbox built from the shim's target profile. Nothing ever leaves sandboxing entirely; a brokered command just gets a sandbox with different permissions.
+A **profile** is a complete sandbox description: mounts, network, environment, shims. `stopit run` and `stopit shell` start the program in `--profile <name>`, or in `default_profile` when `--profile` is omitted. If neither `--profile` nor `default_profile` is set, startup fails with exit 125 listing the declared profiles. `main` is not a special or implicit profile; `stopit default-config` declares `[profiles.main]` and sets `default_profile = "main"` by convention, and a configuration need not have a `main` profile at all. After startup, the **only** way into another profile is a shim: each brokered command runs in a *fresh* sandbox built from the shim's target profile. Nothing ever leaves sandboxing entirely; a brokered command just gets a sandbox with different permissions.
 
 ```
 main profile (shell / agent)                 vcs.local profile (fresh sandbox per command)
@@ -265,14 +263,14 @@ main profile (shell / agent)                 vcs.local profile (fresh sandbox pe
 Profiles come from two places:
 * **Declared by the user** at the top level, as structure only (which sandboxes exist):
   ```toml
-  [profiles.harness]       # inherit = "main" is the default
-  [profiles.bare]
-  inherit = "none"         # starts from the empty sandbox, ignoring base
+  [profiles.main]          # inherit omitted -> starts from the empty sandbox
+  [profiles.harness]
+  inherit = "main"         # inherits main's merged grants
   ```
-  Grants are then attached by providers (`config` and `nix` providers take `profile = "<name>"`; §3.6).
-* **Contributed by providers** as part of their manifest. These are prefixed with the provider's name to avoid collisions: the `vcs` provider contributes `vcs.ro`, `vcs.local`, `vcs.remote`. Inside the manifest they are written as plain single-segment names (`ro`, `local`, `remote`) and the prefix is added automatically (§3.6). Most users never see them.
+  Grants are then attached by providers (every enabled provider sets `profile = "<name>"`; §3.6). Only `"none"` is reserved as a profile name, because `inherit = "none"` means no parent.
+* **Contributed by providers** as part of their manifest. These are prefixed with the provider's `name` to avoid collisions: a provider named `vcs` contributes `vcs.ro`, `vcs.local`, `vcs.remote`. Inside the manifest they are written as plain single-segment names (`ro`, `local`, `remote`) and the prefix is added automatically (§3.6). Most users never see them.
 
-`inherit = "<profile>"` (default `"main"`) means the profile starts from the parent's fully merged grants, then adds its own. `inherit = "none"` starts from the empty sandbox. `stopit-grant` (§7.5) creates a temporary profile: the caller's profile plus the requested delta.
+Omitting `inherit` (or writing `inherit = "none"`) starts the profile from the empty sandbox, both for top-level `[profiles.<name>]` declarations and for contributed `[profiles.<subname>]` entries inside a manifest. Writing `inherit = "<profile>"` starts the profile from the parent's fully merged grants and adds its own. `stopit-grant` (§7.5) creates a temporary profile (`stopit.grant`) inheriting the caller's profile plus the requested delta.
 
 ### 3.4 Path modes
 
@@ -295,7 +293,7 @@ Semantics:
 
 Path syntax (in any provider):
 * `{workspace}` is the host workspace directory, mounted at `workspace.mount` (default `/workspace`, or the canonical host workspace directory when `workspace.mount = "host"`).
-* `~/…` is host `$HOME/…` on the host side and sandbox `HOME` on the sandbox side (`/home/stopit` by default, or `/home/<username>` when `system.user` sets a sandbox username, unless a provider explicitly sets `system.home`; the default base leaves both unset).
+* `~/…` is host `$HOME/…` on the host side and sandbox `HOME` on the sandbox side (`/home/stopit` by default, or `/home/<username>` when `system.user` sets a sandbox username, unless a provider explicitly sets `system.home`; `stopit default-config` leaves both unset).
 * Absolute paths map to the same path inside the sandbox; `fs.bind` entries remap explicitly.
 * Built-in providers may resolve additional concrete host paths internally (e.g. `vcs` resolves git worktree and jj workspace storage, §7.3). These are not user-facing placeholders.
 * **Syntactic validation (at load time):** no `.`/`..`/empty components, no NUL, no trailing `/`; the bare `/` is rejected; a glob is not allowed as the first component directly below `/` or `~` (`/*` and `~/**` are rejected; `{workspace}/**` is fine). Globs are validated too: `**` only as an entire component, no `/` (or range spanning `/`) in a `[...]` class, and the glob must compile. `?` and `[...]` match a single byte, so they do not match a non-ASCII character as a whole (e.g. a `masked` rule `?.env` does not match `é.env`; use `*`). `fs.ephemeral` entries must be literal paths, without glob characters (each rule is backed by one session directory).
@@ -306,49 +304,51 @@ Additional checks:
 
   Rules of every anchor are resolved alike, `{workspace}`, `~` and absolute ones: symlinks on the way to a rule's host path are followed (home-manager and `/etc/static` rely on it), the final component of a matched path is kept as it is (a bind follows it when mounting), and globs never descend into symlinked directories below their walk root. The untrusted-root checks then decide (§6.2, Untrusted links): a host source, or a mount destination on the way through the mount underneath it, that runs through a symlink inside an untrusted root, however the lookup got there, makes a `masked`, `protected`, `ro` or `ephemeral` mount a startup error (a planted link must never switch a restriction off) and drops an `rw` mount (rule or bind) with a warning. This holds for links pointing inside their root too: with the workspace granted `rw`, a planted `x -> .git` would otherwise turn an rw `{workspace}/x/hooks` into a mount at `.git/hooks`, under a stricter rule. A symlink **matched by a glob** inside an untrusted root is skipped with a warning for every mode instead: the walk visits the real files directly, so a planted link can neither redirect the glob nor make it miss them (with `config` renamed to `config2` and `config -> config2` planted, `{workspace}/**/*.env` still matches `config2/prod.env`). Such a match is skipped after the winner at its sandbox path is picked, so nothing is mounted there. A link matched outside every root (a home-manager link matched by `~/.config/*`) is the host's and is kept, and a glob whose literal prefix or walk root runs through a link inside a root reached whatever that link leads to, so its matches are refused like a literal rule's. For a link inside the host workspace, the one root known before every profile is planned, this is decided before walking: such a glob is a startup error for a restrictive mode and skipped with a warning for `rw`, so that a planted `config -> /` cannot make `{workspace}/config/**/*.env` walk the whole host filesystem first (for other roots, see §11). In short: links matched by a glob inside a root are skipped for every mode; links on the way (in a literal path, a glob's literal prefix, a mount destination) or at the end of a literal path are errors for restrictive modes, except that a final link whose target is missing mounts nothing and is skipped like a missing path. A legitimate link skipped this way leaves its target as readable as before if the target does not match the glob (see §11). Likewise, a path that exists but cannot be inspected, or a directory a glob walk cannot read, is never skipped by a `masked`, `protected` or `ro` rule, anywhere (the sandbox could otherwise `chmod 000` a directory it owns to switch a mask off at the next start): the directory that cannot be searched or read (the deepest directory on the way, as written, that can itself be inspected, or the one the walk cannot read) is masked as a whole instead, with a warning, which hides everything the rule could apply to there, and more (§1.5); a glob's other matches still apply. A glob walk lists the entries of a directory that can be read but not searched (`chmod a-x`) without inspecting them, so every match of a restrictive glob is inspected, and one that cannot be masks that directory the same way. Such a mask outranks every other rule at its sandbox path, since a less strict one winning there would lift the restriction below it. When it hides another rule's mount there entirely (the workspace mount, with the workspace itself made unsearchable, or an `rw` grant of that directory), a separate, louder warning names that grant, says it is hidden this session, and how to get it back (restore the directory's permissions). Mounts below it are kept, as below any masked directory (nothing below a directory that cannot be searched can be resolved, so they show other content). An `rw` rule or bind host is skipped with a warning instead. A missing path (including an entry that vanishes during a glob walk, or a path through a dangling link) skips any rule with a warning, and so does a final link whose target is missing (§6.2, Workspace exposure). A `masked` rule matching a symlink masks it as its target's kind (an empty file or an empty directory); a dangling link is skipped with a warning (there is nothing to hide), and a target that cannot be inspected otherwise is a startup error (§11, Behaviour not yet aligned with §1.5), except for a link matched by a glob inside an untrusted root, which is skipped like any such match without looking at its target. A mask whose shape would be decided by a link inside an untrusted root is a startup error like any other restrictive rule: a planted link must not change a mask's shape.
 * **Pinned parent directories.** Renaming a parent directory of a restrictive mount away, such as running `mv config cfg2` when `{workspace}/config/secrets.env` is masked, would otherwise make the literal rule missing at the next start and leave `cfg2/secrets.env` readable. For every `masked`, `protected`, `ro`, or `ephemeral` mount strictly inside a mount of an untrusted root, including the workspace mount, an `rw` mount, or an `ephemeral` mount, stopit self-binds each existing intermediate directory in parent-first order with `--bind-fd` or `--ro-bind-fd`. Each intermediate directory becomes a mount point, so `rename` and `rmdir` on it fail with `EBUSY` while creating, editing, and deleting files inside it still work.
-* **Unix sockets.** Network namespaces isolate abstract sockets, but a socket *file* created by a host process inside an RW directory is reachable through the bind mount (e.g. `.devenv/state/postgres/.s.PGSQL.5432`). With `fs.mask_sockets = true` (default base), sockets found in RW grants at startup are masked (an empty file with mode 0000, so connecting fails with `EACCES`). So are those in a directory that `stopit-grant` mounts read-only (§7.5), since a read-only mount does not stop a connection and the prompt promises read-only access.
+* **Unix sockets.** Network namespaces isolate abstract sockets, but a socket *file* created by a host process inside an RW directory is reachable through the bind mount (e.g. `.devenv/state/postgres/.s.PGSQL.5432`). With `fs.mask_sockets = true` (`stopit default-config`), sockets found in RW grants at startup are masked (an empty file with mode 0000, so connecting fails with `EACCES`). So are those in a directory that `stopit-grant` mounts read-only (§7.5), since a read-only mount does not stop a connection and the prompt promises read-only access.
+* **Missing-path warnings (`fs.warn_missing`).** By default (`fs.warn_missing = true`), literal rules, binds, and globs whose literal prefix does not exist emit a startup warning when skipped. Setting `fs.warn_missing = false` on `[provider.sandbox.fs]` suppresses missing-path warnings for the rules in that `fs` block (such as shared workspace-hygiene rules in `base`, `protect-nix`, or cross-distro `tools` recipes) while keeping security warnings (untrusted links, unreadable directories) enabled.
 * **Hard links.** A protected file with `nlink > 1` is writable through its other name. The sandbox cannot create such links (`link` across mounts fails with `EXDEV`), but pre-existing ones trigger a startup warning.
 
 ### 3.5 Merging and precedence
 
-All providers' manifests are merged per profile, in order: base providers first, then the global `config.toml`'s providers in file order, then `.stopit.toml`'s providers in file order; a profile with `inherit` starts from its parent's merged result.
+All providers' manifests are merged per profile, in order: the global `config.toml`'s providers in file order (unless `inherit_global = false`), then `.stopit.toml`'s providers in file order; a profile with `inherit` starts from its parent's merged result.
 
-**Layering `.stopit.toml` over `config.toml`.** Each provider carries the layer that declared it, `builtin` < `global` < `workspace`, and the project file wins wherever both say something:
+**Layering `.stopit.toml` over `config.toml`.** Each provider carries the layer that declared it, `global` < `workspace`, and the project file wins wherever both say something:
 
-* A top-level field written in `.stopit.toml` overrides the same field in `config.toml`, field by field (`base`, `workspace.mount`, each `[limits]` value, `approval.timeout`, `terminal.clipboard_write`). Writing the built-in default counts as writing it. A field neither file writes takes the built-in default.
+* A top-level field written in `.stopit.toml` overrides the same field in `config.toml`, field by field (`default_profile`, `workspace.mount`, each `[limits]` value, `approval.timeout`, `terminal.clipboard_write`). Writing the built-in default counts as writing it. A field neither file writes takes the built-in default (`default_profile` has no built-in default).
 * `[profiles.<name>]` declarations are a union, and `.stopit.toml`'s declaration of a name replaces `config.toml`'s.
-* A `[[provider]]` in `.stopit.toml` with the same name as one in `config.toml` replaces it, including the implicit names (`config`, `script`, `vcs`, `nix`). Setting `enabled = false` on a `[[provider]]` disables that entry (or a lower-layer or built-in `vcs` provider of the same name) so it is never instantiated or executed. When both are unnamed, stopit warns, since that is rarely meant, except when the workspace entry sets `enabled = false` or when both are workspace-scoped `nix` entries targeting the same `profile` (such as overriding `shell = "agent"`). Two providers with one name in the same file stay an error.
-* Within a profile's own contributions, `env.set` variables, `shims` names, `system.user`, and `system.home` from a higher layer override a lower layer's (setting `shims.<name> = false` or `{ enabled = false }` removes a lower-layer or inherited shim of that name). Two providers of the same layer that disagree stay an error, even when a higher layer also sets the key, except that a `.stopit.toml` provider named `approvals` or `approvals-<profile>` (§5.4) also overrides a shim of the same name from an earlier `.stopit.toml` provider.
-* Two path rules or binds at one sandbox path with the same rank under the rules below and different sources go to the higher of the global and workspace layers, so a project `fs.bind` can replace a global one at the same destination and mode. Two such sources within one layer conflict, even when a higher layer also has one, as for `env.set`. A built-in rule is never replaced this way, and a user rule of the same rank with another source conflicts with it.
+* Every `[[provider]]` carries an explicit `name`. A `[[provider]]` in `.stopit.toml` with the same `name` as one in `config.toml` replaces it cleanly. Setting `enabled = false` on a `[[provider]]` (which requires only `name`) disables that entry or a `config.toml` entry of the same `name` so it is never instantiated or executed. Two providers with one `name` in the same file stay an error.
+* Within a profile's own contributions, scalar settings and keyed entries from the workspace layer override the global layer: `env.set` variables, `shims` names (setting `shims.<name> = false` or `{ enabled = false }` removes a lower-layer or inherited shim of that name), `system.user`, `system.home`, `system.proc`, `system.dev`, `fs.mask_sockets`, `network.mode`, and `sandbox.grant`. Two providers of the same layer that disagree on `env.set`, `shims`, `system.user`, or `system.home` stay an error, even when a higher layer also sets the key, except that a `.stopit.toml` provider named `approvals-<profile>` (§5.4) also overrides a shim of the same name from an earlier `.stopit.toml` provider.
+* Two path rules or binds at one sandbox path with equal `(literal, depth)` specificity and different modes or sources go to the higher layer (`workspace` over `global`), so a project `fs.rw` rule can loosen a global `fs.protected` rule of equal specificity (such as `{workspace}/**/*.nix` or `{workspace}/flake.lock`), and a project `fs.bind` can replace a global one at the same destination. Within the same layer, strictest mode wins and two different sources at equal rank conflict.
 * `env.path_prepend` needs nothing new. Later providers come first, so project entries precede global ones in `PATH`.
 
-When `.stopit.toml` sets `base = "none"`, the global layer does not apply, though stopit still checks it (§3).
+When `.stopit.toml` sets `inherit_global = false`, the global layer does not apply, though stopit still checks and guards `config.toml` (§3).
 
 **Path rules.** For each path, these decide the effective mode:
 1. **Most specific path wins.** An exact path beats a glob; a deeper path beats a shallower one (`{workspace}/.git` beats `{workspace}`; `{workspace}/flake.nix` beats `{workspace}/**/*.nix`).
 2. **A profile's own rules beat inherited rules** at equal specificity. This is what lets `vcs.local` (inheriting `main`) make `.git` writable although `main` masks it.
-3. **Strictest mode wins** among the remaining ties: `masked` > `protected` > `ro` > `ephemeral` > `rw`.
+3. **Higher configuration layer wins** at equal specificity within a profile's own rules (`workspace` > `global`).
+4. **Strictest mode wins** among remaining ties within one layer: `masked` > `protected` > `ro` > `ephemeral` > `rw`.
 
-To loosen a restriction, configure the provider that added it (e.g. `vcs` with `view = "ro"`), add a more specific rule, or use `base = "none"`. Mounts are applied in path-depth order so children overlay parents.
+To loosen a restriction from `config.toml`, disable the provider by `name` (`enabled = false`), override the rule at equal or greater specificity in `.stopit.toml`, or set `inherit_global = false`. Mounts are applied in path-depth order so children overlay parents.
 
-Two kinds of mounts are not rules and stand outside this precedence: the masks synthesized over a directory a restrictive rule cannot inspect (§3.4, Symlinks), which outrank every rule at their path, and the protection of script providers' sources, `nix` providers' entry points (§3.6), and the loaded configuration files (§3), which the supervisor adds after planning wherever a profile would let the sandbox write them, whatever the rules say there.
+Two kinds of mounts are not rules and stand outside this precedence: the masks synthesized over a directory a restrictive rule cannot inspect (§3.4, Symlinks), which outrank every rule at their path, and the protection of script providers' sources, proxy shim executables, `nix` providers' entry points (§3.6), and the loaded configuration files (§3), which the supervisor adds after planning wherever a profile would let the sandbox write them, whatever the rules say there.
 
 **Other sections:**
 
 | Section | Merge rule |
 | :--- | :--- |
 | `env.pass` / `env.deny` | Union; **`deny` always wins** over `pass` |
-| `env.set` | Conflicting values for the same variable are an **error** unless identical; a profile's own value overrides the inherited one, per variable |
+| `env.set` | Conflicting values within one layer are an **error** unless identical; workspace overrides global, and a profile's own value overrides the inherited one, per variable |
 | `env.path_prepend` | Later providers' entries first within a profile, then inherited entries; earlier entries take precedence in `PATH`; duplicates keep the first occurrence |
-| `network.mode` | Within a profile: the most permissive granted mode (`none` < `loopback` < `proxy` < `full`). A profile's own value overrides the inherited one |
+| `network.mode` | Highest layer within a profile wins (most permissive within one layer: `none` < `loopback` < `proxy` < `full`). A profile's own value overrides the inherited one |
 | `network.allow_domains` | Union |
-| `shims` | Union; the same shim name from two providers in one profile is an **error** unless from a higher layer or a `.stopit.toml` `approvals` / `approvals-<profile>` provider (§5.4); a profile's own shim replaces an inherited one of the same name; `false` or `{ enabled = false }` removes an inherited or lower-layer shim |
+| `shims` | Union; the same shim name from two providers in one profile at the same layer is an **error** unless from a `.stopit.toml` `approvals-<profile>` provider (§5.4); workspace overrides global, and a profile's own shim replaces an inherited one of the same name; `false` or `{ enabled = false }` removes an inherited or lower-layer shim |
 | `sandbox.share`, `sandbox.allow_syscalls` | Union |
-| `sandbox.grant` | Within a profile `false` wins; a profile's own explicit value overrides the inherited one. Off unless set, and the default base sets it in `main` |
-| `system.proc`, `system.dev` | Logical OR within a profile; a profile's own explicit value overrides the inherited one |
+| `sandbox.grant` | Highest layer within a profile wins (`false` wins within one layer); a profile's own explicit value overrides the inherited one. Off unless set |
+| `system.proc`, `system.dev` | Highest layer within a profile wins (logical OR within one layer); a profile's own explicit value overrides the inherited one |
 | `system.etc`, `system.groups`, `system.devices` | Union |
-| `system.user`, `system.home` | Conflicting values within a profile at the same layer are an **error** (like `env.set`); a higher layer or a profile's own value overrides the inherited one |
-| `fs.mask_sockets` | Tri-state (unset / `true` / `false`). Within a profile, `true` wins over `false` (strictest wins). A profile's own explicit value overrides the inherited one, so a contributed or user profile can opt out of masking that `main` enables |
+| `system.user`, `system.home` | Conflicting values within a profile at the same layer are an **error** (like `env.set`); workspace overrides global, and a profile's own value overrides the inherited one |
+| `fs.mask_sockets` | Tri-state (unset / `true` / `false`). Highest layer within a profile wins (`true` wins over `false` within one layer). A profile's own explicit value overrides the inherited one |
 
 ### 3.6 Providers
 
@@ -356,18 +356,20 @@ A **provider** produces a **manifest**: the canonical grant structure used by ev
 
 | Field | Applies to | Meaning |
 | :--- | :--- | :--- |
-| `type` | all (optional when `enabled = false` and `name` is set) | `config`, `script`, `vcs`, `nix` |
-| `name` | all | Optional; defaults to `type`. Prefix for contributed profiles; shown in the startup summary |
-| `enabled` | all | Optional boolean (default `true`). When `false`, disables this provider entry (or a lower-layer/built-in provider with the same `name`) |
-| `profile` | `config`, `nix` | Profile the grants apply to (default `main`) |
+| `name` | all (required) | Unique provider identifier within the file; prefix for contributed profiles; shown in the startup summary; matched when overriding or disabling across layers |
+| `enabled` | all | Optional boolean (default `true`). When `false`, disables this provider entry (or a `config.toml` provider with the same `name`); `type` and `profile` may be omitted when `enabled = false` |
+| `type` | all enabled entries (required) | `config`, `script`, `vcs`, `nix` |
+| `profile` | all enabled entries (required) | Target profile the top-level grants apply to |
 | `[provider.sandbox]` | `config` | The manifest itself, written inline in TOML |
-| `source` | `script` | Path to the executable, relative to `.stopit.toml`; executed **on the host** |
+| `source` | `script` | Path to the executable, relative to the declaring config file's directory; executed **on the host** |
 | `protect` | `script` | Whether `source` is automatically `protected` (default `true`) |
 | `[provider.config]` | `script` only | Free-form parameters for the script, passed as JSON on stdin. Only scripts need a free-form keyspace |
-| type-specific keys | built-in types (`vcs`, `nix`) | Options written directly under `[[provider]]` (e.g. `view`, `tools`, `shell`, `file`, `flake`, `cache`) |
+| `[provider.shims.*]` | `vcs` | Explicit brokered shim definitions (same schema as `[provider.sandbox.shims.*]`, §7.1), attached when the workspace is a supported VCS repository |
+| type-specific keys | `vcs`, `nix` | Options written directly under `[[provider]]` (`view` and `signing` for `vcs`; `shell`, `file`, `flake`, and `cache` for `nix`) |
 
 ```toml
 [[provider]]
+name = "certs-and-rust-env"
 type = "config"
 profile = "main"
 [provider.sandbox]
@@ -375,15 +377,23 @@ fs.ro = ["/etc/ssl/certs"]
 env.pass = ["RUST_*", "CARGO_*"]
 
 [[provider]]
+name = "agent-env"
 type = "script"
+profile = "main"
 source = "scripts/agent-env.sh"
 protect = true
 [provider.config]
 devshell = "agent"
 
 [[provider]]
+name = "vcs"
 type = "vcs"
+profile = "main"
 view = "masked"
+[provider.shims.git]
+cmd = ["git", "--no-pager"]
+default = { decision = "ask", profile = "local" }
+rules = [{ prefix = "status", decision = "allow", profile = "local" }]
 ```
 
 **Manifest schema** (identical for `[provider.sandbox]` and script output):
@@ -392,6 +402,7 @@ view = "masked"
 {
   "version": 1,
   "fs": {
+    "warn_missing": true,
     "rw": ["{workspace}"], "ro": [], "masked": [], "protected": [], "ephemeral": ["/tmp", "~"],
     "bind": [{ "host": "/etc/ssl/certs", "sandbox": "/etc/ssl/certs", "mode": "ro" }],
     "mask_sockets": true
@@ -405,8 +416,8 @@ view = "masked"
 }
 ```
 
-* Top-level manifest sections apply to the target profile (`profile` for `config` and `nix`; `main` for other types). Entries under `profiles` are contributed profiles, prefixed with the provider's `name`.
-* **Contributed profile keys** inside a manifest are plain single-segment names (e.g. `local`); the provider's `name` prefix is added automatically (`vcs.local`). Contributed profiles cannot themselves contain `profiles` or `version`.
+* Top-level manifest sections apply to the provider's configured `profile`. Entries under `profiles` are contributed profiles, prefixed with the provider's `name`.
+* **Contributed profile keys** inside a manifest are plain single-segment names (e.g. `local`); the provider's `name` prefix is added automatically (`vcs.local`). Omitting `inherit` on a contributed profile starts from the empty sandbox (`Inherit::None`); write `inherit = "main"` (or another profile) explicitly when inheriting. Contributed profiles cannot themselves contain `profiles` or `version`.
 * **Reference rule:** within a manifest, a plain profile reference (`inherit = "local"`, shim `profile = "ro"`) resolves first to that manifest's own contributed profile, then to a user-declared profile. `main` and other providers' profiles are referenced by their full names. A full name (e.g. `vcs.local`) always resolves globally, including to the manifest's own profiles; plain names are preferred inside a manifest because the provider `name` can change.
 * **Validation:** every manifest table accepts only maps (array forms are rejected) and unknown keys are rejected. A JSON manifest from a script **must** include `"version"`; an inline `[provider.sandbox]` may omit it (defaults to 1). Bind `mode` is one of `ro`, `rw`, `protected` only (`masked` and `ephemeral` have no host content to bind). Bind `host`/`sandbox` paths contain no globs (glob characters are `*`, `?`, `[`, `]`), and a bind's `sandbox` side additionally allows no `{workspace}` placeholder. Path rules are also validated syntactically at load time (§3.4).
 * **Script providers** receive on stdin a JSON object containing their `[provider.config]` and a context (`workspace` host path, `workspace_mount`, `home`, `session_dir`, provider `name`, target `profile`), and print a manifest on stdout. A non-zero exit or invalid manifest aborts startup.
@@ -440,7 +451,7 @@ pub trait Provider: Send + Sync {
 
 **The `nix` provider.** `[[provider]] type = "nix"` resolves a Nix development shell on the host and mounts only the store paths in its runtime closure, never all of `/nix/store` (which on NixOS can contain rendered secrets such as `access-tokens` in `nix.conf`) and never the Nix daemon socket. Changing the tool environment requires the user to edit the protected Nix files on the host and restart or reload the session.
 
-* **Target selection and options.** When neither `file` nor `flake` is set (`file` and `flake` are mutually exclusive), the provider checks `{workspace}/flake.nix` first and `{workspace}/shell.nix` second (`default.nix` is evaluated only when named explicitly via `file = "default.nix"`). When neither exists and `shell` is unset, the provider returns an empty manifest so a global `[[provider]] type = "nix"` is a quiet no-op in non-Nix workspaces. If `flake.nix` exists without a default development shell or package (or if `shell`, `file`, or `flake` is configured and missing or fails to evaluate), startup fails; library or module flakes without a shell can set `enabled = false` on the `nix` provider in `.stopit.toml`. `shell = "<attr>"` selects `<dir>#<attr>` (`devShells.<system>.<attr>`, falling back to `packages.<system>.<attr>`) on flakes or attribute `<attr>` on classic Nix files (`nix print-dev-env --file <file> <attr>`, equivalent to `nix-shell -A <attr>`). `profile` sets the target sandbox profile (default `"main"`).
+* **Target selection and options.** When neither `file` nor `flake` is set (`file` and `flake` are mutually exclusive), the provider checks `{workspace}/flake.nix` first and `{workspace}/shell.nix` second (`default.nix` is evaluated only when named explicitly via `file = "default.nix"`). When neither exists and `shell` is unset, the provider returns an empty manifest so a global `[[provider]] type = "nix"` is a quiet no-op in non-Nix workspaces. If `flake.nix` exists without a default development shell or package (or if `shell`, `file`, or `flake` is configured and missing or fails to evaluate), startup fails; library or module flakes without a shell can set `enabled = false` on the `nix` provider in `.stopit.toml`. `shell = "<attr>"` selects `<dir>#<attr>` (`devShells.<system>.<attr>`, falling back to `packages.<system>.<attr>`) on flakes or attribute `<attr>` on classic Nix files (`nix print-dev-env --file <file> <attr>`, equivalent to `nix-shell -A <attr>`). `profile` sets the target sandbox profile (required on enabled entries).
 * **Input validation and host execution.** Before invoking `nix`, the provider resolves its entry-point paths component by component, walks the target directory tree (always, regardless of `cache`), and refuses any symlink inside an untrusted root on a `.nix` file, `flake.lock`, or directory whose target tree holds Nix inputs (while allowing build links such as `result -> /nix/store/...`), as well as any regular `.nix` or `flake.lock` file with rewritable hard links. The evaluated entry-point files (`flake.nix` and `flake.lock`, or `file`, plus the `flake` directory itself when it differs from `{workspace}`) are added to the supervisor's protected paths in every profile. The `nix` binary is resolved only from absolute `PATH` entries that do not traverse an untrusted root and have no rewritable hard links, and runs in its own process group with a scrubbed allowlisted host environment (dropping `NIX_CONFIG`, `SSH_AUTH_SOCK`, cloud/VCS tokens, and `*_KEY`/`*_SECRET`/`*_TOKEN` variables). Flake evaluation passes `--no-write-lock-file` so `flake.lock` is never mutated by startup, and retries with a `path:` flake reference when Nix's libgit2 rejects a repository's `extensions.refstorage` (such as Git reftables).
 * **Closure mounts and environment grants.** `nix print-dev-env --json` provides both the shell's store references and its environment, and `nix path-info --recursive` expands those references to their full runtime closure, mounted `fs.ro` one store directory per path. Any non-store path, wildcard character, or secret-bearing store derivation (`*-etc`, `*-home-manager-files`, `*nix.conf*`) aborts startup. `shellHook` is never executed; only `"type": "exported"` variables are read. Valid entries from `PATH` (excluding `/`, `/path-not-exists`, and `/no-such-path`) become `env.path_prepend`, and remaining exported variables become `env.set` after filtering `stdenv`/build-sandbox internals (`NIX_BUILD_TOP`, `TMPDIR`, `HOME`, `USER`, `SHELL`, `SHLVL`, `builder`/`outputs`/`phases` attributes, proxy variables) and dummy `/no-cert-file.crt` bundle placeholders (while keeping real `/nix/store/...` CA bundle paths).
 * **Persistent caching and GC roots.** With `cache = true` (default), resolved closures and environment grants are stored mode `0600` under `<data_dir>/nix/<sha256>/cache.json` alongside `--profile` GC root symlinks so `nix-collect-garbage` preserves cached closures across sessions (trees exceeding 50,000 entries bypass persistent caching). Cache keys cover the provider options, canonical target path, the resolved `nix` binary's canonical path and file metadata (`dev`, `ino`, `len`, `mtime`), `NIX_PATH` (for classic files), and a content hash of every `.nix` and `flake.lock` file in the target tree; a cached entry is checked on hit so that the `profile` GC root target and every closure store path still exist on disk, re-evaluating transparently if garbage collection removed one. With `cache = false`, `--profile` roots live in the session directory for the lifetime of the session.
@@ -475,10 +486,10 @@ Any attempt to modify a protected file triggers an approval prompt showing the d
 | :--- | :--- | :--- |
 | `y` | Allow once | Apply this change |
 | `s` | Allow for this session | Apply, and apply further writes to this path without prompting |
-| `p` | Allow and persist | Apply, and add an exact-path `rw` rule (which beats the protecting glob, §3.5) to a `config` provider named `approvals` in `.stopit.toml`, created if absent (appended under `# --- stopit persisted approvals ---`, preserving hand-written configuration and comments). The live policy updates immediately. The prompt states that this removes protection for future sessions |
+| `p` | Allow and persist | Apply, and add an exact-path `rw` rule (which beats the protecting glob, §3.5) to a `config` provider named `approvals-<profile>` in `.stopit.toml`, created if absent (appended under `# --- stopit persisted approvals ---`, preserving hand-written configuration and comments). The live policy updates immediately. The prompt states that this removes protection for future sessions |
 | `n` | Deny | Revert; the syscall fails with `EROFS` |
 
-The same four decisions are used for brokered-tool approvals (§7.4), where "persist" adds an allow rule for that shim to the `approvals` provider.
+The same four decisions are used for brokered-tool approvals (§7.4), where "persist" adds an allow rule for that shim to the `approvals-<profile>` provider.
 
 ### 4.3 Details
 
@@ -493,7 +504,7 @@ The same four decisions are used for brokered-tool approvals (§7.4), where "per
 
 ## 5. Terminal proxy, output filtering and approvals
 
-`stopit run [--workspace DIR] [--profile NAME] [-q|--quiet] [--server ID | --standalone] [--] <cmd> [args…]` runs `<cmd>` in the sandbox, in the session of the `stopit server` serving the workspace if there is one (§5.5); everything from `<cmd>` on is the command's, flags included. `stopit shell` is shorthand for `stopit run $SHELL`, with `SHELL` from the host environment (it is an error if unset; the sandbox must grant that shell). The supervisor exits with the command's status, or `128 + N` if it was killed by signal `N`, as shells report it. When it fails itself before the command starts (configuration, providers, the session directory, a missing bwrap or a failure to spawn it), it prints `stopit: error: …` and exits with 125. The supervisor passes `--json-status-fd` to bwrap so a bwrap setup failure before the sandboxed command runs exits with 125 instead of passing bwrap's own exit code 1 through as the command's status. Warnings are printed as `stopit: warning: …`, each distinct message once (an inherited rule is planned, and warns, again in every profile inheriting it), except missing paths of the default base's own rules (`.envrc`, `flake.lock`, …, which most workspaces lack). After them, unless `--quiet` is given (before the command, like every stopit option), comes the startup summary of what the profile grants (§3). Every line stopit prints is escaped: control and format characters are shown as `\u{1b}` (§6.3), since configuration, scripts and the filesystem put text in them; bwrap's own messages are not stopit's and are not escaped. The supervisor catches `SIGINT`, `SIGQUIT`, `SIGTERM` and `SIGHUP` from the start (a signal ignored when it started stays ignored). One that arrives before bwrap is spawned kills any running script provider's process group, removes the session directory, and exits with `128 + N`; one that arrives while bwrap runs is forwarded to bwrap, whose death ends the sandbox (`--die-with-parent`), and the supervisor then removes the session directory and exits with bwrap's status (`128 + N` when the signal killed it). Caught signals return to their default action on `exec`, so bwrap and script providers inherit nothing from this. Whenever a terminal is involved, the supervisor also ignores `SIGTSTP`, `SIGTTIN` and `SIGTTOU` (`__init` resets them for the command), refuses to start in the background of its terminal, and restores the terminal's settings (`tcsetattr`) after the command. Interactive programs put the terminal into raw mode and draw TUIs, so the supervisor relays a PTY of the sandbox's own to the host terminal.
+`stopit run [--workspace DIR] [--profile NAME] [-q|--quiet] [--server ID | --standalone] [--] <cmd> [args…]` runs `<cmd>` in the sandbox, in the session of the `stopit server` serving the workspace if there is one (§5.5); everything from `<cmd>` on is the command's, flags included. `stopit shell` is shorthand for `stopit run $SHELL`, with `SHELL` from the host environment (it is an error if unset; the sandbox must grant that shell). The supervisor exits with the command's status, or `128 + N` if it was killed by signal `N`, as shells report it. When it fails itself before the command starts (configuration, providers, the session directory, a missing bwrap or a failure to spawn it), it prints `stopit: error: …` and exits with 125. The supervisor passes `--json-status-fd` to bwrap so a bwrap setup failure before the sandboxed command runs exits with 125 instead of passing bwrap's own exit code 1 through as the command's status. Warnings are printed as `stopit: warning: …`, each distinct message once (an inherited rule is planned, and warns, again in every profile inheriting it), unless suppressed for missing paths via `fs.warn_missing = false` (§3.4, as set on `base` and `protect-nix` in `stopit default-config`). After them, unless `--quiet` is given (before the command, like every stopit option), comes the startup summary of what the profile grants (§3). Every line stopit prints is escaped: control and format characters are shown as `\u{1b}` (§6.3), since configuration, scripts and the filesystem put text in them; bwrap's own messages are not stopit's and are not escaped. The supervisor catches `SIGINT`, `SIGQUIT`, `SIGTERM` and `SIGHUP` from the start (a signal ignored when it started stays ignored). One that arrives before bwrap is spawned kills any running script provider's process group, removes the session directory, and exits with `128 + N`; one that arrives while bwrap runs is forwarded to bwrap, whose death ends the sandbox (`--die-with-parent`), and the supervisor then removes the session directory and exits with bwrap's status (`128 + N` when the signal killed it). Caught signals return to their default action on `exec`, so bwrap and script providers inherit nothing from this. Whenever a terminal is involved, the supervisor also ignores `SIGTSTP`, `SIGTTIN` and `SIGTTOU` (`__init` resets them for the command), refuses to start in the background of its terminal, and restores the terminal's settings (`tcsetattr`) after the command. Interactive programs put the terminal into raw mode and draw TUIs, so the supervisor relays a PTY of the sandbox's own to the host terminal.
 
 ### 5.1 PTY proxy
 
@@ -569,7 +580,7 @@ Approval prompts appear on the terminal of `stopit server`, which no sandbox can
 * **Rate limiting:** after the user denies a request, requests in the same scope are denied without a prompt for five seconds, so a sandbox cannot bury the user in prompts. For `stopit-grant`, the scope is every grant from the profile (§7.5). A timeout or a cancel does not start this quiet period.
 * **Client-side memory:** the server's answer says whether it covers the session or starts a quiet period, and the client remembers that for its run. Later writes it covers cost no connection to the server.
 * **Unforgeable by construction:** the sandbox draws only on its own PTY, and the prompt is in another window, so the prompt needs no secret marker.
-* **Precise session and persisted rules:** "Allow for this session" (`s`) matches exactly the displayed scope, which is clipboard writes from that profile, a brokered command's shim and rule, or a grant's grants and scope. Planned remote rules narrow that to this remote *and* this bookmark. Session answers live in the server's memory and end with it. "Allow and persist" (`p`) also remembers the scope for the session and writes the approval to `.stopit.toml` in a `config` provider named `approvals` (or `approvals-<profile>` for another profile): clipboard writes set `[terminal] clipboard_write = "allow"`, brokered commands copy the shim with the matched rule or default set to `decision = "allow"`, and `stopit-grant` appends the requested `fs.ro`, `fs.rw`, and `network` grants to the caller profile's `approvals` provider. Before writing, the server checks the on-disk `.stopit.toml` against the trust store (`check_allowed` or `check_missing`), refusing to persist if the file was modified or planted outside `stopit allow`. It writes existing files in place with `O_NOFOLLOW` so read-only bind mounts in running sandboxes keep the same inode, creates a missing `.stopit.toml` with `O_CREAT | O_EXCL | O_NOFOLLOW` mode `0644`, records the new SHA-256 hash in the trust store, and reloads the session policy immediately. If persisting fails, the server prints the reason and still allows the scope for the session.
+* **Precise session and persisted rules:** "Allow for this session" (`s`) matches exactly the displayed scope, which is clipboard writes from that profile, a brokered command's shim and rule, or a grant's grants and scope. Planned remote rules narrow that to this remote *and* this bookmark. Session answers live in the server's memory and end with it. "Allow and persist" (`p`) also remembers the scope for the session and writes the approval to `.stopit.toml` in a `config` provider named `approvals-<profile>` (always setting `name`, `type = "config"`, and `profile = "<profile>"`): clipboard writes set `[terminal] clipboard_write = "allow"`, brokered commands copy the shim with the matched rule or default set to `decision = "allow"`, and `stopit-grant` appends the requested `fs.ro`, `fs.rw`, and `network` grants to the caller profile's `approvals-<profile>` provider. Before writing, the server checks the on-disk `.stopit.toml` against the trust store (`check_allowed` or `check_missing`), refusing to persist if the file was modified or planted outside `stopit allow`. It writes existing files in place with `O_NOFOLLOW` so read-only bind mounts in running sandboxes keep the same inode, creates a missing `.stopit.toml` with `O_CREAT | O_EXCL | O_NOFOLLOW` mode `0644`, records the new SHA-256 hash in the trust store, and reloads the session policy immediately. If persisting fails, the server prints the reason and still allows the scope for the session.
 * **Deny feedback:** a denied clipboard write is dropped. A denied brokered command exits with `126` and `[stopit: <shim>: denied by user]` on its stderr.
 
 ### 5.5 `stopit server`
@@ -630,7 +641,7 @@ The data directory has a fixed location per user: `<home>/.local/share/stopit`, 
 
 Each state directory is resolved once per session: every symlink on the way that exists is followed, and the rest, which need not exist yet (the data directory usually does not), is joined as written, so a link such as `~/.local -> /data/local` does not hide where it is; the links followed are kept too. Every mount with a host source (any mode, after planning and every other check, so the covers of restricted content and the protected script sources and configuration are included) is compared by its canonical source S:
 * S equal to or inside a state directory is an error, whatever the mode, `masked` included: no rule has a reason to name stopit's state, and the runtime directory exposes other sessions.
-* An `rw` S that contains a state directory, or one of the symlinks on the way to it, is an error naming the mount, its provider, the directory and the fix: grant narrower `rw` paths that leave it out, or make the mount `ro`; when the mount is the workspace's own (a workspace in `~` itself, which the default base grants `rw`, or any workspace containing the data directory), use a workspace that leaves it out, such as a project directory below `~`, or one elsewhere. This is the usual case of `rw ~` containing `~/.local/share/stopit`. It is a configuration mistake rather than a layout contradiction (§1.5), and there is no safe outcome short of refusing: masking the directory inside the grant, as a cover would, still lets the sandbox create the data directory before stopit does or replace a link on the way, and plant a directory the next session would read as its trust store. `rw` is the only writable mode with a host source: `ephemeral` has none, and `protected` is a read-only bind until protected files are served by FUSE, whose writes each need approval.
+* An `rw` S that contains a state directory, or one of the symlinks on the way to it, is an error naming the mount, its provider, the directory and the fix: grant narrower `rw` paths that leave it out, or make the mount `ro`; when the mount is the workspace's own (a workspace in `~` itself, granted `rw`, or any workspace containing the data directory), use a workspace that leaves it out, such as a project directory below `~`, or one elsewhere. This is the usual case of `rw ~` containing `~/.local/share/stopit`. It is a configuration mistake rather than a layout contradiction (§1.5), and there is no safe outcome short of refusing: masking the directory inside the grant, as a cover would, still lets the sandbox create the data directory before stopit does or replace a link on the way, and plant a directory the next session would read as its trust store. `rw` is the only writable mode with a host source: `ephemeral` has none, and `protected` is a read-only bind until protected files are served by FUSE, whose writes each need approval.
 * A read-only (`ro` or `protected`) S that contains the runtime directory (`ro /run/user/1000`), or a data directory that exists (`ro ~`, which would show the trust store and so the list of the user's projects), is masked there: the safe outcome (§1.5). The runtime directory, and a data directory other than the store in use (the default location while `STOPIT_STATE_DIR` is set, which holds the store of sessions started without it), are masked with a warning; the store's own directory is masked silently, since it always exists (below) and `ro ~`, the recommended way to show the home directory (below), always contains it, so a warning would come with every such run and say nothing the user can act on. The directory gets an empty read-only mount where the mount shows it (M's sandbox path joined with its path below S), attributed to `stopit`, unless another mount lies between M's path and that path, mounted on top (it is checked in turn). That mask cannot be moved aside: every `rw` grant containing a state directory is refused above, so no sandbox can rename or replace anything on the way to it; its destination is reached through M's tree along canonical directories, and lies below a valid destination, so it needs no other check. The store's own directory always exists, since every run creates it before compiling the session (§3, The trust store); a data directory that does not exist (the default location while `STOPIT_STATE_DIR` is used, if never used without it) shows nothing, and is left alone, since a read-only view has no mount point for a mask.
 * A `masked` S shows nothing.
 
@@ -687,8 +698,8 @@ When `__init` fails, it prints `stopit __init: ...` to stderr and exits 127 when
 * **Terminal (`tty = true`):** by default, `tty` is `false`, so the broker detaches the command into a new session with `bwrap --new-session` and passes the shim's standard descriptors through, preserving shell typeahead for short commands such as `jj` and `git`. When `tty = true` and the shim runs in the foreground of its controlling terminal with a readable stdin and writable stdout on the same concrete terminal endpoint, the broker confirms after policy and approval checks that the shim still holds the foreground and has ignored job-control signals. The broker then opens a fresh pseudo-terminal on the host, puts the caller's terminal into raw mode, and attaches the slave to stdin, stdout, and any stderr sharing that terminal as the target sandbox's controlling terminal. The broker relays between the caller's terminal and the inner master through `OutputFilter` with `ClipboardPolicy::Allow` so the session's outer `OutputFilter` enforces `clipboard_write`, forwards `SIGWINCH` resizes from `stopit __shim`, and resets terminal modes before restoring the caller's `termios` on exit. Multiplexor and master devices such as `/dev/tty` and `/dev/ptmx`, pipelines, redirected stdio, and background or detached calls run in detached mode without touching terminal settings.
 * **Environment:** the broker discards the shim's environment and builds a clean one from the target profile, out of the environment the run started with.
 * **Decisions.** The broker finds the shim among the caller's profile's shims and dispatches by shim kind:
-  * **Declarative shims (`cmd` + `default` + `rules`):** the broker joins the caller's arguments with single ASCII spaces (`args.join(b" ")`) and evaluates `rules` in **first-match-wins** order. Each rule specifies `decision = "allow" | "ask" | "deny"`, `profile = "<profile>"` (required for `allow` and `ask`, forbidden for `deny`), and **exactly one** matcher: `literal = "<string>"` (exact match; `""` matches zero arguments), `prefix = "<string>"` (argument-boundary prefix match: `joined == prefix` or `joined.starts_with("{prefix} ")`), or `regex = "<pattern>"` (compiled at load time via `regex_automata::meta::Regex` with `dot_matches_new_line(true)`, `unicode(false)`, and `utf8(false)`). If no rule matches, the shim's `default` decides.
-  * **Proxy shims (`proxy`):** after verifying the caller's working directory on the host, the broker executes the resolved host proxy executable in its own session (`setsid`, `stdin = /dev/null`) with the caller's arguments (`argv`), a clean base environment (`PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `TERM`), and `STOPIT_SHIM`, `STOPIT_WORKSPACE`, `STOPIT_WORKSPACE_MOUNT`, `STOPIT_CWD`, `STOPIT_CALLER_PROFILE`, `STOPIT_HOME`, and `STOPIT_SESSION_DIR`. The proxy prints a JSON `ProxyResponse` on stdout (`{ "decision": "allow" | "ask" | "deny", "cmd": ["binary", ...], "profile": "vcs.remote" | { "inherit": "...", ... }, "reason": "..." }`). When `profile` is an inline profile object, the broker compiles it dynamically against the session (as `stopit.proxy`) before launching the command. With `protect = true` (the default), the proxy executable is resolved via `resolve_script_path` and automatically protected across every profile in the session.
+  * **Declarative shims (`cmd` + `default` + `rules`):** the broker joins the caller's arguments with single ASCII spaces (`args.join(b" ")`) and evaluates `rules` in **first-match-wins** order. Each rule specifies `decision = "allow" | "ask" | "deny"`, `profile = "<profile>"` (required for `allow` and `ask`, forbidden for `deny`), and **exactly one** matcher: `literal = "<string>"` (exact match; `""` matches zero arguments), `prefix = "<string>"` (argument-boundary prefix match: `joined == prefix` or `joined.starts_with("{prefix} ")`), `regex = "<pattern>"` (compiled at load time via `regex_automata::meta::Regex` with `dot_matches_new_line(true)`, `unicode(false)`, and `utf8(false)`), or `flags = ["-<c>", "--<long>", ...]` (splits `joined` on ASCII whitespace and matches when any token contains the short flag in a single-dash cluster such as `-R`, `-R/path`, or `-nR`, or starts with an unambiguous `--<prefix>` or `--<prefix>=` of a listed long flag of at least two characters after `--`). If no rule matches, the shim's `default` decides.
+  * **Proxy shims (`proxy`):** after verifying the caller's working directory on the host, the broker executes the resolved host proxy executable in its own session (`setsid`, `stdin = /dev/null`) with the caller's arguments (`argv`), a clean base environment (`PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `TERM`), and `STOPIT_SHIM`, `STOPIT_WORKSPACE`, `STOPIT_WORKSPACE_MOUNT`, `STOPIT_CWD`, `STOPIT_CALLER_PROFILE`, `STOPIT_HOME`, and `STOPIT_SESSION_DIR`. The proxy prints a JSON `ProxyResponse` on stdout (`{ "decision": "allow" | "ask" | "deny", "cmd": ["binary", ...], "profile": "vcs.remote" | { "inherit": "...", ... }, "reason": "..." }`, defaulting `profile` when omitted on `allow`/`ask` to the caller's profile). When `profile` is an inline profile object, the broker compiles it dynamically against the session (as `stopit.proxy`) before launching the command. With `protect = true` (the default), the proxy executable is resolved via `resolve_script_path` and automatically protected across every profile in the session.
   * **Prompts and denials:** `ask` goes to the server's prompt (§5.4), which shows the binary with its arguments, the target profile, the working directory, the shim, and the matched rule. Answering `[s]` remembers the approval for that rule (or, for a proxy shim, that exact command and profile) for the session; answering `[p]` on a declarative shim persists the rule as `decision = "allow"` in `.stopit.toml`. A standalone run has no one to ask, so `ask` denies there and says to run `stopit server`. A refused command exits with `126` and says why on its stderr, as `[stopit: <shim>: denied by user]` or `[stopit: <shim>: the shim's rules deny ...]`.
 * **Binary resolution:** the broker runs the shim's `cmd` binary (or the proxy response's `cmd[0]`) as found in the target profile's `PATH`, without `/run/stopit/bin` in any spelling (compared by device and inode).
 * Unmatched calls on a declarative shim use the shim's `default` (required; conventionally `ask`).
@@ -724,28 +735,38 @@ git = false                              # or { enabled = false }
 
 ### 7.2 Global-flag parsing
 
-Declarative shims (including the built-in `vcs` provider's `jj` and `git` shims) match the caller's space-joined arguments in first-match-wins order using `literal`, `prefix`, and `regex` rules (§7.1), placing `regex` deny rules for dangerous flags first. When full tool-grammar flag parsing or dynamic target profile construction is needed, a shim can use `proxy = "<path>"` to inspect `argv` on the host and return a `ProxyResponse` with a named or inline profile.
+Declarative shims (including `[provider.shims.jj]` and `[provider.shims.git]` on `vcs` providers) match the caller's arguments in first-match-wins order using `literal`, `prefix`, `regex`, and `flags` rules (§7.1), placing `flags` deny rules for dangerous options first. When full tool-grammar flag parsing or dynamic target profile construction is needed, a shim can use `proxy = "<path>"` to inspect `argv` on the host and return a `ProxyResponse` with a named or inline profile.
 
 ### 7.3 The `vcs` provider
 
 ```toml
 [[provider]]
+name    = "vcs"
 type    = "vcs"
+profile = "main"
 view    = "masked"      # "masked" (default) | "ro"
-tools   = ["jj", "git"]
-fetch   = "ask"         # "deny" | "ask" (default) | "allow"
-push    = "ask"         # "deny" | "ask" (default) | "allow"
 signing = false         # SSH commit signing in vcs.local (§7.3.4)
+
+[provider.shims.jj]
+cmd     = ["jj", "--no-pager", "-R", "{workspace}"]
+default = { decision = "ask", profile = "local" }
+rules   = [ ... ]       # see Appendix A
+
+[provider.shims.git]
+cmd     = ["git", "--no-pager"]
+default = { decision = "ask", profile = "local" }
+rules   = [ ... ]       # see Appendix A
 ```
 
 **Implemented so far** (`src/provider/vcs.rs`). The rest of §7.3 is the plan, and this list says where the code stops short of it.
 
-* **Layouts.** The provider reads the layout itself and runs no VCS tool on the workspace. It supports a plain `.git` directory without a `commondir` file, a `.jj` directory with a `repo` directory whose git store, if any, is the workspace's `.git` or inside the jj store, a git worktree whose `.git` file names an admin directory below the common directory's `worktrees/` that names the `.git` file back in its `gitdir`, and a jj secondary workspace (`jj workspace add`) whose `.jj/repo` file names a primary `.jj/repo` directory outside the workspace that names the workspace back in its `workspace_store/index` protobuf file (up to 64 KiB) and whose git store, if any, is inside the primary jj store or is the primary workspace's colocated `.git` directory. Neither directory of a worktree nor a jj secondary workspace's primary repository may be inside the workspace, where `main` could have made them, and pointer paths (`.jj/repo` and `store/git_target`) are checked for clean lexical structure and no symlinks inside the workspace or primary `.jj/repo`. Every pointer file it reads is first opened with `O_PATH` and without following a link, so nothing else is opened, and is read only if it is a regular file of at most 4 KiB (`workspace_store/index` at most 64 KiB). When a jj secondary workspace's `.jj/repo` holds a relative path (as `jj workspace add` writes by default) and `workspace.mount` is not `"host"` (`mount != workspace`), `jj` cannot resolve the relative pointer from the sandbox workspace mount, so the provider warns that `mount = "host"` in `[workspace]` is required for `jj` and leaves the primary repository directories masked in `main`. Other layouts get the mask in `main` but no profiles or shims, with a warning: a worktree or jj secondary workspace that fails the checks, a `.git` directory with a `commondir`, a jj store pointing elsewhere, a workspace below a checkout's root, and a git or jj directory whose path no rule can name (one of `*?[]{}\~`, or not UTF-8).
-* **Profiles.** `vcs.ro`, `vcs.local`, and (unless both `fetch` and `push` are `"deny"`) `vcs.remote` inherit `main`, add the metadata and backing storage `ro` or `rw`, and turn `sandbox.grant` off, since a VCS command has no use for `stopit-grant`. `vcs.ro` and `vcs.local` have `network = "none"`, whatever `main` has, while `vcs.remote` has `network = { mode = "full" }`. In `vcs.local` and `vcs.remote`, the git config files that exist at session start (`config`, `config.worktree`, `info/attributes`, `modules/*/config`, `worktrees/*/config.worktree`), `.jj/repo` (when it is a secondary workspace pointer file), `repo/config.toml`, and `repo/store/git_target` are `ro`, and the `hooks/` and `modules/*/hooks` that exist then are masked. The `jj` shim's reading commands run in `vcs.local` too, since jj snapshots the working copy first, which writes to `.jj`. All three profiles get `system.home = "/home/vcs"`, which sets `HOME` and the home in `/etc/passwd`, with an `ephemeral` rule of their own for it. That rule beats the inherited `~`, whose backing directory `main` shares (§3.4, ephemeral backing directories are keyed by pattern), so no program they start reads configuration `main` wrote to its home. In `main`, a worktree's admin and common directories and a jj secondary workspace's primary `.jj/repo` and `.git` directories get the same view as `.git` and `.jj`, masked or read-only, so a grant of `main` covering them shows nothing. An unsupported `.git` never joins the profiles' storage, and jj colocated with one is not brokered either, since jj would write it with nothing locked.
-* **The repository.** git gets `GIT_DIR`, the `.git` directory or the worktree's admin directory as the sandbox sees it, and `GIT_WORK_TREE`, the workspace mount, so it never uses a repository it would find by walking up from the caller's directory, such as one `main` made in a subdirectory. jj runs as `jj --no-pager -R <workspace mount>` through the shim's `args` (§7.1) for the same reason.
-* **Configuration.** The safe settings travel in the environment, not in files under `/run/stopit`: `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, and `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>` with `core.hooksPath=/dev/null`, `core.fsmonitor=false`, `core.pager=cat`, `protocol.ext.allow=never`, `safe.bareRepository=explicit`, and the host user's `user.name` and `user.email` from `git config --global`. These override the repository's own configuration for those keys only. Its other keys, which the user wrote and `vcs.local` cannot change, still apply. jj gets `JJ_CONFIG=/dev/null`, so no user configuration, and `JJ_USER` and `JJ_EMAIL` from the same identity. All three profiles set `XDG_CONFIG_HOME=/home/vcs/.xdg-config`, inside their own home at a path no `~` grant names. So jj's repository configuration (`jj/repos`) and git's attributes and ignore files come from there, never from the user's `~/.config`, even when a grant of `main` covers it, since the profiles inherit such a grant below their own home.
-* **No editor, pager or signing program.** The caller holds the terminal, so a pager or editor that can run commands would give it a shell in `vcs.local`, whose writes to `.git` and `.jj` host tools trust later. A signing program reads configuration of its own. git gets `GIT_EDITOR=false`, `GIT_SEQUENCE_EDITOR=false`, `GIT_PAGER=cat` and `--no-pager`, and jj `JJ_EDITOR=false` and `--no-pager`. So `git commit` without `-m`, or `jj describe` without `-m`, fails. git also gets `gpg.program`, `gpg.ssh.program` and `gpg.x509.program` set to `false` and `commit.gpgSign`, `tag.gpgSign` and `log.showSignature` off, and both tools get a `GNUPGHOME` where nothing is. So `git commit -S` fails. The `jj` shim refuses `--tool`, `-i` and `--interactive`, which run a diff or merge tool.
-* **Remote commands** (`git fetch`, `pull`, `ls-remote`, `remote update`, `clone`, `push`, and `jj git fetch`, `git clone`, `git push`) are routed to `vcs.remote` according to `fetch` and `push` (default `"ask"` for both). In `vcs.remote`, `/home/vcs/.ssh` is an isolated ephemeral directory of its own, the host's `$SSH_AUTH_SOCK` (when set and resolving without untrusted symlinks to a Unix domain socket outside the workspace and stopit's state directories) is bound read-only at `/home/vcs/.ssh/agent.sock` with `SSH_AUTH_SOCK=/home/vcs/.ssh/agent.sock`, the host's `~/.ssh/known_hosts` (when present) is bound read-only at `/home/vcs/.ssh/known_hosts`, and `GIT_SSH_COMMAND` is set to `"ssh -F /dev/null -o IdentityFile=/dev/null -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/home/vcs/.ssh/known_hosts"` (or `UserKnownHostsFile=/dev/null` when no `~/.ssh/known_hosts` exists on the host). `git clone` also refuses `-u` and `--template`. `vcs.ro` and `vcs.local` have no network and no `SSH_AUTH_SOCK`, so any call the rules miss stays offline in `vcs.local`. `signing = true` is accepted and warned about, since it has no effect yet.
+* **Layouts.** The provider reads the layout itself and runs no VCS tool on the workspace. When the workspace is not a repository (neither `.git` nor `.jj` exists), the provider returns an empty manifest so a global `vcs` entry with `[provider.shims.*]` is a quiet no-op in non-repository directories. Otherwise it supports a plain `.git` directory without a `commondir` file, a `.jj` directory with a `repo` directory whose git store, if any, is the workspace's `.git` or inside the jj store, a git worktree whose `.git` file names an admin directory below the common directory's `worktrees/` that names the `.git` file back in its `gitdir`, and a jj secondary workspace (`jj workspace add`) whose `.jj/repo` file names a primary `.jj/repo` directory outside the workspace that names the workspace back in its `workspace_store/index` protobuf file (up to 64 KiB) and whose git store, if any, is inside the primary jj store or is the primary workspace's colocated `.git` directory. Neither directory of a worktree nor a jj secondary workspace's primary repository may be inside the workspace, where the target profile (`main`) could have made them, and pointer paths (`.jj/repo` and `store/git_target`) are checked for clean lexical structure and no symlinks inside the workspace or primary `.jj/repo`. Every pointer file it reads is first opened with `O_PATH` and without following a link, so nothing else is opened, and is read only if it is a regular file of at most 4 KiB (`workspace_store/index` at most 64 KiB). When a jj secondary workspace's `.jj/repo` holds a relative path (as `jj workspace add` writes by default) and `workspace.mount` is not `"host"` (`mount != workspace`), `jj` cannot resolve the relative pointer from the sandbox workspace mount, so the provider warns that `mount = "host"` in `[workspace]` is required for `jj` and leaves the primary repository directories masked in the target profile. Other layouts get the mask in the target profile without contributed profiles or shims, with a warning: a worktree or jj secondary workspace that fails the checks, a `.git` directory with a `commondir`, a jj store pointing elsewhere, a workspace below a checkout's root, and a git or jj directory whose path no rule can name (one of `*?[]{}\~`, or not UTF-8).
+* **Profiles.** When a supported repository is present, `<name>.ro`, `<name>.local`, and `<name>.remote` inherit the provider's configured `profile` (conventionally `main`), add the metadata and backing storage `ro` or `rw`, and turn `sandbox.grant` off, since a VCS command has no use for `stopit-grant`. `<name>.ro` and `<name>.local` have `network = "none"`, whatever the parent profile has, while `<name>.remote` has `network = { mode = "full" }`. In `<name>.local` and `<name>.remote`, the git config files that exist at session start (`config`, `config.worktree`, `info/attributes`, `modules/*/config`, `worktrees/*/config.worktree`), `.jj/repo` (when it is a secondary workspace pointer file), `repo/config.toml`, and `repo/store/git_target` are `ro`, and the `hooks/` and `modules/*/hooks` that exist then are masked. All three profiles get `system.home = "/home/vcs"`, which sets `HOME` and the home in `/etc/passwd`, with an `ephemeral` rule of their own for it. That rule beats the inherited `~`, whose backing directory `main` shares (§3.4, ephemeral backing directories are keyed by pattern), so no program they start reads configuration `main` wrote to its home. In the provider's target `profile`, a worktree's admin and common directories and a jj secondary workspace's primary `.jj/repo` and `.git` directories get the same view as `.git` and `.jj`, masked or read-only, so a grant covering them shows nothing. An unsupported `.git` never joins the profiles' storage, and jj colocated with one gets no contributed profiles or shims either, since jj would write it with nothing locked.
+* **Explicit shims.** The provider has no hardcoded subcommand tables in Rust; instead `[provider.shims.*]` uses the exact same `ShimSpec` schema as `[provider.sandbox.shims.*]` (§7.1, declarative or proxy), resolving plain profile references (`ro`, `local`, `remote`) to `<name>.ro`, `<name>.local`, and `<name>.remote` (§3.6). When a supported repository is present, `[provider.shims.*]` is attached to the target `profile` (omitting `jj` if the repository has no valid jj workspace, e.g. a plain git repo or relative secondary workspace without `mount = "host"`). Users customize subcommand decisions (such as allowing `fetch` or denying `push`) directly in `[provider.shims.*]` or by overriding a shim in a workspace `config` provider.
+* **The repository.** git gets `GIT_DIR`, the `.git` directory or the worktree's admin directory as the sandbox sees it, and `GIT_WORK_TREE`, the workspace mount, so it never uses a repository it would find by walking up from the caller's directory, such as one `main` made in a subdirectory. In `stopit default-config`, jj runs as `jj --no-pager -R {workspace}` through the shim's `cmd` (§7.1) for the same reason.
+* **Configuration.** The safe settings travel in the environment, not in files under `/run/stopit`: `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, and `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>` with `core.hooksPath=/dev/null`, `core.fsmonitor=false`, `core.pager=cat`, `protocol.ext.allow=never`, `safe.bareRepository=explicit`, and the host user's `user.name` and `user.email` from `git config --global`. These override the repository's own configuration for those keys only. Its other keys, which the user wrote and `<name>.local` cannot change, still apply. jj gets `JJ_CONFIG=/dev/null`, so no user configuration, and `JJ_USER` and `JJ_EMAIL` from the same identity. All three profiles set `XDG_CONFIG_HOME=/home/vcs/.xdg-config`, inside their own home at a path no `~` grant names. So jj's repository configuration (`jj/repos`) and git's attributes and ignore files come from there, never from the user's `~/.config`, even when a grant of `main` covers it, since the profiles inherit such a grant below their own home.
+* **No editor, pager or signing program.** The caller holds the terminal, so a pager or editor that can run commands would give it a shell in `<name>.local`, whose writes to `.git` and `.jj` host tools trust later. A signing program reads configuration of its own. git gets `GIT_EDITOR=false`, `GIT_SEQUENCE_EDITOR=false`, `GIT_PAGER=cat` and `--no-pager`, and jj `JJ_EDITOR=false` and `--no-pager`. So `git commit` without `-m`, or `jj describe` without `-m`, fails. git also gets `gpg.program`, `gpg.ssh.program` and `gpg.x509.program` set to `false` and `commit.gpgSign`, `tag.gpgSign` and `log.showSignature` off, and both tools get a `GNUPGHOME` where nothing is. So `git commit -S` fails. In `stopit default-config`, the `jj` shim refuses `--tool`, `-i` and `--interactive`, which run a diff or merge tool.
+* **Remote commands** routed to `<name>.remote` by `[provider.shims.*]` (`git fetch`, `pull`, `ls-remote`, `remote update`, `clone`, `push`, and `jj git fetch`, `git clone`, `git push` in `stopit default-config`) get an isolated ephemeral `/home/vcs/.ssh` directory, read-only binds of the host's `$SSH_AUTH_SOCK` at `/home/vcs/.ssh/agent.sock` (when set and resolving without untrusted symlinks to a Unix domain socket outside the workspace and stopit's state directories, with `SSH_AUTH_SOCK=/home/vcs/.ssh/agent.sock`) and `~/.ssh/known_hosts` at `/home/vcs/.ssh/known_hosts` (when present), and `GIT_SSH_COMMAND` set to `"ssh -F /dev/null -o IdentityFile=/dev/null -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/home/vcs/.ssh/known_hosts"` (or `UserKnownHostsFile=/dev/null` when no `~/.ssh/known_hosts` exists on the host). `<name>.ro` and `<name>.local` have no network and no `SSH_AUTH_SOCK`, so any call the rules miss stays offline in `<name>.local`. `signing = true` is accepted and warned about, since it has no effect yet.
 
 #### 7.3.1 Layout resolution
 
@@ -820,20 +841,22 @@ With `signing = true`, `vcs.local` (and `vcs.remote`) get a filtered SSH agent s
   * `JJ_CONFIG=/run/stopit/jjconfig-safe.toml` (`ui.pager=":builtin"`, external diff/merge tools and `fix.tools` disabled).
 * Brokered commands see the **host** version of protected files (only approved content exists there).
 
-### 7.4 Default `vcs` shim policy
+### 7.4 `vcs` shim rules in `stopit default-config`
+
+`stopit default-config` writes the `jj` and `git` shims out explicitly under `[provider.shims.*]` (Appendix A):
 
 | Tool | Subcommand | Decision | Profile | Notes |
 | :--- | :--- | :--- | :--- | :--- |
 | `jj` | `status`, `st`, `diff`, `log`, `show`, `evolog`, `op log`, `file show` | Allow | `vcs.ro` (planned), `vcs.local` for now | jj writes `.jj` when it snapshots the working copy |
-| `jj` | `new`, `commit`, `ci`, `describe`, `desc` | Allow | `vcs.local` | `-A`, `-B` and their long forms refused |
+| `jj` | `new`, `commit`, `ci`, `describe`, `desc` | Allow | `vcs.local` | `-A`, `-B`, `--after`, `--before`, `--insert-after`, `--insert-before` refused via `flags` |
 | `jj` | `squash`, `rebase`, `abandon`, `restore`, `undo`, `bookmark *`, `op *` | Ask | `vcs.local` | |
-| `jj` | `git fetch`, `git clone` | `fetch` setting (default Ask). Deny for now | `vcs.remote` | Named remotes only, and clone only from a configured remote's URL (§7.3.3) |
-| `jj` | `git push` | `push` setting (default Ask). Deny for now | `vcs.remote` | Shows resolved URL, commits, bookmarks |
+| `jj` | `git fetch`, `git clone` | Ask | `vcs.remote` | Editable in `[provider.shims.jj]` (e.g. `decision = "allow"` or `"deny"`) |
+| `jj` | `git push` | Ask | `vcs.remote` | Editable in `[provider.shims.jj]` |
 | `git` | `status`, `diff`, `log`, `show`, `add`, `commit` | Allow | `vcs.local` | |
 | `git` | `reset`, `rebase`, `checkout`, `switch`, `branch`, `tag`, `clean`, `stash` | Ask | `vcs.local` | |
-| `git` | `fetch`, `pull`, `ls-remote`, `remote update`, `clone` | `fetch` setting (default Ask). Deny for now | `vcs.remote` | Named remotes only, and clone only from a configured remote's URL |
-| `git` | `push` | `push` setting (default Ask). Deny for now | `vcs.remote` | Shows resolved URL, commits, refs |
-| any | Config-injection flags (§7.2). For git also `--exec` (another name for `--upload-pack` and `--receive-pack`) and `--output` (writes to any path the profile can write), and for jj `--tool`, `-i` and `--interactive` | Deny | | |
+| `git` | `fetch`, `pull`, `ls-remote`, `remote update`, `clone` | Ask | `vcs.remote` | `-u` and `--template` refused before `clone`; editable in `[provider.shims.git]` |
+| `git` | `push` | Ask | `vcs.remote` | Editable in `[provider.shims.git]` |
+| any | Config-injection and repository-switching flags (`flags = [...]`, §7.1). For git also `--exec` and `--output`, and for jj `--tool`, `-i` and `--interactive` | Deny | | Matches short-flag clusters and long-flag prefix abbreviations |
 | any | Anything unlisted, and anything with a flag before the subcommand | Ask | `vcs.local` | |
 
 ### 7.5 `stopit-grant` (ad-hoc capability requests)
@@ -844,7 +867,7 @@ stopit-grant [--scope '<program> [<words>]'] +net:<domain> +net:full +rw:<path> 
 
 A command in a sandbox asks for more than its profile grants, for one command, and the user answers on the server's terminal. It always asks, and a standalone run has no one to ask, so it refuses.
 
-* **Who gets it.** `stopit-grant` is a built-in shim. It is a link in `/run/stopit/bin` like the others (§7.1), and configuration cannot name it. A profile gets it when `sandbox.grant` is on. The default base turns it on in `main`, so every profile inheriting `main` has it, `inherit = "none"` and `base = "none"` do not, and `sandbox.grant = false` from any provider of a profile turns it off there and in the profiles below (§3.5). The `vcs` provider's profiles turn it off (§7.3). With it, `PATH` starts with `/run/stopit/bin` even in a profile without shims.
+* **Who gets it.** `stopit-grant` is a built-in shim. It is a link in `/run/stopit/bin` like the others (§7.1), and configuration cannot name it. A profile gets it when `sandbox.grant` is on (`stopit default-config` sets `sandbox.grant = true` on `base` in `main`, so every profile inheriting `main` has it unless `sandbox.grant = false` turns it off; an empty profile has `sandbox.grant = false`, and the `vcs` provider's contributed profiles turn it off, §7.3). With it, `PATH` starts with `/run/stopit/bin` even in a profile without shims.
 * **Grants.** `+net:<domain>` reaches the domain through the proxy (§8). The temporary profile switches to proxy mode with the caller's domains plus the requested ones. `+net:full` gives the full network through pasta. A caller that already has the full network, or shares the host's network namespace, gets no `+net:` grant, since it would add nothing. `+rw:<path>` and `+ro:<path>` mount a host path read-write or read-only. A path is absolute, appearing at the same path in the sandbox, or `~/…`, which means the host home for the source and the sandbox home for where it appears, as in rules (§3.4). It holds no `{workspace}`, glob, `.`, `..` or control character, and `~/` alone is refused. The path must exist on the host and must not be a socket. A request holds at most 16 grants, and the same path cannot be both `+rw:` and `+ro:`.
 * **The command** follows `--`, which is required, so a `+` argument is never read as the command. Its program must be a bare name looked up in the temporary profile's `PATH`.
 * **Refusals.** The broker tells the sandbox why it refuses only what the sandbox can see for itself. That covers bad arguments, a scope that does not cover the command, a `+net:` grant its network rules out, and an absolute path inside the sandbox's own home (`/home/stopit/…`). Such a path is what the sandbox sees in error messages, and as a host path it names something else, so the refusal suggests the `~/…` form. Without a server, every other request is refused with "needs a yes" before the broker looks at the host. With one, a refusal that depends on the host, such as a missing path or a rule the compiler rejects, gives the sandbox only "refused; the stopit server's terminal says why", and the server's terminal gets the reason. So the sandbox cannot learn host paths, or probe for them unseen. Each refusal exits 126 without a prompt. The server logs at most 20 refusals for a run, and one line when it first refuses a request past them. A request takes its place among them before the broker looks at the host, and gives it back once it reaches the prompt. After that, the run's `stopit-grant` requests are refused before the broker looks at the host, so no probe goes unseen, even with requests sent at once. The server also holds at most 100 log lines while a prompt is up, so a looping sandbox cannot flood its terminal or memory. A granted command that fails to start after the yes gets the same generic line.
@@ -862,9 +885,11 @@ A command in a sandbox asks for more than its profile grants, for one command, a
 There is no harness-specific feature; profiles, providers and shims cover it. To give a harness its credentials and model API access while running every shell it spawns in the stricter `main` profile:
 
 ```toml
-[profiles.harness]          # inherits "main"
+[profiles.harness]
+inherit = "main"
 
 [[provider]]
+name = "harness"
 type = "config"
 profile = "harness"
 [provider.sandbox]
@@ -897,8 +922,8 @@ allow_domains = ["cache.nixos.org", "index.crates.io", "static.crates.io"]
 
 | Mode | Behavior |
 | :--- | :--- |
-| `none` | Network namespace with no interfaces up, so no connectivity at all, not even `lo`. **The `base = "none"` state.** |
-| `loopback` | Only `lo` (`127.0.0.1`/`::1`). Local servers, databases and tests work. **The `base = "default"` setting.** |
+| `none` | Network namespace with no interfaces up, so no connectivity at all, not even `lo`. **The empty-profile default.** |
+| `loopback` | Only `lo` (`127.0.0.1`/`::1`). Local servers, databases and tests work. **The `stopit default-config` setting on `main`.** |
 | `proxy` | `loopback` plus an HTTP `CONNECT` and SOCKS5 proxy on `proxy.sock`, which a bridge in the sandbox serves on `127.0.0.1:1080` and `[::1]:1080`. The proxy variables point there. Domain allowlist enforced |
 | `full` | A network namespace of the sandbox's own, which `pasta` (from passt) connects to the host's network. The host's loopback stays unreachable. No domain filtering; flagged in the startup summary |
 
@@ -941,12 +966,12 @@ path_prepend = ["/nix/store/…/bin"]
 ```
 
 * Host variables are passed **only** if they match a `pass` pattern. **`deny` always wins** over `pass` (e.g. `CARGO_REGISTRY_TOKEN` matches both and is denied).
-* `NIX_CONFIG` is denied by the default base (it commonly carries `access-tokens`).
+* `NIX_CONFIG` is denied in `stopit default-config` (it commonly carries `access-tokens`).
 * `set` values are explicit and not subject to the host filter (`deny` does not apply to them, and they override a passed host variable of the same name); conflicting `set` values across providers are an error (§3.5). `set` must not contain `PATH`: `PATH` is built from `path_prepend`, whose entries are absolute sandbox paths and must not contain `:`.
 * Matching is on the variable's name, byte for byte; `*` stands for any run of bytes, so names and values that are not UTF-8 are matched and passed intact. `pass` is case-sensitive, but `deny` ignores ASCII case, as it is the safety net: `*_TOKEN` also drops `github_token`, and `AWS_*` drops `aws_secret_access_key`.
 * `PATH` is **never** taken from the host (its entries are host paths that mostly do not exist in the sandbox), even if `pass` matches it: it is the `path_prepend` entries joined with `:`, in merged order. With no entries there is no `PATH` at all, and a bare command is not found (§6.3, step 5), unless the profile has shims or `stopit-grant`, whose directory `/run/stopit/bin` then comes first.
 * stopit sets the sandbox's identity itself, because many tools break without `HOME`: `HOME` is the profile's `system.home` (default `/home/<username>`, §6.2 step 4), and `USER` and `LOGNAME` are the user the synthesized `/etc/passwd` defines (`stopit` by default, or the resolved `system.user`). These are never taken from the host by `pass`, even if `pass` matches them, so these variables never reveal the host home path or user name unless `system.user = "host"` or `system.home` explicitly configures it; a broad `pass` can still pass others that do (`PWD`, `XDG_*`, …). `set` may override them (explicit configuration wins), even if that disagrees with `/etc/passwd`; `deny` does not touch them.
-* Under `base = "none"` the environment holds only `HOME`, `USER` and `LOGNAME`.
+* In an empty profile (`inherit` omitted or `"none"`), the environment holds only `HOME`, `USER` and `LOGNAME`.
 * The result is sorted by name, so it is deterministic; a name repeated in the host's environment uses its first occurrence.
 * This is the target's environment, and exactly what it gets: nothing more is added (not even `PWD`). It reaches the target through `__init`, which itself runs with an empty environment but for bwrap's `PWD`, which it discards; the supervisor hands it this environment over an inherited memfd (§6.2, step 8), and `__init` looks a bare command up in this environment's `PATH` (§6.3, step 5).
 
@@ -964,7 +989,7 @@ cpu    = "400%"   # of one CPU
 Session-wide, so not a provider setting. Off unless configured. Mitigates forkbombs and runaway memory (threat class 2).
 
 * **The scope.** With any limit set, `stopit run`, `stopit shell` and `stopit server` move themselves into a transient systemd scope, `stopit-<pid>-<nanos>.scope`. They ask the user's systemd through `busctl --user call ... StartTransientUnit` with their own pid in `PIDs`, so no command line passes through systemd and stopit keeps its pid, descriptors, locks and signal handlers. This happens after stopit reads, checks and layers the configuration, and before it creates the session directory or runs a provider. `pids` sets `TasksMax`, `memory` sets `MemoryMax` in bytes, and `cpu` sets `CPUQuotaPerSecUSec`, systemd's `CPUQuota` in microseconds per second. systemd collects the scope when its last process ends. `PIDs` names stopit by its pid in stopit's own pid namespace, so stopit in a container with a pid namespace of its own but the host user's bus would have systemd move another process, and then fails because it is not in the scope.
-* **What it covers.** What stopit starts afterwards inherits the scope: its sandboxes, the commands its brokers start, pasta and the proxy bridges. So the limits hold for the session as a whole, stopit's own threads included, since `pids` counts threads. A server's attached runs start in the server's scope, and the `stopit run` client stays outside it. A server reads `[limits]` once, when it starts, so limits added later apply after it restarts. A stopit started from inside a session, such as a host command a broker launches, moves into a scope of its own and leaves the outer one, as any process of the user can. Programs the session reaches through D-Bus or socket activation, such as a keyring, run in their own units. The limits hold only while the sandbox cannot reach the user's bus or write `/sys/fs/cgroup`, since the scope's control files belong to the user. The default base mounts neither.
+* **What it covers.** What stopit starts afterwards inherits the scope: its sandboxes, the commands its brokers start, pasta and the proxy bridges. So the limits hold for the session as a whole, stopit's own threads included, since `pids` counts threads. A server's attached runs start in the server's scope, and the `stopit run` client stays outside it. A server reads `[limits]` once, when it starts, so limits added later apply after it restarts. A stopit started from inside a session, such as a host command a broker launches, moves into a scope of its own and leaves the outer one, as any process of the user can. Programs the session reaches through D-Bus or socket activation, such as a keyring, run in their own units. The limits hold only while the sandbox cannot reach the user's bus or write `/sys/fs/cgroup`, since the scope's control files belong to the user. `stopit default-config` mounts neither.
 * **Checks.** stopit waits up to 5 seconds for its own cgroup, the cgroup v2 line of `/proc/self/cgroup`, to be the scope. Then it reads the scope's `pids.max`, `memory.max` and `cpu.max` below `/sys/fs/cgroup`, and refuses to go on unless every configured limit is there. The kernel rounds `memory.max` down to a page, so it may be up to 64 KiB lower. stopit exits 125 if `PATH` has no `busctl`, if `/sys/fs/cgroup` is not cgroup v2, if systemd refuses the scope (stopit prints its error, escaped), if stopit is not in the scope after 5 seconds, or if a configured limit is missing, as with a controller the user's systemd lacks.
 * **What the limits are not.** `MemoryMax` covers memory charged after the move, not what stopit used before it, and not swap. stopit does not support cgroup v2 delegation without systemd.
 
@@ -975,7 +1000,7 @@ Session-wide, so not a provider setting. Off unless configured. Mitigates forkbo
 * **Nested repository creation.** The sandbox can create `subdir/.git` (or `.jj`) with hostile config (e.g. `core.fsmonitor`) that a shell prompt running `git status` on `cd` would execute on the host. Not mitigated in v1. Future fix: full-workspace FUSE (below) can intercept `mkdir .git` anywhere.
 * **Self-loading settings created in the session.** Protected rules for agent and editor settings (`.claude`, `.gemini`, `.mcp.json`, `.vscode`, `.envrc` and others, Appendix A) and Nix entry points (`flake.nix`, `flake.lock`, `shell.nix` when `[[provider]] type = "nix"` is active) cover only paths that exist at session start (§3.4). In a project without them, the sandbox can create, say, `.claude/settings.json` with a hook, `opencode.json` with an MCP command, or a `flake.nix`, `flake.lock` (in a previously unlocked flake), or `shell.nix`, which the host tool or the next session's `nix` provider evaluates when it starts there. §3.4's reasoning that new files are safe because every file that could reference them is protected does not hold for tools that load a directory or entry-point file by name. The future fix is the same as for nested repositories.
 * **Ignored `close()` errors** make denied in-place writes look successful to some programs (§4.3).
-* **Auto-import patterns and imported Nix files under `base = "none"`.** Auto-import helpers (`import-tree`, haumea, `listFilesRecursive`) evaluate *new* `.nix` files without any protected file changing. Under `base = "none"`, the `nix` provider automatically protects its entry-point `flake.nix`, `flake.lock`, or `file`, while other `.nix` files imported from writable directories need an explicit `protected` rule (such as `"{workspace}/**/*.nix"`, which `base = "default"` includes). Data files read during provider evaluation (`rust-toolchain.toml`, `Cargo.toml`) are not protected by default.
+* **Auto-import patterns and imported Nix files.** Auto-import helpers (`import-tree`, haumea, `listFilesRecursive`) evaluate *new* `.nix` files without any protected file changing. The `nix` provider automatically protects its entry-point `flake.nix`, `flake.lock`, or `file`, while other `.nix` files imported from writable directories rely on `protect-nix` (`"{workspace}/**/*.nix"` in `stopit default-config`) or an explicit `protected` rule. Data files read during provider evaluation (`rust-toolchain.toml`, `Cargo.toml`) are not protected unless listed explicitly.
 * **Secrets inside granted tool closures** (packages that embed tokens) are visible.
 * **Git history** (including removed secrets) is reachable through brokered VCS commands.
 * **HTTPS remote credentials** in `.git/config` are readable when `vcs` uses `view = "ro"`.
@@ -1092,39 +1117,37 @@ Where the phases stand:
 8. Output filter: emitting OSC 52, OSC 5113, OSC 1337, CSI 21t produces nothing on the host TTY.
 9. Protected in-place write denied → `close()` returns `EROFS`, host unchanged; allowed → host content updated **with the same inode**.
 10. Protected rename denied → `EROFS`; allowed → host updated in place, temp file removed.
-11. `base = "none"`: `stopit run /bin/sh` fails (nothing mounted); network has no interfaces; environment is only `HOME`, `USER` and `LOGNAME`.
-12. **Expressiveness golden test:** Appendix A under `base = "none"` compiles to the same `SandboxSpec` as `base = "default"` for every profile.
-13. **Precedence:** an exact-path `rw` beats a protecting glob; `vcs.local`'s own `rw` on `.git` beats `main`'s inherited mask; equal-specificity ties resolve to the strictest mode; conflicting `env.set` across providers fails startup; `inherit = "none"` yields the empty sandbox.
+11. Empty profile (`inherit = "none"` or omitted): `stopit run /bin/sh` fails (nothing mounted); network has no interfaces; environment is only `HOME`, `USER` and `LOGNAME`.
+12. **`stopit default-config` test:** `DEFAULT_CONFIG_TOML` parses cleanly and compiles deterministic `SandboxSpec`s for `main` and VCS profiles.
+13. **Precedence:** an exact-path `rw` beats a protecting glob; a workspace rule beats a global rule at equal `(literal, depth)` specificity; `vcs.local`'s own `rw` on `.git` beats `main`'s inherited mask; within-layer equal-specificity ties resolve to the strictest mode; conflicting `env.set` within one layer fails startup; omitting `inherit` or setting `inherit = "none"` yields the empty sandbox.
 14. Brokered `jj commit` succeeds; `jj --config-toml=… status` is denied; `jj -R /elsewhere` is rejected; writing `.git/config` from `vcs.local` → `EROFS`.
 15. **VCS layouts:** brokered `git commit` works from a git worktree (common dir writable, common `config` read-only, hooks masked); brokered `jj commit` works from a jj secondary workspace; from a subdirectory workspace, `jj status` sees the full checkout while `main` sees only `{workspace}`; backing storage is absent in `main` with `view = "masked"`.
 16. **Remote access:** `git push <url>` is denied; `git push origin` reaches only the resolved `host:port` (any other destination through the tunnel is refused); the filtered agent offers only the remote's key; `fetch = "deny"` returns `126`; `jj git clone` of a non-configured URL is denied; with `signing = true`, `jj commit` produces a signed commit while `vcs.local` still has no network.
 
 ---
 
-## Appendix A. `base = "default"` written out
+## Appendix A. `stopit default-config`
+
+`stopit default-config` prints `src/default_config.toml` verbatim so `~/.config/stopit/config.toml` starts from explicit, editable providers (`base`, `protect-nix`, and `vcs`):
 
 ```toml
-base = "none"
+default_profile = "main"
 
-[workspace]
-mount = "/workspace"
+[profiles.main]
 
-[approval]
-timeout = "off"
-
-[terminal]
-clipboard_write = "block"
-
-# --- What the built-in default `config` provider grants ---
 [[provider]]
-type = "config"
 name = "base"
+type = "config"
 profile = "main"
+
 [provider.sandbox]
 system = { proc = true, dev = "minimal", etc = ["passwd", "group", "hosts", "nsswitch.conf"] }
 network = { mode = "loopback" }
 sandbox = { grant = true }
+
 [provider.sandbox.fs]
+warn_missing = false
+mask_sockets = true
 rw = ["{workspace}"]
 masked = [
   "{workspace}/**/.env", "{workspace}/**/.env.*", "{workspace}/**/*.pem",
@@ -1133,102 +1156,125 @@ masked = [
   "{workspace}/**/*credentials*.json", "{workspace}/**/id_rsa",
   "{workspace}/**/id_ed25519", "{workspace}/**/.terraformrc",
 ]
-mask_sockets = true
 protected = [
-  "{workspace}/**/*.nix", "{workspace}/flake.lock", "{workspace}/.envrc",
-  "{workspace}/.stopit.toml", "{workspace}/**/.stopit.toml", "{workspace}/.vscode",
-  "{workspace}/.idea", "{workspace}/.github/workflows",
-  "{workspace}/.gitmodules",
-  "{workspace}/.cargo/config.toml", "{workspace}/.cargo/config",
-  "{workspace}/.bazelrc", "{workspace}/.claude", "{workspace}/.gemini",
-  "{workspace}/.cursor", "{workspace}/.mcp.json", "{workspace}/.zed",
-  "{workspace}/**/.nvim.lua", "{workspace}/**/.exrc",
+  "{workspace}/.envrc", "{workspace}/.stopit.toml", "{workspace}/**/.stopit.toml",
+  "{workspace}/.vscode", "{workspace}/.idea", "{workspace}/.github/workflows",
+  "{workspace}/.gitmodules", "{workspace}/.cargo/config.toml",
+  "{workspace}/.cargo/config", "{workspace}/.bazelrc", "{workspace}/.claude",
+  "{workspace}/.gemini", "{workspace}/.codex", "{workspace}/opencode.json",
+  "{workspace}/.opencode", "{workspace}/.cursor", "{workspace}/.mcp.json",
+  "{workspace}/.zed", "{workspace}/**/.nvim.lua", "{workspace}/**/.exrc",
   "{workspace}/.gdbinit", "{workspace}/.lldbinit",
 ]
 ephemeral = ["/tmp", "~"]
+
 [provider.sandbox.env]
 pass = ["TERM", "LANG", "COLORTERM"]
 deny = ["*_TOKEN", "*_KEY", "*_SECRET", "*_PASSWORD", "AWS_*", "GITHUB_*", "SSH_AUTH_SOCK", "NIX_CONFIG"]
 
-# --- The built-in `vcs` provider with its default options ---
 [[provider]]
-type    = "vcs"
-view    = "masked"
-tools   = ["jj", "git"]
-fetch   = "ask"
-push    = "ask"
-signing = false
+name = "protect-nix"
+type = "config"
+profile = "main"
 
-# Plus at least one user provider granting tools (required).
-```
+[provider.sandbox.fs]
+warn_missing = false
+protected = ["{workspace}/**/*.nix", "{workspace}/flake.lock"]
 
-For reference, the `vcs` provider's manifest is ordinary manifest data. For a **plain colocated repository** (all metadata inside `{workspace}`), its grants are equivalent to the following. For worktrees, jj secondary workspaces and subdirectory workspaces, the provider adds the resolved backing-storage and checkout-root paths (§7.3.1) as concrete absolute paths in the same sections. Inside a manifest, contributed profiles use plain names and references (§3.6); from outside they appear as `vcs.ro`, `vcs.local`, `vcs.remote`.
+[[provider]]
+name = "vcs"
+type = "vcs"
+profile = "main"
+view = "masked"
 
-```toml
-[provider.sandbox.fs]                      # applied to "main"
-masked = ["{workspace}/.git", "{workspace}/.jj"]
-
-[provider.sandbox.profiles.ro]             # appears as "vcs.ro"; inherits "main"
-fs.ro = ["{workspace}/.git", "{workspace}/.jj", "~/.config/jj/repos/<repo-id>"]
-sandbox.grant = false
-
-[provider.sandbox.profiles.local]          # appears as "vcs.local"
-fs.rw = ["{workspace}/.git", "{workspace}/.jj"]
-fs.ro = [
-  "{workspace}/.git/config", "{workspace}/.git/config.worktree", "{workspace}/.git/info/attributes",
-  "{workspace}/.git/modules/*/config", "{workspace}/.git/worktrees/*/config.worktree",
-  "{workspace}/.jj/repo/config.toml", "{workspace}/.jj/repo/store/git_target",
-  "~/.config/jj/repos/<repo-id>",
-]
-fs.masked = ["{workspace}/.git/hooks", "{workspace}/.git/modules/*/hooks"]
-sandbox.grant = false
-
-[provider.sandbox.profiles.remote]         # appears as "vcs.remote"
-inherit = "local"
-network.mode = "proxy"                     # domains derived from the resolved remote at approval time
-
-[provider.sandbox.shims.jj]
+[provider.shims.jj]
 cmd = ["jj", "--no-pager", "-R", "{workspace}"]
 default = { decision = "ask", profile = "local" }
 rules = [
-  { regex = '(?:^| )(?:-R[^ ]*|--(?:config|config-file|config-toml|repository|tool|interactive)(?:=.*)?|-i)(?: |$)', decision = "deny" },
-  { prefix = "status", decision = "allow", profile = "ro" },
-  { prefix = "diff", decision = "allow", profile = "ro" },
-  { prefix = "log", decision = "allow", profile = "ro" },
-  { prefix = "show", decision = "allow", profile = "ro" },
-  { prefix = "evolog", decision = "allow", profile = "ro" },
-  { prefix = "op log", decision = "allow", profile = "ro" },
-  { prefix = "git fetch", decision = "ask", profile = "remote" },   # from `fetch`
-  { prefix = "git clone", decision = "ask", profile = "remote" },   # from `fetch`
-  { prefix = "git push", decision = "ask", profile = "remote" },    # from `push`
-  { regex = '(?:^| )(?:-[AB][^ ]*|--insert-(?:after|before)(?:=.*)?)(?: |$)', decision = "deny" },
+  { flags = ["--config", "--config-file", "--config-toml", "-R", "--repository", "--tool", "-i", "--interactive"], decision = "deny" },
+  { prefix = "status", decision = "allow", profile = "local" },
+  { prefix = "st", decision = "allow", profile = "local" },
+  { prefix = "diff", decision = "allow", profile = "local" },
+  { prefix = "log", decision = "allow", profile = "local" },
+  { prefix = "show", decision = "allow", profile = "local" },
+  { prefix = "evolog", decision = "allow", profile = "local" },
+  { prefix = "op log", decision = "allow", profile = "local" },
+  { prefix = "file show", decision = "allow", profile = "local" },
+  { prefix = "squash", decision = "ask", profile = "local" },
+  { prefix = "rebase", decision = "ask", profile = "local" },
+  { prefix = "abandon", decision = "ask", profile = "local" },
+  { prefix = "restore", decision = "ask", profile = "local" },
+  { prefix = "undo", decision = "ask", profile = "local" },
+  { regex = '^bookmark [^-][^ ]*(?: |$)', decision = "ask", profile = "local" },
+  { regex = '^op [^-][^ ]*(?: |$)', decision = "ask", profile = "local" },
+  { prefix = "git fetch", decision = "ask", profile = "remote" },
+  { prefix = "git clone", decision = "ask", profile = "remote" },
+  { prefix = "git push", decision = "ask", profile = "remote" },
+  { flags = ["-A", "--insert-after", "--after", "-B", "--insert-before", "--before"], decision = "deny" },
   { prefix = "new", decision = "allow", profile = "local" },
   { prefix = "commit", decision = "allow", profile = "local" },
+  { prefix = "ci", decision = "allow", profile = "local" },
   { prefix = "describe", decision = "allow", profile = "local" },
+  { prefix = "desc", decision = "allow", profile = "local" },
 ]
 
-[provider.sandbox.shims.git]
+[provider.shims.git]
 cmd = ["git", "--no-pager"]
 default = { decision = "ask", profile = "local" }
 rules = [
-  { regex = '(?:^| )(?:-c[^ ]*|-C[^ ]*|--(?:config-env|exec-path|upload-pack|receive-pack|exec|output|git-dir|work-tree|namespace)(?:=.*)?)(?: |$)', decision = "deny" },
+  { flags = ["-c", "--config-env", "--exec-path", "--upload-pack", "--receive-pack", "--exec", "--output", "-C", "--git-dir", "--work-tree", "--namespace"], decision = "deny" },
   { prefix = "status", decision = "allow", profile = "local" },
   { prefix = "diff", decision = "allow", profile = "local" },
   { prefix = "log", decision = "allow", profile = "local" },
   { prefix = "show", decision = "allow", profile = "local" },
   { prefix = "add", decision = "allow", profile = "local" },
   { prefix = "commit", decision = "allow", profile = "local" },
-  { prefix = "fetch", decision = "ask", profile = "remote" },          # from `fetch`
-  { prefix = "pull", decision = "ask", profile = "remote" },           # from `fetch`
-  { prefix = "ls-remote", decision = "ask", profile = "remote" },      # from `fetch`
-  { prefix = "remote update", decision = "ask", profile = "remote" },  # from `fetch`
-  { prefix = "push", decision = "ask", profile = "remote" },           # from `push`
-  { regex = '(?:^| )(?:-u[^ ]*|--template(?:=.*)?)(?: |$)', decision = "deny" },
-  { prefix = "clone", decision = "ask", profile = "remote" },          # from `fetch`
+  { prefix = "reset", decision = "ask", profile = "local" },
+  { prefix = "rebase", decision = "ask", profile = "local" },
+  { prefix = "checkout", decision = "ask", profile = "local" },
+  { prefix = "switch", decision = "ask", profile = "local" },
+  { prefix = "branch", decision = "ask", profile = "local" },
+  { prefix = "tag", decision = "ask", profile = "local" },
+  { prefix = "clean", decision = "ask", profile = "local" },
+  { prefix = "stash", decision = "ask", profile = "local" },
+  { prefix = "fetch", decision = "ask", profile = "remote" },
+  { prefix = "pull", decision = "ask", profile = "remote" },
+  { prefix = "ls-remote", decision = "ask", profile = "remote" },
+  { prefix = "remote update", decision = "ask", profile = "remote" },
+  { prefix = "push", decision = "ask", profile = "remote" },
+  { flags = ["-u", "--template"], decision = "deny" },
+  { prefix = "clone", decision = "ask", profile = "remote" },
 ]
 ```
 
-The declarative form above reproduces the `vcs` provider's manifest grants and shims.
+For a **plain colocated repository** (all metadata inside `{workspace}`), the `vcs` provider's filesystem and profile grants are equivalent to the following (for worktrees and jj secondary workspaces, resolved backing-storage paths from §7.3 are added as concrete absolute paths in the same sections; inside a manifest, contributed profiles use plain names and appear externally as `<name>.ro`, `<name>.local`, `<name>.remote`):
+
+```toml
+[provider.sandbox.fs]                      # applied to the provider's `profile` ("main")
+masked = ["{workspace}/.git", "{workspace}/.jj"]
+
+[provider.sandbox.profiles.ro]             # appears as "vcs.ro"
+inherit = "main"
+fs.ro = ["{workspace}/.git", "{workspace}/.jj"]
+network.mode = "none"
+sandbox.grant = false
+
+[provider.sandbox.profiles.local]          # appears as "vcs.local"
+inherit = "main"
+fs.rw = ["{workspace}/.git", "{workspace}/.jj"]
+fs.ro = [
+  "{workspace}/.git/config", "{workspace}/.git/config.worktree", "{workspace}/.git/info/attributes",
+  "{workspace}/.git/modules/*/config", "{workspace}/.git/worktrees/*/config.worktree",
+  "{workspace}/.jj/repo/config.toml", "{workspace}/.jj/repo/store/git_target",
+]
+fs.masked = ["{workspace}/.git/hooks", "{workspace}/.git/modules/*/hooks"]
+network.mode = "none"
+sandbox.grant = false
+
+[provider.sandbox.profiles.remote]         # appears as "vcs.remote"
+inherit = "local"
+network.mode = "full"
+```
 
 ---
 
