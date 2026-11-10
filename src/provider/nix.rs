@@ -16,6 +16,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use rustix::fs::{AtFlags, FileType, FlockOperation, Mode, OFlags};
 use rustix::io::Errno;
@@ -23,11 +24,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use self::ignore::{IgnoreStack, RuleLayer};
 use super::script::{
     HostCommandResult, STDOUT_LIMIT, describe_status, describe_stderr, run_host_command,
 };
 use super::{Provider, ProviderContext, ProviderError, ProviderOutput};
-use crate::config::{NixShell, NixSource, ProfileRef, ProviderName, ProviderOrigin};
+use crate::config::{
+    NixIgnorePattern, NixShell, NixSource, ProfileRef, ProviderName, ProviderOrigin,
+};
 use crate::manifest::{
     EnvName, EnvValue, Manifest, PathPattern, SearchPathEntry, ShellHook, ShellHookSetting,
 };
@@ -36,8 +40,10 @@ use crate::spec::{ScriptPathError, has_rewritable_hard_links, resolve_script_pat
 use crate::supervisor::Ownership;
 use crate::trust::check_store_file;
 
+mod ignore;
+
 /// Domain tag and schema version mixed into every persistent Nix cache key.
-const CACHE_DOMAIN: &[u8] = b"stopit-nix-cache-v2\0";
+const CACHE_DOMAIN: &[u8] = b"stopit-nix-cache-v3\0";
 
 /// Format version stored inside `cache.json`.
 const CACHE_FORMAT_VERSION: u32 = 2;
@@ -66,17 +72,8 @@ const MAX_VALIDATE_WALK_ENTRIES: usize = 250_000;
 /// Maximum size of a single `.nix` or `flake.lock` file hashed for caching.
 const MAX_NIX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 
-/// Directory names skipped when walking a workspace or flake tree for `.nix`
-/// and `flake.lock` inputs.
-const IGNORED_WALK_DIRS: &[&str] = &[
-    ".git",
-    ".jj",
-    ".hg",
-    "target",
-    "node_modules",
-    ".direnv",
-    ".cache",
-];
+/// VCS directory names skipped during untrusted symlink checks on directory targets.
+const IGNORED_VCS_DIRS: &[&str] = &[".git", ".jj", ".hg"];
 
 /// Host environment variables passed through to `nix` on the host. All other
 /// host variables (including `NIX_CONFIG`, `SSH_AUTH_SOCK`, and secret tokens)
@@ -214,6 +211,8 @@ pub struct NixProvider {
     flake: Option<NixSource>,
     cache: bool,
     shell_hook: bool,
+    gitignore: bool,
+    ignore: Vec<NixIgnorePattern>,
     base_dir: PathBuf,
     origin: ProviderOrigin,
     nix_program: Option<PathBuf>,
@@ -303,6 +302,8 @@ impl NixProvider {
             flake,
             cache,
             shell_hook: true,
+            gitignore: true,
+            ignore: Vec::new(),
             base_dir: base_dir.to_owned(),
             origin,
             nix_program: None,
@@ -320,6 +321,20 @@ impl NixProvider {
     /// in-sandbox `sandbox.shell_hook` grant (defaults to `true`).
     pub fn with_shell_hook(mut self, shell_hook: bool) -> Self {
         self.shell_hook = shell_hook;
+        self
+    }
+
+    /// Configures whether `.gitignore` files inside the target tree exclude
+    /// paths from validation, cache hashing, and flake staging (defaults to `true`).
+    pub fn with_gitignore(mut self, gitignore: bool) -> Self {
+        self.gitignore = gitignore;
+        self
+    }
+
+    /// Configures additional gitignore-style glob patterns relative to the
+    /// target root excluded from validation, cache hashing, and flake staging.
+    pub fn with_ignore(mut self, ignore: Vec<NixIgnorePattern>) -> Self {
+        self.ignore = ignore;
         self
     }
 
@@ -463,33 +478,50 @@ impl NixProvider {
         Ok(())
     }
 
-    /// Validates all `*.nix` and `flake.lock` entries in `target`'s directory
-    /// tree (even when `cache = false`) so imported Nix files cannot run through
-    /// untrusted symlinks or rewritable hard links.
+    /// Validates all `*.nix`, `flake.lock`, and consulted `.gitignore` entries in
+    /// `target`'s directory tree (even when `cache = false`) so imported Nix files
+    /// cannot run through untrusted symlinks or rewritable hard links, and verifies
+    /// that every non-ignored symlink in a flake tree is a valid relative intra-flake symlink.
     fn validate_target_inputs(
         &self,
         target: &NixTarget,
         ctx: &ProviderContext,
+        protected: &mut Vec<PathBuf>,
     ) -> Result<(), ProviderError> {
-        let root_to_walk = match target {
-            NixTarget::Flake { dir } => Some(dir.as_path()),
-            NixTarget::File { file } => file
-                .parent()
-                .filter(|p| *p != Path::new("/") && *p != ctx.home),
+        let (root_to_walk, is_flake) = match target {
+            NixTarget::Flake { dir } => (Some(dir.as_path()), true),
+            NixTarget::File { file } => (
+                file.parent()
+                    .filter(|p| *p != Path::new("/") && *p != ctx.home),
+                false,
+            ),
         };
         if let Some(root) = root_to_walk {
             let mut visited = 0usize;
-            self.validate_nix_tree(root, root, ctx, &mut visited)?;
+            let mut stack = IgnoreStack::new(&self.ignore);
+            self.validate_nix_tree(
+                root,
+                root,
+                is_flake,
+                ctx,
+                &mut stack,
+                &mut visited,
+                protected,
+            )?;
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn validate_nix_tree(
         &self,
         root: &Path,
         dir: &Path,
+        is_flake: bool,
         ctx: &ProviderContext,
+        stack: &mut IgnoreStack,
         visited: &mut usize,
+        protected: &mut Vec<PathBuf>,
     ) -> Result<(), ProviderError> {
         let read_dir = match fs::read_dir(dir) {
             Ok(rd) => rd,
@@ -498,6 +530,7 @@ impl NixProvider {
                 return Err(self.nix_err(format!("cannot read directory {}: {e}", dir.display())));
             }
         };
+        let mut entries = Vec::new();
         for item in read_dir {
             *visited = visited.saturating_add(1);
             if *visited > MAX_VALIDATE_WALK_ENTRIES {
@@ -512,6 +545,36 @@ impl NixProvider {
                     dir.display()
                 ))
             })?;
+            entries.push(entry);
+        }
+        entries.sort_by_key(|e| e.file_name());
+
+        let saved_layers = stack.layer_count();
+
+        if self.gitignore
+            && let Some(entry) = entries.iter().find(|e| e.file_name() == ".gitignore")
+        {
+            let full_path = entry.path();
+            let ft = entry.file_type().map_err(|e| {
+                self.nix_err(format!("cannot inspect {}: {e}", full_path.display()))
+            })?;
+            if ft.is_symlink()
+                && let Some(untrusted) = innermost_untrusted_root(&full_path, ctx)
+            {
+                return Err(self.untrusted_link_err(&full_path, &full_path, &untrusted));
+            }
+            let resolved_gi = self.resolve_checked_path(&full_path, false, ctx)?;
+            self.check_regular_unlinked_file(&full_path, &resolved_gi)?;
+            if !protected.contains(&resolved_gi) {
+                protected.push(resolved_gi.clone());
+            }
+            let bytes = read_bounded_regular_file(&resolved_gi).map_err(|e| self.nix_err(e))?;
+            let content = String::from_utf8_lossy(&bytes);
+            let base_rel = dir.strip_prefix(root).unwrap_or(Path::new(""));
+            stack.push_layer(RuleLayer::from_gitignore_bytes(base_rel, &content));
+        }
+
+        for entry in entries {
             let file_name = entry.file_name();
             let name_str = file_name.to_str();
             let full_path = entry.path();
@@ -519,11 +582,28 @@ impl NixProvider {
                 self.nix_err(format!("cannot inspect {}: {e}", full_path.display()))
             })?;
 
+            if name_str == Some(".gitignore") && self.gitignore {
+                continue;
+            }
+
+            let rel = full_path.strip_prefix(root).unwrap_or(&full_path);
+            let is_root_flake_entry =
+                is_flake && dir == root && matches!(name_str, Some("flake.nix" | "flake.lock"));
+
+            if !is_root_flake_entry && stack.is_ignored(rel, name_str.unwrap_or(""), ft.is_dir()) {
+                continue;
+            }
+
             if ft.is_dir() {
-                if name_str.is_some_and(|n| IGNORED_WALK_DIRS.contains(&n)) {
-                    continue;
-                }
-                self.validate_nix_tree(root, &full_path, ctx, visited)?;
+                self.validate_nix_tree(
+                    root,
+                    &full_path,
+                    is_flake,
+                    ctx,
+                    stack,
+                    visited,
+                    protected,
+                )?;
                 continue;
             }
 
@@ -548,6 +628,9 @@ impl NixProvider {
                         return Err(self.untrusted_link_err(&full_path, &full_path, &untrusted));
                     }
                 }
+                if is_flake {
+                    validate_flake_symlink(root, &full_path).map_err(|r| self.nix_err(r))?;
+                }
                 continue;
             }
 
@@ -555,6 +638,8 @@ impl NixProvider {
                 self.check_regular_unlinked_file(&full_path, &full_path)?;
             }
         }
+
+        stack.truncate(saved_layers);
         Ok(())
     }
 
@@ -820,6 +905,177 @@ impl NixProvider {
         }
     }
 
+    fn create_staged_flake_dir(
+        &self,
+        ctx: &ProviderContext,
+    ) -> Result<StagedFlakeDir, ProviderError> {
+        let pid = std::process::id();
+        let parent_dir = if let Some(data_dir) = &ctx.data_dir {
+            if let Some(parent) = data_dir.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    self.nix_err(format!("cannot create {}: {e}", parent.display()))
+                })?;
+            }
+            ensure_private_subdir(data_dir).map_err(|e| self.nix_err(e))?;
+            let nix_dir = data_dir.join(NIX_CACHE_DIR);
+            ensure_private_subdir(&nix_dir).map_err(|e| self.nix_err(e))?;
+            nix_dir
+        } else {
+            ctx.session_dir.clone()
+        };
+
+        for _ in 0..100 {
+            let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir_name = if ctx.data_dir.is_some() {
+                format!(".stage-{pid}-{seq}")
+            } else {
+                format!("nix-stage-{pid}-{seq}")
+            };
+            let stage_path = parent_dir.join(dir_name);
+            match create_private_dir(&stage_path) {
+                Ok(()) => return Ok(StagedFlakeDir { path: stage_path }),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(self.nix_err(format!(
+                        "cannot create staged flake directory {}: {e}",
+                        stage_path.display()
+                    )));
+                }
+            }
+        }
+        Err(self.nix_err("failed to create a unique temporary staged flake directory"))
+    }
+
+    fn stage_flake_tree(
+        &self,
+        root: &Path,
+        src_dir: &Path,
+        dst_dir: &Path,
+        stack: &mut IgnoreStack,
+        staged_entries: &mut usize,
+        staged_symlinks: &mut Vec<PathBuf>,
+    ) -> Result<(), ProviderError> {
+        let read_dir = match fs::read_dir(src_dir) {
+            Ok(rd) => rd,
+            Err(e) if src_dir != root && e.kind() == io::ErrorKind::PermissionDenied => {
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(self.nix_err(format!(
+                    "cannot read directory {}: {e}",
+                    src_dir.display()
+                )));
+            }
+        };
+
+        let mut entries = Vec::new();
+        for item in read_dir {
+            *staged_entries = staged_entries.saturating_add(1);
+            if *staged_entries > MAX_VALIDATE_WALK_ENTRIES {
+                return Err(self.nix_err(format!(
+                    "cannot stage flake {}: directory exceeds {MAX_VALIDATE_WALK_ENTRIES} entries",
+                    root.display()
+                )));
+            }
+            let entry = item.map_err(|e| {
+                self.nix_err(format!(
+                    "cannot read directory entry in {}: {e}",
+                    src_dir.display()
+                ))
+            })?;
+            entries.push(entry);
+        }
+        entries.sort_by_key(|e| e.file_name());
+
+        let saved_layers = stack.layer_count();
+        let mut resolved_gi_path: Option<PathBuf> = None;
+
+        if self.gitignore
+            && let Some(entry) = entries.iter().find(|e| e.file_name() == ".gitignore")
+        {
+            let full_path = entry.path();
+            let ft = entry.file_type().map_err(|e| {
+                self.nix_err(format!("cannot inspect {}: {e}", full_path.display()))
+            })?;
+            let resolved_gi = if ft.is_symlink() {
+                fs::canonicalize(&full_path).map_err(|e| {
+                    self.nix_err(format!("cannot resolve symlink {}: {e}", full_path.display()))
+                })?
+            } else {
+                full_path.clone()
+            };
+            let bytes = read_bounded_regular_file(&resolved_gi).map_err(|e| self.nix_err(e))?;
+            let content = String::from_utf8_lossy(&bytes);
+            let base_rel = src_dir.strip_prefix(root).unwrap_or(Path::new(""));
+            stack.push_layer(RuleLayer::from_gitignore_bytes(base_rel, &content));
+            resolved_gi_path = Some(resolved_gi);
+        }
+
+        for entry in entries {
+            let file_name = entry.file_name();
+            let name_str = file_name.to_str();
+            let full_path = entry.path();
+            let ft = entry.file_type().map_err(|e| {
+                self.nix_err(format!("cannot inspect {}: {e}", full_path.display()))
+            })?;
+
+            let rel = full_path.strip_prefix(root).unwrap_or(&full_path);
+            let is_root_flake_entry =
+                src_dir == root && matches!(name_str, Some("flake.nix" | "flake.lock"));
+
+            if !is_root_flake_entry && stack.is_ignored(rel, name_str.unwrap_or(""), ft.is_dir()) {
+                continue;
+            }
+
+            let dst_path = dst_dir.join(&file_name);
+
+            if name_str == Some(".gitignore") && self.gitignore {
+                if let Some(ref resolved_gi) = resolved_gi_path {
+                    stage_regular_file(resolved_gi, &dst_path).map_err(|r| self.nix_err(r))?;
+                }
+                continue;
+            }
+
+            if ft.is_dir() {
+                create_private_dir(&dst_path).map_err(|e| {
+                    self.nix_err(format!(
+                        "cannot create staged directory {}: {e}",
+                        dst_path.display()
+                    ))
+                })?;
+                self.stage_flake_tree(
+                    root,
+                    &full_path,
+                    &dst_path,
+                    stack,
+                    staged_entries,
+                    staged_symlinks,
+                )?;
+                continue;
+            }
+
+            if ft.is_symlink() {
+                let raw_target = validate_flake_symlink(root, &full_path)
+                    .map_err(|r| self.nix_err(r))?;
+                std::os::unix::fs::symlink(&raw_target, &dst_path).map_err(|e| {
+                    self.nix_err(format!(
+                        "cannot create staged symlink {}: {e}",
+                        dst_path.display()
+                    ))
+                })?;
+                staged_symlinks.push(dst_path);
+                continue;
+            }
+
+            if ft.is_file() {
+                stage_regular_file(&full_path, &dst_path).map_err(|r| self.nix_err(r))?;
+            }
+        }
+
+        stack.truncate(saved_layers);
+        Ok(())
+    }
+
     /// Evaluates `target`, writing a GC root to `profile_path`, and returns the
     /// validated [`CachedNixEnv`].
     fn evaluate_uncached(
@@ -827,27 +1083,59 @@ impl NixProvider {
         nix_bin: &Path,
         target: &NixTarget,
         profile_path: &Path,
+        ctx: &ProviderContext,
     ) -> Result<CachedNixEnv, ProviderError> {
         let dev_env_bytes = match target {
             NixTarget::Flake { dir } => {
-                let dir_str = dir.to_str().ok_or_else(|| {
-                    self.nix_err(format!("flake directory {:?} is not valid UTF-8", dir))
+                let staged = self.create_staged_flake_dir(ctx)?;
+                check_flake_dir_syntax(&staged.path).map_err(|r| self.nix_err(r))?;
+                let staged_str = staged.path.to_str().ok_or_else(|| {
+                    self.nix_err(format!(
+                        "staged flake directory {:?} is not valid UTF-8",
+                        staged.path
+                    ))
                 })?;
-                let installable = format_flake_installable(dir_str, self.shell.as_ref());
-                let args = build_flake_print_dev_env_args(profile_path, &installable);
-                match self.invoke_nix(nix_bin, &args) {
-                    HostCommandResult::Failed { stderr, .. }
-                        if stderr.contains("extensions.refstorage") =>
-                    {
-                        let fallback = format!("path:{installable}");
-                        let retry_args = build_flake_print_dev_env_args(profile_path, &fallback);
-                        self.finish_nix_result(
-                            "print-dev-env",
-                            self.invoke_nix(nix_bin, &retry_args),
-                        )?
+
+                let mut stack = IgnoreStack::new(&self.ignore);
+                let mut staged_entries = 0usize;
+                let mut staged_symlinks = Vec::new();
+                self.stage_flake_tree(
+                    dir,
+                    dir,
+                    &staged.path,
+                    &mut stack,
+                    &mut staged_entries,
+                    &mut staged_symlinks,
+                )?;
+
+                let canonical_staged_root = fs::canonicalize(&staged.path).map_err(|e| {
+                    self.nix_err(format!(
+                        "cannot canonicalize staged flake directory {}: {e}",
+                        staged.path.display()
+                    ))
+                })?;
+                for dst_link in staged_symlinks {
+                    let canonical_link = fs::canonicalize(&dst_link).map_err(|e| {
+                        self.nix_err(format!(
+                            "staged symlink {} failed post-stage resolution: {e}",
+                            dst_link.display()
+                        ))
+                    })?;
+                    if !canonical_link.starts_with(&canonical_staged_root) {
+                        return Err(self.nix_err(format!(
+                            "staged symlink {} escapes staged directory; resolves to {}",
+                            dst_link.display(),
+                            canonical_link.display()
+                        )));
                     }
-                    other => self.finish_nix_result("print-dev-env", other)?,
                 }
+
+                let installable = format!(
+                    "path:{}",
+                    format_flake_installable(staged_str, self.shell.as_ref())
+                );
+                let args = build_flake_print_dev_env_args(profile_path, &installable);
+                self.finish_nix_result("print-dev-env", self.invoke_nix(nix_bin, &args))?
             }
             NixTarget::File { file } => {
                 let mut args = vec![
@@ -918,14 +1206,28 @@ impl NixProvider {
             }
             None => hasher.update([0u8]),
         }
+        hasher.update([u8::from(self.gitignore)]);
+        hasher.update((self.ignore.len() as u64).to_le_bytes());
+        for pat in &self.ignore {
+            hash_len_bytes(&mut hasher, pat.as_str().as_bytes());
+        }
 
+        let mut stack = IgnoreStack::new(&self.ignore);
         let mut visited = 0usize;
         match target {
             NixTarget::Flake { dir } => {
                 hasher.update(b"flake\0");
                 hash_len_bytes(&mut hasher, dir.as_os_str().as_bytes());
-                if !hash_nix_tree(dir, dir, &mut visited, &mut hasher)
-                    .map_err(|reason| self.nix_err(reason))?
+                if !hash_nix_tree(
+                    dir,
+                    dir,
+                    true,
+                    self.gitignore,
+                    &mut stack,
+                    &mut visited,
+                    &mut hasher,
+                )
+                .map_err(|reason| self.nix_err(reason))?
                 {
                     return Ok(None);
                 }
@@ -944,8 +1246,16 @@ impl NixProvider {
                 if let Some(parent) = file.parent()
                     && parent != Path::new("/")
                     && parent != ctx.home
-                    && !hash_nix_tree(parent, parent, &mut visited, &mut hasher)
-                        .map_err(|reason| self.nix_err(reason))?
+                    && !hash_nix_tree(
+                        parent,
+                        parent,
+                        false,
+                        self.gitignore,
+                        &mut stack,
+                        &mut visited,
+                        &mut hasher,
+                    )
+                    .map_err(|reason| self.nix_err(reason))?
                 {
                     return Ok(None);
                 }
@@ -968,7 +1278,7 @@ impl NixProvider {
             && let Some(data_dir) = &ctx.data_dir
             && let Some(key) = self.compute_cache_key(nix_bin, nix_meta, target, ctx)?
         {
-            return self.resolve_cached(data_dir, &key, nix_bin, target);
+            return self.resolve_cached(data_dir, &key, nix_bin, target, ctx);
         }
 
         // Uncached path: keep the `--profile` GC root in `session_dir` so the
@@ -987,7 +1297,7 @@ impl NixProvider {
         let root_fd =
             open_verified_private_dir(&root_dir).map_err(|reason| self.nix_err(reason))?;
         clear_stale_profile_links_at(&root_dir, &root_fd).map_err(|reason| self.nix_err(reason))?;
-        self.evaluate_uncached(nix_bin, target, &root_dir.join("profile"))
+        self.evaluate_uncached(nix_bin, target, &root_dir.join("profile"), ctx)
     }
 
     fn resolve_cached(
@@ -996,6 +1306,7 @@ impl NixProvider {
         key: &str,
         nix_bin: &Path,
         target: &NixTarget,
+        ctx: &ProviderContext,
     ) -> Result<CachedNixEnv, ProviderError> {
         let entry_dir =
             ensure_cache_entry_dir(data_dir, key).map_err(|reason| self.nix_err(reason))?;
@@ -1008,7 +1319,7 @@ impl NixProvider {
                 entry_dir.display()
             ))
         })?;
-        let result = self.resolve_cached_locked(&entry_dir, &entry_fd, nix_bin, target);
+        let result = self.resolve_cached_locked(&entry_dir, &entry_fd, nix_bin, target, ctx);
         let _ = rustix::fs::flock(&entry_fd, FlockOperation::Unlock);
         result
     }
@@ -1019,6 +1330,7 @@ impl NixProvider {
         entry_fd: &OwnedFd,
         nix_bin: &Path,
         target: &NixTarget,
+        ctx: &ProviderContext,
     ) -> Result<CachedNixEnv, ProviderError> {
         #[cfg(test)]
         let store_root = self.store_check_root.as_deref();
@@ -1033,7 +1345,7 @@ impl NixProvider {
 
         clear_stale_profile_links_at(entry_dir, entry_fd).map_err(|reason| self.nix_err(reason))?;
         let profile_path = entry_dir.join("profile");
-        let fresh = self.evaluate_uncached(nix_bin, target, &profile_path)?;
+        let fresh = self.evaluate_uncached(nix_bin, target, &profile_path, ctx)?;
         write_cached_env(entry_dir, entry_fd, &fresh).map_err(|reason| self.nix_err(reason))?;
         Ok(fresh)
     }
@@ -1045,10 +1357,10 @@ impl Provider for NixProvider {
     }
 
     fn manifest(&self, ctx: &ProviderContext) -> Result<ProviderOutput, ProviderError> {
-        let (target, protected) = self.discover_target(ctx)?;
-        let _ = self.protected.set(protected);
+        let (target, mut protected) = self.discover_target(ctx)?;
 
         let Some(target) = target else {
+            let _ = self.protected.set(protected);
             return Ok(ProviderOutput {
                 profile: self.profile.clone(),
                 manifest: Manifest::default(),
@@ -1056,7 +1368,9 @@ impl Provider for NixProvider {
             });
         };
 
-        self.validate_target_inputs(&target, ctx)?;
+        self.validate_target_inputs(&target, ctx, &mut protected)?;
+        let _ = self.protected.set(protected);
+
         let (nix_bin, nix_meta) = self.resolve_nix_binary(ctx)?;
         let env = self.resolve_env(&nix_bin, &nix_meta, &target, ctx)?;
         let manifest =
@@ -1075,6 +1389,130 @@ impl Provider for NixProvider {
             .cloned()
             .ok_or_else(|| self.nix_err("internal error: protected_paths called before manifest"))
     }
+}
+
+struct StagedFlakeDir {
+    path: PathBuf,
+}
+
+impl Drop for StagedFlakeDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+const MAX_SYMLINK_HOPS: u32 = 40;
+
+fn resolve_flake_symlink_step(
+    canonical_root: &Path,
+    cur: &mut PathBuf,
+    target: &Path,
+    hops_left: &mut u32,
+) -> Result<(), ()> {
+    if !target.is_relative() || target.as_os_str().is_empty() {
+        return Err(());
+    }
+    for comp in target.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if cur.as_path() == canonical_root {
+                    return Err(());
+                }
+                if !fs::metadata(&*cur).map_err(|_| ())?.is_dir() {
+                    return Err(());
+                }
+                if !cur.pop() {
+                    return Err(());
+                }
+            }
+            std::path::Component::Normal(part) => {
+                let next = cur.join(part);
+                let meta = fs::symlink_metadata(&next).map_err(|_| ())?;
+                if meta.is_symlink() {
+                    if *hops_left == 0 {
+                        return Err(());
+                    }
+                    *hops_left -= 1;
+                    let link_target = fs::read_link(&next).map_err(|_| ())?;
+                    resolve_flake_symlink_step(canonical_root, cur, &link_target, hops_left)?;
+                } else {
+                    *cur = next;
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return Err(()),
+        }
+    }
+    Ok(())
+}
+
+fn validate_flake_symlink(root: &Path, full_path: &Path) -> Result<PathBuf, String> {
+    let raw_target = fs::read_link(full_path)
+        .map_err(|e| format!("cannot read symbolic link {}: {e}", full_path.display()))?;
+    let fail = || {
+        format!(
+            "cannot stage flake {}: symlink {} -> {} points outside the flake directory or is dangling; remove it or exclude it via `.gitignore` or `ignore`",
+            root.display(),
+            full_path.display(),
+            raw_target.display()
+        )
+    };
+    if !raw_target.is_relative() || raw_target.as_os_str().is_empty() {
+        return Err(fail());
+    }
+
+    let canonical_root = fs::canonicalize(root)
+        .map_err(|e| format!("cannot canonicalize flake root {}: {e}", root.display()))?;
+    let parent = full_path.parent().unwrap_or(root);
+    let canonical_parent = fs::canonicalize(parent)
+        .map_err(|e| format!("cannot canonicalize parent {}: {e}", parent.display()))?;
+
+    let mut cur = canonical_parent;
+    let mut hops_left = MAX_SYMLINK_HOPS;
+    resolve_flake_symlink_step(&canonical_root, &mut cur, &raw_target, &mut hops_left)
+        .map_err(|_| fail())?;
+
+    if !cur.starts_with(&canonical_root) {
+        return Err(fail());
+    }
+
+    let canonical_final = fs::canonicalize(full_path).map_err(|_| fail())?;
+    if !canonical_final.starts_with(&canonical_root) {
+        return Err(fail());
+    }
+
+    Ok(raw_target)
+}
+
+fn stage_regular_file(src_path: &Path, dst_path: &Path) -> Result<(), String> {
+    let src_fd = rustix::fs::open(
+        src_path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NOCTTY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| format!("cannot open source file {}: {e}", src_path.display()))?;
+    let stat = rustix::fs::fstat(&src_fd)
+        .map_err(|e| format!("cannot stat source file {}: {e}", src_path.display()))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(format!("{} is not a regular file", src_path.display()));
+    }
+    let mode = if stat.st_mode & 0o111 != 0 { 0o700 } else { 0o600 };
+    let dst_fd = rustix::fs::open(
+        dst_path,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(mode),
+    )
+    .map_err(|e| format!("cannot create staged file {}: {e}", dst_path.display()))?;
+
+    if rustix::fs::ioctl_ficlone(&dst_fd, &src_fd).is_err() {
+        let mut src_file = File::from(src_fd);
+        let mut dst_file = File::from(dst_fd);
+        io::copy(&mut src_file, &mut dst_file)
+            .map_err(|e| format!("cannot copy staged file to {}: {e}", dst_path.display()))?;
+    }
+    Ok(())
 }
 
 fn check_flake_dir_syntax(dir: &Path) -> Result<(), String> {
@@ -1348,7 +1786,7 @@ fn dir_contains_nix_inputs(dir: &Path, visited: &mut usize) -> Result<bool, Stri
             .file_type()
             .map_err(|e| format!("cannot inspect {}: {e}", entry.path().display()))?;
         if ft.is_dir()
-            && !name_str.is_some_and(|n| IGNORED_WALK_DIRS.contains(&n))
+            && !name_str.is_some_and(|n| IGNORED_VCS_DIRS.contains(&n))
             && dir_contains_nix_inputs(&entry.path(), visited)?
         {
             return Ok(true);
@@ -1434,16 +1872,16 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-/// Reads and hashes a regular file without following symlinks or blocking on FIFOs.
-fn hash_regular_file(path: &Path, hasher: &mut Sha256) -> Result<(), String> {
+/// Reads a regular file up to [`MAX_NIX_INPUT_BYTES`] without following symlinks or blocking on FIFOs.
+fn read_bounded_regular_file(path: &Path) -> Result<Vec<u8>, String> {
     let fd = rustix::fs::open(
         path,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NOCTTY | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|e| format!("cannot open {} for hashing: {e}", path.display()))?;
+    .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     let stat = rustix::fs::fstat(&fd)
-        .map_err(|e| format!("cannot stat {} for hashing: {e}", path.display()))?;
+        .map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
         return Err(format!("{} is not a regular file", path.display()));
     }
@@ -1452,23 +1890,32 @@ fn hash_regular_file(path: &Path, hasher: &mut Sha256) -> Result<(), String> {
     File::from(fd)
         .take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(|e| format!("cannot read {} for hashing: {e}", path.display()))?;
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     if bytes.len() > MAX_NIX_INPUT_BYTES {
         return Err(format!(
             "{} exceeds {MAX_NIX_INPUT_BYTES} bytes",
             path.display()
         ));
     }
+    Ok(bytes)
+}
+
+/// Reads and hashes a regular file without following symlinks or blocking on FIFOs.
+fn hash_regular_file(path: &Path, hasher: &mut Sha256) -> Result<(), String> {
+    let bytes = read_bounded_regular_file(path)?;
     hash_len_bytes(hasher, &bytes);
     Ok(())
 }
 
 /// Walks `dir` deterministically without following symlinks, hashing the
-/// relative path and content of every `*.nix` and `flake.lock` entry. Returns
+/// relative path and content of every `*.nix`, `flake.lock`, and `.gitignore` entry. Returns
 /// `Ok(false)` when [`MAX_HASH_WALK_ENTRIES`] is exceeded.
 fn hash_nix_tree(
     root: &Path,
     dir: &Path,
+    is_flake: bool,
+    gitignore: bool,
+    stack: &mut IgnoreStack,
     visited: &mut usize,
     hasher: &mut Sha256,
 ) -> Result<bool, String> {
@@ -1494,24 +1941,64 @@ fn hash_nix_tree(
     }
     entries.sort_by_key(|e| e.file_name());
 
+    let saved_layers = stack.layer_count();
+
+    if gitignore
+        && let Some(entry) = entries.iter().find(|e| e.file_name() == ".gitignore")
+    {
+        let full_path = entry.path();
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("cannot inspect {}: {e}", full_path.display()))?;
+        let resolved_gi = if ft.is_symlink() {
+            fs::canonicalize(&full_path)
+                .map_err(|e| format!("cannot resolve symlink {}: {e}", full_path.display()))?
+        } else {
+            full_path.clone()
+        };
+        let bytes = read_bounded_regular_file(&resolved_gi)?;
+        let rel = full_path.strip_prefix(root).unwrap_or(&full_path);
+        hasher.update(b"gitignore\0");
+        hash_len_bytes(hasher, rel.as_os_str().as_bytes());
+        hash_len_bytes(hasher, &bytes);
+        let content = String::from_utf8_lossy(&bytes);
+        let base_rel = dir.strip_prefix(root).unwrap_or(Path::new(""));
+        stack.push_layer(RuleLayer::from_gitignore_bytes(base_rel, &content));
+    }
+
     for entry in entries {
         let file_name = entry.file_name();
         let name_str = file_name.to_str();
+        let full_path = entry.path();
         let ft = entry
             .file_type()
-            .map_err(|e| format!("cannot inspect {}: {e}", entry.path().display()))?;
+            .map_err(|e| format!("cannot inspect {}: {e}", full_path.display()))?;
 
-        if ft.is_dir() {
-            if name_str.is_some_and(|n| IGNORED_WALK_DIRS.contains(&n)) {
-                continue;
-            }
-            if !hash_nix_tree(root, &entry.path(), visited, hasher)? {
-                return Ok(false);
-            }
+        if name_str == Some(".gitignore") && gitignore {
             continue;
         }
 
-        if ft.is_symlink() && name_str.is_some_and(|n| n == "result" || n.starts_with("result-")) {
+        let rel = full_path.strip_prefix(root).unwrap_or(&full_path);
+        let is_root_flake_entry =
+            is_flake && dir == root && matches!(name_str, Some("flake.nix" | "flake.lock"));
+
+        if !is_root_flake_entry && stack.is_ignored(rel, name_str.unwrap_or(""), ft.is_dir()) {
+            continue;
+        }
+
+        if ft.is_dir() {
+            if !hash_nix_tree(
+                root,
+                &full_path,
+                is_flake,
+                gitignore,
+                stack,
+                visited,
+                hasher,
+            )? {
+                stack.truncate(saved_layers);
+                return Ok(false);
+            }
             continue;
         }
 
@@ -1520,8 +2007,6 @@ fn hash_nix_tree(
             continue;
         }
 
-        let full_path = entry.path();
-        let rel = full_path.strip_prefix(root).unwrap_or(&full_path);
         hash_len_bytes(hasher, rel.as_os_str().as_bytes());
         if ft.is_symlink() {
             hasher.update(b"symlink\0");
@@ -1535,6 +2020,8 @@ fn hash_nix_tree(
             hasher.update(b"other\0");
         }
     }
+
+    stack.truncate(saved_layers);
     Ok(true)
 }
 
@@ -1888,6 +2375,12 @@ mod tests {
             &format!(
                 r#"printf '%s\n' "$*" >> {log:?}
 if [ "$3" = "print-dev-env" ]; then
+  staged="${{8#path:}}"
+  staged="${{staged%#agent}}"
+  if [ ! -f "$staged/flake.nix" ]; then
+    echo "staged flake.nix not found in $staged" >&2
+    exit 1
+  fi
   # "$6" is the --profile target
   ln -s /bin/sh "$6"
   cat <<'JSON'
@@ -1979,12 +2472,26 @@ fi
         let logged = fs::read_to_string(&args_log).unwrap();
         assert!(
             logged.contains(&format!(
-                "print-dev-env --no-write-lock-file --profile {} --json {}#agent",
+                "print-dev-env --no-write-lock-file --profile {} --json path:",
                 f.session.join("nix-nix/profile").display(),
-                f.ws.display()
-            )),
+            )) && logged.contains("#agent"),
             "{logged}"
         );
+
+        let session_staged: Vec<_> = fs::read_dir(&f.session)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(".stage-") || n.starts_with("nix-stage-"))
+            .collect();
+        assert!(session_staged.is_empty(), "{session_staged:?}");
+        let data_nix = f.data.join(NIX_CACHE_DIR);
+        if let Ok(rd) = fs::read_dir(&data_nix) {
+            let data_staged: Vec<_> = rd
+                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                .filter(|n| n.starts_with(".stage-") || n.starts_with("nix-stage-"))
+                .collect();
+            assert!(data_staged.is_empty(), "{data_staged:?}");
+        }
     }
 
     #[test]
@@ -1992,30 +2499,38 @@ fi
         let f = TestFixture::new();
         fs::write(f.ws.join("flake.nix"), "{}").unwrap();
         let store_a = format!("/nix/store/{HASH_A}-hello-1.0");
+        let call_count_file = f.root.join("calls.log");
         let nix_bin = write_fake_nix(
             &f.bin,
             &format!(
-                r#"if [ "$3" = "print-dev-env" ]; then
+                r#"echo "$3 ${{8:-}}" >> {log:?}
+if [ "$3" = "print-dev-env" ]; then
   case "$8" in
     path:*)
       ln -s /bin/sh "$6"
       printf '{{"variables": {{"PATH": {{"type": "exported", "value": "{store_a}/bin"}}}}}}'
       ;;
     *)
-      echo "error: unsupported extension name extensions.refstorage" >&2
+      echo "error: expected path: installable on first attempt" >&2
       exit 1
       ;;
   esac
 elif [ "$3" = "path-info" ]; then
   printf '%s\n' "{store_a}"
 fi
-"#
+"#,
+                log = call_count_file
             ),
         );
 
         let p = f.provider(&nix_bin);
         let out = p.manifest(&f.ctx()).unwrap();
         assert_eq!(out.manifest.grants.fs.ro.len(), 1);
+        let calls = fs::read_to_string(&call_count_file).unwrap();
+        let lines: Vec<&str> = calls.lines().collect();
+        assert_eq!(lines.len(), 2, "{calls}");
+        assert!(lines[0].starts_with("print-dev-env path:"), "{calls}");
+        assert!(lines[1].starts_with("path-info"), "{calls}");
     }
 
     #[test]
@@ -2558,5 +3073,487 @@ fi
                 .contains("absent from the `nix path-info` closure"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn gitignored_tree_skips_out_of_store_symlinks_and_protects_gitignore() {
+        let f = TestFixture::new();
+        fs::write(f.ws.join("flake.nix"), "{}").unwrap();
+        fs::write(f.ws.join("flake.lock"), "{}").unwrap();
+        fs::write(f.ws.join(".gitignore"), "buck-out/\n").unwrap();
+        let sub = f.ws.join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(sub.join("kept.txt"), "hello").unwrap();
+        symlink("../flake.nix", sub.join("rel-link")).unwrap();
+
+        let buck_out = f.ws.join("buck-out");
+        fs::create_dir(&buck_out).unwrap();
+        // Populate buck-out with out-of-store, dangling, and symlinked .nix files:
+        let outside = f.root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("foo.nix"), "{}").unwrap();
+        symlink(outside.join("foo.nix"), buck_out.join("foo.nix")).unwrap();
+        symlink("/nix/store/dummy", buck_out.join("store-link")).unwrap();
+        symlink("nonexistent", buck_out.join("dangling")).unwrap();
+
+        // Also add .git and .jj
+        fs::create_dir(f.ws.join(".git")).unwrap();
+        fs::create_dir(f.ws.join(".jj")).unwrap();
+
+        let store_a = format!("/nix/store/{HASH_A}-test-1.0");
+        let nix_bin = write_fake_nix(
+            &f.bin,
+            &format!(
+                r#"if [ "$3" = "print-dev-env" ]; then
+  staged="${{8#path:}}"
+  # Verify staged contents:
+  [ -f "$staged/flake.nix" ] || exit 10
+  [ -f "$staged/flake.lock" ] || exit 11
+  [ -f "$staged/.gitignore" ] || exit 12
+  [ -f "$staged/sub/kept.txt" ] || exit 13
+  [ -L "$staged/sub/rel-link" ] || exit 14
+  [ ! -e "$staged/sub/ignored.txt" ] || exit 15
+  [ ! -e "$staged/buck-out" ] || exit 16
+  [ ! -e "$staged/.git" ] || exit 17
+  [ ! -e "$staged/.jj" ] || exit 18
+  ln -s /bin/sh "$6"
+  printf '{{"variables": {{"PATH": {{"type": "exported", "value": "{store_a}/bin"}}}}}}'
+elif [ "$3" = "path-info" ]; then
+  printf '%s\n' "{store_a}"
+fi
+"#
+            ),
+        );
+
+        let p = f.provider(&nix_bin);
+        let out = p.manifest(&f.ctx()).unwrap();
+        assert_eq!(out.manifest.grants.fs.ro.len(), 1);
+
+        // Verify protected_paths includes flake.nix, flake.lock, and both .gitignore files
+        let prot = p.protected_paths().unwrap();
+        assert!(prot.contains(&f.ws.join("flake.nix")));
+        assert!(prot.contains(&f.ws.join("flake.lock")));
+        assert!(prot.contains(&f.ws.join(".gitignore")));
+        assert!(prot.contains(&sub.join(".gitignore")));
+
+        // Verify no staging dir remained
+        let data_nix = f.data.join(NIX_CACHE_DIR);
+        if let Ok(rd) = fs::read_dir(&data_nix) {
+            let data_staged: Vec<_> = rd
+                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                .filter(|n| n.starts_with(".stage-") || n.starts_with("nix-stage-"))
+                .collect();
+            assert!(data_staged.is_empty(), "{data_staged:?}");
+        }
+    }
+
+    #[test]
+    fn gitignore_disabled_with_custom_ignore() {
+        let f = TestFixture::new();
+        fs::write(f.ws.join("flake.nix"), "{}").unwrap();
+        fs::write(f.ws.join("flake.lock"), "{}").unwrap();
+        fs::write(f.ws.join(".gitignore"), "buck-out/\n").unwrap();
+        fs::write(f.ws.join("app.log"), "log").unwrap();
+        let buck_out = f.ws.join("buck-out");
+        fs::create_dir(&buck_out).unwrap();
+        symlink("nonexistent", buck_out.join("dangling")).unwrap();
+
+        let store_a = format!("/nix/store/{HASH_A}-test-1.0");
+        let nix_bin = write_fake_nix(
+            &f.bin,
+            &format!(
+                r#"if [ "$3" = "print-dev-env" ]; then
+  staged="${{8#path:}}"
+  [ -f "$staged/flake.nix" ] || exit 10
+  [ ! -e "$staged/buck-out" ] || exit 11
+  [ ! -e "$staged/app.log" ] || exit 12
+  ln -s /bin/sh "$6"
+  printf '{{"variables": {{"PATH": {{"type": "exported", "value": "{store_a}/bin"}}}}}}'
+elif [ "$3" = "path-info" ]; then
+  printf '%s\n' "{store_a}"
+fi
+"#
+            ),
+        );
+
+        // 1. With gitignore = false and no ignore: buck-out/dangling causes manifest to fail
+        let p_fail = f.provider(&nix_bin).with_gitignore(false);
+        let err = p_fail.manifest(&f.ctx()).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(err.to_string().contains("dangling"), "{err}");
+
+        // 2. With gitignore = false and ignore = ["buck-out", "*.log"]: manifest succeeds and excludes app.log
+        let p_ok = f
+            .provider(&nix_bin)
+            .with_gitignore(false)
+            .with_ignore(vec!["buck-out".parse().unwrap(), "*.log".parse().unwrap()]);
+        let out = p_ok.manifest(&f.ctx()).unwrap();
+        assert_eq!(out.manifest.grants.fs.ro.len(), 1);
+    }
+
+    #[test]
+    fn non_ignored_invalid_symlinks_fail_closed_with_remedy() {
+        let f = TestFixture::new();
+        fs::write(f.ws.join("flake.nix"), "{}").unwrap();
+        let store_a = format!("/nix/store/{HASH_A}-test-1.0");
+        let nix_bin = write_fake_nix(
+            &f.bin,
+            &format!(
+                r#"if [ "$3" = "print-dev-env" ]; then
+  ln -s /bin/sh "$6"
+  printf '{{"variables": {{"PATH": {{"type": "exported", "value": "{store_a}/bin"}}}}}}'
+elif [ "$3" = "path-info" ]; then
+  printf '%s\n' "{store_a}"
+fi
+"#
+            ),
+        );
+
+        // Case A: absolute symlink
+        let abs_link = f.ws.join("abs-link");
+        symlink("/etc/hosts", &abs_link).unwrap();
+        let err_abs = f.provider(&nix_bin).manifest(&f.ctx()).unwrap_err();
+        assert!(
+            err_abs.to_string().contains("points outside the flake directory or is dangling; remove it or exclude it via `.gitignore` or `ignore`"),
+            "{err_abs}"
+        );
+        fs::remove_file(&abs_link).unwrap();
+
+        // Case B: dangling relative symlink
+        let dgl_link = f.ws.join("dgl-link");
+        symlink("missing_file", &dgl_link).unwrap();
+        let err_dgl = f.provider(&nix_bin).manifest(&f.ctx()).unwrap_err();
+        assert!(
+            err_dgl.to_string().contains("points outside the flake directory or is dangling; remove it or exclude it via `.gitignore` or `ignore`"),
+            "{err_dgl}"
+        );
+        fs::remove_file(&dgl_link).unwrap();
+
+        // Case C: parent-escaping relative symlink
+        let sub = f.ws.join("sub");
+        fs::create_dir(&sub).unwrap();
+        let sneaky = sub.join("sneaky");
+        symlink("../../outside", &sneaky).unwrap();
+        let err_sneaky = f.provider(&nix_bin).manifest(&f.ctx()).unwrap_err();
+        assert!(
+            err_sneaky.to_string().contains("points outside the flake directory or is dangling; remove it or exclude it via `.gitignore` or `ignore`"),
+            "{err_sneaky}"
+        );
+        fs::remove_file(&sneaky).unwrap();
+
+        // Case D: trailing slash on a symlink to a regular file (kernel ENOTDIR)
+        let slash_link = f.ws.join("link");
+        symlink("flake.nix/", &slash_link).unwrap();
+        let err_slash = f.provider(&nix_bin).manifest(&f.ctx()).unwrap_err();
+        assert!(
+            err_slash.to_string().contains("points outside the flake directory or is dangling; remove it or exclude it via `.gitignore` or `ignore`"),
+            "{err_slash}"
+        );
+        fs::remove_file(&slash_link).unwrap();
+
+        // Case E: `..` applied to a non-directory (kernel ENOTDIR)
+        let link_a = f.ws.join("a");
+        let link_b = f.ws.join("b");
+        symlink("flake.nix", &link_a).unwrap();
+        symlink("a/..", &link_b).unwrap();
+        let err_notdir = f.provider(&nix_bin).manifest(&f.ctx()).unwrap_err();
+        assert!(
+            err_notdir.to_string().contains("points outside the flake directory or is dangling; remove it or exclude it via `.gitignore` or `ignore`"),
+            "{err_notdir}"
+        );
+        fs::remove_file(&link_a).unwrap();
+        fs::remove_file(&link_b).unwrap();
+
+        // Staging directory must be cleaned up on failure
+        let data_nix = f.data.join(NIX_CACHE_DIR);
+        if let Ok(rd) = fs::read_dir(&data_nix) {
+            let data_staged: Vec<_> = rd
+                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                .filter(|n| n.starts_with(".stage-") || n.starts_with("nix-stage-"))
+                .collect();
+            assert!(data_staged.is_empty(), "{data_staged:?}");
+        }
+    }
+
+    #[test]
+    fn untrusted_gitignore_symlinks_and_hard_links_are_refused() {
+        let f = TestFixture::new();
+        fs::write(f.ws.join("flake.nix"), "{}").unwrap();
+        let outside = f.root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join(".gitignore"), "target/\n").unwrap();
+
+        let store_a = format!("/nix/store/{HASH_A}-test-1.0");
+        let nix_bin = write_fake_nix(
+            &f.bin,
+            &format!(
+                r#"if [ "$3" = "print-dev-env" ]; then
+  ln -s /bin/sh "$6"
+  printf '{{"variables": {{"PATH": {{"type": "exported", "value": "{store_a}/bin"}}}}}}'
+elif [ "$3" = "path-info" ]; then
+  printf '%s\n' "{store_a}"
+fi
+"#
+            ),
+        );
+
+        // Symlinked .gitignore inside workspace is refused
+        symlink(outside.join(".gitignore"), f.ws.join(".gitignore")).unwrap();
+        let err = f.provider(&nix_bin).manifest(&f.ctx()).unwrap_err();
+        assert!(err.to_string().contains("runs through symlink"), "{err}");
+        fs::remove_file(f.ws.join(".gitignore")).unwrap();
+
+        // Hard-linked writable .gitignore (nlink > 1) is refused
+        let gi = f.ws.join(".gitignore");
+        fs::write(&gi, "target/\n").unwrap();
+        let gi_alias = f.ws.join("gi_alias");
+        fs::hard_link(&gi, &gi_alias).unwrap();
+        let err_hl = f.provider(&nix_bin).manifest(&f.ctx()).unwrap_err();
+        assert!(err_hl.to_string().contains("hard links"), "{err_hl}");
+        fs::remove_file(&gi_alias).unwrap();
+        fs::remove_file(&gi).unwrap();
+
+        // A directory named .gitignore fails closed instead of being skipped
+        let sub = f.ws.join("sub");
+        fs::create_dir_all(sub.join(".gitignore")).unwrap();
+        fs::write(sub.join(".gitignore").join("evil.nix"), "{}").unwrap();
+        let err_dir = f.provider(&nix_bin).manifest(&f.ctx()).unwrap_err();
+        assert!(err_dir.to_string().contains("not a regular file"), "{err_dir}");
+    }
+
+    #[test]
+    fn cache_key_invalidated_by_gitignore_and_ignore_settings() {
+        let f = TestFixture::new();
+        fs::write(f.ws.join("flake.nix"), "{}").unwrap();
+        fs::write(f.ws.join(".gitignore"), "target/\n").unwrap();
+
+        let fake_store_root = f.root.join("nix-store");
+        let obj_name = format!("{HASH_A}-test-1.0");
+        let host_obj = fake_store_root.join(&obj_name);
+        fs::create_dir_all(&host_obj).unwrap();
+        let store_a = format!("/nix/store/{obj_name}");
+
+        let call_count_file = f.root.join("calls.log");
+        let nix_bin = write_fake_nix(
+            &f.bin,
+            &format!(
+                r#"echo "$3" >> {log:?}
+if [ "$3" = "print-dev-env" ]; then
+  ln -sf {host_obj:?} "$6"
+  printf '{{"variables": {{"PATH": {{"type": "exported", "value": "{store_a}/bin"}}}}}}'
+elif [ "$3" = "path-info" ]; then
+  printf '%s\n' "{store_a}"
+fi
+"#,
+                log = call_count_file,
+                host_obj = host_obj,
+                store_a = store_a,
+            ),
+        );
+
+        let make_provider = || f.provider(&nix_bin).with_store_check_root(&fake_store_root);
+
+        // 1. Initial run: evaluates and caches
+        let p1 = make_provider();
+        let out1 = p1.manifest(&f.ctx()).unwrap();
+        assert_eq!(out1.manifest.grants.fs.ro.len(), 1);
+        let count1 = fs::read_to_string(&call_count_file).unwrap().lines().count();
+        assert_eq!(count1, 2);
+
+        // 2. Second run: cache hit, no nix commands run
+        let p2 = make_provider();
+        let out2 = p2.manifest(&f.ctx()).unwrap();
+        assert_eq!(out2.manifest.grants.fs.ro.len(), 1);
+        let count2 = fs::read_to_string(&call_count_file).unwrap().lines().count();
+        assert_eq!(count2, 2);
+
+        // 3. Edit .gitignore: cache invalidated, re-evaluates
+        fs::write(f.ws.join(".gitignore"), "target/\nbuild/\n").unwrap();
+        let p3 = make_provider();
+        let out3 = p3.manifest(&f.ctx()).unwrap();
+        assert_eq!(out3.manifest.grants.fs.ro.len(), 1);
+        let count3 = fs::read_to_string(&call_count_file).unwrap().lines().count();
+        assert_eq!(count3, 4);
+
+        // 4. Toggle gitignore = false: cache invalidated, re-evaluates
+        let p4 = make_provider().with_gitignore(false);
+        let out4 = p4.manifest(&f.ctx()).unwrap();
+        assert_eq!(out4.manifest.grants.fs.ro.len(), 1);
+        let count4 = fs::read_to_string(&call_count_file).unwrap().lines().count();
+        assert_eq!(count4, 6);
+
+        // 5. Change ignore = [...]: cache invalidated, re-evaluates
+        let p5 = make_provider()
+            .with_ignore(vec!["buck-out".parse().unwrap()]);
+        let out5 = p5.manifest(&f.ctx()).unwrap();
+        assert_eq!(out5.manifest.grants.fs.ro.len(), 1);
+        let count5 = fs::read_to_string(&call_count_file).unwrap().lines().count();
+        assert_eq!(count5, 8);
+    }
+
+    #[test]
+    fn trusted_symlink_gitignore_validates_protects_and_stages() {
+        let f = TestFixture::new();
+        let flake_dir = f.root.join("flake");
+        fs::create_dir(&flake_dir).unwrap();
+        fs::write(flake_dir.join("flake.nix"), "{}").unwrap();
+        fs::write(flake_dir.join("ignored.txt"), "secret").unwrap();
+
+        let shared_gi = f.root.join("shared.gitignore");
+        fs::write(&shared_gi, "ignored.txt\n").unwrap();
+        symlink("../shared.gitignore", flake_dir.join(".gitignore")).unwrap();
+
+        let store_a = format!("/nix/store/{HASH_A}-test-1.0");
+        let nix_bin = write_fake_nix(
+            &f.bin,
+            &format!(
+                r#"if [ "$3" = "print-dev-env" ]; then
+  staged="${{8#path:}}"
+  [ -f "$staged/flake.nix" ] || exit 10
+  [ ! -e "$staged/ignored.txt" ] || exit 11
+  [ -f "$staged/.gitignore" ] || exit 12
+  ln -s /bin/sh "$6"
+  printf '{{"variables": {{"PATH": {{"type": "exported", "value": "{store_a}/bin"}}}}}}'
+elif [ "$3" = "path-info" ]; then
+  printf '%s\n' "{store_a}"
+fi
+"#
+            ),
+        );
+
+        let p = NixProvider::new(
+            "nix".parse().unwrap(),
+            "main".parse().unwrap(),
+            None,
+            None,
+            Some("flake".parse().unwrap()),
+            true,
+            &f.root,
+        )
+        .with_nix_program(&nix_bin);
+
+        let out = p.manifest(&f.ctx()).unwrap();
+        assert_eq!(out.manifest.grants.fs.ro.len(), 1);
+
+        let protected = p.protected_paths().unwrap();
+        let canonical_shared = fs::canonicalize(&shared_gi).unwrap();
+        assert!(protected.contains(&canonical_shared), "{protected:?}");
+    }
+
+    #[test]
+    fn symlink_chain_escape_via_parent_fails_closed() {
+        let f = TestFixture::new();
+        fs::write(f.ws.join("flake.nix"), "{}").unwrap();
+        let sub = f.ws.join("sub");
+        fs::create_dir(&sub).unwrap();
+        symlink("..", sub.join("up")).unwrap();
+
+        let ws_name = f.ws.file_name().unwrap().to_str().unwrap();
+        let escape_target = format!("sub/up/../{ws_name}/flake.nix");
+        symlink(&escape_target, f.ws.join("escape")).unwrap();
+
+        let store_a = format!("/nix/store/{HASH_A}-test-1.0");
+        let nix_bin = write_fake_nix(
+            &f.bin,
+            &format!(
+                r#"if [ "$3" = "print-dev-env" ]; then
+  ln -s /bin/sh "$6"
+  printf '{{"variables": {{"PATH": {{"type": "exported", "value": "{store_a}/bin"}}}}}}'
+elif [ "$3" = "path-info" ]; then
+  printf '%s\n' "{store_a}"
+fi
+"#
+            ),
+        );
+
+        let err = f.provider(&nix_bin).manifest(&f.ctx()).unwrap_err();
+        assert!(
+            err.to_string().contains("points outside the flake directory or is dangling"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn root_flake_nix_and_lock_never_ignored_by_gitignore() {
+        let f = TestFixture::new();
+        fs::write(f.ws.join("flake.nix"), "{}").unwrap();
+        fs::write(f.ws.join("flake.lock"), "{ \"version\": 1 }").unwrap();
+        fs::write(f.ws.join("other.nix"), "{}").unwrap();
+        fs::write(f.ws.join(".gitignore"), "*\n").unwrap();
+
+        let store_a = format!("/nix/store/{HASH_A}-test-1.0");
+        let fake_store_root = f.root.join("nix-store");
+        let obj_name = format!("{HASH_A}-test-1.0");
+        let host_obj = fake_store_root.join(&obj_name);
+        fs::create_dir_all(&host_obj).unwrap();
+
+        let calls = f.root.join("calls.log");
+        let nix_bin = write_fake_nix(
+            &f.bin,
+            &format!(
+                r#"echo "$3" >> {calls:?}
+if [ "$3" = "print-dev-env" ]; then
+  staged="${{8#path:}}"
+  [ -f "$staged/flake.nix" ] || exit 10
+  [ -f "$staged/flake.lock" ] || exit 11
+  [ ! -e "$staged/other.nix" ] || exit 12
+  ln -sf {host_obj:?} "$6"
+  printf '{{"variables": {{"PATH": {{"type": "exported", "value": "{store_a}/bin"}}}}}}'
+elif [ "$3" = "path-info" ]; then
+  printf '%s\n' "{store_a}"
+fi
+"#,
+                calls = calls,
+                host_obj = host_obj,
+                store_a = store_a,
+            ),
+        );
+
+        let make_p = || f.provider(&nix_bin).with_store_check_root(&fake_store_root);
+        let out = make_p().manifest(&f.ctx()).unwrap();
+        assert_eq!(out.manifest.grants.fs.ro.len(), 1);
+        let c1 = fs::read_to_string(&calls).unwrap().lines().count();
+        assert_eq!(c1, 2);
+
+        // Cache hit
+        make_p().manifest(&f.ctx()).unwrap();
+        let c2 = fs::read_to_string(&calls).unwrap().lines().count();
+        assert_eq!(c2, 2);
+
+        // Invalidate by modifying flake.lock
+        fs::write(f.ws.join("flake.lock"), "{ \"version\": 2 }").unwrap();
+        make_p().manifest(&f.ctx()).unwrap();
+        let c3 = fs::read_to_string(&calls).unwrap().lines().count();
+        assert_eq!(c3, 4);
+    }
+
+    #[test]
+    fn empty_gitignore_and_regular_file_dotgit_worktree_supported() {
+        let f = TestFixture::new();
+        fs::write(f.ws.join("flake.nix"), "{}").unwrap();
+        fs::write(f.ws.join(".gitignore"), "").unwrap();
+        fs::write(f.ws.join(".git"), "gitdir: /outside/worktrees/ws\n").unwrap();
+
+        let store_a = format!("/nix/store/{HASH_A}-test-1.0");
+        let nix_bin = write_fake_nix(
+            &f.bin,
+            &format!(
+                r#"if [ "$3" = "print-dev-env" ]; then
+  staged="${{8#path:}}"
+  [ -f "$staged/flake.nix" ] || exit 10
+  [ -f "$staged/.gitignore" ] || exit 11
+  [ ! -e "$staged/.git" ] || exit 12
+  ln -s /bin/sh "$6"
+  printf '{{"variables": {{"PATH": {{"type": "exported", "value": "{store_a}/bin"}}}}}}'
+elif [ "$3" = "path-info" ]; then
+  printf '%s\n' "{store_a}"
+fi
+"#
+            ),
+        );
+
+        let out = f.provider(&nix_bin).manifest(&f.ctx()).unwrap();
+        assert_eq!(out.manifest.grants.fs.ro.len(), 1);
     }
 }

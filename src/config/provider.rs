@@ -296,6 +296,84 @@ impl fmt::Display for NixSource {
     }
 }
 
+/// A gitignore-style glob pattern relative to the target root configured on
+/// a `nix` provider (`ignore = [...]`).
+///
+/// Non-empty, free of NUL bytes and control characters, not starting with `!`
+/// (negation is not supported in explicit provider `ignore` rules), naming a
+/// relative path or pattern without empty, `.`, or `..` components, and compiling
+/// as a valid glob.
+///
+/// # Examples
+///
+/// ```
+/// use stopit::config::NixIgnorePattern;
+///
+/// let pat: NixIgnorePattern = "buck-out".parse().unwrap();
+/// assert_eq!(pat.as_str(), "buck-out");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(try_from = "String")]
+pub struct NixIgnorePattern(String);
+
+impl NixIgnorePattern {
+    /// The ignore pattern as written.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for NixIgnorePattern {
+    type Err = ValueError;
+
+    fn from_str(s: &str) -> Result<Self, ValueError> {
+        let bad = |why: &str| ValueError::new(format!("invalid nix ignore pattern {s:?}: {why}"));
+        if s.is_empty() {
+            return Err(bad("must not be empty"));
+        }
+        if s.contains('\0') {
+            return Err(bad("must not contain NUL bytes"));
+        }
+        if s.chars().any(char::is_control) {
+            return Err(bad("must not contain control characters"));
+        }
+        if s.starts_with('!') {
+            return Err(bad(
+                "negation (`!`) is not supported in `ignore` patterns; list only paths to exclude",
+            ));
+        }
+        let without_leading = s.strip_prefix('/').unwrap_or(s);
+        let trimmed = without_leading.strip_suffix('/').unwrap_or(without_leading);
+        if trimmed.is_empty() {
+            return Err(bad("must name a relative path or pattern"));
+        }
+        for component in trimmed.split('/') {
+            if component.is_empty() || component == "." || component == ".." {
+                return Err(bad("must not contain empty, `.`, or `..` path components"));
+            }
+        }
+        globset::GlobBuilder::new(trimmed)
+            .literal_separator(true)
+            .build()
+            .map_err(|err| bad(&err.to_string()))?;
+        Ok(NixIgnorePattern(s.to_owned()))
+    }
+}
+
+impl TryFrom<String> for NixIgnorePattern {
+    type Error = ValueError;
+
+    fn try_from(s: String) -> Result<Self, ValueError> {
+        s.parse()
+    }
+}
+
+impl fmt::Display for NixIgnorePattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// How the `vcs` provider presents VCS metadata in its target profile (§7.3).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -359,6 +437,12 @@ pub enum ProviderKind {
         /// Whether the devShell's `shellHook` runs inside the sandbox before
         /// the target command; defaults to `true`.
         shell_hook: bool,
+        /// Whether `.gitignore` files inside the target tree exclude paths from
+        /// validation, cache hashing, and flake staging; defaults to `true`.
+        gitignore: bool,
+        /// Additional gitignore-style glob patterns relative to the target root
+        /// excluded from validation, cache hashing, and flake staging.
+        ignore: Vec<NixIgnorePattern>,
     },
 }
 
@@ -414,6 +498,8 @@ struct RawProviderEntry {
     flake: Option<NixSource>,
     cache: Option<bool>,
     shell_hook: Option<bool>,
+    gitignore: Option<bool>,
+    ignore: Option<Vec<NixIgnorePattern>>,
 }
 
 impl TryFrom<MapOnly<RawProviderEntry>> for ProviderEntry {
@@ -442,7 +528,7 @@ impl TryFrom<MapOnly<RawProviderEntry>> for ProviderEntry {
         }
 
         // Keys that are present, with the types that accept them.
-        let present: [(&str, bool, &[&str]); 13] = [
+        let present: [(&str, bool, &[&str]); 15] = [
             (
                 "profile",
                 raw.profile.is_some(),
@@ -460,6 +546,8 @@ impl TryFrom<MapOnly<RawProviderEntry>> for ProviderEntry {
             ("flake", raw.flake.is_some(), &["nix"]),
             ("cache", raw.cache.is_some(), &["nix"]),
             ("shell_hook", raw.shell_hook.is_some(), &["nix"]),
+            ("gitignore", raw.gitignore.is_some(), &["nix"]),
+            ("ignore", raw.ignore.is_some(), &["nix"]),
         ];
         if let Some((key, _, owners)) = present
             .iter()
@@ -518,6 +606,8 @@ impl TryFrom<MapOnly<RawProviderEntry>> for ProviderEntry {
                     flake: raw.flake,
                     cache: raw.cache.unwrap_or(true),
                     shell_hook: raw.shell_hook.unwrap_or(true),
+                    gitignore: raw.gitignore.unwrap_or(true),
+                    ignore: raw.ignore.unwrap_or_default(),
                 }
             }
             _ => ProviderKind::Vcs {
@@ -606,7 +696,7 @@ mod tests {
         };
         assert_eq!(nix_prof, &pref("main"));
         assert_eq!(nix_sb.grants.fs.warn_missing, Some(false));
-        assert_eq!(nix_sb.grants.fs.protected.len(), 2);
+        assert_eq!(nix_sb.grants.fs.protected.len(), 3);
 
         let ProviderKind::Vcs {
             profile: vcs_prof,
@@ -741,6 +831,8 @@ mod tests {
             ("type = \"config\"\nview = \"ro\"", "view", "config"),
             ("type = \"config\"\nshims = {}", "shims", "config"),
             ("type = \"config\"\nsigning = true", "signing", "config"),
+            ("type = \"config\"\ngitignore = true", "gitignore", "config"),
+            ("type = \"config\"\nignore = [\"x\"]", "ignore", "config"),
             (
                 "type = \"script\"\nsource = \"x\"\nsandbox = {}",
                 "sandbox",
@@ -756,10 +848,22 @@ mod tests {
                 "signing",
                 "script",
             ),
+            (
+                "type = \"script\"\nsource = \"x\"\ngitignore = false",
+                "gitignore",
+                "script",
+            ),
+            (
+                "type = \"script\"\nsource = \"x\"\nignore = [\"x\"]",
+                "ignore",
+                "script",
+            ),
             ("type = \"vcs\"\nsource = \"x\"", "source", "vcs"),
             ("type = \"vcs\"\nsandbox = {}", "sandbox", "vcs"),
             ("type = \"vcs\"\nprotect = true", "protect", "vcs"),
             ("type = \"vcs\"\nconfig = {}", "config", "vcs"),
+            ("type = \"vcs\"\ngitignore = true", "gitignore", "vcs"),
+            ("type = \"vcs\"\nignore = [\"x\"]", "ignore", "vcs"),
         ] {
             let msg = err(&format!(
                 "[[provider]]\nname = \"p\"\nprofile = \"main\"\n{src}"
@@ -798,19 +902,40 @@ mod tests {
                 flake: None,
                 cache: true,
                 shell_hook: true,
+                gitignore: true,
+                ignore: Vec::new(),
             }
         );
 
-        let e_no_hook = one(
-            "[[provider]]\nname = \"nix\"\ntype = \"nix\"\nprofile = \"main\"\nshell_hook = false",
+        let e_custom = one(
+            "[[provider]]\nname = \"nix\"\ntype = \"nix\"\nprofile = \"main\"\nshell_hook = false\ngitignore = false\nignore = [\"buck-out\", \"*.log\", \"gen/**\"]",
         );
         assert!(matches!(
-            e_no_hook.kind,
+            e_custom.kind,
             ProviderKind::Nix {
                 shell_hook: false,
+                gitignore: false,
+                ref ignore,
                 ..
-            }
+            } if ignore.iter().map(|p| p.as_str()).collect::<Vec<_>>() == ["buck-out", "*.log", "gen/**"]
         ));
+
+        for bad in [
+            "",
+            "!keep",
+            "../escape",
+            "a/../b",
+            "a//b",
+            "/",
+            "//buck-out",
+            "buck-out//",
+            "[unclosed",
+        ] {
+            let msg = err(&format!(
+                "[[provider]]\nname = \"nix\"\ntype = \"nix\"\nprofile = \"main\"\nignore = [{bad:?}]"
+            ));
+            assert!(msg.contains("invalid nix ignore pattern"), "{bad:?}: {msg}");
+        }
 
         let msg = err(
             "[[provider]]\nname = \"nix\"\ntype = \"nix\"\nprofile = \"main\"\n\

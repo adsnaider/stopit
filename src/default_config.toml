@@ -70,11 +70,11 @@ ephemeral = ["/tmp", "~"]
 pass = ["TERM", "LANG", "COLORTERM"]
 deny = ["*_TOKEN", "*_KEY", "*_SECRET", "*_PASSWORD", "AWS_*", "GITHUB_*", "SSH_AUTH_SOCK", "NIX_CONFIG"]
 
-# Protect Nix files evaluated on the host. In a repository where the sandbox
-# is meant to edit Nix files (such as a NixOS configuration repo), disable this
-# in `.stopit.toml` with `[[provider]]` + `name = "protect-nix"` + `enabled = false`
-# (and also set `enabled = false` on `name = "nix"` if enabled globally, so
-# transitive `.nix` imports are not evaluated on the host).
+# Protect Nix and .gitignore files evaluated on the host. In a repository where
+# the sandbox is meant to edit Nix files (such as a NixOS configuration repo),
+# disable this in `.stopit.toml` with `[[provider]]` + `name = "protect-nix"` +
+# `enabled = false` (and also set `enabled = false` on `name = "nix"` if enabled
+# globally, so transitive `.nix` imports are not evaluated on the host).
 [[provider]]
 name = "protect-nix"
 type = "config"
@@ -82,7 +82,7 @@ profile = "main"
 
 [provider.sandbox.fs]
 warn_missing = false
-protected = ["{workspace}/**/*.nix", "{workspace}/flake.lock"]
+protected = ["{workspace}/**/*.nix", "{workspace}/flake.lock", "{workspace}/**/.gitignore"]
 
 # Version control masking and brokered `jj` / `git` shims.
 # Contributed profiles `ro`, `local`, and `remote` are created automatically
@@ -182,3 +182,5 @@ rules = [
 # type = "nix"
 # profile = "main"
 # shell_hook = true
+# gitignore = true
+# ignore = ["buck-out"]

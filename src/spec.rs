@@ -4974,6 +4974,7 @@ mod tests {
         f.file("ws/flake.nix");
         f.file("ws/nix/a.nix");
         f.file("ws/flake.lock");
+        f.file("ws/.gitignore");
 
         // Standalone `DEFAULT_CONFIG_TOML` compiles directly without layering.
         let standalone_cfg = Config::from_toml_str(crate::config::DEFAULT_CONFIG_TOML).unwrap();
@@ -4992,14 +4993,14 @@ mod tests {
             layered.get(&pr("main")).unwrap().spec,
         );
 
-        // Disabling `protect-nix` in `.stopit.toml` leaves `.nix` and `flake.lock`
-        // writable directly in `main`.
+        // Disabling `protect-nix` in `.stopit.toml` leaves `.nix`, `flake.lock`,
+        // and `.gitignore` writable directly in `main`.
         let disabled = f.compile("[[provider]]\nname = \"protect-nix\"\nenabled = false\n");
         let disabled_mounts = mounts(spec(&disabled, "main"));
         assert!(
             !disabled_mounts
                 .iter()
-                .any(|(p, _, _)| p.contains(".nix") || p.contains("flake.lock")),
+                .any(|(p, _, _)| p.contains(".nix") || p.contains("flake.lock") || p.contains(".gitignore")),
             "{disabled_mounts:?}"
         );
 
@@ -5021,6 +5022,10 @@ mod tests {
         );
         assert!(
             over_mounts.contains(&row("/workspace/flake.lock", Rw, "allow-nix")),
+            "{over_mounts:?}"
+        );
+        assert!(
+            over_mounts.contains(&row("/workspace/.gitignore", Protected, "protect-nix")),
             "{over_mounts:?}"
         );
     }
@@ -6833,7 +6838,7 @@ mod tests {
         let all_globs: Vec<(&str, PathMode)> = [
             rep("base", Masked, base_globs_masked),
             rep("base", Protected, base_globs_protected),
-            rep("protect-nix", Protected, 1),
+            rep("protect-nix", Protected, 2),
         ]
         .concat();
         let globs_and_literals: Vec<(&str, PathMode)> = [
@@ -6843,7 +6848,7 @@ mod tests {
                 Protected,
                 base_globs_protected + base_literals_protected,
             ),
-            rep("protect-nix", Protected, 2),
+            rep("protect-nix", Protected, 3),
         ]
         .concat();
         let nix_and_literals: Vec<(&str, PathMode)> = [
@@ -6851,6 +6856,7 @@ mod tests {
             rep("protect-nix", Protected, 2),
         ]
         .concat();
+        #[allow(clippy::type_complexity)]
         let cases: [(&[&str], &str, u32, Vec<(&str, PathMode)>); 4] = [
             // Every `**` glob fails to read it.
             (

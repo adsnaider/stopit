@@ -624,6 +624,8 @@ pub fn from_entry_with_origin(
             flake,
             cache,
             shell_hook,
+            gitignore,
+            ignore,
         } => Ok(Box::new(
             NixProvider::with_origin(
                 entry.name.clone(),
@@ -635,7 +637,9 @@ pub fn from_entry_with_origin(
                 base_dir,
                 origin,
             )
-            .with_shell_hook(*shell_hook),
+            .with_shell_hook(*shell_hook)
+            .with_gitignore(*gitignore)
+            .with_ignore(ignore.clone()),
         )),
     }
 }

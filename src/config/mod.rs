@@ -14,7 +14,8 @@ mod provider;
 
 pub use profile::{Inherit, ProfileDecl, ProfileName, ProfileRef};
 pub use provider::{
-    NixShell, NixSource, ProviderEntry, ProviderKind, ProviderName, ScriptSource, VcsView,
+    NixIgnorePattern, NixShell, NixSource, ProviderEntry, ProviderKind, ProviderName, ScriptSource,
+    VcsView,
 };
 
 /// Embedded TOML template printed by `stopit default-config`.
@@ -779,6 +780,8 @@ const NIX_COMMENTED_PROVIDERS: &str = "    # --- Host tools (uncomment the recip
     #   type = \"nix\";
     #   profile = \"main\";
     #   shell_hook = true;
+    #   # gitignore = true;
+    #   # ignore = [ \"buck-out\" ];
     # }";
 
 /// Renders [`DEFAULT_CONFIG_TOML`] as a Nix attribute set (`stopit default-config --format nix`),

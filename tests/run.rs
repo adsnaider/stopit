@@ -6620,7 +6620,7 @@ fi
     );
     let logged = fs::read_to_string(&args_log).unwrap();
     assert!(
-        logged.contains(&format!("{}#agent", s.ws().display())),
+        logged.contains("path:") && logged.contains("#agent"),
         "{logged}"
     );
 
