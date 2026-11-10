@@ -64,9 +64,10 @@ pub enum CliCommand {
     /// Create an empty `.stopit.toml` in the workspace (refusing if one
     /// already exists) and allow it.
     Init {
-        /// Which workspace.
-        #[command(flatten)]
-        workspace: WorkspaceArg,
+        /// The workspace directory to initialize [default: the current
+        /// directory].
+        #[arg(long, value_name = "DIR")]
+        workspace: Option<PathBuf>,
     },
     /// Allow the workspace's existing `.stopit.toml`. Review it first, since
     /// it decides what the sandbox may do and which scripts run on the host.
@@ -347,14 +348,12 @@ mod tests {
         );
         assert_eq!(
             parse(&["init"]).unwrap(),
-            CliCommand::Init {
-                workspace: WorkspaceArg::default()
-            }
+            CliCommand::Init { workspace: None }
         );
         assert_eq!(
             parse(&["init", "--workspace", "w"]).unwrap(),
             CliCommand::Init {
-                workspace: ws(Some("w"))
+                workspace: Some("w".into())
             }
         );
         assert_eq!(

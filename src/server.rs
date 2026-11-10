@@ -759,7 +759,7 @@ pub(crate) fn pick_server(
         };
         if let Some(given) = &invocation.workspace {
             let ws = discover_workspace(cwd, Some(given))?;
-            let workspace = ws.dir;
+            let workspace = ws.dir.clone();
             if workspace != server.record.workspace() {
                 return Err(RunError::ServerWorkspace {
                     id: id.clone(),
@@ -767,6 +767,7 @@ pub(crate) fn pick_server(
                     served: server.record.workspace(),
                 });
             }
+            ws.require_config(true)?;
         }
         return connect(&server).map(Some);
     }

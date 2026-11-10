@@ -54,6 +54,14 @@ fn help_prints_to_stdout_and_exits_zero() {
     }
     // The internal init helper is not advertised.
     assert!(!help.contains("__init"), "{help}");
+
+    let init_help_out = stopit().args(["init", "--help"]).output().unwrap();
+    assert_eq!(init_help_out.status.code(), Some(0));
+    let init_help = String::from_utf8(init_help_out.stdout).unwrap();
+    assert!(
+        init_help.contains("[default: the current directory]"),
+        "{init_help}"
+    );
 }
 
 #[test]

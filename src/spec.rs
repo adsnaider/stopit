@@ -645,6 +645,45 @@ pub enum SpecError {
     /// host paths"). Boxed to keep `SpecError` small.
     #[error(transparent)]
     ReservedHostSource(Box<ReservedHostSource>),
+    /// An allowed `.stopit.toml` in `allowed.json` lies inside a writable
+    /// mount of the profile and either cannot be inspected (an ancestor
+    /// directory inside the writable mount cannot be searched) or has
+    /// rewritable hard links (§3).
+    #[error(transparent)]
+    AllowedConfig(Box<AllowedConfigError>),
+}
+
+/// Failure protecting another workspace's allowed `.stopit.toml` exposed inside
+/// a writable mount.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum AllowedConfigError {
+    /// Inspecting the allowed configuration path inside a writable mount failed
+    /// (for example because a directory inside the writable mount has mode
+    /// `0000`).
+    #[error(
+        "cannot inspect allowed configuration {path:?} inside a writable mount ({}): \
+         restore directory search permissions or run `stopit revoke` on it",
+        io::Error::from(*.kind)
+    )]
+    Uninspectable {
+        /// Canonical path recorded in `allowed.json`.
+        path: PathBuf,
+        /// Error kind from `openat2` / `openat` / `statx`.
+        kind: io::ErrorKind,
+    },
+    /// The allowed configuration file has multiple hard links while exposed
+    /// inside a writable mount.
+    #[error(
+        "refusing to expose allowed configuration {path:?} inside a writable mount while it has \
+         {links} hard links, since a sandbox could rewrite it through another name; give it a \
+         single link or run `stopit revoke` on it"
+    )]
+    HardLinked {
+        /// Canonical path recorded in `allowed.json`.
+        path: PathBuf,
+        /// Link count (`stx_nlink`).
+        links: u64,
+    },
 }
 
 /// A restrictive mount's destination could not be checked for symlinks: a
@@ -1549,6 +1588,7 @@ fn check_host_sources(
     ctx: &ExpansionContext,
     roots: &UntrustedRoots,
     protected: &[SourceToProtect<'_>],
+    allowed: &crate::trust::Allowed,
     vcs_providers: &BTreeSet<ProviderName>,
     state: &StateDirs,
     warnings: &mut Vec<SpecWarning>,
@@ -1715,6 +1755,7 @@ fn check_host_sources(
         .collect();
     let mounts = cover_restricted_exposure(kept, &sources, ws_host, vcs_providers, warnings);
     let mounts = protect_sources(mounts, &rw_sources, protected, state, warnings);
+    let mounts = protect_allowed_configs(mounts, &rw_sources, protected, allowed, state)?;
     let workspace = (ws_host, ctx.workspace_sandbox());
     let mounts = check_state_dirs(mounts, &canonical, workspace, state, warnings)?;
     let (mounts, lazy_socket_scan) = match (mask_sockets, defer_socket_scan) {
@@ -2543,6 +2584,207 @@ fn protect_sources(
     mounts.extend(added);
     sort_plan(&mut mounts);
     mounts
+}
+
+/// Protects any allowed `.stopit.toml` in `allowed` that a kept `rw` mount of
+/// the profile exposes without overmounting (DESIGN.md §3).
+///
+/// Entries outside the profile's `rw` mounts are never touched. For an entry
+/// `p_path` inside a canonical `rw` mount `s`, inspects `p_path` via `O_PATH`
+/// and `statx(EMPTY_PATH)` without requiring `0o022 == 0` or read permission so
+/// a sandbox cannot disable protection across runs with `chmod 0777` or
+/// `chmod 0000`, failing closed if an ancestor directory inside `s` is
+/// unsearchable (`EACCES`) or if `p_path` has rewritable hard links.
+fn protect_allowed_configs(
+    mut mounts: Vec<PlannedMount>,
+    rw_sources: &BTreeMap<PathBuf, PathBuf>,
+    already_protected: &[SourceToProtect<'_>],
+    allowed: &crate::trust::Allowed,
+    state: &StateDirs,
+) -> Result<Vec<PlannedMount>, SpecError> {
+    if allowed.is_empty() || rw_sources.is_empty() {
+        return Ok(mounts);
+    }
+    let stopit: ProviderName = SUPERVISOR_PROVIDER_NAME
+        .parse()
+        .expect("the supervisor's name is a valid provider name");
+    let mut added: BTreeMap<PathBuf, PlannedMount> = BTreeMap::new();
+    {
+        let at: BTreeSet<&Path> = mounts.iter().map(|m| m.sandbox.as_path()).collect();
+        for (p_path, stored_id) in allowed.iter() {
+            if already_protected.iter().any(|sp| sp.path == p_path) {
+                continue;
+            }
+            if state.iter().any(|(_, sp)| p_path.starts_with(&sp.path)) {
+                continue;
+            }
+            let mut exposures: Vec<(&Path, &Path, PathBuf)> = Vec::new();
+            for m in &mounts {
+                if m.mode != PathMode::Rw {
+                    continue;
+                }
+                let Some(s) = rw_sources.get(&m.sandbox) else {
+                    continue;
+                };
+                let Ok(rel) = p_path.strip_prefix(s) else {
+                    continue;
+                };
+                let x = join_rel(&m.sandbox, rel);
+                let overmounted = x
+                    .ancestors()
+                    .take_while(|a| *a != m.sandbox)
+                    .any(|a| at.contains(a));
+                if !overmounted {
+                    exposures.push((s.as_path(), rel, x));
+                }
+            }
+            let Some(&(first_s, first_rel, _)) = exposures.first() else {
+                continue;
+            };
+            if !inspect_allowed_for_protection(first_s, first_rel, p_path, stored_id)? {
+                continue;
+            }
+            for (_, _, x) in exposures {
+                added.entry(x.clone()).or_insert_with(|| PlannedMount {
+                    sandbox: x,
+                    source: MountSource::Host {
+                        path: p_path.to_owned(),
+                        kind: EntryKind::File,
+                    },
+                    mode: PathMode::Protected,
+                    provider: stopit.clone(),
+                    glob_link: false,
+                });
+            }
+        }
+    }
+    if added.is_empty() {
+        return Ok(mounts);
+    }
+    let added: Vec<PlannedMount> = added.into_values().collect();
+    debug_assert!(check_mount_destinations(&added, true).is_ok());
+    mounts.retain(|m| added.iter().all(|a| a.sandbox != m.sandbox));
+    mounts.extend(added);
+    sort_plan(&mut mounts);
+    Ok(mounts)
+}
+
+fn inspect_allowed_for_protection(
+    s: &Path,
+    rel: &Path,
+    p_path: &Path,
+    stored_id: crate::trust::FileIdentity,
+) -> Result<bool, SpecError> {
+    use rustix::fs::{
+        AtFlags, CWD, Mode, OFlags, ResolveFlags, StatxFlags, openat, openat2, statx,
+    };
+    use rustix::io::Errno;
+
+    let fail_errno = |e: Errno| {
+        SpecError::AllowedConfig(Box::new(AllowedConfigError::Uninspectable {
+            path: p_path.to_owned(),
+            kind: io::Error::from(e).kind(),
+        }))
+    };
+    let fail_io = |e: io::Error| {
+        SpecError::AllowedConfig(Box::new(AllowedConfigError::Uninspectable {
+            path: p_path.to_owned(),
+            kind: e.kind(),
+        }))
+    };
+
+    let fd = if rel.as_os_str().is_empty() {
+        let (Some(dir), Some(name)) = (p_path.parent(), p_path.file_name()) else {
+            return Ok(false);
+        };
+        let dir_fd = match openat2(
+            CWD,
+            dir,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS,
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT | Errno::NOTDIR) => return Ok(false),
+            Err(e) => return Err(fail_errno(e)),
+        };
+        match openat(
+            &dir_fd,
+            name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT | Errno::NOTDIR | Errno::LOOP) => return Ok(false),
+            Err(e) => return Err(fail_errno(e)),
+        }
+    } else {
+        let Some(name) = rel.file_name() else {
+            return Ok(false);
+        };
+        let s_fd = match openat2(
+            CWD,
+            s,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS,
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT | Errno::NOTDIR) => return Ok(false),
+            Err(e) => return Err(fail_errno(e)),
+        };
+        let dir_fd = match rel.parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(rel_dir) => match openat2(
+                &s_fd,
+                rel_dir,
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::NO_SYMLINKS,
+            ) {
+                Ok(fd) => fd,
+                Err(Errno::NOENT | Errno::NOTDIR | Errno::LOOP) => return Ok(false),
+                Err(e) => return Err(fail_errno(e)),
+            },
+            None => s_fd,
+        };
+        match openat(
+            &dir_fd,
+            name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT | Errno::NOTDIR | Errno::LOOP) => return Ok(false),
+            Err(e) => return Err(fail_errno(e)),
+        }
+    };
+
+    let stx = statx(
+        &fd,
+        "",
+        AtFlags::EMPTY_PATH,
+        StatxFlags::BASIC_STATS | StatxFlags::BTIME,
+    )
+    .map_err(fail_errno)?;
+    if u32::from(stx.stx_mode) & libc::S_IFMT != libc::S_IFREG {
+        return Ok(false);
+    }
+    let actual_id = crate::trust::FileIdentity::from_statx(&stx).map_err(fail_io)?;
+    if actual_id != stored_id {
+        return Ok(false);
+    }
+    let is_nix_store_immutable = p_path.starts_with("/nix/store/")
+        && stx.stx_uid == 0
+        && u32::from(stx.stx_mode) & 0o222 == 0;
+    if stx.stx_nlink > 1 && !is_nix_store_immutable {
+        return Err(SpecError::AllowedConfig(Box::new(
+            AllowedConfigError::HardLinked {
+                path: p_path.to_owned(),
+                links: u64::from(stx.stx_nlink),
+            },
+        )));
+    }
+    Ok(true)
 }
 
 /// `base` joined with the relative path `rel`, or `base` itself if `rel` is
@@ -3549,6 +3791,7 @@ fn compile_profile(
     roots.add_rw_mounts(None, &planned.plan.mounts);
     let scan_cache = Arc::new(SocketScanCache::default());
     let vcs_providers = BTreeSet::new();
+    let default_allowed = crate::trust::Allowed::default();
     finish_profile_inner(
         planned,
         grants,
@@ -3556,6 +3799,7 @@ fn compile_profile(
         ctx,
         &roots,
         &[],
+        &default_allowed,
         &vcs_providers,
         state,
         false,
@@ -3626,6 +3870,7 @@ fn finish_profile_inner(
     ctx: &ExpansionContext,
     roots: &UntrustedRoots,
     protected: &[SourceToProtect<'_>],
+    allowed: &crate::trust::Allowed,
     vcs_providers: &BTreeSet<ProviderName>,
     state: &StateDirs,
     defer_socket_scan: bool,
@@ -3648,6 +3893,7 @@ fn finish_profile_inner(
         &profile_ctx,
         roots,
         protected,
+        allowed,
         vcs_providers,
         state,
         &mut warnings,
@@ -3810,12 +4056,14 @@ impl CompiledSession {
     /// only the leaf profile and clones all other profiles from `self`.
     /// Returns `Ok(None)` if `extra` is not a single new contributed profile or
     /// if its mounts introduce a new `rw` untrusted root.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn compile_extra_profile_lazy(
         &self,
         config: &Config,
         base_outputs: &[(ProviderName, ProviderOutput)],
         extra: (ProviderName, ProviderOutput),
         protected: &[ProtectedSource],
+        allowed: &crate::trust::Allowed,
         state: &StateDirs,
         ctx: &ExpansionContext,
     ) -> Result<Option<CompiledSession>, CompileError> {
@@ -3868,6 +4116,7 @@ impl CompiledSession {
             ctx,
             &self.roots,
             &protected,
+            allowed,
             &vcs_providers,
             state,
             true,
@@ -4024,6 +4273,7 @@ pub fn compile_session_granted(
         config,
         outputs,
         protected,
+        &crate::trust::Allowed::default(),
         state,
         ctx,
         granted,
@@ -4047,6 +4297,7 @@ pub fn compile_session_granted_lazy(
         config,
         outputs,
         protected,
+        &crate::trust::Allowed::default(),
         state,
         ctx,
         granted,
@@ -4055,18 +4306,29 @@ pub fn compile_session_granted_lazy(
     )
 }
 
-/// [`compile_session_granted_lazy`] reusing an existing [`SocketScanCache`].
-pub(crate) fn compile_session_granted_lazy_with_cache(
+/// [`compile_session_granted_lazy`] protecting `allowed` configurations across
+/// `rw` mounts and optionally reusing an existing [`SocketScanCache`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compile_session_granted_lazy_with_allowed(
     config: &Config,
     outputs: Vec<(ProviderName, ProviderOutput)>,
     protected: &[ProtectedSource],
+    allowed: &crate::trust::Allowed,
     state: &StateDirs,
     ctx: &ExpansionContext,
     granted: &BTreeSet<PathBuf>,
-    scan_cache: Arc<SocketScanCache>,
+    scan_cache: Option<Arc<SocketScanCache>>,
 ) -> Result<CompiledSession, CompileError> {
     compile_session_inner(
-        config, outputs, protected, state, ctx, granted, true, scan_cache,
+        config,
+        outputs,
+        protected,
+        allowed,
+        state,
+        ctx,
+        granted,
+        true,
+        scan_cache.unwrap_or_default(),
     )
 }
 
@@ -4084,6 +4346,7 @@ fn compile_session_inner(
     config: &Config,
     outputs: Vec<(ProviderName, ProviderOutput)>,
     protected: &[ProtectedSource],
+    allowed: &crate::trust::Allowed,
     state: &StateDirs,
     ctx: &ExpansionContext,
     granted: &BTreeSet<PathBuf>,
@@ -4131,6 +4394,7 @@ fn compile_session_inner(
             ctx,
             &roots,
             &protected,
+            allowed,
             &vcs_providers,
             state,
             defer_socket_scan,
@@ -6721,6 +6985,7 @@ mod tests {
             let mut warnings = Vec::new();
             let scan_cache = Arc::new(SocketScanCache::default());
             let vcs = BTreeSet::new();
+            let allowed = crate::trust::Allowed::default();
             let under = check_host_sources(
                 vec![ws.clone(), mask.clone(), protected.clone()],
                 false,
@@ -6729,6 +6994,7 @@ mod tests {
                 &f.ctx,
                 &roots,
                 &[],
+                &allowed,
                 &vcs,
                 &f.state,
                 &mut warnings,
@@ -6742,6 +7008,7 @@ mod tests {
                 &f.ctx,
                 &roots,
                 &[],
+                &allowed,
                 &vcs,
                 &f.state,
                 &mut Vec::new(),
@@ -6811,6 +7078,7 @@ mod tests {
         };
         let roots = UntrustedRoots::new(&f.ws());
         let vcs = BTreeSet::new();
+        let allowed = crate::trust::Allowed::default();
         let e = check_host_sources(
             vec![m],
             false,
@@ -6819,6 +7087,7 @@ mod tests {
             &f.ctx,
             &roots,
             &[],
+            &allowed,
             &vcs,
             &f.state,
             &mut Vec::new(),
@@ -10914,7 +11183,15 @@ fs.masked = [\"{workspace}/hidden\"]
         );
 
         let fast = base_session
-            .compile_extra_profile_lazy(&cfg, &base_outputs, extra.clone(), &[], &f.state, &f.ctx)
+            .compile_extra_profile_lazy(
+                &cfg,
+                &base_outputs,
+                extra.clone(),
+                &[],
+                &crate::trust::Allowed::default(),
+                &f.state,
+                &f.ctx,
+            )
             .unwrap()
             .expect("single-leaf extra profile");
         let mut full_outputs = base_outputs;

@@ -171,8 +171,8 @@ pub struct BirthTime {
     pub nsec: u32,
 }
 
-/// Allocation identity of an allowed `.stopit.toml` regular file: device,
-/// inode, and (when reported by the filesystem) creation timestamp.
+/// Allocation identity of an allowed `.stopit.toml` regular file, comprising
+/// its device, inode, and creation timestamp when reported by the filesystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileIdentity {
@@ -194,8 +194,21 @@ impl FileIdentity {
             AtFlags::EMPTY_PATH,
             StatxFlags::BASIC_STATS | StatxFlags::BTIME,
         )?;
+        Self::from_statx(&stx)
+    }
+
+    /// Extracts `(dev, ino, btime)` from a `statx(BASIC_STATS | BTIME)` result.
+    pub(crate) fn from_statx(stx: &rustix::fs::Statx) -> io::Result<Self> {
+        if stx.stx_mask & StatxFlags::INO.bits() == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "filesystem did not report inode number (STATX_INO)",
+            ));
+        }
         let dev = makedev(stx.stx_dev_major, stx.stx_dev_minor);
-        let btime = if stx.stx_mask & StatxFlags::BTIME.bits() != 0 {
+        let btime = if stx.stx_mask & StatxFlags::BTIME.bits() != 0
+            && stx.stx_btime.tv_nsec < 1_000_000_000
+        {
             Some(BirthTime {
                 sec: stx.stx_btime.tv_sec,
                 nsec: stx.stx_btime.tv_nsec,
@@ -287,16 +300,22 @@ impl Allowed {
     }
 
     /// Parses the store from `json` (`version = 2`, or migrating valid
-    /// `version = 1` entries whose on-disk file still matches its SHA-256).
-    fn from_json(json: &[u8]) -> Result<Self, String> {
+    /// `version = 1` entries whose on-disk file still matches its SHA-256),
+    /// returning `(allowed, migrated_from_v1)`.
+    fn from_json_versioned(json: &[u8]) -> Result<(Self, bool), String> {
         let header: StoreVersionProbe = serde_json::from_slice(json).map_err(|e| e.to_string())?;
         match header.version {
-            FORMAT_VERSION => Self::from_v2_json(json),
-            LEGACY_FORMAT_VERSION => Self::from_v1_json(json),
+            FORMAT_VERSION => Self::from_v2_json(json).map(|a| (a, false)),
+            LEGACY_FORMAT_VERSION => Self::from_v1_json(json).map(|a| (a, true)),
             other => Err(format!(
                 "unknown version {other}, expected {FORMAT_VERSION}"
             )),
         }
+    }
+
+    #[cfg(test)]
+    fn from_json(json: &[u8]) -> Result<Self, String> {
+        Self::from_json_versioned(json).map(|(a, _)| a)
     }
 
     fn from_v2_json(json: &[u8]) -> Result<Self, String> {
@@ -339,12 +358,28 @@ fn decode_store_path(raw_path: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(OsString::from_vec(bytes)))
 }
 
-/// Checks whether a legacy `v1` entry's file still exists as a trusted regular
-/// file with the exact `expected_hash`, returning its current [`FileIdentity`]
-/// if so.
+/// Checks whether a legacy `v1` entry's canonical `path` still exists without
+/// symlinks on the way as a trusted single-link regular file matching
+/// `expected_hash`, returning its current [`FileIdentity`] if so.
 fn migrate_v1_entry(path: &Path, expected_hash: &str, uid: u32) -> Option<FileIdentity> {
-    let fd = rustix::fs::open(
-        path,
+    let (dir, name) = (path.parent()?, path.file_name()?);
+    let dir_fd = rustix::fs::openat2(
+        rustix::fs::CWD,
+        dir,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        rustix::fs::ResolveFlags::NO_SYMLINKS,
+    )
+    .ok()?;
+    let dir_stat = rustix::fs::fstat(&dir_fd).ok()?;
+    if (dir_stat.st_uid != uid && dir_stat.st_uid != 0)
+        || (dir_stat.st_mode & 0o022 != 0 && dir_stat.st_mode & libc::S_ISVTX == 0)
+    {
+        return None;
+    }
+    let fd = rustix::fs::openat(
+        &dir_fd,
+        name,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NOCTTY | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )
@@ -353,6 +388,7 @@ fn migrate_v1_entry(path: &Path, expected_hash: &str, uid: u32) -> Option<FileId
     if stat.st_mode & libc::S_IFMT != libc::S_IFREG
         || stat.st_uid != uid
         || stat.st_mode & 0o022 != 0
+        || stat.st_nlink != 1
     {
         return None;
     }
@@ -496,7 +532,31 @@ impl TrustStore {
     }
 
     /// The allowed configurations: none if there is no store file yet.
+    ///
+    /// When the on-disk store is still in `version = 1` format, persists the
+    /// migrated `version = 2` store on a best-effort basis under the directory
+    /// lock (re-reading under the lock so concurrent `version = 2` updates are
+    /// never overwritten).
     pub fn read(&self) -> Result<Allowed, TrustError> {
+        let (allowed, was_v1) = self.read_unlocked()?;
+        if !was_v1 {
+            return Ok(allowed);
+        }
+        if rustix::fs::flock(&self.fd, FlockOperation::LockExclusive).is_ok() {
+            let refreshed = self.read_unlocked();
+            if let Ok((migrated, still_v1)) = refreshed {
+                if still_v1 {
+                    let _ = self.write(&migrated);
+                }
+                let _ = rustix::fs::flock(&self.fd, FlockOperation::Unlock);
+                return Ok(migrated);
+            }
+            let _ = rustix::fs::flock(&self.fd, FlockOperation::Unlock);
+        }
+        Ok(allowed)
+    }
+
+    fn read_unlocked(&self) -> Result<(Allowed, bool), TrustError> {
         let path = self.file_path();
         let read_error = |source: io::Error| TrustError::Read {
             path: path.clone(),
@@ -509,7 +569,7 @@ impl TrustStore {
             Mode::empty(),
         ) {
             Ok(fd) => fd,
-            Err(Errno::NOENT) => return Ok(Allowed::default()),
+            Err(Errno::NOENT) => return Ok((Allowed::default(), false)),
             Err(Errno::LOOP) => {
                 return Err(TrustError::Untrusted {
                     path,
@@ -527,13 +587,13 @@ impl TrustStore {
         )?;
         let mut json = Vec::new();
         File::from(fd).read_to_end(&mut json).map_err(read_error)?;
-        Allowed::from_json(&json).map_err(|reason| TrustError::Corrupt { path, reason })
+        Allowed::from_json_versioned(&json).map_err(|reason| TrustError::Corrupt { path, reason })
     }
 
     /// Reads the store, applies `change` to it, and writes it back if
-    /// `change` changed it, all under an exclusive lock on the directory,
-    /// so that concurrent updates do not lose each other's entries.
-    /// Returns what `change` returned.
+    /// `change` changed it (or if it was migrated from `version = 1`), all
+    /// under an exclusive lock on the directory, so that concurrent updates do
+    /// not lose each other's entries. Returns what `change` returned.
     pub fn update<R>(&self, change: impl FnOnce(&mut Allowed) -> R) -> Result<R, TrustError> {
         rustix::fs::flock(&self.fd, FlockOperation::LockExclusive).map_err(|e| {
             TrustError::Lock {
@@ -547,10 +607,10 @@ impl TrustStore {
     }
 
     fn locked_update<R>(&self, change: impl FnOnce(&mut Allowed) -> R) -> Result<R, TrustError> {
-        let mut allowed = self.read()?;
+        let (mut allowed, was_v1) = self.read_unlocked()?;
         let before = allowed.clone();
         let result = change(&mut allowed);
-        if allowed != before {
+        if was_v1 || allowed != before {
             self.write(&allowed)?;
         }
         Ok(result)
@@ -730,25 +790,79 @@ mod tests {
         let back = Allowed::from_json(&json).unwrap();
         assert_eq!(back, allowed);
 
-        // Legacy v1 migration: unmodified file migrates; modified file is dropped.
+        // Legacy v1 migration: unmodified single-link trusted file migrates;
+        // modified, hard-linked, parent-symlinked, or untrusted-directory files
+        // are dropped; `TrustStore::read` persists `version = 2` on disk so
+        // subsequent in-place edits stay allowed.
         let (_d, root) = tmp();
         let good = root.join("good.toml");
         let modified = root.join("modified.toml");
-        fs::write(&good, "ok").unwrap();
-        fs::set_permissions(&good, fs::Permissions::from_mode(0o644)).unwrap();
+        let hardlinked = root.join("hardlinked.toml");
+        let hardlinked_twin = root.join("hardlinked_twin.toml");
+        let real_dir = root.join("real_dir");
+        let link_dir = root.join("link_dir");
+        let unsafe_dir = root.join("unsafe_dir");
+        fs::create_dir(&real_dir).unwrap();
+        symlink(&real_dir, &link_dir).unwrap();
+        fs::create_dir(&unsafe_dir).unwrap();
+        fs::set_permissions(&unsafe_dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let via_parent_link = link_dir.join("cfg.toml");
+        let in_unsafe_dir = unsafe_dir.join("cfg.toml");
+
+        for p in [
+            &good,
+            &hardlinked,
+            &real_dir.join("cfg.toml"),
+            &in_unsafe_dir,
+        ] {
+            fs::write(p, "ok").unwrap();
+            fs::set_permissions(p, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        fs::hard_link(&hardlinked, &hardlinked_twin).unwrap();
         fs::write(&modified, "changed").unwrap();
         fs::set_permissions(&modified, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let store_dir = root.join("store");
+        let store = TrustStore::open(&store_dir).unwrap();
         let v1_json = format!(
-            "{{\"version\": 1, \"allowed\": {{\"{}\": \"{}\", \"{}\": \"{}\"}}}}",
+            "{{\"version\": 1, \"allowed\": {{\"{}\": \"{}\", \"{}\": \"{}\", \"{}\": \"{}\", \"{}\": \"{}\", \"{}\": \"{}\"}}}}",
             hex(good.as_os_str().as_bytes()),
             sha256_hex(b"ok"),
             hex(modified.as_os_str().as_bytes()),
             sha256_hex(b"original"),
+            hex(hardlinked.as_os_str().as_bytes()),
+            sha256_hex(b"ok"),
+            hex(via_parent_link.as_os_str().as_bytes()),
+            sha256_hex(b"ok"),
+            hex(in_unsafe_dir.as_os_str().as_bytes()),
+            sha256_hex(b"ok"),
         );
-        let migrated = Allowed::from_json(v1_json.as_bytes()).unwrap();
+        fs::write(store.file_path(), v1_json.as_bytes()).unwrap();
+        fs::set_permissions(store.file_path(), fs::Permissions::from_mode(0o600)).unwrap();
+
+        let migrated = store.read().unwrap();
         let good_id = FileIdentity::of_fd(File::open(&good).unwrap().as_fd()).unwrap();
         assert_eq!(migrated.decide(&good, good_id), Decision::Allowed);
         assert!(!migrated.contains(&modified));
+        assert!(!migrated.contains(&hardlinked));
+        assert!(!migrated.contains(&via_parent_link));
+        assert!(!migrated.contains(&in_unsafe_dir));
+
+        let persisted = fs::read_to_string(store.file_path()).unwrap();
+        assert!(persisted.contains("\"version\": 2"), "{persisted}");
+        // In-place edit to `good` preserves `(dev, ino, btime)` and stays allowed on re-read.
+        {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&good)
+                .unwrap();
+            f.write_all(b"edited in place\n").unwrap();
+        }
+        let reread = store.read().unwrap();
+        let good_id_after = FileIdentity::of_fd(File::open(&good).unwrap().as_fd()).unwrap();
+        assert_eq!(reread.decide(&good, good_id_after), Decision::Allowed);
+        fs::set_permissions(&unsafe_dir, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]

@@ -174,7 +174,7 @@ pub enum RunError {
     /// `stopit init` without `--workspace` was run inside an existing workspace.
     #[error(
         "refusing to initialize {CONFIG_FILE} in {dir:?} because {outer:?} already exists in a \
-         parent directory; run stopit from {:?} to use that workspace, or pass \
+         parent directory; `stopit run` in {dir:?} already uses workspace {:?}, or pass \
          `stopit init --workspace {}` to initialize a nested workspace explicitly",
         outer.parent().unwrap_or(Path::new("/")),
         quote_path(dir)
@@ -213,6 +213,15 @@ pub enum RunError {
     /// The configuration file cannot be read.
     #[error("cannot read {path:?}: {source}")]
     ReadConfig {
+        /// The configuration file.
+        path: PathBuf,
+        /// The underlying error.
+        source: io::Error,
+    },
+
+    /// The configuration file cannot be written.
+    #[error("cannot write {path:?}: {source}")]
+    WriteConfig {
         /// The configuration file.
         path: PathBuf,
         /// The underlying error.
@@ -636,15 +645,16 @@ fn init_config(workspace: Option<&Path>) -> Result<Vec<String>, RunError> {
             dir
         }
     };
+    let explicit_ws = workspace.map(|_| dir.clone());
     let config_path = dir.join(CONFIG_FILE);
     if config_in(&dir)?.is_some() {
         return Err(RunError::ConfigAlreadyExists {
             path: config_path,
-            workspace: workspace.map(|_| dir),
+            workspace: explicit_ws,
         });
     }
     let store = TrustStore::open(&data_dirs_from_host()?.store.path)?;
-    let identity = write_trusted_config(&dir, None, b"")?;
+    let identity = write_trusted_config(&dir, explicit_ws.as_deref(), None, b"")?;
     store.update(|allowed| allowed.allow(config_path.clone(), identity))?;
     Ok(vec![format!("initialized and allowed {config_path:?}")])
 }
@@ -735,18 +745,47 @@ enum EntryState {
 }
 
 fn entry_state(path: &Path, stored_id: FileIdentity) -> EntryState {
-    use rustix::fs::{Mode, OFlags};
-    match rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NOCTTY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+    use rustix::fs::{
+        AtFlags, CWD, Mode, OFlags, ResolveFlags, StatxFlags, openat, openat2, statx,
+    };
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return EntryState::Missing;
+    };
+    let dir_fd = match openat2(
+        CWD,
+        dir,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS,
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::LOOP) => return EntryState::Replaced,
+        Err(_) => return EntryState::Missing,
+    };
+    let fd = match openat(
+        &dir_fd,
+        name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     ) {
-        Ok(fd) => match FileIdentity::of_fd(fd.as_fd()) {
-            Ok(actual) if actual == stored_id => EntryState::Ok,
-            _ => EntryState::Replaced,
-        },
-        Err(Errno::NOENT) => EntryState::Missing,
-        Err(_) => EntryState::Replaced,
+        Ok(fd) => fd,
+        Err(Errno::NOENT | Errno::NOTDIR) => return EntryState::Missing,
+        Err(_) => return EntryState::Replaced,
+    };
+    let Ok(stx) = statx(
+        &fd,
+        "",
+        AtFlags::EMPTY_PATH,
+        StatxFlags::BASIC_STATS | StatxFlags::BTIME,
+    ) else {
+        return EntryState::Replaced;
+    };
+    if u32::from(stx.stx_mode) & libc::S_IFMT != libc::S_IFREG {
+        return EntryState::Replaced;
+    }
+    match FileIdentity::from_statx(&stx) {
+        Ok(actual) if actual == stored_id => EntryState::Ok,
+        _ => EntryState::Replaced,
     }
 }
 
@@ -889,8 +928,8 @@ fn no_default_profile_message(
             .parent()
             .unwrap_or_else(|| Path::new("~/.config/stopit"));
         return format!(
-            "no configuration file was found at {global_config:?} or {CONFIG_FILE}; \
-             run `mkdir -p {} && stopit default-config > {}` to create one",
+            "no global configuration was found at {global_config:?} and {CONFIG_FILE} defines no \
+             profiles; run `mkdir -p {} && stopit default-config > {}` to create one",
             quote_path(dir),
             quote_path(global_config),
         );
@@ -1027,7 +1066,7 @@ fn load_policy<S>(
         Some(gf) => Some(gf.parse_layer()?),
         None => None,
     };
-    let has_any_config = !file.bytes.is_empty() || global_file.is_some();
+    let has_any_config = !file.bytes.trim_ascii().is_empty() || global_file.is_some();
     let global_entries = global_layer
         .as_ref()
         .map(|layer| layer.providers.clone())
@@ -1090,11 +1129,6 @@ fn load_policy<S>(
         provider: supervisor_name.clone(),
         path: file.path.clone(),
     });
-    for extra in other_allowed_protected(&allowed, &file.path, &supervisor_name) {
-        if !protected.iter().any(|p| p.path == extra.path) {
-            protected.push(extra);
-        }
-    }
     for path in global_guarded {
         if !protected.iter().any(|p| p.path == path) {
             protected.push(ProtectedSource {
@@ -1108,13 +1142,15 @@ fn load_policy<S>(
         data: data_dirs,
         config: config_dirs,
     };
-    let compiled = crate::spec::compile_session_granted_lazy(
+    let compiled = crate::spec::compile_session_granted_lazy_with_allowed(
         &config,
         outputs.clone(),
         &protected,
+        &allowed,
         &state,
         &ctx,
         granted,
+        None,
     )?;
     let compile_warnings = warning_lines(&compiled);
     let policy = SessionPolicy {
@@ -1288,14 +1324,25 @@ impl LoadedSession {
             .map_err(|e| format!("cannot read {config_path:?} as UTF-8: {e}"))?
             .to_owned();
         let updated = crate::persist::update_config_toml(&existing_str, target)?;
-        write_trusted_config(&self.workspace.dir, Some(file.identity), updated.as_bytes())
-            .map_err(|e| e.to_string())?;
+        write_trusted_config(
+            &self.workspace.dir,
+            explicit,
+            Some(file.identity),
+            updated.as_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
         self.reload_locked().map_err(|e| e.to_string())?;
         Ok(())
     }
 
     fn granted(&self) -> std::sync::MutexGuard<'_, GrantedRw> {
         self.granted.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn read_allowed(&self) -> Result<Allowed, RunError> {
+        TrustStore::open(&self.state.data.store.path)?
+            .read()
+            .map_err(Into::into)
     }
 
     /// Compiles with `policy` and `outputs`, and `granted` as more untrusted
@@ -1306,13 +1353,16 @@ impl LoadedSession {
         outputs: Vec<(ProviderName, ProviderOutput)>,
         granted: &std::collections::BTreeSet<PathBuf>,
     ) -> Result<CompiledSession, RunError> {
-        Ok(crate::spec::compile_session_granted_lazy(
+        let allowed = self.read_allowed()?;
+        Ok(crate::spec::compile_session_granted_lazy_with_allowed(
             &policy.config,
             outputs,
             &policy.protected,
+            &allowed,
             &self.state,
             &policy.ctx,
             granted,
+            Some(policy.compiled.scan_cache()),
         )?)
     }
 
@@ -1350,14 +1400,16 @@ impl LoadedSession {
     ) -> Result<(Arc<SessionPolicy>, CompiledSession, Vec<String>), RunError> {
         let policy = self.policy();
         let granted = self.granted().paths.clone();
-        let compiled = crate::spec::compile_session_granted_lazy_with_cache(
+        let allowed = self.read_allowed()?;
+        let compiled = crate::spec::compile_session_granted_lazy_with_allowed(
             &policy.config,
             policy.outputs.clone(),
             &policy.protected,
+            &allowed,
             &self.state,
             &policy.ctx,
             &granted,
-            policy.compiled.scan_cache(),
+            Some(policy.compiled.scan_cache()),
         )?;
         let warnings = warning_lines(&compiled);
         Ok((policy, compiled, warnings))
@@ -1379,6 +1431,7 @@ impl LoadedSession {
         extra: (ProviderName, ProviderOutput),
         rw: &[PathBuf],
     ) -> Result<(CompiledSession, u64), RunError> {
+        let allowed = self.read_allowed()?;
         let (mut granted, generation) = {
             let state = self.granted();
             (state.paths.clone(), state.generation)
@@ -1393,6 +1446,7 @@ impl LoadedSession {
                 &policy.outputs,
                 extra.clone(),
                 &policy.protected,
+                &allowed,
                 &self.state,
                 &policy.ctx,
             )?
@@ -1402,14 +1456,15 @@ impl LoadedSession {
         granted.extend(rw.iter().cloned());
         let mut outputs = policy.outputs.clone();
         outputs.push(extra);
-        let compiled = crate::spec::compile_session_granted_lazy_with_cache(
+        let compiled = crate::spec::compile_session_granted_lazy_with_allowed(
             &policy.config,
             outputs,
             &policy.protected,
+            &allowed,
             &self.state,
             &policy.ctx,
             &granted,
-            policy.compiled.scan_cache(),
+            Some(policy.compiled.scan_cache()),
         )?;
         Ok((compiled, generation))
     }
@@ -2534,6 +2589,15 @@ fn allow_command_hint(workspace: Option<&Path>) -> String {
     }
 }
 
+fn missing_global_config_path() -> Option<PathBuf> {
+    let dirs = config_dirs_from_host().ok()?;
+    let global = dirs.active.path.join(GLOBAL_CONFIG_FILE);
+    match fs::symlink_metadata(&global) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Some(global),
+        _ => None,
+    }
+}
+
 fn no_config_message(dir: &Path, explicit: bool) -> String {
     let place = if explicit {
         format!("the workspace {}", dir.display())
@@ -2542,6 +2606,19 @@ fn no_config_message(dir: &Path, explicit: bool) -> String {
     };
     let init_cmd = init_command_hint(dir, explicit);
     let allow_cmd = allow_command_hint(explicit.then_some(dir));
+    if let Some(global) = missing_global_config_path() {
+        let cfg_dir = global
+            .parent()
+            .unwrap_or_else(|| Path::new("~/.config/stopit"));
+        return format!(
+            "no {CONFIG_FILE} in {place} (and no global configuration at {global:?}); \
+             run `mkdir -p {} && stopit default-config > {}` to create a global configuration, \
+             then run `{init_cmd}` in the project root to create and allow an empty {CONFIG_FILE} \
+             (or create {CONFIG_FILE} and run `{allow_cmd}`)",
+            quote_path(cfg_dir),
+            quote_path(&global),
+        );
+    }
     format!(
         "no {CONFIG_FILE} in {place}; stopit requires a {CONFIG_FILE} in the workspace root so \
          sandboxes cannot plant one where none existed; run `{init_cmd}` in the project root to \
@@ -2568,43 +2645,6 @@ fn not_allowed_message(path: &Path, replaced: bool, workspace: Option<&Path>) ->
 /// ([`shell_quote`]).
 fn quote_path(path: &Path) -> String {
     shell_quote(path.as_os_str().as_bytes())
-}
-
-/// Collects supervisor [`ProtectedSource`] entries for every other currently
-/// valid allowed `.stopit.toml` in `allowed`, so a sandbox with a broad `fs.rw`
-/// grant cannot modify or unlink another allowed workspace's configuration.
-fn other_allowed_protected(
-    allowed: &Allowed,
-    active_config: &Path,
-    supervisor_name: &ProviderName,
-) -> Vec<ProtectedSource> {
-    let mut out = Vec::new();
-    for (path, stored_id) in allowed.iter() {
-        if path == active_config {
-            continue;
-        }
-        let Ok(fd) = open_trusted(path) else {
-            continue;
-        };
-        let Ok(actual_id) = FileIdentity::of_fd(fd.as_fd()) else {
-            continue;
-        };
-        if actual_id != stored_id {
-            continue;
-        }
-        let file = File::from(fd);
-        let Ok(meta) = file.metadata() else {
-            continue;
-        };
-        if has_rewritable_hard_links(path, &meta) {
-            continue;
-        }
-        out.push(ProtectedSource {
-            provider: supervisor_name.clone(),
-            path: path.to_path_buf(),
-        });
-    }
-    out
 }
 
 /// Where [`RunError::NothingToAllow`] looked.
@@ -2762,13 +2802,14 @@ fn open_trusted(path: &Path) -> Result<rustix::fd::OwnedFd, RunError> {
 /// and mode `0644`.
 fn write_trusted_config(
     dir: &Path,
+    explicit_workspace: Option<&Path>,
     expected_identity: Option<FileIdentity>,
     bytes: &[u8],
 ) -> Result<FileIdentity, RunError> {
     use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, fstat, ftruncate, openat, openat2};
     use std::io::Write as _;
     let path = dir.join(CONFIG_FILE);
-    let io_error = |source: io::Error| RunError::ReadConfig {
+    let io_error = |source: io::Error| RunError::WriteConfig {
         path: path.clone(),
         source,
     };
@@ -2790,6 +2831,15 @@ fn write_trusted_config(
                 "the way to it, {dir:?}, runs through a symbolic link"
             )));
         }
+        Err(e @ (Errno::NOSYS | Errno::PERM)) => {
+            return Err(io_error(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "openat2 failed ({e}); stopit needs it on Linux 5.6 or later, without a \
+                     seccomp profile that blocks it"
+                ),
+            )));
+        }
         Err(e) => return Err(io_error(e.into())),
     };
     let dir_stat = fstat(&dir_fd).map_err(|e| io_error(e.into()))?;
@@ -2802,7 +2852,7 @@ fn write_trusted_config(
             Ownership::of(&dir_stat),
             uid,
         )
-        .map_err(&untrusted)?;
+        .map_err(untrusted)?;
     }
     let (flags, mode) = if expected_identity.is_some() {
         (
@@ -2826,7 +2876,7 @@ fn write_trusted_config(
         Err(Errno::EXIST) if expected_identity.is_none() => {
             return Err(RunError::ConfigAlreadyExists {
                 path,
-                workspace: None,
+                workspace: explicit_workspace.map(Path::to_path_buf),
             });
         }
         Err(Errno::LOOP) => return Err(untrusted("it is a symbolic link".into())),
@@ -2834,7 +2884,7 @@ fn write_trusted_config(
     };
     let file_stat = fstat(&fd).map_err(|e| io_error(e.into()))?;
     check_config_trust(Ownership::of(&file_stat), Ownership::of(&dir_stat), uid)
-        .map_err(&untrusted)?;
+        .map_err(untrusted)?;
     if file_stat.st_nlink != 1 {
         return Err(untrusted(format!(
             "{path:?} has {} hard links, and a sandbox could rewrite it through another one; \
@@ -4813,28 +4863,32 @@ mod tests {
         let cfg = root.join(CONFIG_FILE);
 
         // Creating a new `.stopit.toml` succeeds when absent.
-        let id_before =
-            write_trusted_config(&root, None, b"[terminal]\nclipboard_write = \"allow\"\n")
-                .unwrap();
+        let id_before = write_trusted_config(
+            &root,
+            None,
+            None,
+            b"[terminal]\nclipboard_write = \"allow\"\n",
+        )
+        .unwrap();
 
         // If `expected_identity == None` but a file already exists, `O_EXCL` refuses it.
-        assert!(write_trusted_config(&root, None, b"second\n").is_err());
+        assert!(write_trusted_config(&root, None, None, b"second\n").is_err());
 
         // Updating an existing `.stopit.toml` writes in place and preserves `(dev, ino, btime)`.
-        let id_after = write_trusted_config(&root, Some(id_before), b"# updated\n").unwrap();
+        let id_after = write_trusted_config(&root, None, Some(id_before), b"# updated\n").unwrap();
         assert_eq!(id_after, id_before);
         assert_eq!(fs::read(&cfg).unwrap(), b"# updated\n");
 
         // A mismatched `FileIdentity` is refused without truncating the file!
         let mut wrong_id = id_before;
         wrong_id.ino += 1;
-        assert!(write_trusted_config(&root, Some(wrong_id), b"bad\n").is_err());
+        assert!(write_trusted_config(&root, None, Some(wrong_id), b"bad\n").is_err());
         assert_eq!(fs::read(&cfg).unwrap(), b"# updated\n");
 
         // A hard-linked `.stopit.toml` is refused without truncating the file!
         let hard = root.join("hard.toml");
         fs::hard_link(&cfg, &hard).unwrap();
-        assert!(write_trusted_config(&root, Some(id_before), b"bad\n").is_err());
+        assert!(write_trusted_config(&root, None, Some(id_before), b"bad\n").is_err());
         assert_eq!(fs::read(&cfg).unwrap(), b"# updated\n");
         fs::remove_file(&hard).unwrap();
 
@@ -4843,8 +4897,8 @@ mod tests {
         fs::write(&other, b"original\n").unwrap();
         fs::remove_file(&cfg).unwrap();
         symlink(&other, &cfg).unwrap();
-        assert!(write_trusted_config(&root, Some(id_before), b"hijacked\n").is_err());
-        assert!(write_trusted_config(&root, None, b"hijacked\n").is_err());
+        assert!(write_trusted_config(&root, None, Some(id_before), b"hijacked\n").is_err());
+        assert!(write_trusted_config(&root, None, None, b"hijacked\n").is_err());
         assert_eq!(fs::read(&other).unwrap(), b"original\n");
     }
 }

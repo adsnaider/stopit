@@ -510,6 +510,20 @@ fn assert_default_base_ran(out: &Output) {
 #[test]
 fn missing_workspace_configuration_is_refused_until_stopit_init() {
     let s = Setup::new();
+    // When neither `config.toml` nor `.stopit.toml` exists, the error hints both
+    // `stopit default-config` and `stopit init`.
+    let out_unbootstrapped = output(s.run_probe_command(&[]), b"[]");
+    assert_eq!(code(&out_unbootstrapped), 125, "{out_unbootstrapped:?}");
+    let err_unbootstrapped = stderr(&out_unbootstrapped);
+    assert!(
+        err_unbootstrapped.contains("stopit default-config >"),
+        "{err_unbootstrapped}"
+    );
+    assert!(
+        err_unbootstrapped.contains("stopit init"),
+        "{err_unbootstrapped}"
+    );
+
     s.write_global_config(&global_search_config());
     // Without `.stopit.toml`, `stopit run` refuses to start and suggests `stopit init`.
     let out = output(s.run_probe_command(&[]), b"[]");
@@ -518,6 +532,24 @@ fn missing_workspace_configuration_is_refused_until_stopit_init() {
     assert!(err.contains("no .stopit.toml"), "{err}");
     assert!(err.contains("run `stopit init`"), "{err}");
     assert!(!s.runtime().join("stopit").exists());
+
+    // `stopit init` refuses when `.stopit.toml` is a dangling symlink or mode `0000` file.
+    symlink("/nonexistent/target", s.config_path()).unwrap();
+    let sym_dup = output(s.stopit(&["init"]), b"");
+    assert_eq!(code(&sym_dup), 125, "{sym_dup:?}");
+    assert!(stderr(&sym_dup).contains("already exists"), "{sym_dup:?}");
+    fs::remove_file(s.config_path()).unwrap();
+
+    fs::write(s.config_path(), "").unwrap();
+    fs::set_permissions(s.config_path(), fs::Permissions::from_mode(0o000)).unwrap();
+    let mode0_dup = output(s.stopit(&["init"]), b"");
+    assert_eq!(code(&mode0_dup), 125, "{mode0_dup:?}");
+    assert!(
+        stderr(&mode0_dup).contains("already exists"),
+        "{mode0_dup:?}"
+    );
+    fs::set_permissions(s.config_path(), fs::Permissions::from_mode(0o644)).unwrap();
+    fs::remove_file(s.config_path()).unwrap();
 
     // `stopit init` creates an empty `.stopit.toml` and allows it in one step.
     let init_out = s.init(&[]);
@@ -1253,6 +1285,186 @@ fn a_deleted_or_swapped_allowed_configuration_is_refused_and_other_allowed_confi
         "# sibling config\n"
     );
     assert!(s.no_session_left());
+}
+
+#[test]
+fn cross_workspace_allowed_config_resists_chmod_0777_and_chmod_0000_attacks() {
+    let s = Setup::with_config("");
+    let sibling = s.root.join("sibling");
+    fs::create_dir(&sibling).unwrap();
+    fs::set_permissions(&sibling, fs::Permissions::from_mode(0o755)).unwrap();
+    s.init(&["--workspace", sibling.to_str().unwrap()]);
+    let sibling_cfg = sibling.join(".stopit.toml");
+    {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&sibling_cfg)
+            .unwrap();
+        f.write_all(b"# sibling config\n").unwrap();
+    }
+
+    s.write_config(&format!("fs.rw = [{sibling:?}]\nfs.mask_sockets = false"));
+
+    // Attack 1: Run 1 makes `sibling` mode `0777`; Run 2 must still mount
+    // `sibling/.stopit.toml` read-only (`EROFS`) rather than skipping it.
+    let r1 = s.probe(&[], &[chmod(&sibling, 0o777)]);
+    assert_eq!(ok(&r1[0]), &Data::Done, "{r1:?}");
+    let r2 = s.probe(&[], &[write(&sibling_cfg, "tampered")]);
+    assert_eq!(errno(&r2[0]), "EROFS", "{r2:?}");
+    assert_eq!(
+        fs::read_to_string(&sibling_cfg).unwrap(),
+        "# sibling config\n"
+    );
+
+    // Attack 2: Run 3 makes `sibling` mode `0000` (unsearchable); Run 4 must
+    // fail closed at compile time rather than starting with `sibling` writable
+    // and `sibling/.stopit.toml` unprotected.
+    let r3 = s.probe(&[], &[chmod(&sibling, 0o000)]);
+    assert_eq!(ok(&r3[0]), &Data::Done, "{r3:?}");
+    let out4 = output(s.run_probe_command(&[]), b"[]");
+    fs::set_permissions(&sibling, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(code(&out4), 125, "{out4:?}");
+    assert!(
+        stderr(&out4).contains("cannot inspect allowed configuration"),
+        "{}",
+        stderr(&out4)
+    );
+    assert_eq!(
+        fs::read_to_string(&sibling_cfg).unwrap(),
+        "# sibling config\n"
+    );
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn live_server_refreshes_cross_workspace_allowed_protections_and_ignores_deleted_siblings() {
+    let Some(sh_cfg) = shell_config() else {
+        return;
+    };
+    let Some((server_master, server_slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::new();
+    let projects = s.root.join("projects");
+    fs::create_dir(&projects).unwrap();
+    fs::set_permissions(&projects, fs::Permissions::from_mode(0o755)).unwrap();
+    let extra_grant = s.root.join("extra_ws");
+    fs::create_dir(&extra_grant).unwrap();
+    fs::set_permissions(&extra_grant, fs::Permissions::from_mode(0o755)).unwrap();
+
+    s.write_config(&format!(
+        "{sh_cfg}fs.rw = [{projects:?}]\n[approval]\ntimeout = \"20s\"\n"
+    ));
+    let server = Server::start_on_terminal(&s, &server_master, server_slave);
+
+    // Initialize `ws_b` inside `projects` and `extra_ws` outside `projects`
+    // *after* `server` has already started.
+    let ws_b = projects.join("ws_b");
+    fs::create_dir(&ws_b).unwrap();
+    fs::set_permissions(&ws_b, fs::Permissions::from_mode(0o755)).unwrap();
+    s.init(&["--workspace", ws_b.to_str().unwrap()]);
+    let ws_b_cfg = ws_b.join(".stopit.toml");
+
+    s.init(&["--workspace", extra_grant.to_str().unwrap()]);
+    let extra_cfg = extra_grant.join(".stopit.toml");
+
+    // 1. Next attached run on `server` refreshes `allowed.json` and protects `ws_b/.stopit.toml`.
+    let results = s.probe(
+        &[],
+        &[
+            write(&ws_b_cfg, "tampered"),
+            write(ws_b.join("ok.txt"), "ok"),
+        ],
+    );
+    assert_eq!(errno(&results[0]), "EROFS", "{results:?}");
+    assert_eq!(ok(&results[1]), &Data::Done, "{results:?}");
+
+    // 2. `stopit-grant +rw:<extra_ws>` on `server` also refreshes `allowed.json`
+    // and protects `extra_ws/.stopit.toml`.
+    let script = format!(
+        "stopit-grant +rw:{extra} -- sh -c '\
+           (echo bad > {extra}/.stopit.toml) 2>/dev/null && echo OVERWROTE || echo PROTECTED; \
+           echo ok > {extra}/work.txt && echo WROTE_WORK'",
+        extra = extra_grant.display()
+    );
+    let child = command_output_async(s.stopit(&["run", "--quiet", "/bin/sh", "-c", &script]));
+    server.wait_for_log("[n] deny: ");
+    answer(&server, &server_master, b"y", "allowed once");
+    let grant_out = child.join().unwrap();
+    assert_eq!(code(&grant_out), 0, "{grant_out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&grant_out.stdout),
+        "PROTECTED\nWROTE_WORK\n"
+    );
+    assert_eq!(fs::read_to_string(&extra_cfg).unwrap(), "");
+
+    // 3. Deleting `ws_b` and `extra_ws` while `server` is still running does
+    // NOT DoS subsequent runs on `server`.
+    fs::remove_dir_all(&ws_b).unwrap();
+    fs::remove_dir_all(&extra_grant).unwrap();
+    let after_del = s.probe(&[], &[Op::Cwd]);
+    assert_eq!(
+        ok(&after_del[0]),
+        &Data::Cwd("/workspace".into()),
+        "{after_del:?}"
+    );
+}
+
+#[test]
+fn hardlinked_allowed_configuration_is_refused_before_script_providers_run() {
+    let s = Setup::new();
+    let marker = s.root.join("script_ran");
+    let script_path = s.root.join("provider.sh");
+    fs::write(
+        &script_path,
+        format!("#!/bin/sh\nprintf x > {marker:?}\necho '{{}}'\n"),
+    )
+    .unwrap();
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let cfg_body = probe_config(&format!(
+        "\n[[provider]]\nname = \"marker\"\ntype = \"script\"\nprofile = \"main\"\nsource = {script_path:?}\n"
+    ));
+    s.write_raw_config(&cfg_body);
+
+    let twin = s.ws().join("twin.toml");
+    fs::hard_link(s.config_path(), &twin).unwrap();
+
+    let out = output(s.run_probe_command(&[]), b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    assert!(
+        stderr(&out).contains("has 2 hard links"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(
+        !marker.exists(),
+        "script provider ran despite hard-linked .stopit.toml!"
+    );
+
+    // Also verify `stopit allowed` distinguishes a mode `0000` regular file (`Ok`)
+    // from a parent directory replaced by a symlink (`(replaced)`).
+    fs::remove_file(&twin).unwrap();
+    fs::set_permissions(s.config_path(), fs::Permissions::from_mode(0o000)).unwrap();
+    let allowed_mode0 = output(s.stopit(&["allowed"]), b"");
+    fs::set_permissions(s.config_path(), fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&allowed_mode0.stdout),
+        format!("{:?}\n", s.config_path())
+    );
+
+    let orig_cfg = s.config_path();
+    let moved = s.root.join("ws_moved");
+    fs::rename(s.ws(), &moved).unwrap();
+    symlink(&moved, s.ws()).unwrap();
+    let mut cmd = s.stopit(&["allowed"]);
+    cmd.current_dir(&s.root);
+    let allowed_symlink_parent = output(cmd, b"");
+    assert_eq!(
+        String::from_utf8_lossy(&allowed_symlink_parent.stdout),
+        format!("{orig_cfg:?} (replaced)\n")
+    );
 }
 
 #[test]
