@@ -23,7 +23,9 @@
 //! 7. Enforce the Landlock ruleset ([`crate::landlock::apply`]).
 //! 8. Install the seccomp-BPF filter ([`crate::seccomp::install`]).
 //! 9. Reset signal dispositions and unblock all signals, then `execve` the
-//!    target with the decoded environment, searching that environment's `PATH`
+//!    target with the decoded environment (or, when `spec.shell_hook` is set,
+//!    evaluate the hook script at top level before replacing the shell with
+//!    `stopit __exec` to resolve and `execve` the target), searching `PATH`
 //!    when the command name contains no `/`.
 //!
 //! If any step fails, `__init` writes `stopit __init: ...` to stderr and exits

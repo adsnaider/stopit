@@ -6605,12 +6605,15 @@ fn sandbox_shell_hook_mutates_path_propagates_exit_and_preserves_odd_argv() {
          if [ -n \"${FAIL_HOOK:-}\" ]; then exit 42; fi\n\
          export HOOK_VAR=\"argc=$#\"\n\
          export PATH=\"/workspace/hook-bin:$PATH\"\\\n'''\n\
-         [provider.sandbox.env]\npass = [\"FAIL_HOOK\"]\n",
+         [provider.sandbox.env]\npass = [\"FAIL_HOOK\"]\n\
+         [provider.sandbox.shims]\n\
+         hook-tool = { cmd = \"hook-tool\", default = { decision = \"allow\", profile = \"main\" } }\n",
     );
 
-    // 1. Bare command added to PATH by `shellHook` is resolved by `stopit __exec`,
-    // sees `$# == 0` during the hook, survives a trailing `\` in the script, and
-    // preserves single quotes, `$`, backticks, and newlines in target arguments.
+    // 1. Bare command added to PATH by `shellHook` (and wrapped in a shim targeting `main`,
+    // exercising `stopit __exec --skip-shims` so the shim does not recurse into `/run/stopit/bin`)
+    // sees `$# == 0` during the hook, survives a trailing `\` in the script, and preserves
+    // single quotes, `$`, backticks, and newlines in target arguments.
     let odd1 = "a'b $HOME `id`";
     let odd2 = "line1\nline2";
     let out = output(

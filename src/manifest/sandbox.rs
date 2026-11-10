@@ -1,8 +1,8 @@
-//! The `sandbox` manifest section: hardening opt-outs (DESIGN.md §6.2, §6.3).
+//! The `sandbox` manifest section: hardening opt-outs, `stopit-grant`, and
+//! in-sandbox `shell_hook` (DESIGN.md §6.2, §6.3, §7.5).
 //!
-//! Hardening is on by default. A provider may only loosen it in the two ways
-//! modelled here: sharing a namespace with the host, and re-enabling a
-//! syscall from a short list.
+//! Hardening is on by default. A provider may configure shared namespaces,
+//! opt-in syscalls, `stopit-grant`, and an optional in-sandbox `shell_hook`.
 
 use std::fmt;
 use std::str::FromStr;
@@ -102,11 +102,6 @@ impl TryFrom<RawShellHook> for ShellHookSetting {
 
     fn try_from(raw: RawShellHook) -> Result<Self, ValueError> {
         if raw.enabled == Some(false) {
-            if raw.shell.is_some() || raw.script.is_some() {
-                return Err(ValueError::new(
-                    "invalid shell_hook: `shell` and `script` must be omitted when `enabled = false`",
-                ));
-            }
             return Ok(ShellHookSetting::Disabled);
         }
         let Some(shell) = raw.shell else {
@@ -576,9 +571,16 @@ mod tests {
             Some(ShellHookSetting::Disabled)
         );
 
+        let m: Manifest = toml_ok(
+            "sandbox.shell_hook = { enabled = false, shell = \"/bin/sh\", script = \"echo\" }",
+        );
+        assert_eq!(
+            m.grants.sandbox.shell_hook,
+            Some(ShellHookSetting::Disabled)
+        );
+
         toml_err("sandbox.shell_hook = true");
         toml_err("sandbox.shell_hook = { shell = \"sh\", script = \"echo\" }");
         toml_err("sandbox.shell_hook = { shell = \"/bin/sh\" }");
-        toml_err("sandbox.shell_hook = { enabled = false, shell = \"/bin/sh\" }");
     }
 }
