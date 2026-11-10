@@ -1127,7 +1127,7 @@ Where the phases stand:
 
 ## Appendix A. `stopit default-config`
 
-`stopit default-config` prints `src/default_config.toml` so `~/.config/stopit/config.toml` starts from explicit, editable providers (`base`, `protect-nix`, and `vcs`; comments and the commented-out `tools` and `nix` recipes at the bottom of `src/default_config.toml` are omitted below for brevity):
+`stopit default-config` (`--format toml` by default, or `--format nix` for a Nix attribute set matching `programs.stopit.config` in Home Manager) prints `src/default_config.toml` so `~/.config/stopit/config.toml` starts from explicit, editable providers (`base`, `protect-nix`, and `vcs`; comments and the commented-out `tools` and `nix` recipes at the bottom of `src/default_config.toml` are omitted below for brevity):
 
 ```toml
 default_profile = "main"

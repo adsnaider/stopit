@@ -727,6 +727,263 @@ pub enum ClipboardWrite {
     Ask,
 }
 
+/// Commented host-tool and `nix` provider recipes placed inside `provider = [ ... ];`
+/// at the bottom of [`default_config_nix`].
+const NIX_COMMENTED_PROVIDERS: &str = "    # --- Host tools (uncomment the recipe matching your system) ---
+
+    # Debian, Ubuntu, Fedora, or Arch:
+    # {
+    #   name = \"tools\";
+    #   type = \"config\";
+    #   profile = \"main\";
+    #   sandbox.fs = {
+    #     warn_missing = false;
+    #     ro = [
+    #       \"/usr/bin\" \"/usr/sbin\" \"/usr/lib\" \"/usr/lib64\" \"/usr/libexec\" \"/usr/share\"
+    #       \"/bin\" \"/lib\" \"/lib64\" \"/etc/alternatives\" \"/etc/ssl/certs\" \"/etc/pki\"
+    #     ];
+    #   };
+    #   sandbox.env.path_prepend = [ \"/usr/local/bin\" \"/usr/bin\" \"/bin\" ];
+    # }
+
+    # NixOS (closure-only per project with `nix` below, or `/nix/store` for quick setup):
+    # {
+    #   name = \"tools\";
+    #   type = \"config\";
+    #   profile = \"main\";
+    #   sandbox.fs.ro = [ \"/nix/store\" \"/run/current-system/sw\" \"/usr/bin/env\" \"/bin/sh\" \"/etc/ssl/certs\" ];
+    #   sandbox.env.path_prepend = [ \"/run/current-system/sw/bin\" ];
+    # }
+
+    # Optional: automatically mount a project's `flake.nix` or `shell.nix` devShell closure:
+    # {
+    #   name = \"nix\";
+    #   type = \"nix\";
+    #   profile = \"main\";
+    # }";
+
+/// Renders [`DEFAULT_CONFIG_TOML`] as a Nix attribute set (`stopit default-config --format nix`),
+/// suitable for `programs.stopit.config` (or `stopit.config`) in Home Manager.
+pub fn default_config_nix() -> String {
+    let root: toml::Table =
+        toml::from_str(DEFAULT_CONFIG_TOML).expect("DEFAULT_CONFIG_TOML is valid TOML");
+    let mut out = String::from(
+        "# Default stopit configuration (`stopit default-config --format nix`).\n\
+         # Assign to `programs.stopit.config` (or `stopit.config`) in Home Manager\n\
+         # and uncomment a `tools` recipe at the bottom.\n\n{\n",
+    );
+    for key in ordered_table_keys(&root) {
+        let val = &root[key];
+        out.push_str("  ");
+        out.push_str(&nix_attr_key(key));
+        out.push_str(" = ");
+        if key == "provider"
+            && let toml::Value::Array(items) = val
+        {
+            out.push_str("[\n");
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                out.push_str("    ");
+                out.push_str(&render_nix_value(item, 4));
+                out.push('\n');
+            }
+            out.push('\n');
+            out.push_str(NIX_COMMENTED_PROVIDERS);
+            out.push_str("\n  ];\n");
+        } else {
+            out.push_str(&render_nix_value(val, 2));
+            out.push_str(";\n");
+        }
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// Keys emitted first in rendered Nix attribute sets so provider headers,
+/// shims, and shim rules read naturally rather than purely alphabetically.
+const PRIORITY_NIX_KEYS: &[&str] = &[
+    "default_profile",
+    "inherit",
+    "name",
+    "type",
+    "profile",
+    "enabled",
+    "view",
+    "signing",
+    "cmd",
+    "proxy",
+    "protect",
+    "tty",
+    "default",
+    "literal",
+    "prefix",
+    "regex",
+    "flags",
+    "decision",
+];
+
+fn ordered_table_keys(table: &toml::Table) -> Vec<&str> {
+    let mut keys: Vec<&str> = Vec::with_capacity(table.len());
+    for &prio in PRIORITY_NIX_KEYS {
+        if let Some((k, _)) = table.get_key_value(prio) {
+            keys.push(k.as_str());
+        }
+    }
+    for k in table.keys() {
+        if !PRIORITY_NIX_KEYS.contains(&k.as_str()) {
+            keys.push(k.as_str());
+        }
+    }
+    keys
+}
+
+fn render_nix_value(val: &toml::Value, indent: usize) -> String {
+    match val {
+        toml::Value::String(s) => nix_string(s),
+        toml::Value::Integer(n) => {
+            if *n < 0 {
+                format!("({n})")
+            } else {
+                n.to_string()
+            }
+        }
+        toml::Value::Float(f) => {
+            let mut s = f.to_string();
+            if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+                s.push_str(".0");
+            }
+            if *f < 0.0 { format!("({s})") } else { s }
+        }
+        toml::Value::Boolean(b) => b.to_string(),
+        toml::Value::Datetime(dt) => nix_string(&dt.to_string()),
+        toml::Value::Array(items) => {
+            if items.is_empty() {
+                return "[ ]".to_owned();
+            }
+            if let Some(inline) = try_inline_nix_array(items) {
+                return inline;
+            }
+            let pad = " ".repeat(indent + 2);
+            let close_pad = " ".repeat(indent);
+            let mut out = String::from("[\n");
+            for item in items {
+                out.push_str(&pad);
+                out.push_str(&render_nix_value(item, indent + 2));
+                out.push('\n');
+            }
+            out.push_str(&close_pad);
+            out.push(']');
+            out
+        }
+        toml::Value::Table(table) => {
+            if table.is_empty() {
+                return "{ }".to_owned();
+            }
+            if let Some(inline) = try_inline_nix_table(table) {
+                return inline;
+            }
+            let pad = " ".repeat(indent + 2);
+            let close_pad = " ".repeat(indent);
+            let mut out = String::from("{\n");
+            for key in ordered_table_keys(table) {
+                out.push_str(&pad);
+                out.push_str(&nix_attr_key(key));
+                out.push_str(" = ");
+                out.push_str(&render_nix_value(&table[key], indent + 2));
+                out.push_str(";\n");
+            }
+            out.push_str(&close_pad);
+            out.push('}');
+            out
+        }
+    }
+}
+
+fn is_nix_scalar(val: &toml::Value) -> bool {
+    matches!(
+        val,
+        toml::Value::String(_)
+            | toml::Value::Integer(_)
+            | toml::Value::Float(_)
+            | toml::Value::Boolean(_)
+            | toml::Value::Datetime(_)
+    )
+}
+
+fn try_inline_nix_array(items: &[toml::Value]) -> Option<String> {
+    if items.len() > 12 || !items.iter().all(is_nix_scalar) {
+        return None;
+    }
+    let rendered: Vec<String> = items.iter().map(|v| render_nix_value(v, 0)).collect();
+    let joined = format!("[ {} ]", rendered.join(" "));
+    (joined.len() <= 140).then_some(joined)
+}
+
+fn try_inline_nix_table(table: &toml::Table) -> Option<String> {
+    if table.len() > 4 {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(table.len());
+    for key in ordered_table_keys(table) {
+        let v = &table[key];
+        let rv = match v {
+            _ if is_nix_scalar(v) => render_nix_value(v, 0),
+            toml::Value::Array(items) => try_inline_nix_array(items)?,
+            _ => return None,
+        };
+        parts.push(format!("{} = {rv};", nix_attr_key(key)));
+    }
+    let joined = format!("{{ {} }}", parts.join(" "));
+    (joined.len() <= 180).then_some(joined)
+}
+
+/// Formats `key` as an unquoted Nix identifier if valid and non-reserved, or a
+/// quoted Nix string otherwise.
+fn nix_attr_key(key: &str) -> String {
+    const NIX_KEYWORDS: &[&str] = &[
+        "if", "then", "else", "assert", "with", "let", "in", "rec", "inherit", "or", "true",
+        "false", "null",
+    ];
+    let mut chars = key.chars();
+    let valid_ident = match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '\'')
+        }
+        _ => false,
+    };
+    if valid_ident && !NIX_KEYWORDS.contains(&key) {
+        key.to_owned()
+    } else {
+        nix_string(key)
+    }
+}
+
+/// Escapes `s` as a Nix double-quoted string literal (`"..."`), escaping `\`,
+/// `"`, `\n`, `\r`, `\t`, and `${` (`\${` prevents Nix string interpolation).
+fn nix_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '$' if chars.peek() == Some(&'{') => {
+                chars.next();
+                out.push_str("\\${");
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1277,5 +1534,27 @@ mod tests {
         assert_eq!(l.providers.len(), 1);
         assert_eq!(l.providers[0].entry.name.as_str(), "custom-nix");
         assert!(!l.providers[0].entry.enabled);
+    }
+
+    #[test]
+    fn nix_escaping_and_default_config_nix_structure() {
+        assert_eq!(
+            nix_string(r#"a "b" \ ${interp} $plain"#),
+            r#""a \"b\" \\ \${interp} $plain""#
+        );
+        assert_eq!(nix_string("a\nb\tc"), "\"a\\nb\\tc\"");
+        assert_eq!(nix_attr_key("protect-nix"), "protect-nix");
+        assert_eq!(nix_attr_key("inherit"), "\"inherit\"");
+        assert_eq!(nix_attr_key("op log"), "\"op log\"");
+        assert_eq!(nix_attr_key("123"), "\"123\"");
+
+        let rendered = default_config_nix();
+        assert!(
+            rendered.contains("default_profile = \"main\";"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("name = \"protect-nix\";"), "{rendered}");
+        assert!(rendered.contains("name = \"vcs\";"), "{rendered}");
+        assert!(rendered.contains("#   name = \"tools\";"), "{rendered}");
     }
 }

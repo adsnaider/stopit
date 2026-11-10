@@ -39,7 +39,7 @@ stopit bakes no implicit sandbox rules into its binary. Every profile, mount, en
 cargo build --release      # the binary is target/release/stopit
 ```
 
-With Nix, `nix build` gives a `stopit` that finds bubblewrap and pasta on its own, and `nix develop` a shell with the toolchain. The flake also has a Home Manager module:
+With Nix, `nix build` gives a `stopit` that finds bubblewrap and pasta on its own, and `nix develop` a shell with the toolchain. The flake also has a Home Manager module (`programs.stopit.config` or `stopit.config`, which you can seed with `stopit default-config --format nix`):
 
 ```nix
 imports = [ stopit.homeModules.default ];   # adds stopit to home.packages

@@ -10,7 +10,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// `stopit`'s arguments.
 #[derive(Debug, Parser)]
@@ -81,8 +81,28 @@ pub enum CliCommand {
     },
     /// List the configurations you allowed.
     Allowed,
-    /// Print the default configuration template (`~/.config/stopit/config.toml`).
-    DefaultConfig,
+    /// Print the default configuration template (`~/.config/stopit/config.toml`
+    /// or a Nix attribute set for Home Manager).
+    DefaultConfig {
+        /// Output format (`toml` or `nix`).
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = DefaultConfigFormat::Toml,
+            value_name = "FORMAT"
+        )]
+        format: DefaultConfigFormat,
+    },
+}
+
+/// Output format for `stopit default-config`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum DefaultConfigFormat {
+    /// TOML document suitable for `~/.config/stopit/config.toml`.
+    #[default]
+    Toml,
+    /// Nix attribute set suitable for `programs.stopit.config` in Home Manager.
+    Nix,
 }
 
 /// The options `run` and `shell` share.
@@ -398,5 +418,29 @@ mod tests {
         let e = parse(&["run", "--server", "abc", "--standalone", "ls"]).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::ArgumentConflict);
         assert!(parse(&["server", "ls"]).is_err());
+    }
+
+    #[test]
+    fn default_config_format_flag() {
+        assert_eq!(
+            parse(&["default-config"]).unwrap(),
+            CliCommand::DefaultConfig {
+                format: DefaultConfigFormat::Toml
+            }
+        );
+        assert_eq!(
+            parse(&["default-config", "--format", "toml"]).unwrap(),
+            CliCommand::DefaultConfig {
+                format: DefaultConfigFormat::Toml
+            }
+        );
+        assert_eq!(
+            parse(&["default-config", "--format=nix"]).unwrap(),
+            CliCommand::DefaultConfig {
+                format: DefaultConfigFormat::Nix
+            }
+        );
+        let e = parse(&["default-config", "--format", "json"]).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidValue);
     }
 }

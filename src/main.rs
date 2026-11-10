@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::process::ExitCode;
 
 use clap::Parser;
-use stopit::cli::{Cli, CliCommand};
+use stopit::cli::{Cli, CliCommand, DefaultConfigFormat};
 use stopit::supervisor::{self, Invocation};
 
 fn main() -> ExitCode {
@@ -58,8 +58,11 @@ fn main() -> ExitCode {
             return supervisor::revoke(workspace.workspace, config);
         }
         CliCommand::Allowed => return supervisor::allowed(),
-        CliCommand::DefaultConfig => {
-            print!("{}", stopit::config::DEFAULT_CONFIG_TOML);
+        CliCommand::DefaultConfig { format } => {
+            match format {
+                DefaultConfigFormat::Toml => print!("{}", stopit::config::DEFAULT_CONFIG_TOML),
+                DefaultConfigFormat::Nix => print!("{}", stopit::config::default_config_nix()),
+            }
             return ExitCode::SUCCESS;
         }
         CliCommand::Server { workspace, quiet } => {

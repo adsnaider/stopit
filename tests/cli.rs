@@ -96,10 +96,59 @@ fn shell_without_shell_fails_clearly() {
 
 #[test]
 fn default_config_prints_valid_global_toml() {
-    let out = stopit().arg("default-config").output().unwrap();
+    for args in [
+        &["default-config"][..],
+        &["default-config", "--format", "toml"][..],
+    ] {
+        let out = stopit().args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert!(out.stderr.is_empty(), "{out:?}");
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(text, stopit::config::DEFAULT_CONFIG_TOML);
+        stopit::config::ConfigLayer::from_global_toml_str(&text).unwrap();
+    }
+}
+
+#[test]
+fn default_config_format_nix_matches_default_config_toml() {
+    let out = stopit()
+        .args(["default-config", "--format", "nix"])
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     assert!(out.stderr.is_empty(), "{out:?}");
-    let text = String::from_utf8(out.stdout).unwrap();
-    assert_eq!(text, stopit::config::DEFAULT_CONFIG_TOML);
-    stopit::config::ConfigLayer::from_global_toml_str(&text).unwrap();
+    let nix_text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(nix_text, stopit::config::default_config_nix());
+
+    // When `nix` is installed on the host, evaluate the generated Nix expression
+    // and assert structural equality with `builtins.fromTOML DEFAULT_CONFIG_TOML`.
+    if Command::new("nix").arg("--version").output().is_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nix_path = tmp.path().join("default_config.nix");
+        let toml_path = tmp.path().join("default_config.toml");
+        std::fs::write(&nix_path, &nix_text).unwrap();
+        std::fs::write(&toml_path, stopit::config::DEFAULT_CONFIG_TOML).unwrap();
+        let expr = format!(
+            "(import {}) == builtins.fromTOML (builtins.readFile {})",
+            nix_path.display(),
+            toml_path.display()
+        );
+        let eval = Command::new("nix")
+            .args([
+                "--extra-experimental-features",
+                "nix-command",
+                "eval",
+                "--impure",
+                "--expr",
+                &expr,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(eval.status.code(), Some(0), "{eval:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&eval.stdout).trim(),
+            "true",
+            "nix output disagreed with DEFAULT_CONFIG_TOML:\n{nix_text}"
+        );
+    }
 }
