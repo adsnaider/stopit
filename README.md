@@ -116,7 +116,7 @@ stopit server                         # terminal 1, stays in the foreground
 stopit run --profile claude claude    # terminal 2
 ```
 
-`stopit run` and `stopit shell` attach to the project's server when one runs, so every run shares one session, with one `/tmp` and one home. Questions for you, such as whether a brokered command may run or whether the agent may write to your clipboard, appear in the server's terminal, never in the agent's, so the agent cannot draw a fake prompt or answer one. On a prompt, `y` allows once, `s` allows for the session, `p` allows and saves the rule to `.stopit.toml` (allowing the updated file and reloading the server immediately), and `n` denies. Without a server, anything that needs a yes is refused. `--standalone` runs without the server, and `--server ID` picks one by the id it prints. While no prompt is active, press `r` in the server's terminal to reload `config.toml` and `.stopit.toml` in place without losing the session's `/tmp` or home.
+`stopit run` and `stopit shell` attach to the project's server when one runs, so every run shares one session, with one `/tmp` and one home. Questions for you, such as whether a brokered command may run or whether the agent may write to your clipboard, appear in the server's terminal, never in the agent's, so the agent cannot draw a fake prompt or answer one. On a prompt, `y` allows once, `s` allows for the session, `p` allows and saves the rule to `.stopit.toml` (allowing the updated file and reloading the server immediately), and `n` denies. Set `[approval] timeout = "5m"` (with `s`, `m`, or `h`, or `"off"` by default) in `config.toml` or `.stopit.toml` to auto-deny unanswered prompts after a deadline; `.stopit.toml` overrides `config.toml`. Without a server, anything that needs a yes is refused. `--standalone` runs without the server, and `--server ID` picks one by the id it prints. While no prompt is active, press `r` in the server's terminal to reload `config.toml` and `.stopit.toml` in place without losing the session's `/tmp` or home.
 
 ### Profiles for agents
 
@@ -411,9 +411,10 @@ shell = "agent"            # devShells.<system>.agent on flakes, or attribute ag
 # file = "nix/ci.nix"      # evaluate a specific classic Nix file (mutually exclusive with flake)
 # flake = "nix"            # evaluate a flake in another directory
 # cache = true             # cache resolved closures + GC roots in ~/.local/share/stopit/nix
+# shell_hook = true        # run non-empty shellHook inside the sandbox before the command
 ```
 
-`flake.lock` is never modified during evaluation, `shellHook` is not executed, exported variables from the shell (other than internal `stdenv`, sandbox identity, and proxy variables) are applied to the profile, and closures containing secret-bearing derivations (`*-etc`, `*-home-manager-files`, `*nix.conf*`) are refused. Set `enabled = false` on `[[provider]] name = "nix"` in `.stopit.toml` for a library or module flake that defines no development shell or default package.
+`flake.lock` is never modified during evaluation, `shellHook` is never run on the host and instead executes inside the sandbox right before the target command via the development shell's `bash` (`shell_hook = false` disables it, and `vcs` profiles clear inherited hooks so brokered `git` and `jj` calls stay fast and clean), exported variables from the shell (other than internal `stdenv`, sandbox identity, and proxy variables) are applied to the profile, and closures containing secret-bearing derivations (`*-etc`, `*-home-manager-files`, `*nix.conf*`) are refused. Set `enabled = false` on `[[provider]] name = "nix"` in `.stopit.toml` for a library or module flake that defines no development shell or default package.
 
 ### Generate grants with a script
 

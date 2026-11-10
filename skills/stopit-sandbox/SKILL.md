@@ -70,9 +70,10 @@ target profile (for example, `vcs.local`, where `.jj` and `.git` are unmasked).
   "ask"`, the broker prompts the user on the `stopit server` terminal (`[y]
   allow once  [s] allow for this session  [p] allow and persist  [n] deny`), or
   denies immediately in a standalone run without a server. If the broker refuses
-  a command or the user denies it, the shim prints `[stopit: <shim>: <reason>]`
-  to stderr and exits with status `126`. Do not retry a denied command in a
-  tight loop; adjust your approach or ask the user.
+  a command, the user denies it, or `[approval] timeout` expires before an
+  answer (`approval prompt timed out after ...`), the shim prints `[stopit:
+  <shim>: <reason>]` to stderr and exits with status `126`. Do not retry a
+  denied command in a tight loop; adjust your approach or ask the user.
 - **Default `vcs` shim rules (`stopit default-config`).**
   - Allowed without prompting (`allow`): `jj status`/`st`, `diff`, `log`,
     `show`, `evolog`, `op log`, `file show`, `new`, `commit`/`ci`,
