@@ -3,6 +3,11 @@
 
 default_profile = "main"
 
+# Optional: auto-deny unanswered `ask` prompts on `stopit server` after a duration
+# ("off" by default, or "<int><s|m|h>", such as "30s" or "5m"):
+# [approval]
+# timeout = "5m"
+
 [profiles.main]
 
 # Baseline sandbox isolation, secret masks, and protected editor/agent configs.

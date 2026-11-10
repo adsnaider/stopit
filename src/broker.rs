@@ -542,11 +542,10 @@ fn run_shim(conn: &UnixStream, shared: &Shared, number: u64) -> Result<u8, Failu
                 target_profile: profile.clone(),
                 spec: spec.clone(),
             };
-            if !approver
-                .decide_with_persist(&asker, &request, Some(&persist_target), conn.as_fd())
-                .allows()
-            {
-                say(&format!("{name}: denied by user"));
+            let verdict =
+                approver.decide_with_persist(&asker, &request, Some(&persist_target), conn.as_fd());
+            if !verdict.allows() {
+                say(&format!("{name}: {}", verdict.denial_reason()));
                 return Ok(EXIT_DENIED);
             }
             profile
@@ -702,11 +701,9 @@ fn run_proxy_shim(
             profile: shared.caller.as_str().to_owned(),
             command: ctx.command.clone(),
         };
-        if !approver
-            .decide_with_persist(&asker, &request, None, conn.as_fd())
-            .allows()
-        {
-            say("denied by user");
+        let verdict = approver.decide_with_persist(&asker, &request, None, conn.as_fd());
+        if !verdict.allows() {
+            say(&verdict.denial_reason());
             return Ok(EXIT_DENIED);
         }
     }
@@ -1337,11 +1334,9 @@ fn run_grant(
         net_domains: request.net.iter().cloned().collect(),
         net_full: request.full,
     };
-    if !approver
-        .decide_with_persist(&asker, &ask, Some(&persist_target), conn.as_fd())
-        .allows()
-    {
-        say("denied by user");
+    let verdict = approver.decide_with_persist(&asker, &ask, Some(&persist_target), conn.as_fd());
+    if !verdict.allows() {
+        say(&verdict.denial_reason());
         return Ok(EXIT_DENIED);
     }
     // Another request may have asked for rw paths since the compile, and

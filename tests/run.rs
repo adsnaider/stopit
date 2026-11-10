@@ -6476,3 +6476,60 @@ fn workspace_can_disable_protect_nix_or_override_nix_files_in_main() {
     );
     assert!(s.no_session_left());
 }
+
+#[test]
+fn approval_timeout_applies_globally_or_per_project_and_reports_timeout() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let Some((server_master, server_slave)) = open_pty() else {
+        return;
+    };
+    let s = Setup::new();
+    // Global config sets a long 30m timeout; `.stopit.toml` overrides it to 1s.
+    s.write_global_config(&format!(
+        "{}\n[approval]\ntimeout = \"30m\"\n{config}\
+         [[provider]]\ntype = \"config\"\nname = \"ask-echo\"\nprofile = \"main\"\n\
+         [provider.sandbox]\n\
+         shims.myecho = {{ cmd = \"echo\", default = {{ decision = \"ask\", profile = \"main\" }} }}\n",
+        stopit::config::DEFAULT_CONFIG_TOML
+    ));
+    s.write_raw_config("[approval]\ntimeout = \"1s\"\n");
+
+    let mut server = Server::start_on_terminal(&s, &server_master, server_slave);
+
+    // 1. Unanswered prompt times out after 1s, reporting the timeout both on
+    // the server terminal and on the shim's stderr without starting a 5s quiet period.
+    let out = output(
+        s.stopit(&["run", "--quiet", "/bin/sh", "-c", "myecho timed-out-call"]),
+        b"",
+    );
+    assert_eq!(code(&out), 126, "{out:?}");
+    let err = stderr(&out);
+    assert!(
+        err.contains("[stopit: myecho: approval prompt timed out after 1s]"),
+        "{err}"
+    );
+    let log = server.log();
+    assert!(log.contains("(timeout 1s)"), "{log}");
+    assert!(log.contains("timed out after 1s (denied)"), "{log}");
+
+    // 2. Immediate retry prompts right away (no quiet period after timeout) and
+    // succeeds when answered with `y`.
+    server.log.lock().unwrap().clear();
+    let client = command_output_async(s.stopit(&[
+        "run",
+        "--quiet",
+        "/bin/sh",
+        "-c",
+        "myecho immediate-retry",
+    ]));
+    server.wait_for_log("[n] deny: ");
+    answer(&server, &server_master, b"y", "allowed once");
+    let out = client.join().unwrap();
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "immediate-retry\n");
+
+    assert_eq!(server.stop(), 128 + libc::SIGTERM);
+    assert!(s.no_session_left());
+}

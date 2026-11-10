@@ -220,8 +220,10 @@ pub enum Verdict {
     Persist,
     /// Denied by the user, so the scope is quiet for [`QUIET_AFTER_DENY`].
     DeniedByUser,
-    /// Denied without the user's answer: no terminal, a timeout, a cancel,
-    /// content that cannot be shown, or a denial still in effect.
+    /// The prompt's `[approval] timeout` expired before an answer arrived.
+    TimedOut(Duration),
+    /// Denied without the user's answer: no terminal, a cancel, content that
+    /// cannot be shown, or a denial still in effect.
     Denied,
 }
 
@@ -229,6 +231,17 @@ impl Verdict {
     /// Whether the request may proceed.
     pub fn allows(self) -> bool {
         matches!(self, Verdict::Once | Verdict::Session | Verdict::Persist)
+    }
+
+    /// Diagnostic printed to a brokered command's stderr when `!self.allows()`.
+    pub fn denial_reason(self) -> String {
+        match self {
+            Verdict::TimedOut(d) => format!(
+                "approval prompt timed out after {}",
+                ApprovalTimeout::format_duration(d)
+            ),
+            _ => "denied by user".to_owned(),
+        }
     }
 }
 
@@ -669,8 +682,7 @@ impl Approver {
             Verdict::Persist => match (&self.persister, persist) {
                 (Some(persister), Some(target)) => {
                     if let Some(prefix) = &redrawn_prefix {
-                        let loading =
-                            format!("{prefix}\x1b[2m  reloading configuration...\x1b[0m");
+                        let loading = format!("{prefix}\x1b[2m  reloading configuration...\x1b[0m");
                         let _ = write_all(terminal.as_fd(), loading.as_bytes());
                     }
                     let outcome = match persister(target) {
@@ -692,6 +704,10 @@ impl Approver {
                 }
                 (None, _) => "allowed and persisted to .stopit.toml".to_owned(),
             },
+            Verdict::TimedOut(d) => format!(
+                "timed out after {} (denied)",
+                ApprovalTimeout::format_duration(d)
+            ),
             Verdict::DeniedByUser | Verdict::Denied => "denied".to_owned(),
         };
         if !(verdict == Verdict::Persist && self.persister.is_some() && persist.is_some()) {
@@ -710,7 +726,7 @@ impl Approver {
                 Verdict::DeniedByUser => {
                     state.quiet.insert(quiet, Instant::now() + self.quiet_after);
                 }
-                Verdict::Once | Verdict::Denied => {}
+                Verdict::Once | Verdict::TimedOut(_) | Verdict::Denied => {}
             }
         };
         drop(prompting);
@@ -739,26 +755,33 @@ impl Approver {
             rows_up += line_rows(indented.chars().count(), cols);
             text.push_str(&format!("{indented}\r\n"));
         }
-        rows_up += bar_rows(PROMPT_ACTION_BAR.len(), cols);
-        text.push_str(PROMPT_ACTION_BAR);
+        let timeout = *self.timeout.lock().unwrap_or_else(|e| e.into_inner());
+        let action_bar = match timeout {
+            ApprovalTimeout::Off => PROMPT_ACTION_BAR.to_owned(),
+            ApprovalTimeout::After(after) => format!(
+                "  (timeout {}){PROMPT_ACTION_BAR}",
+                ApprovalTimeout::format_duration(after)
+            ),
+        };
+        rows_up += bar_rows(action_bar.len(), cols);
+        text.push_str(&action_bar);
         write_all(terminal, text.as_bytes())?;
         // Keys typed before the prompt, and during its first moment, do not
         // count.
         flush_input(terminal);
         std::thread::sleep(self.arming_delay);
         flush_input(terminal);
-        let timeout = *self.timeout.lock().unwrap_or_else(|e| e.into_inner());
         let deadline = match timeout {
             ApprovalTimeout::Off => None,
-            ApprovalTimeout::After(after) => Some(Instant::now() + after),
+            ApprovalTimeout::After(after) => Some((after, Instant::now() + after)),
         };
         let verdict = loop {
             let wait = match deadline {
                 None => -1,
-                Some(deadline) => {
+                Some((after, deadline)) => {
                     let left = deadline.saturating_duration_since(Instant::now());
                     if left.is_zero() {
-                        break Verdict::Denied;
+                        break Verdict::TimedOut(after);
                     }
                     left.as_millis().min(i32::MAX as u128) as i32
                 }
@@ -1279,17 +1302,23 @@ mod tests {
         // And typed as soon as the prompt shows, within the arming delay.
         let master = t.master.try_clone().unwrap();
         let typist = std::thread::spawn(move || {
-            wait_for(&master, "[n] deny: ");
+            let bar = wait_for(&master, "[n] deny: ");
             rustix::io::write(&master, b"y").unwrap();
-            wait_for(&master, "denied")
+            let after = wait_for(&master, "denied");
+            format!("{bar}{after}")
         });
         let start = Instant::now();
         assert_eq!(
             t.approver.decide(&asker("main"), &hi(), t.cancel.as_fd()),
-            Verdict::Denied
+            Verdict::TimedOut(Duration::from_millis(500))
         );
         assert!(start.elapsed() >= Duration::from_millis(2500));
-        assert!(typist.join().unwrap().contains("denied"));
+        let shown = typist.join().unwrap();
+        assert!(shown.contains("(timeout 500ms)"), "{shown:?}");
+        assert!(
+            shown.contains("timed out after 500ms (denied)"),
+            "{shown:?}"
+        );
         // A timeout is not the user's denial: no quiet period.
         assert_eq!(
             t.approver
@@ -1503,12 +1532,8 @@ mod tests {
         let user = answer(t.master.try_clone().unwrap(), b"p");
         let target = crate::persist::PersistTarget::ClipboardWrite;
         assert_eq!(
-            t.approver.decide_with_persist(
-                &asker("main"),
-                &hi(),
-                Some(&target),
-                t.cancel.as_fd(),
-            ),
+            t.approver
+                .decide_with_persist(&asker("main"), &hi(), Some(&target), t.cancel.as_fd(),),
             Verdict::Persist
         );
         assert!(Verdict::Persist.allows());
@@ -1527,12 +1552,8 @@ mod tests {
         assert_eq!(persisted.lock().unwrap().len(), 1);
         // Remembered for the session without prompting again.
         assert_eq!(
-            t.approver.decide_with_persist(
-                &asker("main"),
-                &hi(),
-                Some(&target),
-                t.cancel.as_fd(),
-            ),
+            t.approver
+                .decide_with_persist(&asker("main"), &hi(), Some(&target), t.cancel.as_fd(),),
             Verdict::Session
         );
     }
@@ -1547,17 +1568,16 @@ mod tests {
 
         let user = answer(t.master.try_clone().unwrap(), b"p");
         let target = crate::persist::PersistTarget::ClipboardWrite;
-        let verdict = t.approver.decide_with_persist(
-            &asker("main"),
-            &hi(),
-            Some(&target),
-            t.cancel.as_fd(),
-        );
+        let verdict =
+            t.approver
+                .decide_with_persist(&asker("main"), &hi(), Some(&target), t.cancel.as_fd());
         assert_eq!(verdict, Verdict::Persist);
         assert!(verdict.allows());
         let shown = user.join().unwrap();
         assert!(
-            shown.contains("allowed for this session (could not persist to .stopit.toml: disk full)"),
+            shown.contains(
+                "allowed for this session (could not persist to .stopit.toml: disk full)"
+            ),
             "{shown:?}"
         );
         assert_eq!(
@@ -1572,10 +1592,10 @@ mod tests {
         let t = on_pty(ApprovalTimeout::Off, QUIET_AFTER_DENY);
         t.approver
             .set_timeout(ApprovalTimeout::After(Duration::from_secs(5)));
-        t.approver.state().quiet.insert(
-            hi().scope("main"),
-            Instant::now() + Duration::from_secs(60),
-        );
+        t.approver
+            .state()
+            .quiet
+            .insert(hi().scope("main"), Instant::now() + Duration::from_secs(60));
         t.approver.clear_quiet();
         assert!(t.approver.state().quiet.is_empty());
 

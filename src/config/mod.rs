@@ -652,6 +652,24 @@ pub enum ApprovalTimeout {
     After(Duration),
 }
 
+impl ApprovalTimeout {
+    /// Short human-readable rendering of `d` (such as `"30s"`, `"5m"`, `"1h"`).
+    pub fn format_duration(d: Duration) -> String {
+        let secs = d.as_secs();
+        if d.subsec_nanos() == 0 && secs > 0 {
+            if secs.is_multiple_of(3600) {
+                format!("{}h", secs / 3600)
+            } else if secs.is_multiple_of(60) {
+                format!("{}m", secs / 60)
+            } else {
+                format!("{secs}s")
+            }
+        } else {
+            format!("{}ms", d.as_millis())
+        }
+    }
+}
+
 impl FromStr for ApprovalTimeout {
     type Err = ValueError;
 
@@ -770,7 +788,10 @@ pub fn default_config_nix() -> String {
     let mut out = String::from(
         "# Default stopit configuration (`stopit default-config --format nix`).\n\
          # Assign to `programs.stopit.config` (or `stopit.config`) in Home Manager\n\
-         # and uncomment a `tools` recipe at the bottom.\n\n{\n",
+         # and uncomment a `tools` recipe at the bottom.\n\n\
+         {\n\
+         \x20 # Optional: auto-deny unanswered `ask` prompts on `stopit server` (e.g. \"30s\" or \"5m\"):\n\
+         \x20 # approval.timeout = \"5m\";\n\n",
     );
     for key in ordered_table_keys(&root) {
         let val = &root[key];
