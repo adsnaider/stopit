@@ -86,24 +86,24 @@ imports = [ stopit.homeModules.default ];   # adds stopit to home.packages
 
    This file needs no `stopit allow`. stopit trusts it because only you can write it, and it checks that no sandbox can.
 
-2. Run a command in a project:
+2. Initialize a project and run a command:
 
    ```sh
    cd ~/Projects/myproject
+   stopit init                  # creates an empty .stopit.toml and allows it
    stopit run ls -la /workspace
    stopit shell                 # runs $SHELL, which must exist in the sandbox
    ```
 
-   The command's exit code is passed through. stopit's own errors exit with 125.
+   Every workspace requires an allowed `.stopit.toml` so it is mounted read-only in every sandbox. If the project already has a `.stopit.toml` (for example after cloning), review it and run `stopit allow` instead of `stopit init`. The command's exit code is passed through. stopit's own errors exit with 125.
 
-3. To change what a project's sandboxes get, add a `.stopit.toml` and allow it:
+3. To change what a project's sandboxes get, edit `.stopit.toml`:
 
    ```sh
    $EDITOR .stopit.toml
-   stopit allow
    ```
 
-   `stopit allow` prints the file's size and SHA-256. Run it again after every change. Until you do, `stopit run` refuses to start, so a change you did not review never takes effect.
+   stopit records `.stopit.toml`'s file identity (`dev`, `ino`, and creation time `btime`) rather than a content hash, so in-place edits take effect on the next run (or when pressing `r` in `stopit server`) without running `stopit allow` again. If `.stopit.toml` is deleted and recreated, or replaced by a tool or editor that writes a temporary file and renames it into place, run `stopit allow` once to trust the replacement file.
 
 ## Running agents
 
@@ -116,7 +116,7 @@ stopit server                         # terminal 1, stays in the foreground
 stopit run --profile claude claude    # terminal 2
 ```
 
-`stopit run` and `stopit shell` attach to the project's server when one runs, so every run shares one session, with one `/tmp` and one home. Questions for you, such as whether a brokered command may run or whether the agent may write to your clipboard, appear in the server's terminal, never in the agent's, so the agent cannot draw a fake prompt or answer one. On a prompt, `y` allows once, `s` allows for the session, `p` allows and saves the rule to `.stopit.toml` (allowing the updated file and reloading the server immediately), and `n` denies. Set `[approval] timeout = "5m"` (with `s`, `m`, or `h`, or `"off"` by default) in `config.toml` or `.stopit.toml` to auto-deny unanswered prompts after a deadline; `.stopit.toml` overrides `config.toml`. Without a server, anything that needs a yes is refused. `--standalone` runs without the server, and `--server ID` picks one by the id it prints. While no prompt is active, press `r` in the server's terminal to reload `config.toml` and `.stopit.toml` in place without losing the session's `/tmp` or home.
+`stopit run` and `stopit shell` attach to the project's server when one runs, so every run shares one session, with one `/tmp` and one home. Questions for you, such as whether a brokered command may run or whether the agent may write to your clipboard, appear in the server's terminal, never in the agent's, so the agent cannot draw a fake prompt or answer one. On a prompt, `y` allows once, `s` allows for the session, `p` allows and saves the rule to `.stopit.toml` (updating `.stopit.toml` in place and reloading the server immediately), and `n` denies. Set `[approval] timeout = "5m"` (with `s`, `m`, or `h`, or `"off"` by default) in `config.toml` or `.stopit.toml` to auto-deny unanswered prompts after a deadline; `.stopit.toml` overrides `config.toml`. Without a server, anything that needs a yes is refused. `--standalone` runs without the server, and `--server ID` picks one by the id it prints. While no prompt is active, press `r` in the server's terminal to reload `config.toml` and `.stopit.toml` in place without losing the session's `/tmp` or home.
 
 ### Profiles for agents
 
@@ -432,20 +432,21 @@ The script runs with your privileges, so stopit protects it in every sandbox (`p
 
 ### Run from a subdirectory or another directory
 
-stopit walks up from the current directory to the nearest `.stopit.toml`. That directory is the workspace, or the current directory if there is none. `--workspace DIR` picks it explicitly. If a directory above also has a `.stopit.toml` you own, stopit refuses to start, because a sandbox could have planted the inner one. Pass `--workspace` to choose.
+stopit walks up from the current directory to the nearest `.stopit.toml`. That directory is the workspace (`stopit init` creates `.stopit.toml` in the current directory when starting a new workspace). `--workspace DIR` picks the workspace explicitly. If a directory above also has a `.stopit.toml` you own, stopit refuses to start, because a sandbox could have planted the inner one. Pass `--workspace` to choose.
 
 ## Managing allowed configurations
 
 ```sh
-stopit allow                      # allow the current .stopit.toml as it is now
+stopit init                       # create an empty .stopit.toml and allow it
+stopit allow                      # allow an existing or replaced .stopit.toml
 stopit allowed                    # list allowed configurations
 stopit revoke                     # remove the current one
 stopit revoke PATH                # remove an entry by path, even if the project is gone
 ```
 
-Allowed configurations are recorded by path and content hash in `~/.local/share/stopit`. No sandbox can write there. If an allowed `.stopit.toml` disappears, stopit refuses to fall back to the global configuration until you restore it or revoke it.
+Allowed configurations are recorded by canonical path and file identity (`dev`, `ino`, and `btime`) in `~/.local/share/stopit/allowed.json`. No sandbox can write there, and every valid allowed `.stopit.toml` is protected across sandboxes even when an `fs.rw` grant covers another workspace. `stopit allowed` marks deleted files `(missing)` and recreated or atomic-renamed files `(replaced)`.
 
-`stopit allow` trusts the file as it is when you run it, so read it first, especially after an agent has worked in the project.
+`stopit allow` trusts the file as it is when you run it, so read it first, especially after cloning a repository or after an agent has worked in a directory.
 
 ## Startup summary
 
@@ -458,7 +459,7 @@ Before the sandbox starts, `stopit run` and `stopit shell` print to stderr what 
 - The proxy reaches ports 443 and 80 only, so SSH needs `full` mode.
 - A prompt holds up the run's output until you answer it.
 - `tty` and `ttyname` fail inside the sandbox.
-- Script providers are not hashed by `stopit allow`. A script you change after allowing still runs.
+- Editors or host VCS commands that replace `.stopit.toml` via write-and-rename create a new file identity and require `stopit allow` once afterwards.
 - A sandbox can create files that host tools run or trust where none existed when the session started: a `.git` in a subdirectory, or in the project when it has none, a `flake.nix`, `flake.lock` or `shell.nix` when `type = "nix"` is enabled in a project that lacked them, or agent and editor settings such as `.claude/`, `.gemini/`, `.mcp.json`, `opencode.json`, `.opencode/`, `.codex/` and `.vscode/`. Look before running git, nix or an agent on the host there.
 
 DESIGN.md section 11 has the complete list.
