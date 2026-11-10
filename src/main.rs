@@ -56,6 +56,7 @@ fn main() -> ExitCode {
                 }
             }
         }
+        CliCommand::Init { workspace } => return supervisor::init(workspace.workspace),
         CliCommand::Allow { workspace } => return supervisor::allow(workspace.workspace),
         CliCommand::Revoke { workspace, config } => {
             return supervisor::revoke(workspace.workspace, config);

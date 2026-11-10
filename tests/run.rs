@@ -87,6 +87,15 @@ impl Setup {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
     }
 
+    /// `stopit init <options…>` from the workspace, which must succeed;
+    /// returns what it printed.
+    fn init(&self, options: &[&str]) -> String {
+        let out = output(self.stopit(&[&["init"][..], options].concat()), b"");
+        assert_eq!(code(&out), 0, "{out:?}");
+        assert_eq!(stderr(&out), "", "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    }
+
     /// `stopit allow <options…>` from the workspace, which must succeed;
     /// returns what it printed.
     fn allow(&self, options: &[&str]) -> String {
@@ -499,20 +508,55 @@ fn assert_default_base_ran(out: &Output) {
 }
 
 #[test]
-fn no_workspace_configuration_runs_the_global_configuration_in_the_cwd() {
-    // Without a `.stopit.toml` the user-global configuration applies, with
-    // nothing to allow.
+fn missing_workspace_configuration_is_refused_until_stopit_init() {
     let s = Setup::new();
     s.write_global_config(&global_search_config());
+    // Without `.stopit.toml`, `stopit run` refuses to start and suggests `stopit init`.
+    let out = output(s.run_probe_command(&[]), b"[]");
+    assert_eq!(code(&out), 125, "{out:?}");
+    let err = stderr(&out);
+    assert!(err.contains("no .stopit.toml"), "{err}");
+    assert!(err.contains("run `stopit init`"), "{err}");
+    assert!(!s.runtime().join("stopit").exists());
+
+    // `stopit init` creates an empty `.stopit.toml` and allows it in one step.
+    let init_out = s.init(&[]);
+    assert_eq!(
+        init_out,
+        format!("initialized and allowed {:?}\n", s.config_path())
+    );
     let out = output(s.run_probe_command(&[]), b"[]");
     assert_default_base_ran(&out);
     assert!(s.no_session_left());
-    // `--workspace` does not look up: `sub` has none of its own, though the
-    // directory above it has one, which is not allowed.
-    s.write_unallowed("inherit_global = false\n");
+
+    // Re-running `stopit init` when `.stopit.toml` already exists is refused,
+    // and running `stopit init` from a subdirectory without `--workspace` is
+    // refused because an outer `.stopit.toml` already exists above it.
+    let dup = output(s.stopit(&["init"]), b"");
+    assert_eq!(code(&dup), 125, "{dup:?}");
+    assert!(stderr(&dup).contains("already exists"), "{dup:?}");
+
     fs::create_dir(s.ws().join("sub")).unwrap();
-    let out = output(s.run_probe_command(&["--workspace", "sub"]), b"[]");
-    assert_default_base_ran(&out);
+    let mut sub_init = s.stopit(&["init"]);
+    sub_init.current_dir(s.ws().join("sub"));
+    let nested_init = output(sub_init, b"");
+    assert_eq!(code(&nested_init), 125, "{nested_init:?}");
+    assert!(
+        stderr(&nested_init).contains("already exists in a parent directory"),
+        "{nested_init:?}"
+    );
+
+    // `--workspace sub` does not look up: `sub` has no `.stopit.toml` of its own
+    // until `stopit init --workspace sub` initializes it explicitly.
+    let out_sub = output(s.run_probe_command(&["--workspace", "sub"]), b"[]");
+    assert_eq!(code(&out_sub), 125, "{out_sub:?}");
+    assert!(
+        stderr(&out_sub).contains("stopit init --workspace"),
+        "{out_sub:?}"
+    );
+    s.init(&["--workspace", "sub"]);
+    let out_sub_ok = output(s.run_probe_command(&["--workspace", "sub"]), b"[]");
+    assert_default_base_ran(&out_sub_ok);
     assert!(s.no_session_left());
 }
 
@@ -543,7 +587,8 @@ fn missing_configuration_or_default_profile_is_refused_with_a_clear_hint() {
     let s = Setup::new();
     let global = s.config_dir().join("config.toml");
 
-    // 1. Neither `config.toml` nor `.stopit.toml` exists: hints `stopit default-config`.
+    // 1. Empty `.stopit.toml` without `config.toml`: hints `stopit default-config`.
+    s.init(&[]);
     let out = output(s.run_probe_command(&[]), b"[]");
     assert_eq!(code(&out), 125, "{out:?}");
     let err = stderr(&out);
@@ -584,9 +629,8 @@ fn the_global_configuration_grants_tools_to_every_workspace() {
         };
         env.get("WHICH").cloned()
     };
-    // Without a workspace configuration, and with an empty one.
-    assert_eq!(which(&s).as_deref(), Some("global"));
-    s.write_raw_config("");
+    // With an initialized empty workspace configuration.
+    s.init(&[]);
     assert_eq!(which(&s).as_deref(), Some("global"));
     // A workspace provider overrides a global `env.set` variable.
     s.write_raw_config(
@@ -603,6 +647,7 @@ fn the_global_configuration_grants_tools_to_every_workspace() {
 #[test]
 fn project_settings_override_global_settings() {
     let s = Setup::new();
+    s.init(&[]);
     s.write_global_config(&format!(
         "{}\n[workspace]\nmount = \"/global-ws\"\n",
         probe_config("")
@@ -734,6 +779,7 @@ fn a_global_configuration_reached_through_a_writable_link_is_refused() {
     fs::remove_file(&global).unwrap();
     symlink(dotfiles.join("current/stopit.toml"), &global).unwrap();
     // Fine while nothing writable holds the link.
+    s.init(&[]);
     let results = s.probe(&[], &[Op::Cwd]);
     assert_eq!(ok(&results[0]), &Data::Cwd("/workspace".into()));
     s.write_raw_config(
@@ -757,6 +803,7 @@ fn a_global_configuration_reached_through_a_writable_link_is_refused() {
 #[test]
 fn a_workspace_provider_replacing_a_global_one_by_name_is_quiet_and_protect_nix_can_be_disabled() {
     let s = Setup::new();
+    s.init(&[]);
     s.write_global_config(&probe_config(""));
     fs::write(s.ws().join("flake.nix"), "# original\n").unwrap();
 
@@ -778,6 +825,7 @@ fn a_workspace_provider_replacing_a_global_one_by_name_is_quiet_and_protect_nix_
 #[test]
 fn an_untrusted_global_configuration_is_refused() {
     let s = Setup::new();
+    s.init(&[]);
     let global = s.write_global_config(&probe_config(""));
     fs::set_permissions(&global, fs::Permissions::from_mode(0o664)).unwrap();
     let out = output(s.run_probe_command(&[]), b"[]");
@@ -843,6 +891,7 @@ fn a_symlinked_global_configuration_is_protected_at_its_target() {
 #[test]
 fn a_relative_global_script_provider_runs_from_the_configuration_directory() {
     let s = Setup::new();
+    s.init(&[]);
     let dir = s.config_dir();
     let (probe_dir, _) = probe_at_host_path();
     s.write_global_config(&format!(
@@ -924,22 +973,22 @@ fn marking_script(script: &Path, marker: &Path) -> String {
 }
 
 /// What `stopit` prints when it refuses `config` as not allowed: new (or
-/// revoked), or `changed`, with the `allow` command to run.
-fn not_allowed(config: &Path, changed: bool, allow: &str) -> String {
-    let what = if changed {
-        "it changed since it was last allowed"
+/// revoked), or `replaced`, with the `allow` command to run.
+fn not_allowed(config: &Path, replaced: bool, allow: &str) -> String {
+    let what = if replaced {
+        "it was replaced or recreated since it was allowed"
     } else {
-        "it is new: it has not been allowed, or was revoked"
+        "it has not been allowed, or was revoked"
     };
     format!(
-        "stopit: error: refusing to use {config:?}: {what}. stopit only uses a configuration \
-         you allowed, as it was when you allowed it, since it decides what the sandbox may do \
-         and which scripts run on the host; review it, then run `{allow}`\n"
+        "stopit: error: refusing to use {config:?} because {what}. stopit only uses a \
+         configuration file you allowed, since it decides what the sandbox may do and which \
+         scripts run on the host; review it, then run `{allow}`\n"
     )
 }
 
 #[test]
-fn a_configuration_runs_only_once_allowed_and_as_allowed() {
+fn a_configuration_runs_once_allowed_survives_in_place_edits_and_refuses_replacement() {
     let s = Setup::new();
     let marker = s.root.join("ran");
     let script = marking_script(&s.root.join("mark.sh"), &marker);
@@ -961,15 +1010,7 @@ fn a_configuration_runs_only_once_allowed_and_as_allowed() {
 
     // Allowed, it runs.
     let bytes = fs::read(&config).unwrap();
-    let hash = stopit::trust::sha256_hex(&bytes);
-    // The whole hash and the size, to check against the version reviewed.
-    assert_eq!(
-        s.allow(&[]),
-        format!(
-            "allowed {config:?} ({} bytes, sha256 {hash})\n",
-            bytes.len()
-        )
-    );
+    assert_eq!(s.allow(&[]), format!("allowed {config:?}\n"));
     assert_eq!(mode(&s.state_dir()), 0o700);
     assert_eq!(mode(&s.store_file()), 0o600);
     s.probe(&[], &[]);
@@ -980,13 +1021,29 @@ fn a_configuration_runs_only_once_allowed_and_as_allowed() {
     assert_eq!(code(&out), 0, "{out:?}");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        format!("{} {config:?}\n", &hash[..12])
+        format!("{config:?}\n")
     );
 
-    // Changed by a single byte, it is refused again.
+    // Editing `.stopit.toml` in place on the host preserves `(dev, ino, btime)`,
+    // so it continues running WITHOUT needing `stopit allow` again!
     let mut edited = bytes.clone();
     edited.push(b'\n');
     fs::write(&config, &edited).unwrap();
+    s.probe(&[], &[]);
+    assert!(marker.exists());
+    fs::remove_file(&marker).unwrap();
+
+    // Deleting and recreating `.stopit.toml` (or replacing via `rename`) changes
+    // `(dev, ino, btime)`, so it is refused until `stopit allow` is run again!
+    fs::remove_file(&config).unwrap();
+    thread::sleep(Duration::from_millis(5));
+    fs::write(&config, &edited).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+    let out_allowed = output(s.stopit(&["allowed"]), b"");
+    assert_eq!(
+        String::from_utf8_lossy(&out_allowed.stdout),
+        format!("{config:?} (replaced)\n")
+    );
     let out = output(s.run_probe_command(&[]), b"[]");
     assert_eq!(code(&out), 125, "{out:?}");
     assert_eq!(stderr(&out), not_allowed(&config, true, "stopit allow"));
@@ -1031,8 +1088,8 @@ fn allow_needs_a_configuration_and_a_valid_one() {
     assert_eq!(
         stderr(&out),
         format!(
-            "stopit: error: no .stopit.toml in {} or any directory above it: there is nothing \
-             to allow\n",
+            "stopit: error: no .stopit.toml in {} or any directory above it; run `stopit init` \
+             to create and allow one\n",
             s.ws().display()
         )
     );
@@ -1125,21 +1182,16 @@ fn a_configuration_planted_outside_any_workspace_is_refused() {
 }
 
 #[test]
-fn a_deleted_allowed_configuration_is_not_replaced_by_the_defaults() {
-    // The user's configuration may grant less than the default one: once
-    // allowed, its absence is refused until the user says otherwise.
+fn a_deleted_or_swapped_allowed_configuration_is_refused_and_other_allowed_configs_stay_protected()
+{
     let s = Setup::with_config("");
     s.write_global_config(&global_search_config());
     let config = s.config_path();
     fs::create_dir(s.ws().join("sub")).unwrap();
     fs::remove_file(&config).unwrap();
-    let refused = format!(
-        "stopit: error: refusing to run the default configuration: {config:?} was allowed but \
-         is missing, and the defaults may grant what it did not; restore it, or run `stopit \
-         revoke {}` to use the defaults there\n",
-        config.display()
-    );
-    // From the workspace, from below it, and with `--workspace`.
+
+    // From the workspace, from below it, and with `--workspace`, a missing `.stopit.toml`
+    // is refused cleanly.
     for (cwd, options) in [
         (s.ws(), &[][..]),
         (s.ws().join("sub"), &[]),
@@ -1149,21 +1201,22 @@ fn a_deleted_allowed_configuration_is_not_replaced_by_the_defaults() {
         command.current_dir(&cwd);
         let out = output(command, b"[]");
         assert_eq!(code(&out), 125, "{cwd:?} {options:?}: {out:?}");
-        assert_eq!(stderr(&out), refused, "{cwd:?} {options:?}");
+        assert!(
+            stderr(&out).contains("no .stopit.toml"),
+            "{cwd:?} {options:?}: {}",
+            stderr(&out)
+        );
         assert!(out.stdout.is_empty(), "{out:?}");
         assert!(!s.runtime().join("stopit").exists());
     }
-    // `--workspace` does not look up: `sub` was never configured.
-    let out = output(s.run_probe_command(&["--workspace", "sub"]), b"[]");
-    assert_default_base_ran(&out);
-    // `allowed` marks it.
+
+    // `allowed` marks the deleted entry `(missing)`, and `revoke <path>` removes it.
     let out = output(s.stopit(&["allowed"]), b"");
     assert_eq!(code(&out), 0, "{out:?}");
     assert!(
         String::from_utf8_lossy(&out.stdout).ends_with(&format!("{config:?} (missing)\n")),
         "{out:?}"
     );
-    // Revoked by its path, the defaults run.
     let out = output(
         s.stopit(&[OsString::from("revoke"), config.clone().into()]),
         b"",
@@ -1173,57 +1226,33 @@ fn a_deleted_allowed_configuration_is_not_replaced_by_the_defaults() {
         String::from_utf8_lossy(&out.stdout),
         format!("revoked {config:?}\n")
     );
-    let out = output(s.run_probe_command(&[]), b"[]");
-    assert_default_base_ran(&out);
-    assert!(s.no_session_left());
-}
 
-#[test]
-fn a_link_swapped_in_for_an_allowed_workspace_does_not_run_the_defaults() {
-    // A sandbox with `rw` on the directory holding the workspace moves the
-    // workspace away and puts a link to a directory without configuration
-    // in its place: discovery resolves the link, and finds none.
-    let s = Setup::with_config("");
-    s.write_global_config(&global_search_config());
-    let config = s.config_path();
-    let ws = s.ws();
-    let elsewhere = s.root.join("elsewhere");
-    fs::create_dir(&elsewhere).unwrap();
-    fs::rename(&ws, s.root.join("ws.old")).unwrap();
-    symlink(&elsewhere, &ws).unwrap();
-    let refused = format!(
-        "stopit: error: refusing to run the default configuration: {config:?} was allowed, but \
-         {ws:?}, on the way to it, is now a symbolic link, so it is not where it was allowed, \
-         and the defaults may grant what it did not; restore it, or run `stopit revoke {}` to \
-         use the defaults there\n",
-        config.display()
+    // Another allowed workspace's `.stopit.toml` inside an `fs.rw` grant is
+    // automatically protected read-only by the supervisor (`EROFS` / `EBUSY`).
+    let sibling = s.root.join("sibling");
+    fs::create_dir(&sibling).unwrap();
+    fs::set_permissions(&sibling, fs::Permissions::from_mode(0o755)).unwrap();
+    s.init(&["--workspace", sibling.to_str().unwrap()]);
+    let sibling_cfg = sibling.join(".stopit.toml");
+    fs::write(&sibling_cfg, "# sibling config\n").unwrap();
+
+    s.write_config(&format!("fs.rw = [{sibling:?}]"));
+    let results = s.probe(
+        &[],
+        &[
+            write(&sibling_cfg, "tampered"),
+            remove(&sibling_cfg),
+            write(sibling.join("other.txt"), "ok"),
+        ],
     );
-    // From the workspace as the shell names it (`PWD`), or with
-    // `--workspace`.
-    let mut from_ws = s.run_probe_command(&[]);
-    from_ws.env("PWD", &ws);
-    let mut named = s.run_probe_command(&["--workspace", "../ws"]);
-    named.current_dir(s.root.join("home"));
-    for command in [from_ws, named] {
-        let what = format!("{command:?}");
-        let out = output(command, b"[]");
-        assert_eq!(code(&out), 125, "{what}: {out:?}");
-        assert_eq!(stderr(&out), refused, "{what}");
-        assert!(!s.runtime().join("stopit").exists());
-    }
-    // Revoked, the defaults run there.
-    let out = output(
-        s.stopit(&[OsString::from("revoke"), config.clone().into()]),
-        b"",
-    );
-    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(errno(&results[0]), "EROFS", "{results:?}");
+    assert_eq!(errno(&results[1]), "EBUSY", "{results:?}");
+    assert_eq!(ok(&results[2]), &Data::Done, "{results:?}");
     assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        format!("revoked {config:?}\n")
+        fs::read_to_string(&sibling_cfg).unwrap(),
+        "# sibling config\n"
     );
-    let mut command = s.run_probe_command(&[]);
-    command.env("PWD", &ws);
-    assert_default_base_ran(&output(command, b"[]"));
+    assert!(s.no_session_left());
 }
 
 #[test]
@@ -1673,9 +1702,12 @@ fn an_invalid_configuration_is_an_error_naming_the_file() {
     let s = Setup::new();
     let contents = "bogus = \"\x1b]52;c;aGk=\x07\"\n";
     s.write_unallowed(contents);
+    let cfg_file = File::open(s.config_path()).unwrap();
+    let id = stopit::trust::FileIdentity::of_fd(std::os::fd::AsFd::as_fd(&cfg_file)).unwrap();
+    drop(cfg_file);
     stopit::trust::TrustStore::open(&s.state_dir())
         .unwrap()
-        .update(|a| a.allow(s.config_path(), contents.as_bytes()))
+        .update(|a| a.allow(s.config_path(), id))
         .unwrap();
     let out = output(s.stopit(&["run", "true"]), b"");
     assert_eq!(code(&out), 125, "{out:?}");
@@ -5218,6 +5250,8 @@ fn git_runs_in_a_worktree_whose_storage_is_outside_the_workspace() {
     for (name, bytes) in saved {
         fs::write(s.ws().join(name), bytes).unwrap();
     }
+    fs::set_permissions(s.ws(), fs::Permissions::from_mode(0o755)).unwrap();
+    s.allow(&[]);
     let admin = fs::canonicalize(repo.join(".git/worktrees/ws")).unwrap();
     let script = format!(
         "ls -A {admin} 2>/dev/null | wc -l; echo $(ls -A {common} 2>/dev/null); \
@@ -5717,6 +5751,7 @@ fn workspace_mount_host_places_workspace_under_ephemeral_home_and_expands_shim_a
     ));
 
     let ws_arg = ws.to_str().unwrap();
+    s.init(&["--workspace", ws_arg]);
     let mut server_cmd = s.stopit(&["server", "--workspace", ws_arg]);
     server_cmd
         .stdin(server_slave.try_clone().unwrap())
@@ -5808,6 +5843,7 @@ fn workspace_mount_host_with_default_home_and_stopit_grant() {
     ));
 
     let ws_arg = ws.to_str().unwrap();
+    s.init(&["--workspace", ws_arg]);
     let mut server_cmd = s.stopit(&["server", "--workspace", ws_arg]);
     server_cmd
         .stdin(server_slave.try_clone().unwrap())
@@ -5875,6 +5911,7 @@ fn workspace_mount_host_at_home_itself_is_refused() {
     let s = Setup::new();
     let home = s.root.join("home");
     fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+    s.init(&["--workspace", home.to_str().unwrap()]);
     s.write_global_config(&format!(
         "{}\n[workspace]\nmount = \"host\"\n{config}\
          [[provider]]\ntype = \"config\"\nname = \"same-home\"\nprofile = \"main\"\n\
@@ -5898,19 +5935,20 @@ fn workspace_mount_host_at_home_itself_is_refused() {
     let err = stderr(&out);
     assert!(err.contains("system.home"), "{err:?}");
 
-    // With default `system.home` (`/home/stopit`), `--workspace /tmp` is refused
-    // by `check_reserved_paths`, and `--workspace <s.root>` is refused because
-    // the writable workspace would contain stopit's config/state directories.
+    // With default `system.home` (`/home/stopit`), `[workspace] mount = "/tmp"` is
+    // refused by `check_reserved_paths`, and `--workspace <s.root>` is refused
+    // because the writable workspace would contain stopit's config/state directories.
     s.write_global_config(&format!(
         "{}\n[workspace]\nmount = \"host\"\n{config}",
         stopit::config::DEFAULT_CONFIG_TOML
     ));
+    fs::write(home.join(".stopit.toml"), "[workspace]\nmount = \"/tmp\"\n").unwrap();
     let out_tmp = output(
         s.stopit(&[
             "run",
             "--quiet",
             "--workspace",
-            "/tmp",
+            home.to_str().unwrap(),
             "/bin/sh",
             "-c",
             "true",
@@ -5924,6 +5962,7 @@ fn workspace_mount_host_at_home_itself_is_refused() {
     );
 
     fs::set_permissions(&s.root, fs::Permissions::from_mode(0o755)).unwrap();
+    s.init(&["--workspace", s.root.to_str().unwrap()]);
     let out_state = output(
         s.stopit(&[
             "run",
@@ -6270,6 +6309,7 @@ fi
 
     // 1. Without `flake.nix` or `shell.nix`, the nix provider is a no-op (0 `nix`
     // calls) and grants neither `NIX_DEV_VAR` nor the store `PATH`.
+    s.init(&[]);
     let no_flake_ops = [Op::Env];
     let no_flake_input = serde_json::to_vec(&no_flake_ops).unwrap();
     let no_flake_out = output(make_cmd(), &no_flake_input);
@@ -6470,6 +6510,7 @@ fn workspace_can_disable_protect_nix_or_override_nix_files_in_main() {
     ));
     fs::write(s.ws().join("configuration.nix"), "{ }").unwrap();
     fs::write(s.ws().join("flake.lock"), "{}").unwrap();
+    s.init(&[]);
 
     // 1. Default global config protects `*.nix` and `flake.lock` in `main`.
     let r = s.probe(

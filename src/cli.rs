@@ -1,6 +1,6 @@
 //! The command line of `stopit` (DESIGN.md §5): `stopit run`, `stopit
-//! shell`, `stopit server` (§5.5), the trust store's `stopit allow`,
-//! `revoke` and `allowed` (§3), and `--version`.
+//! shell`, `stopit server` (§5.5), the trust store's `stopit init`,
+//! `allow`, `revoke` and `allowed` (§3), and `--version`.
 //!
 //! The internal `stopit __init` (§6.3) is not part of it: `main` dispatches
 //! it before this parser runs, so its argv contract (`__init --env-fd N --
@@ -61,7 +61,14 @@ pub enum CliCommand {
         #[arg(short, long)]
         quiet: bool,
     },
-    /// Allow the workspace's `.stopit.toml` as it is now. Review it first:
+    /// Create an empty `.stopit.toml` in the workspace (refusing if one
+    /// already exists) and allow it.
+    Init {
+        /// Which workspace.
+        #[command(flatten)]
+        workspace: WorkspaceArg,
+    },
+    /// Allow the workspace's existing `.stopit.toml`. Review it first, since
     /// it decides what the sandbox may do and which scripts run on the host.
     Allow {
         /// Which workspace.
@@ -336,6 +343,18 @@ mod tests {
             parse(&["allow"]).unwrap(),
             CliCommand::Allow {
                 workspace: ws(None)
+            }
+        );
+        assert_eq!(
+            parse(&["init"]).unwrap(),
+            CliCommand::Init {
+                workspace: WorkspaceArg::default()
+            }
+        );
+        assert_eq!(
+            parse(&["init", "--workspace", "w"]).unwrap(),
+            CliCommand::Init {
+                workspace: ws(Some("w"))
             }
         );
         assert_eq!(

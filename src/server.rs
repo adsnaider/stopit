@@ -117,7 +117,9 @@ fn run_server(workspace: Option<&Path>, quiet: bool) -> Result<ExitCode, RunErro
     let cwd = std::env::current_dir().map_err(RunError::Cwd)?;
     // One server per workspace, decided by a lock rather than by looking,
     // and before any provider runs.
-    let workspace_dir = discover_workspace(&cwd, workspace)?.dir;
+    let ws = discover_workspace(&cwd, workspace)?;
+    ws.require_config(workspace.is_some())?;
+    let workspace_dir = ws.dir;
     let _workspace_lock = lock_workspace(&workspace_dir)?;
     let loaded = Arc::new(LoadedSession::load(&cwd, workspace)?);
     for line in loaded.warning_lines() {
@@ -756,7 +758,8 @@ pub(crate) fn pick_server(
             return Err(RunError::NoSuchServer { id: id.clone() });
         };
         if let Some(given) = &invocation.workspace {
-            let workspace = discover_workspace(cwd, Some(given))?.dir;
+            let ws = discover_workspace(cwd, Some(given))?;
+            let workspace = ws.dir;
             if workspace != server.record.workspace() {
                 return Err(RunError::ServerWorkspace {
                     id: id.clone(),
@@ -767,7 +770,9 @@ pub(crate) fn pick_server(
         }
         return connect(&server).map(Some);
     }
-    let workspace = discover_workspace(cwd, invocation.workspace.as_deref())?.dir;
+    let ws = discover_workspace(cwd, invocation.workspace.as_deref())?;
+    ws.require_config(invocation.workspace.is_some())?;
+    let workspace = ws.dir;
     let Some(server) = servers
         .into_iter()
         .find(|s| s.record.workspace() == workspace)

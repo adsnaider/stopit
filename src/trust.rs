@@ -1,13 +1,19 @@
-//! The trust store: the configurations the user allowed (DESIGN.md §3,
-//! Trust on first use).
+//! The trust store: the workspace configurations the user allowed (DESIGN.md §3).
 //!
-//! A `.stopit.toml` decides every grant and which script providers run on
-//! the host, and a sandbox can write one where a later `stopit run` finds
-//! it. So, as direnv does, stopit only uses a configuration the user allowed
-//! with `stopit allow`, in the exact content they allowed: the store maps
-//! each allowed configuration's canonical path to the SHA-256 of its bytes.
+//! Running a sandbox requires `.stopit.toml` to exist in the workspace, and the
+//! supervisor mounts every allowed `.stopit.toml` read-only inside every
+//! sandbox. To prevent a sandbox from planting a `.stopit.toml` in a writable
+//! subdirectory (or a freshly cloned repository from running an unreviewed
+//! `.stopit.toml`), stopit only loads a `.stopit.toml` whose canonical path and
+//! file allocation identity (`dev`, `ino`, and `statx` `btime` creation
+//! timestamp) match an entry recorded by `stopit init` or `stopit allow`.
 //!
-//! It lives in stopit's data directory ([`crate::state::DataDirs::store`]),
+//! Editing `.stopit.toml` in place on the host preserves its `(dev, ino, btime)`
+//! identity and needs no `stopit allow`, while deleting and recreating the file
+//! (even if the filesystem reuses the inode number) or replacing it via
+//! `rename` changes `(ino, btime)` and requires `stopit allow` again.
+//!
+//! The store lives in stopit's data directory ([`crate::state::DataDirs::store`]),
 //! as [`STORE_FILE`]:
 //!
 //! * The directory is created if missing (its parents with
@@ -25,25 +31,26 @@
 //!   which is synced and renamed over the store, so a reader sees either
 //!   the old store or the new one. Read-modify-write updates
 //!   ([`TrustStore::update`]) hold an exclusive `flock` on the directory,
-//!   so concurrent `stopit allow` runs do not lose each other's entries.
+//!   so concurrent updates do not lose each other's entries.
 //!   Readers need no lock: the rename is atomic.
 //!
-//! The file is JSON: `{"version": 1, "allowed": {"<path>": "<sha256>"}}`.
+//! The file is JSON:
+//! `{"version": 2, "allowed": {"<hex-path>": {"dev": ..., "ino": ..., "btime": {"sec": ..., "nsec": ...}}}}`.
 //! Paths may hold any bytes but NUL, and JSON strings are Unicode, so each
-//! path is written as the lowercase hex of its bytes; hashes are lowercase
-//! hex too. The file is not meant to be edited by hand (`stopit allowed`
-//! lists it).
+//! path is written as the lowercase hex of its bytes. Legacy `version = 1`
+//! stores (keyed by SHA-256) migrate entries whose on-disk regular file still
+//! matches its recorded SHA-256.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{AtFlags, FlockOperation, Mode, OFlags};
+use rustix::fs::{AtFlags, FlockOperation, Mode, OFlags, StatxFlags, makedev, statx};
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -60,11 +67,17 @@ pub const STORE_FILE: &str = "allowed.json";
 /// [`STORE_FILE`]. Only written under the directory's lock.
 const TEMP_FILE: &str = "allowed.json.tmp";
 
-/// The version of the store file's format.
-const FORMAT_VERSION: u32 = 1;
+/// Legacy content-hash store format version.
+const LEGACY_FORMAT_VERSION: u32 = 1;
+
+/// Current store file format version.
+const FORMAT_VERSION: u32 = 2;
 
 /// Mode of the store file.
 const FILE_MODE: u32 = 0o600;
+
+/// Maximum `.stopit.toml` size read during `v1` store migration.
+const MAX_MIGRATE_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Error using the trust store.
 #[derive(Debug, Error)]
@@ -148,6 +161,56 @@ pub enum TrustError {
     },
 }
 
+/// Nanosecond inode birth timestamp from `statx` (`stx_btime`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BirthTime {
+    /// Seconds since the Unix epoch.
+    pub sec: i64,
+    /// Nanoseconds within the second (`0..1_000_000_000`).
+    pub nsec: u32,
+}
+
+/// Allocation identity of an allowed `.stopit.toml` regular file: device,
+/// inode, and (when reported by the filesystem) creation timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileIdentity {
+    /// Device number (`makedev(stx_dev_major, stx_dev_minor)`).
+    pub dev: u64,
+    /// Inode number (`stx_ino`).
+    pub ino: u64,
+    /// Creation timestamp (`stx_btime`), if supported by the filesystem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub btime: Option<BirthTime>,
+}
+
+impl FileIdentity {
+    /// Queries `(dev, ino, btime)` on an open descriptor with `statx(EMPTY_PATH)`.
+    pub fn of_fd(fd: BorrowedFd<'_>) -> io::Result<Self> {
+        let stx = statx(
+            fd,
+            "",
+            AtFlags::EMPTY_PATH,
+            StatxFlags::BASIC_STATS | StatxFlags::BTIME,
+        )?;
+        let dev = makedev(stx.stx_dev_major, stx.stx_dev_minor);
+        let btime = if stx.stx_mask & StatxFlags::BTIME.bits() != 0 {
+            Some(BirthTime {
+                sec: stx.stx_btime.tv_sec,
+                nsec: stx.stx_btime.tv_nsec,
+            })
+        } else {
+            None
+        };
+        Ok(FileIdentity {
+            dev,
+            ino: stx.stx_ino,
+            btime,
+        })
+    }
+}
+
 /// The SHA-256 of `bytes`, as lowercase hex.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(Sha256::digest(bytes).as_slice())
@@ -156,54 +219,51 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// Whether the store allows a configuration (see [`Allowed::decide`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
-    /// Its path is allowed with exactly this content.
+    /// Its path is allowed with this exact file allocation identity.
     Allowed,
-    /// Its path is allowed, with other content.
-    Changed,
+    /// Its path was allowed, but the file on disk has a different `(dev, ino, btime)`
+    /// (deleted and recreated, or replaced by an atomic rename).
+    Replaced,
     /// Its path is not allowed.
     Unknown,
 }
 
-/// The allowed configurations: canonical path to the SHA-256 (lowercase
-/// hex) of the content allowed.
+/// The allowed configurations: canonical `.stopit.toml` path to its
+/// [`FileIdentity`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Allowed {
-    entries: BTreeMap<PathBuf, String>,
+    entries: BTreeMap<PathBuf, FileIdentity>,
 }
 
 impl Allowed {
-    /// Whether the configuration at the canonical `path`, holding `bytes`,
-    /// is allowed.
-    pub fn decide(&self, path: &Path, bytes: &[u8]) -> Decision {
+    /// Whether the configuration at the canonical `path` with `identity` is
+    /// allowed.
+    pub fn decide(&self, path: &Path, identity: FileIdentity) -> Decision {
         match self.entries.get(path) {
             None => Decision::Unknown,
-            Some(hash) if *hash == sha256_hex(bytes) => Decision::Allowed,
-            Some(_) => Decision::Changed,
+            Some(&stored) if stored == identity => Decision::Allowed,
+            Some(_) => Decision::Replaced,
         }
     }
 
-    /// Whether `path` has an entry, whatever its hash.
+    /// Whether `path` has an entry in the store.
     pub fn contains(&self, path: &Path) -> bool {
         self.entries.contains_key(path)
     }
 
-    /// Allows the configuration at the canonical `path` with the content
-    /// `bytes`, replacing any earlier entry for `path`, and returns the
-    /// hash recorded.
-    pub fn allow(&mut self, path: PathBuf, bytes: &[u8]) -> String {
-        let hash = sha256_hex(bytes);
-        self.entries.insert(path, hash.clone());
-        hash
+    /// Records `path` as allowed with `identity`, replacing any earlier entry.
+    pub fn allow(&mut self, path: PathBuf, identity: FileIdentity) {
+        self.entries.insert(path, identity);
     }
 
-    /// Removes `path`'s entry; whether there was one.
+    /// Removes `path`'s entry; returns whether there was one.
     pub fn revoke(&mut self, path: &Path) -> bool {
         self.entries.remove(path).is_some()
     }
 
-    /// Every entry, path and hash, in path order.
-    pub fn iter(&self) -> impl Iterator<Item = (&Path, &str)> {
-        self.entries.iter().map(|(p, h)| (p.as_path(), h.as_str()))
+    /// Every entry (`(path, identity)`), in path order.
+    pub fn iter(&self) -> impl Iterator<Item = (&Path, FileIdentity)> {
+        self.entries.iter().map(|(p, &id)| (p.as_path(), id))
     }
 
     /// Whether nothing is allowed.
@@ -211,14 +271,14 @@ impl Allowed {
         self.entries.is_empty()
     }
 
-    /// The store file's content.
+    /// Serializes the store in `version = 2` JSON format.
     fn to_json(&self) -> Vec<u8> {
-        let file = StoreFile {
+        let file = StoreFileV2 {
             version: FORMAT_VERSION,
             allowed: self
                 .entries
                 .iter()
-                .map(|(p, h)| (hex(p.as_os_str().as_bytes()), h.clone()))
+                .map(|(p, &id)| (hex(p.as_os_str().as_bytes()), id))
                 .collect(),
         };
         let mut json = serde_json::to_vec_pretty(&file).expect("the store serializes");
@@ -226,36 +286,107 @@ impl Allowed {
         json
     }
 
-    /// The store in the store file's content `json`, or why it is not one.
+    /// Parses the store from `json` (`version = 2`, or migrating valid
+    /// `version = 1` entries whose on-disk file still matches its SHA-256).
     fn from_json(json: &[u8]) -> Result<Self, String> {
-        let file: StoreFile = serde_json::from_slice(json).map_err(|e| e.to_string())?;
-        if file.version != FORMAT_VERSION {
-            return Err(format!(
-                "unknown version {}, expected {FORMAT_VERSION}",
-                file.version
-            ));
+        let header: StoreVersionProbe = serde_json::from_slice(json).map_err(|e| e.to_string())?;
+        match header.version {
+            FORMAT_VERSION => Self::from_v2_json(json),
+            LEGACY_FORMAT_VERSION => Self::from_v1_json(json),
+            other => Err(format!(
+                "unknown version {other}, expected {FORMAT_VERSION}"
+            )),
         }
+    }
+
+    fn from_v2_json(json: &[u8]) -> Result<Self, String> {
+        let file: StoreFileV2 = serde_json::from_slice(json).map_err(|e| e.to_string())?;
         let mut entries = BTreeMap::new();
-        for (path, hash) in file.allowed {
-            let bytes = unhex(&path).ok_or_else(|| format!("invalid path {path:?}"))?;
-            if bytes.first() != Some(&b'/') || bytes.contains(&0) {
-                return Err(format!("invalid path {path:?}"));
+        for (raw_path, id) in file.allowed {
+            let path = decode_store_path(&raw_path)?;
+            if let Some(bt) = id.btime
+                && bt.nsec >= 1_000_000_000
+            {
+                return Err(format!("invalid btime.nsec {} for {raw_path:?}", bt.nsec));
             }
+            entries.insert(path, id);
+        }
+        Ok(Allowed { entries })
+    }
+
+    fn from_v1_json(json: &[u8]) -> Result<Self, String> {
+        let file: StoreFileV1 = serde_json::from_slice(json).map_err(|e| e.to_string())?;
+        let uid = rustix::process::getuid().as_raw();
+        let mut entries = BTreeMap::new();
+        for (raw_path, hash) in file.allowed {
+            let path = decode_store_path(&raw_path)?;
             if hash.len() != 64 || unhex(&hash).is_none() {
                 return Err(format!("invalid hash {hash:?}"));
             }
-            entries.insert(PathBuf::from(OsString::from_vec(bytes)), hash);
+            if let Some(id) = migrate_v1_entry(&path, &hash, uid) {
+                entries.insert(path, id);
+            }
         }
         Ok(Allowed { entries })
     }
 }
 
-/// The store file's format.
+fn decode_store_path(raw_path: &str) -> Result<PathBuf, String> {
+    let bytes = unhex(raw_path).ok_or_else(|| format!("invalid path {raw_path:?}"))?;
+    if bytes.first() != Some(&b'/') || bytes.contains(&0) {
+        return Err(format!("invalid path {raw_path:?}"));
+    }
+    Ok(PathBuf::from(OsString::from_vec(bytes)))
+}
+
+/// Checks whether a legacy `v1` entry's file still exists as a trusted regular
+/// file with the exact `expected_hash`, returning its current [`FileIdentity`]
+/// if so.
+fn migrate_v1_entry(path: &Path, expected_hash: &str, uid: u32) -> Option<FileIdentity> {
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NOCTTY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()?;
+    let stat = rustix::fs::fstat(&fd).ok()?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+        || stat.st_uid != uid
+        || stat.st_mode & 0o022 != 0
+    {
+        return None;
+    }
+    let id = FileIdentity::of_fd(fd.as_fd()).ok()?;
+    let mut bytes = Vec::new();
+    File::from(fd)
+        .take(MAX_MIGRATE_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_MIGRATE_CONFIG_BYTES {
+        return None;
+    }
+    (sha256_hex(&bytes) == expected_hash).then_some(id)
+}
+
+#[derive(Deserialize)]
+struct StoreVersionProbe {
+    version: u32,
+}
+
+/// Current (`version = 2`) store file format.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StoreFile {
+struct StoreFileV2 {
     version: u32,
-    /// Hex of each path's bytes to the hex SHA-256 of its content.
+    allowed: BTreeMap<String, FileIdentity>,
+}
+
+/// Legacy (`version = 1`) store file format.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoreFileV1 {
+    #[allow(dead_code)]
+    version: u32,
     allowed: BTreeMap<String, String>,
 }
 
@@ -347,7 +478,6 @@ impl TrustStore {
             Mode::empty(),
         )
         .map_err(|e| open_error(e.into()))?;
-        // The directory opened is the one checked.
         let stat = rustix::fs::fstat(&fd).map_err(|e| open_error(e.into()))?;
         if (stat.st_dev, stat.st_ino) != (checked.dev(), checked.ino()) {
             return Err(open_error(io::Error::other(
@@ -372,8 +502,6 @@ impl TrustStore {
             path: path.clone(),
             source,
         };
-        // Non-blocking, so that a FIFO does not hang the open; it is refused
-        // as not a regular file.
         let fd = match rustix::fs::openat(
             &self.fd,
             STORE_FILE,
@@ -413,8 +541,6 @@ impl TrustStore {
                 source: e.into(),
             }
         })?;
-        // The lock goes with the descriptor's last close; unlock explicitly
-        // so that it does not outlive the update.
         let result = self.locked_update(change);
         let _ = rustix::fs::flock(&self.fd, FlockOperation::Unlock);
         result
@@ -430,10 +556,6 @@ impl TrustStore {
         Ok(result)
     }
 
-    /// Replaces the store file with `allowed`, atomically: a new file
-    /// (`O_EXCL`, 0600) is written, synced and renamed over it, and the
-    /// directory synced. Only called under the lock, so [`TEMP_FILE`] is
-    /// no one else's; one left by a crashed update is removed first.
     fn write(&self, allowed: &Allowed) -> Result<(), TrustError> {
         let write_error = |source: io::Error| TrustError::Write {
             path: self.file_path(),
@@ -451,7 +573,6 @@ impl TrustStore {
         )
         .map_err(|e| write_error(e.into()))?;
         let written = (|| {
-            // Whatever the umask.
             rustix::fs::fchmod(&fd, Mode::from_raw_mode(FILE_MODE))?;
             let mut file = File::from(fd);
             file.write_all(&allowed.to_json())?;
@@ -470,13 +591,12 @@ impl TrustStore {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
     use tempfile::TempDir;
 
     use super::*;
 
-    /// A canonical temporary directory.
     fn tmp() -> (TempDir, PathBuf) {
         let dir = TempDir::new().unwrap();
         let root = fs::canonicalize(dir.path()).unwrap();
@@ -485,6 +605,17 @@ mod tests {
 
     fn mode(path: &Path) -> u32 {
         fs::symlink_metadata(path).unwrap().mode() & 0o7777
+    }
+
+    fn sample_id(ino: u64, nsec: u32) -> FileIdentity {
+        FileIdentity {
+            dev: 42,
+            ino,
+            btime: Some(BirthTime {
+                sec: 1_700_000_000,
+                nsec,
+            }),
+        }
     }
 
     #[test]
@@ -510,91 +641,155 @@ mod tests {
     }
 
     #[test]
-    fn allow_revoke_and_decide() {
+    fn allow_revoke_and_decide_by_file_identity() {
         let mut allowed = Allowed::default();
         let path = Path::new("/ws/.stopit.toml");
-        assert_eq!(allowed.decide(path, b"x"), Decision::Unknown);
+        let id1 = sample_id(10, 100);
+        let id1_recreated_same_ino = sample_id(10, 200);
+        let id2 = sample_id(11, 100);
+
+        assert_eq!(allowed.decide(path, id1), Decision::Unknown);
         assert!(!allowed.contains(path));
-        let hash = allowed.allow(path.to_path_buf(), b"x");
-        assert_eq!(hash, sha256_hex(b"x"));
+        allowed.allow(path.to_path_buf(), id1);
         assert!(allowed.contains(path));
         assert!(!allowed.contains(Path::new("/ws")));
-        assert_eq!(allowed.decide(path, b"x"), Decision::Allowed);
-        assert_eq!(allowed.decide(path, b"x\n"), Decision::Changed);
-        // Another path with the same content is not allowed.
+        assert_eq!(allowed.decide(path, id1), Decision::Allowed);
+        // Same inode number with a newer btime (inode reuse after delete+recreate) is rejected.
         assert_eq!(
-            allowed.decide(Path::new("/other/.stopit.toml"), b"x"),
+            allowed.decide(path, id1_recreated_same_ino),
+            Decision::Replaced
+        );
+        assert_eq!(allowed.decide(path, id2), Decision::Replaced);
+        assert_eq!(
+            allowed.decide(Path::new("/other/.stopit.toml"), id1),
             Decision::Unknown
         );
-        // Allowing again replaces the entry.
-        allowed.allow(path.to_path_buf(), b"y");
-        assert_eq!(allowed.decide(path, b"x"), Decision::Changed);
-        assert_eq!(allowed.decide(path, b"y"), Decision::Allowed);
+
+        allowed.allow(path.to_path_buf(), id2);
+        assert_eq!(allowed.decide(path, id1), Decision::Replaced);
+        assert_eq!(allowed.decide(path, id2), Decision::Allowed);
         assert_eq!(allowed.iter().count(), 1);
         assert!(allowed.revoke(path));
         assert!(!allowed.revoke(path));
-        assert_eq!(allowed.decide(path, b"y"), Decision::Unknown);
+        assert_eq!(allowed.decide(path, id2), Decision::Unknown);
         assert!(allowed.is_empty());
     }
 
     #[test]
-    fn the_json_round_trips_with_any_path_bytes() {
+    fn file_identity_persists_across_in_place_edits_and_changes_on_recreate() {
+        let (_d, root) = tmp();
+        let path = root.join(".stopit.toml");
+        fs::write(&path, "default_profile = \"main\"\n").unwrap();
+        let f1 = File::open(&path).unwrap();
+        let id_initial = FileIdentity::of_fd(f1.as_fd()).unwrap();
+        drop(f1);
+
+        // In-place truncation and write keeps `(dev, ino, btime)` unchanged.
+        {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(b"default_profile = \"agent\"\n").unwrap();
+        }
+        let f2 = File::open(&path).unwrap();
+        let id_after_in_place = FileIdentity::of_fd(f2.as_fd()).unwrap();
+        drop(f2);
+        assert_eq!(id_initial, id_after_in_place);
+
+        // Deleting and recreating (sleeping briefly so `btime` advances even if `ino` is reused)
+        // yields a distinct `FileIdentity`.
+        fs::remove_file(&path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(&path, "default_profile = \"main\"\n").unwrap();
+        let f3 = File::open(&path).unwrap();
+        let id_recreated = FileIdentity::of_fd(f3.as_fd()).unwrap();
+        assert_ne!(id_initial, id_recreated);
+    }
+
+    #[test]
+    fn json_round_trips_and_migrates_matching_v1_entries() {
         let mut allowed = Allowed::default();
-        allowed.allow("/a/.stopit.toml".into(), b"a");
+        allowed.allow("/a/.stopit.toml".into(), sample_id(1, 10));
         let odd = PathBuf::from(OsString::from_vec(
             b"/\xff\xfe/x\n\"y/.stopit.toml".to_vec(),
         ));
-        allowed.allow(odd.clone(), b"b");
+        allowed.allow(
+            odd.clone(),
+            FileIdentity {
+                dev: 7,
+                ino: 8,
+                btime: None,
+            },
+        );
         let json = allowed.to_json();
         let text = String::from_utf8(json.clone()).unwrap();
         assert!(text.contains(&hex(b"/a/.stopit.toml")), "{text}");
-        assert!(text.contains("\"version\": 1"), "{text}");
+        assert!(text.contains("\"version\": 2"), "{text}");
         let back = Allowed::from_json(&json).unwrap();
         assert_eq!(back, allowed);
-        assert_eq!(back.decide(&odd, b"b"), Decision::Allowed);
+
+        // Legacy v1 migration: unmodified file migrates; modified file is dropped.
+        let (_d, root) = tmp();
+        let good = root.join("good.toml");
+        let modified = root.join("modified.toml");
+        fs::write(&good, "ok").unwrap();
+        fs::set_permissions(&good, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&modified, "changed").unwrap();
+        fs::set_permissions(&modified, fs::Permissions::from_mode(0o644)).unwrap();
+        let v1_json = format!(
+            "{{\"version\": 1, \"allowed\": {{\"{}\": \"{}\", \"{}\": \"{}\"}}}}",
+            hex(good.as_os_str().as_bytes()),
+            sha256_hex(b"ok"),
+            hex(modified.as_os_str().as_bytes()),
+            sha256_hex(b"original"),
+        );
+        let migrated = Allowed::from_json(v1_json.as_bytes()).unwrap();
+        let good_id = FileIdentity::of_fd(File::open(&good).unwrap().as_fd()).unwrap();
+        assert_eq!(migrated.decide(&good, good_id), Decision::Allowed);
+        assert!(!migrated.contains(&modified));
     }
 
     #[test]
     fn invalid_json_is_refused_with_a_reason() {
-        let h = sha256_hex(b"");
         let p = hex(b"/a");
         for (json, reason) in [
             ("", "EOF"),
-            ("[]", "expected struct StoreFile"),
-            ("{\"version\": 1, \"allowed\": []}", "invalid type"),
-            ("{\"version\": 2, \"allowed\": {}}", "unknown version 2"),
-            ("{\"version\": 1}", "missing field"),
+            ("[]", "expected struct StoreVersionProbe"),
+            ("{\"version\": 2, \"allowed\": []}", "invalid type"),
+            ("{\"version\": 99, \"allowed\": {}}", "unknown version 99"),
+            ("{\"version\": 2}", "missing field"),
             (
-                "{\"version\": 1, \"allowed\": {}, \"x\": 1}",
+                "{\"version\": 2, \"allowed\": {}, \"x\": 1}",
                 "unknown field",
             ),
             (
-                &format!("{{\"version\": 1, \"allowed\": {{\"/a\": \"{h}\"}}}}"),
+                "{\"version\": 2, \"allowed\": {\"/a\": {\"dev\": 1, \"ino\": 2}}}",
                 "invalid path",
             ),
             (
                 &format!(
-                    "{{\"version\": 1, \"allowed\": {{\"{}\": \"{h}\"}}}}",
+                    "{{\"version\": 2, \"allowed\": {{\"{}\": {{\"dev\": 1, \"ino\": 2}}}}}}",
                     hex(b"rel")
                 ),
                 "invalid path",
             ),
             (
                 &format!(
-                    "{{\"version\": 1, \"allowed\": {{\"{}\": \"{h}\"}}}}",
+                    "{{\"version\": 2, \"allowed\": {{\"{}\": {{\"dev\": 1, \"ino\": 2}}}}}}",
                     hex(b"/a\0b")
                 ),
                 "invalid path",
             ),
             (
-                &format!("{{\"version\": 1, \"allowed\": {{\"{p}\": \"abc\"}}}}"),
-                "invalid hash",
+                &format!(
+                    "{{\"version\": 2, \"allowed\": {{\"{p}\": {{\"dev\": 1, \"ino\": 2, \"btime\": {{\"sec\": 1, \"nsec\": 1000000000}}}}}}}}"
+                ),
+                "invalid btime.nsec",
             ),
             (
-                &format!(
-                    "{{\"version\": 1, \"allowed\": {{\"{p}\": \"{}\"}}}}",
-                    h.to_uppercase()
-                ),
+                &format!("{{\"version\": 1, \"allowed\": {{\"{p}\": \"abc\"}}}}"),
                 "invalid hash",
             ),
         ] {
@@ -608,24 +803,20 @@ mod tests {
         let (_d, root) = tmp();
         let dir = root.join("a/b/stopit");
         let store = TrustStore::open(&dir).unwrap();
-        // Created with its parents, private.
         assert_eq!(mode(&dir), 0o700);
-        // No file yet: an empty store, and nothing is written for it.
         assert_eq!(store.read().unwrap(), Allowed::default());
         assert!(!store.file_path().exists());
-        let hash = store
-            .update(|a| a.allow("/ws/.stopit.toml".into(), b"x"))
+        let id = sample_id(10, 20);
+        store
+            .update(|a| a.allow("/ws/.stopit.toml".into(), id))
             .unwrap();
-        assert_eq!(hash, sha256_hex(b"x"));
         assert_eq!(mode(&store.file_path()), 0o600);
         assert_eq!(store.file_path(), dir.join(STORE_FILE));
-        // Read again, from a store opened anew.
         let again = TrustStore::open(&dir).unwrap().read().unwrap();
         assert_eq!(
-            again.decide(Path::new("/ws/.stopit.toml"), b"x"),
+            again.decide(Path::new("/ws/.stopit.toml"), id),
             Decision::Allowed
         );
-        // No temporary file is left.
         let names: Vec<_> = fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name())
@@ -637,28 +828,29 @@ mod tests {
     fn an_update_keeps_the_other_entries() {
         let (_d, root) = tmp();
         let store = TrustStore::open(&root.join("stopit")).unwrap();
+        let id_a1 = sample_id(1, 0);
+        let id_a2 = sample_id(2, 0);
+        let id_b = sample_id(3, 0);
         store
-            .update(|a| a.allow("/a/.stopit.toml".into(), b"a"))
+            .update(|a| a.allow("/a/.stopit.toml".into(), id_a1))
             .unwrap();
         store
-            .update(|a| a.allow("/b/.stopit.toml".into(), b"b"))
+            .update(|a| a.allow("/b/.stopit.toml".into(), id_b))
             .unwrap();
-        // A stale temporary file of a crashed update is replaced.
         fs::write(root.join("stopit").join(TEMP_FILE), "junk").unwrap();
         store
-            .update(|a| a.allow("/a/.stopit.toml".into(), b"a2"))
+            .update(|a| a.allow("/a/.stopit.toml".into(), id_a2))
             .unwrap();
         let allowed = store.read().unwrap();
         assert_eq!(
-            allowed.decide(Path::new("/a/.stopit.toml"), b"a2"),
+            allowed.decide(Path::new("/a/.stopit.toml"), id_a2),
             Decision::Allowed
         );
         assert_eq!(
-            allowed.decide(Path::new("/b/.stopit.toml"), b"b"),
+            allowed.decide(Path::new("/b/.stopit.toml"), id_b),
             Decision::Allowed
         );
         assert!(!root.join("stopit").join(TEMP_FILE).exists());
-        // Revoking one keeps the other; revoking nothing writes nothing.
         assert!(
             store
                 .update(|a| a.revoke(Path::new("/a/.stopit.toml")))
@@ -674,7 +866,7 @@ mod tests {
         let allowed = store.read().unwrap();
         assert_eq!(allowed.iter().count(), 1);
         assert_eq!(
-            allowed.decide(Path::new("/b/.stopit.toml"), b"b"),
+            allowed.decide(Path::new("/b/.stopit.toml"), id_b),
             Decision::Allowed
         );
     }
@@ -688,11 +880,12 @@ mod tests {
             .map(|i| {
                 let dir = dir.clone();
                 std::thread::spawn(move || {
-                    // Each its own descriptor, as separate processes have.
                     let store = TrustStore::open(&dir).unwrap();
                     for j in 0..5 {
                         store
-                            .update(|a| a.allow(format!("/{i}/{j}").into(), b"x"))
+                            .update(|a| {
+                                a.allow(format!("/{i}/{j}").into(), sample_id(i * 10 + j, 0))
+                            })
                             .unwrap();
                     }
                 })
@@ -722,11 +915,11 @@ mod tests {
         let e = store.read().unwrap_err();
         assert!(matches!(e, TrustError::Corrupt { .. }), "{e}");
         assert!(e.to_string().contains(&format!("{path:?}")), "{e}");
-        // An update does not overwrite it either.
-        let e = store.update(|a| a.allow("/x".into(), b"")).unwrap_err();
+        let e = store
+            .update(|a| a.allow("/x".into(), sample_id(1, 0)))
+            .unwrap_err();
         assert!(matches!(e, TrustError::Corrupt { .. }), "{e}");
         assert_eq!(fs::read_to_string(&path).unwrap(), "{not json");
-        // Nor is an empty file an empty store.
         fs::write(&path, "").unwrap();
         assert!(matches!(store.read(), Err(TrustError::Corrupt { .. })));
     }
@@ -735,7 +928,9 @@ mod tests {
     fn a_store_file_others_can_access_or_a_link_is_refused() {
         let (_d, root) = tmp();
         let store = TrustStore::open(&root.join("stopit")).unwrap();
-        store.update(|a| a.allow("/x".into(), b"")).unwrap();
+        store
+            .update(|a| a.allow("/x".into(), sample_id(1, 0)))
+            .unwrap();
         let path = store.file_path();
         for bad in [0o644, 0o620, 0o602, 0o640] {
             fs::set_permissions(&path, fs::Permissions::from_mode(bad)).unwrap();
@@ -745,13 +940,11 @@ mod tests {
         }
         fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
         assert!(store.read().is_ok());
-        // A link, even to a private file of the user's.
         fs::rename(&path, root.join("real.json")).unwrap();
         symlink(root.join("real.json"), &path).unwrap();
         let e = store.read().unwrap_err();
         assert!(matches!(e, TrustError::Untrusted { .. }), "{e}");
         assert!(e.to_string().contains("symbolic link"), "{e}");
-        // A directory.
         fs::remove_file(&path).unwrap();
         fs::create_dir(&path).unwrap();
         let e = store.read().unwrap_err();
@@ -772,7 +965,6 @@ mod tests {
             e.contains("owned by uid 1001, not by you (uid 1000)"),
             "{e}"
         );
-        // Root's too.
         assert!(check_store_file(file(0, 0o600), ME).is_err());
         let e = check_store_file(file(ME, 0o604), ME).unwrap_err();
         assert!(e.contains("mode 0604"), "{e}");
@@ -786,7 +978,6 @@ mod tests {
 
     #[test]
     fn a_store_directory_that_is_not_private_is_refused() {
-        // A link, even to a private directory of the user's.
         let (_d, root) = tmp();
         fs::create_dir(root.join("real")).unwrap();
         fs::set_permissions(root.join("real"), fs::Permissions::from_mode(0o700)).unwrap();
@@ -797,7 +988,6 @@ mod tests {
             "{e}"
         );
         assert_eq!(fs::read_dir(root.join("real")).unwrap().count(), 0);
-        // Open to others.
         fs::remove_file(root.join("stopit")).unwrap();
         fs::create_dir(root.join("stopit")).unwrap();
         fs::set_permissions(root.join("stopit"), fs::Permissions::from_mode(0o750)).unwrap();
@@ -810,16 +1000,12 @@ mod tests {
             "{e}"
         );
         assert!(e.to_string().contains("0750"), "{e}");
-        // A file.
         let (_d, root) = tmp();
         fs::write(root.join("stopit"), "").unwrap();
         let e = TrustStore::open(&root.join("stopit")).unwrap_err();
         assert!(matches!(e, TrustError::Dir(_)), "{e}");
-        // A parent that cannot be created.
         let e = TrustStore::open(&root.join("stopit/sub/stopit")).unwrap_err();
         assert!(matches!(e, TrustError::CreateDir { .. }), "{e}");
-        // The message says how to keep the store elsewhere, for a home
-        // directory that cannot hold it (`/nonexistent`, `/var/empty`).
         assert!(
             e.to_string().ends_with(
                 "if your home directory cannot hold it, set STOPIT_STATE_DIR to the absolute \
@@ -831,7 +1017,6 @@ mod tests {
 
     #[test]
     fn a_store_directory_of_someone_else_is_refused() {
-        // `/proc` is root's; skip when the tests run as root.
         if rustix::process::getuid().is_root() {
             return;
         }
