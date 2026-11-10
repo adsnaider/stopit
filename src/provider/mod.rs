@@ -623,16 +623,20 @@ pub fn from_entry_with_origin(
             file,
             flake,
             cache,
-        } => Ok(Box::new(NixProvider::with_origin(
-            entry.name.clone(),
-            profile.clone(),
-            shell.clone(),
-            file.clone(),
-            flake.clone(),
-            *cache,
-            base_dir,
-            origin,
-        ))),
+            shell_hook,
+        } => Ok(Box::new(
+            NixProvider::with_origin(
+                entry.name.clone(),
+                profile.clone(),
+                shell.clone(),
+                file.clone(),
+                flake.clone(),
+                *cache,
+                base_dir,
+                origin,
+            )
+            .with_shell_hook(*shell_hook),
+        )),
     }
 }
 

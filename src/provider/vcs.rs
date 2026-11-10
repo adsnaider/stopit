@@ -915,9 +915,15 @@ impl VcsProvider {
         // inherit, whose backing directory `main` shares.
         let home = || list(vec![VCS_HOME.to_owned()]);
         let system = || Value::Table(table([("home", VCS_HOME.into())]));
-        // A VCS command has no use for `stopit-grant`, and a grant on top
-        // of these profiles would mount host paths beside the metadata.
-        let no_grant = || Value::Table(table([("grant", false.into())]));
+        // A VCS command has no use for `stopit-grant` or an inherited
+        // `shell_hook` (which could write banners to stdout or source
+        // sandbox-editable workspace scripts inside `vcs.local`/`vcs.remote`).
+        let no_grant = || {
+            Value::Table(table([
+                ("grant", false.into()),
+                ("shell_hook", false.into()),
+            ]))
+        };
         let mut ro = toml::Table::new();
         ro.insert("network".into(), offline());
         ro.insert("system".into(), system());

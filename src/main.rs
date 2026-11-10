@@ -14,6 +14,9 @@ fn main() -> ExitCode {
         if subcommand == stopit::init::SUBCOMMAND {
             return ExitCode::from(stopit::init::run(rest));
         }
+        if subcommand == stopit::init::EXEC_SUBCOMMAND {
+            return ExitCode::from(stopit::init::run_exec(rest));
+        }
         // A shim's call, from the trampoline in a sandbox (DESIGN.md §7.1).
         if subcommand == stopit::shim::SUBCOMMAND {
             return ExitCode::from(stopit::shim::run(rest));

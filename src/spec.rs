@@ -92,6 +92,9 @@ pub struct SandboxSpec {
     pub shims: BTreeMap<ShimName, (ShimSpec, ProviderName)>,
     /// Whether the sandbox gets `stopit-grant` (§7.5).
     pub grant: bool,
+    /// Optional shell hook script run inside the sandbox right before
+    /// `execve`ing the target command.
+    pub shell_hook: Option<crate::manifest::ShellHook>,
 }
 
 /// System mounts and synthesized files (§6.2 steps 3 and 4).
@@ -3683,6 +3686,7 @@ fn finish_profile_inner(
         allow_syscalls: grants.sandbox.allow_syscalls.clone(),
         shims: grants.shims.clone(),
         grant: grants.sandbox.grant,
+        shell_hook: grants.sandbox.shell_hook.clone(),
     };
     Ok(CompiledProfile {
         spec,

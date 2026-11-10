@@ -411,6 +411,15 @@ impl BwrapCommand {
         init_spec.pty_slave = terminal == TerminalSession::Pty;
         init_spec.cwd = extras.cwd.clone();
         init_spec.skip_shims = extras.skip_shims;
+        init_spec.shell_hook = spec.shell_hook.as_ref().map(|hook| init::ShellHookExec {
+            shell: hook.shell.clone(),
+            script: hook.script.clone(),
+            stopit_prefix: provisioned
+                .command_prefix(Path::new(SANDBOX_RUNTIME_DIR))
+                .into_iter()
+                .map(|arg| arg.as_os_str().as_bytes().to_vec())
+                .collect(),
+        });
         // `__init` enters `extras.cwd` itself, from the root, with
         // `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS)`.
         let cwd = if extras.cwd.is_some() {
@@ -1060,10 +1069,12 @@ fn checked(arg: &OsStr) -> Result<OsString, BwrapError> {
 fn host_proc_has(path: &Path) -> bool {
     static PRESENT: std::sync::OnceLock<[bool; PROC_OPTIONAL_MASKS.len()]> =
         std::sync::OnceLock::new();
-    let present = PRESENT.get_or_init(|| {
-        PROC_OPTIONAL_MASKS.map(|p| Path::new(p).symlink_metadata().is_ok())
-    });
-    if let Some(idx) = PROC_OPTIONAL_MASKS.iter().position(|p| Path::new(p) == path) {
+    let present = PRESENT
+        .get_or_init(|| PROC_OPTIONAL_MASKS.map(|p| Path::new(p).symlink_metadata().is_ok()));
+    if let Some(idx) = PROC_OPTIONAL_MASKS
+        .iter()
+        .position(|p| Path::new(p) == path)
+    {
         present[idx]
     } else {
         path.symlink_metadata().is_ok()
@@ -2187,9 +2198,12 @@ mod tests {
         let mut spec = SandboxSpec::default();
         spec.system.dev = Some(DevMode::Minimal);
         assert_eq!(golden(&spec), around(&["--dev", "/dev"]));
-        spec.system.devices = ["/dev/kvm".parse().unwrap(), "/dev/vhost-vsock".parse().unwrap()]
-            .into_iter()
-            .collect();
+        spec.system.devices = [
+            "/dev/kvm".parse().unwrap(),
+            "/dev/vhost-vsock".parse().unwrap(),
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(
             golden(&spec),
             around(&[
@@ -2374,7 +2388,9 @@ mod tests {
             let s = spec(vec![host(dst, "/h", EntryKind::Dir, Ro)]);
             let args = golden(&s);
             assert!(
-                !args.windows(3).any(|w| w == ["--symlink", "/run", "/var/run"]),
+                !args
+                    .windows(3)
+                    .any(|w| w == ["--symlink", "/run", "/var/run"]),
                 "{dst}: {args:?}"
             );
         }
@@ -2382,7 +2398,8 @@ mod tests {
         let s = spec(vec![host("/var/tmp", "/h", EntryKind::Dir, Ro)]);
         let args = golden(&s);
         assert!(
-            args.windows(3).any(|w| w == ["--symlink", "/run", "/var/run"]),
+            args.windows(3)
+                .any(|w| w == ["--symlink", "/run", "/var/run"]),
             "{args:?}"
         );
     }

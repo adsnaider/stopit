@@ -23,7 +23,7 @@ use crate::config::{ProfileRef, ProviderName, ProviderOrigin};
 use crate::manifest::{
     Bind, DevMode, DevicePath, Domain, EnvName, EnvPattern, EnvValue, EtcFile, FsGrants, GroupName,
     OptInSyscall, PathPattern, SandboxHome, SandboxUser, SearchPathEntry, ShareableNamespace,
-    ShimName, ShimSpec,
+    ShellHook, ShellHookSetting, ShimName, ShimSpec,
 };
 use crate::policy::{NetworkMode, PathMode};
 
@@ -123,6 +123,8 @@ pub struct EffectiveSandbox {
     pub allow_syscalls: BTreeSet<OptInSyscall>,
     /// Whether the sandbox gets `stopit-grant`.
     pub grant: bool,
+    /// Optional shell hook script run inside the sandbox before `exec`ing the target.
+    pub shell_hook: Option<ShellHook>,
 }
 
 /// A profile's effective grants. The default value is the empty sandbox.
@@ -237,6 +239,29 @@ pub enum MergeError {
         /// The provider that granted it again.
         second_provider: ProviderName,
     },
+
+    /// Two providers set conflicting `sandbox.shell_hook` scripts for one
+    /// profile at the same layer.
+    #[error(transparent)]
+    ShellHookConflict(Box<ShellHookConflict>),
+}
+
+/// Two providers set conflicting `sandbox.shell_hook` values for one profile
+/// at the same layer (see [`MergeError::ShellHookConflict`]).
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "profile {:?}: conflicting sandbox.shell_hook from provider {:?} and provider {:?}",
+    .profile.as_str(),
+    .first_provider.as_str(),
+    .second_provider.as_str()
+)]
+pub struct ShellHookConflict {
+    /// The profile.
+    pub profile: ProfileRef,
+    /// The provider that set the first hook.
+    pub first_provider: ProviderName,
+    /// The provider that set the conflicting hook.
+    pub second_provider: ProviderName,
 }
 
 /// Two providers set different `system.user` values for one profile (see
@@ -361,6 +386,7 @@ fn merge_profile(
                 own.iter().map(|c| &c.grants.sandbox.allow_syscalls),
             ),
             grant: merge_grant(inherited.sandbox.grant, own),
+            shell_hook: merge_shell_hook(profile, inherited.sandbox.shell_hook.as_ref(), own)?,
         },
         shims: merge_shims(profile, &inherited.shims, own)?,
     })
@@ -669,6 +695,52 @@ fn merge_shims(
         }
     }
     Ok(out)
+}
+
+/// `sandbox.shell_hook`: higher [`ProviderOrigin`] overrides lower within a
+/// profile; within the same layer `Disabled` (`false`) wins over `Run` (so a
+/// same-layer `config` entry can turn off a `nix` hook), identical `Run` hooks
+/// pass, and two distinct `Run` hooks return [`MergeError::ShellHookConflict`].
+/// A profile's own explicit setting (`Run` or `Disabled`) overrides the
+/// inherited hook.
+fn merge_shell_hook(
+    profile: &ProfileRef,
+    inherited: Option<&ShellHook>,
+    own: &[Contribution],
+) -> Result<Option<ShellHook>, MergeError> {
+    let Some(max_origin) = own
+        .iter()
+        .filter_map(|c| c.grants.sandbox.shell_hook.as_ref().map(|_| c.origin))
+        .max()
+    else {
+        return Ok(inherited.cloned());
+    };
+    let mut disabled = false;
+    let mut first_run: Option<(&ShellHook, &ProviderName)> = None;
+    for c in own.iter().filter(|c| c.origin == max_origin) {
+        let Some(setting) = &c.grants.sandbox.shell_hook else {
+            continue;
+        };
+        match setting {
+            ShellHookSetting::Disabled => disabled = true,
+            ShellHookSetting::Run(hook) => match first_run {
+                None => first_run = Some((hook, &c.provider)),
+                Some((prev, _)) if prev == hook => {}
+                Some((_, first_provider)) => {
+                    return Err(MergeError::ShellHookConflict(Box::new(ShellHookConflict {
+                        profile: profile.clone(),
+                        first_provider: first_provider.clone(),
+                        second_provider: c.provider.clone(),
+                    })));
+                }
+            },
+        }
+    }
+    if disabled {
+        Ok(None)
+    } else {
+        Ok(first_run.map(|(h, _)| h.clone()))
+    }
 }
 
 /// `fs.mask_sockets` (§3.5): higher [`ProviderOrigin`] overrides lower within
@@ -1823,5 +1895,87 @@ mod tests {
         );
         assert!(!is_approvals_provider(&pn("approvals")));
         assert!(is_approvals_provider(&pn("approvals-main")));
+    }
+
+    #[test]
+    fn shell_hook_inherits_overrides_disables_and_detects_same_layer_conflict() {
+        let global = format!(
+            "[profiles.agent]\ninherit = \"main\"\n\
+             [profiles.quiet]\ninherit = \"main\"\n\
+             {}{}",
+            prov(
+                "g-hook",
+                "main",
+                "sandbox.shell_hook = { shell = \"/bin/sh\", script = \"export G=1\" }"
+            ),
+            prov("g-quiet", "quiet", "sandbox.shell_hook = false"),
+        );
+        let m = layered(&global, "").unwrap();
+        let expected = ShellHook::new("/bin/sh".into(), "export G=1".into()).unwrap();
+        assert_eq!(eff(&m, "main").sandbox.shell_hook.as_ref(), Some(&expected));
+        assert_eq!(
+            eff(&m, "agent").sandbox.shell_hook.as_ref(),
+            Some(&expected)
+        );
+        assert_eq!(eff(&m, "quiet").sandbox.shell_hook, None);
+
+        // Workspace layer overrides global, and same-layer `false` wins over `Run`.
+        let m2 = layered(
+            &global,
+            &prov(
+                "w-hook",
+                "main",
+                "sandbox.shell_hook = { shell = \"/bin/bash\", script = \"export W=2\" }",
+            ),
+        )
+        .unwrap();
+        let expected_w = ShellHook::new("/bin/bash".into(), "export W=2".into()).unwrap();
+        assert_eq!(
+            eff(&m2, "main").sandbox.shell_hook.as_ref(),
+            Some(&expected_w)
+        );
+        assert_eq!(
+            eff(&m2, "agent").sandbox.shell_hook.as_ref(),
+            Some(&expected_w)
+        );
+        assert_eq!(eff(&m2, "quiet").sandbox.shell_hook, None);
+
+        let m3 = layered(
+            &global,
+            &format!(
+                "{}{}",
+                prov(
+                    "w-hook",
+                    "main",
+                    "sandbox.shell_hook = { shell = \"/bin/bash\", script = \"export W=2\" }"
+                ),
+                prov("w-off", "main", "sandbox.shell_hook = false"),
+            ),
+        )
+        .unwrap();
+        assert_eq!(eff(&m3, "main").sandbox.shell_hook, None);
+
+        // Two distinct `Run` hooks at the same layer conflict.
+        let err = layered(
+            "",
+            &format!(
+                "{}{}",
+                prov(
+                    "a",
+                    "main",
+                    "sandbox.shell_hook = { shell = \"/bin/sh\", script = \"echo a\" }"
+                ),
+                prov(
+                    "b",
+                    "main",
+                    "sandbox.shell_hook = { shell = \"/bin/sh\", script = \"echo b\" }"
+                ),
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"profile "main": conflicting sandbox.shell_hook from provider "a" and provider "b""#
+        );
     }
 }

@@ -181,3 +181,4 @@ rules = [
 # name = "nix"
 # type = "nix"
 # profile = "main"
+# shell_hook = true

@@ -2,9 +2,10 @@
 //!
 //! Resolves a project's Nix development environment on the host via
 //! `nix print-dev-env --json` and `nix path-info --recursive`, granting only
-//! the shell's runtime `/nix/store` closure read-only plus its exported `PATH`
-//! and toolchain environment variables, without executing `shellHook` or
-//! exposing the Nix daemon inside the sandbox.
+//! the shell's runtime `/nix/store` closure read-only plus its exported `PATH`,
+//! toolchain environment variables, and (by default) an in-sandbox `shellHook`
+//! script without running `shellHook` on the host or exposing the Nix daemon
+//! inside the sandbox.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -27,7 +28,9 @@ use super::script::{
 };
 use super::{Provider, ProviderContext, ProviderError, ProviderOutput};
 use crate::config::{NixShell, NixSource, ProfileRef, ProviderName, ProviderOrigin};
-use crate::manifest::{EnvName, EnvValue, Manifest, PathPattern, SearchPathEntry};
+use crate::manifest::{
+    EnvName, EnvValue, Manifest, PathPattern, SearchPathEntry, ShellHook, ShellHookSetting,
+};
 use crate::session::{check_private_dir, create_private_dir};
 use crate::spec::{ScriptPathError, has_rewritable_hard_links, resolve_script_path};
 use crate::supervisor::Ownership;
@@ -37,7 +40,7 @@ use crate::trust::check_store_file;
 const CACHE_DOMAIN: &[u8] = b"stopit-nix-cache-v2\0";
 
 /// Format version stored inside `cache.json`.
-const CACHE_FORMAT_VERSION: u32 = 1;
+const CACHE_FORMAT_VERSION: u32 = 2;
 
 /// Subdirectory inside `data_dir` holding cached Nix environments and GC roots.
 const NIX_CACHE_DIR: &str = "nix";
@@ -210,6 +213,7 @@ pub struct NixProvider {
     file: Option<NixSource>,
     flake: Option<NixSource>,
     cache: bool,
+    shell_hook: bool,
     base_dir: PathBuf,
     origin: ProviderOrigin,
     nix_program: Option<PathBuf>,
@@ -235,6 +239,10 @@ struct CachedNixEnv {
     store_paths: Vec<String>,
     path_prepend: Vec<String>,
     env_set: BTreeMap<String, String>,
+    #[serde(default)]
+    shell_bin: Option<String>,
+    #[serde(default)]
+    shell_hook: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -294,6 +302,7 @@ impl NixProvider {
             file,
             flake,
             cache,
+            shell_hook: true,
             base_dir: base_dir.to_owned(),
             origin,
             nix_program: None,
@@ -305,6 +314,13 @@ impl NixProvider {
             extra_host_env: Vec::new(),
             protected: OnceLock::new(),
         }
+    }
+
+    /// Configures whether the devShell's `shellHook` is emitted as an
+    /// in-sandbox `sandbox.shell_hook` grant (defaults to `true`).
+    pub fn with_shell_hook(mut self, shell_hook: bool) -> Self {
+        self.shell_hook = shell_hook;
+        self
     }
 
     /// Overrides the `nix` executable path for unit tests.
@@ -863,14 +879,16 @@ impl NixProvider {
 
         let store_paths =
             parse_and_validate_closure(&path_info_bytes).map_err(|reason| self.nix_err(reason))?;
-        let (path_prepend, env_set) =
+        let parsed_env =
             parse_dev_env_json(&dev_env_bytes).map_err(|reason| self.nix_err(reason))?;
 
         Ok(CachedNixEnv {
             version: CACHE_FORMAT_VERSION,
             store_paths,
-            path_prepend,
-            env_set,
+            path_prepend: parsed_env.path_prepend,
+            env_set: parsed_env.env_set,
+            shell_bin: parsed_env.shell_bin,
+            shell_hook: parsed_env.shell_hook,
         })
     }
 
@@ -1041,7 +1059,8 @@ impl Provider for NixProvider {
         self.validate_target_inputs(&target, ctx)?;
         let (nix_bin, nix_meta) = self.resolve_nix_binary(ctx)?;
         let env = self.resolve_env(&nix_bin, &nix_meta, &target, ctx)?;
-        let manifest = build_manifest(&env).map_err(|reason| self.nix_err(reason))?;
+        let manifest =
+            build_manifest(&env, self.shell_hook).map_err(|reason| self.nix_err(reason))?;
 
         Ok(ProviderOutput {
             profile: self.profile.clone(),
@@ -1163,15 +1182,54 @@ fn is_secret_store_name(store_name: &str) -> bool {
         || store_name.contains("nix.conf")
 }
 
-/// Parses `nix print-dev-env --json` stdout into `(path_prepend, env_set)`.
-fn parse_dev_env_json(bytes: &[u8]) -> Result<(Vec<String>, BTreeMap<String, String>), String> {
+struct ParsedDevEnv {
+    path_prepend: Vec<String>,
+    env_set: BTreeMap<String, String>,
+    shell_bin: Option<String>,
+    shell_hook: Option<String>,
+}
+
+/// Parses `nix print-dev-env --json` stdout into [`ParsedDevEnv`].
+fn parse_dev_env_json(bytes: &[u8]) -> Result<ParsedDevEnv, String> {
     let parsed: PrintDevEnvJson = serde_json::from_slice(bytes)
         .map_err(|e| format!("`nix print-dev-env --json` printed invalid JSON: {e}"))?;
 
     let mut path_prepend = Vec::new();
     let mut env_set = BTreeMap::new();
+    let mut shell_bin = None;
+    let mut shell_hook = None;
 
     for (name, var) in parsed.variables {
+        if matches!(var.kind.as_str(), "exported" | "var") {
+            if name == "shell" {
+                let val = var.value.as_str().ok_or_else(|| {
+                    "variable \"shell\" in `nix print-dev-env --json` does not have a string value"
+                        .to_owned()
+                })?;
+                if !val.is_empty() {
+                    ShellHook::new(val.to_owned(), String::new())
+                        .map_err(|e| format!("invalid devShell `shell` from nix: {e}"))?;
+                    shell_bin = Some(val.to_owned());
+                }
+                continue;
+            }
+            if name == "shellHook" {
+                let val = var.value.as_str().ok_or_else(|| {
+                    "variable \"shellHook\" in `nix print-dev-env --json` does not have a string value"
+                        .to_owned()
+                })?;
+                if val.contains('\0') {
+                    return Err("devShell `shellHook` from nix contains a NUL byte".into());
+                }
+                if !val
+                    .trim_matches(|c: char| c.is_ascii_whitespace())
+                    .is_empty()
+                {
+                    shell_hook = Some(val.to_owned());
+                }
+                continue;
+            }
+        }
         if var.kind != "exported" {
             continue;
         }
@@ -1213,7 +1271,12 @@ fn parse_dev_env_json(bytes: &[u8]) -> Result<(Vec<String>, BTreeMap<String, Str
         env_set.insert(name, val.to_owned());
     }
 
-    Ok((path_prepend, env_set))
+    Ok(ParsedDevEnv {
+        path_prepend,
+        env_set,
+        shell_bin,
+        shell_hook,
+    })
 }
 
 fn is_dummy_nix_env_value(name: &str, val: &str) -> bool {
@@ -1294,7 +1357,24 @@ fn dir_contains_nix_inputs(dir: &Path, visited: &mut usize) -> Result<bool, Stri
     Ok(false)
 }
 
-fn build_manifest(env: &CachedNixEnv) -> Result<Manifest, String> {
+fn validate_shell_in_closure(shell: &str, store_paths: &[String]) -> Result<(), String> {
+    let Some(after) = shell.strip_prefix("/nix/store/") else {
+        return Ok(());
+    };
+    let top = match after.split_once('/') {
+        Some((dir, _)) => format!("/nix/store/{dir}"),
+        None => shell.to_owned(),
+    };
+    validate_store_path(&top)?;
+    if !store_paths.iter().any(|sp| sp == &top) {
+        return Err(format!(
+            "devShell `shell` {shell:?} lies under {top:?}, which is absent from the `nix path-info` closure"
+        ));
+    }
+    Ok(())
+}
+
+fn build_manifest(env: &CachedNixEnv, include_shell_hook: bool) -> Result<Manifest, String> {
     let mut manifest = Manifest::default();
     for sp in &env.store_paths {
         validate_store_path(sp)?;
@@ -1323,6 +1403,18 @@ fn build_manifest(env: &CachedNixEnv) -> Result<Manifest, String> {
             .parse()
             .map_err(|e| format!("invalid cached value for {k:?}: {e}"))?;
         manifest.grants.env.set.insert(name, val);
+    }
+    if include_shell_hook
+        && let Some(script) = &env.shell_hook
+        && !script
+            .trim_matches(|c: char| c.is_ascii_whitespace())
+            .is_empty()
+    {
+        let shell = env.shell_bin.as_deref().unwrap_or("/bin/sh");
+        validate_shell_in_closure(shell, &env.store_paths)?;
+        let hook = ShellHook::new(shell.to_owned(), script.clone())
+            .map_err(|e| format!("invalid cached shellHook: {e}"))?;
+        manifest.grants.sandbox.shell_hook = Some(ShellHookSetting::Run(hook));
     }
     Ok(manifest)
 }
@@ -2376,6 +2468,94 @@ fi
             .unwrap_err();
         assert!(
             err.to_string().contains("refusing to read nix cache"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn shell_hook_emitted_by_default_skipped_when_disabled_and_validates_store_shell() {
+        let f = TestFixture::new();
+        fs::write(f.ws.join("flake.nix"), "{}").unwrap();
+        let store_bash = "/nix/store/00000000000000000000000000000001-bash-5.2";
+        let missing_bash = "/nix/store/00000000000000000000000000000002-bash-5.2";
+
+        let nix_bin = write_fake_nix(
+            &f.bin,
+            &format!(
+                r#"if [ "$3" = "print-dev-env" ]; then
+  ln -sf /bin/sh "$6"
+  cat <<'JSON'
+{{
+  "variables": {{
+    "PATH": {{"type": "exported", "value": "{store_bash}/bin"}},
+    "shell": {{"type": "exported", "value": "{store_bash}/bin/bash"}},
+    "shellHook": {{"type": "exported", "value": "export FOO=bar"}}
+  }}
+}}
+JSON
+elif [ "$3" = "path-info" ]; then
+  printf '%s\n' "{store_bash}"
+fi
+"#
+            ),
+        );
+
+        let p_on = NixProvider::new(
+            "nix".parse().unwrap(),
+            "main".parse().unwrap(),
+            None,
+            None,
+            None,
+            false,
+            &f.ws,
+        )
+        .with_nix_program(&nix_bin);
+        let out_on = p_on.manifest(&f.ctx()).unwrap();
+        assert_eq!(
+            out_on.manifest.grants.sandbox.shell_hook,
+            Some(ShellHookSetting::Run(
+                ShellHook::new(format!("{store_bash}/bin/bash"), "export FOO=bar".into()).unwrap()
+            ))
+        );
+
+        let out_off = p_on.with_shell_hook(false).manifest(&f.ctx()).unwrap();
+        assert_eq!(out_off.manifest.grants.sandbox.shell_hook, None);
+
+        // Whitespace-only shellHook produces None.
+        let parsed_ws = parse_dev_env_json(
+            br#"{"variables": {"shellHook": {"type": "exported", "value": "  \n\t  "}}}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed_ws.shell_hook, None);
+
+        // Store shell absent from `nix path-info` closure fails closed when enabled.
+        let nix_bad_shell = write_fake_nix(
+            &f.bin,
+            &format!(
+                r#"if [ "$3" = "print-dev-env" ]; then
+  ln -sf /bin/sh "$6"
+  printf '{{"variables": {{"shell": {{"type": "exported", "value": "{missing_bash}/bin/bash"}}, "shellHook": {{"type": "exported", "value": "export X=1"}}}}}}'
+elif [ "$3" = "path-info" ]; then
+  printf '%s\n' "{store_bash}"
+fi
+"#
+            ),
+        );
+        let err = NixProvider::new(
+            "nix".parse().unwrap(),
+            "main".parse().unwrap(),
+            None,
+            None,
+            None,
+            false,
+            &f.ws,
+        )
+        .with_nix_program(&nix_bad_shell)
+        .manifest(&f.ctx())
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("absent from the `nix path-info` closure"),
             "{err}"
         );
     }

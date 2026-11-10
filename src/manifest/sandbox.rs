@@ -7,16 +7,18 @@
 use std::fmt;
 use std::str::FromStr;
 
+use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize, Serializer};
 
+use super::check_plain_absolute;
 use crate::error::ValueError;
 use crate::serde_util::MapOnly;
 
 /// The `sandbox` section.
 ///
 /// Deserializes from a table or object only, never from a sequence. Both
-/// lists are merged by union. `grant` is an `Option` so that merging can
-/// tell "unset" from an explicit value.
+/// lists are merged by union. `grant` and `shell_hook` are `Option`s so that
+/// merging can tell "unset" from an explicit value.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(from = "MapOnly<RawSandboxGrants>")]
 pub struct SandboxGrants {
@@ -26,6 +28,9 @@ pub struct SandboxGrants {
     pub allow_syscalls: Vec<OptInSyscall>,
     /// Whether the sandbox gets `stopit-grant` (DESIGN.md §7.5).
     pub grant: Option<bool>,
+    /// Optional shell hook script run inside the sandbox right before executing
+    /// the target command (or `Disabled` to clear an inherited/lower-layer hook).
+    pub shell_hook: Option<ShellHookSetting>,
 }
 
 #[derive(Default, Deserialize)]
@@ -34,6 +39,7 @@ struct RawSandboxGrants {
     share: Vec<ShareableNamespace>,
     allow_syscalls: Vec<OptInSyscall>,
     grant: Option<bool>,
+    shell_hook: Option<ShellHookSetting>,
 }
 
 impl From<MapOnly<RawSandboxGrants>> for SandboxGrants {
@@ -42,7 +48,112 @@ impl From<MapOnly<RawSandboxGrants>> for SandboxGrants {
             share: raw.share,
             allow_syscalls: raw.allow_syscalls,
             grant: raw.grant,
+            shell_hook: raw.shell_hook,
         }
+    }
+}
+
+/// Shell hook script executed inside the sandbox right before `execve`ing the
+/// target command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ShellHook {
+    /// Plain absolute path of the shell binary inside the sandbox (for example
+    /// `/nix/store/<hash>-bash-.../bin/bash` or `/bin/sh`).
+    pub shell: String,
+    /// Shell snippet evaluated before running the target command (no NUL bytes).
+    pub script: String,
+}
+
+impl ShellHook {
+    /// Validates and constructs a [`ShellHook`].
+    pub fn new(shell: String, script: String) -> Result<Self, ValueError> {
+        check_plain_absolute(&shell)
+            .map_err(|why| ValueError::new(format!("invalid shell_hook.shell {shell:?}: {why}")))?;
+        if script.contains('\0') {
+            return Err(ValueError::new(
+                "invalid shell_hook.script: must not contain NUL bytes",
+            ));
+        }
+        Ok(ShellHook { shell, script })
+    }
+}
+
+/// Manifest setting for `sandbox.shell_hook`: either a [`ShellHook`] to run or
+/// an explicit disable tombstone (`false` / `{ enabled = false }`) clearing an
+/// inherited or lower-layer hook.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellHookSetting {
+    /// Run this shell hook inside the sandbox before the target command.
+    Run(ShellHook),
+    /// Clear any inherited or lower-layer shell hook.
+    Disabled,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawShellHook {
+    enabled: Option<bool>,
+    shell: Option<String>,
+    script: Option<String>,
+}
+
+impl TryFrom<RawShellHook> for ShellHookSetting {
+    type Error = ValueError;
+
+    fn try_from(raw: RawShellHook) -> Result<Self, ValueError> {
+        if raw.enabled == Some(false) {
+            if raw.shell.is_some() || raw.script.is_some() {
+                return Err(ValueError::new(
+                    "invalid shell_hook: `shell` and `script` must be omitted when `enabled = false`",
+                ));
+            }
+            return Ok(ShellHookSetting::Disabled);
+        }
+        let Some(shell) = raw.shell else {
+            return Err(ValueError::new(
+                "invalid shell_hook: missing required field `shell`",
+            ));
+        };
+        let Some(script) = raw.script else {
+            return Err(ValueError::new(
+                "invalid shell_hook: missing required field `script`",
+            ));
+        };
+        ShellHook::new(shell, script).map(ShellHookSetting::Run)
+    }
+}
+
+impl<'de> Deserialize<'de> for ShellHookSetting {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ShellHookVisitor;
+
+        impl<'de> Visitor<'de> for ShellHookVisitor {
+            type Value = ShellHookSetting;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a map `{ shell = \"...\", script = \"...\" }` or `false`")
+            }
+
+            fn visit_bool<E: de::Error>(self, v: bool) -> Result<ShellHookSetting, E> {
+                if !v {
+                    Ok(ShellHookSetting::Disabled)
+                } else {
+                    Err(E::custom(
+                        "invalid shell_hook: boolean `true` is not valid; use `false` to disable or `{ shell = \"...\", script = \"...\" }`",
+                    ))
+                }
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<ShellHookSetting, A::Error> {
+                let raw = RawShellHook::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                ShellHookSetting::try_from(raw).map_err(de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_any(ShellHookVisitor)
     }
 }
 
@@ -441,5 +552,33 @@ mod tests {
         assert!(msg.contains("syscalls"), "{msg}");
         let msg = toml_err("[sandbox]\nallow_syscall = []");
         assert!(msg.contains("allow_syscall"), "{msg}");
+    }
+
+    #[test]
+    fn shell_hook_parses_table_and_false_and_validates_paths() {
+        let m: Manifest =
+            toml_ok("[sandbox]\nshell_hook = { shell = \"/bin/sh\", script = \"export A=1\" }");
+        assert_eq!(
+            m.grants.sandbox.shell_hook,
+            Some(ShellHookSetting::Run(ShellHook {
+                shell: "/bin/sh".into(),
+                script: "export A=1".into(),
+            }))
+        );
+        let m: Manifest = toml_ok("sandbox.shell_hook = false");
+        assert_eq!(
+            m.grants.sandbox.shell_hook,
+            Some(ShellHookSetting::Disabled)
+        );
+        let m: Manifest = toml_ok("sandbox.shell_hook = { enabled = false }");
+        assert_eq!(
+            m.grants.sandbox.shell_hook,
+            Some(ShellHookSetting::Disabled)
+        );
+
+        toml_err("sandbox.shell_hook = true");
+        toml_err("sandbox.shell_hook = { shell = \"sh\", script = \"echo\" }");
+        toml_err("sandbox.shell_hook = { shell = \"/bin/sh\" }");
+        toml_err("sandbox.shell_hook = { enabled = false, shell = \"/bin/sh\" }");
     }
 }

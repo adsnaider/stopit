@@ -356,6 +356,9 @@ pub enum ProviderKind {
         /// Whether resolved manifests are cached under stopit's data directory;
         /// defaults to `true`.
         cache: bool,
+        /// Whether the devShell's `shellHook` runs inside the sandbox before
+        /// the target command; defaults to `true`.
+        shell_hook: bool,
     },
 }
 
@@ -410,6 +413,7 @@ struct RawProviderEntry {
     file: Option<NixSource>,
     flake: Option<NixSource>,
     cache: Option<bool>,
+    shell_hook: Option<bool>,
 }
 
 impl TryFrom<MapOnly<RawProviderEntry>> for ProviderEntry {
@@ -438,7 +442,7 @@ impl TryFrom<MapOnly<RawProviderEntry>> for ProviderEntry {
         }
 
         // Keys that are present, with the types that accept them.
-        let present: [(&str, bool, &[&str]); 12] = [
+        let present: [(&str, bool, &[&str]); 13] = [
             (
                 "profile",
                 raw.profile.is_some(),
@@ -455,6 +459,7 @@ impl TryFrom<MapOnly<RawProviderEntry>> for ProviderEntry {
             ("file", raw.file.is_some(), &["nix"]),
             ("flake", raw.flake.is_some(), &["nix"]),
             ("cache", raw.cache.is_some(), &["nix"]),
+            ("shell_hook", raw.shell_hook.is_some(), &["nix"]),
         ];
         if let Some((key, _, owners)) = present
             .iter()
@@ -512,6 +517,7 @@ impl TryFrom<MapOnly<RawProviderEntry>> for ProviderEntry {
                     file: raw.file,
                     flake: raw.flake,
                     cache: raw.cache.unwrap_or(true),
+                    shell_hook: raw.shell_hook.unwrap_or(true),
                 }
             }
             _ => ProviderKind::Vcs {
@@ -791,8 +797,20 @@ mod tests {
                 file: None,
                 flake: None,
                 cache: true,
+                shell_hook: true,
             }
         );
+
+        let e_no_hook = one(
+            "[[provider]]\nname = \"nix\"\ntype = \"nix\"\nprofile = \"main\"\nshell_hook = false",
+        );
+        assert!(matches!(
+            e_no_hook.kind,
+            ProviderKind::Nix {
+                shell_hook: false,
+                ..
+            }
+        ));
 
         let msg = err(
             "[[provider]]\nname = \"nix\"\ntype = \"nix\"\nprofile = \"main\"\n\

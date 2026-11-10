@@ -53,11 +53,18 @@ use crate::spec::{NetworkSpec, SandboxSpec};
 /// The subcommand that runs the init helper.
 pub const SUBCOMMAND: &str = "__init";
 
+/// The subcommand that resolves and `execve`s the target after a `shell_hook`
+/// finishes inside the sandbox.
+pub const EXEC_SUBCOMMAND: &str = "__exec";
+
 /// The option naming the environment descriptor, `--env-fd N`.
 pub const ENV_FD_OPTION: &str = "--env-fd";
 
 /// The option naming the init specification descriptor, `--spec-fd M`.
 pub const SPEC_FD_OPTION: &str = "--spec-fd";
+
+/// The option instructing `stopit __exec` to omit the shim directory from `PATH`.
+pub const SKIP_SHIMS_OPTION: &str = "--skip-shims";
 
 /// Maximum encoded byte size accepted for the target environment.
 pub const MAX_ENV_BYTES: usize = 16 << 20;
@@ -225,6 +232,24 @@ pub struct InitSpec {
     /// ([`crate::shim::SANDBOX_BIN`]), as a shim's own binary must never
     /// be a shim again.
     pub skip_shims: bool,
+    /// Optional shell hook run inside the sandbox right before `execve`ing
+    /// the target command.
+    #[serde(default)]
+    pub shell_hook: Option<ShellHookExec>,
+}
+
+/// Shell hook execution specification passed to `stopit __init`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellHookExec {
+    /// Plain absolute path of the shell binary inside the sandbox.
+    pub shell: String,
+    /// Shell snippet evaluated before running the target command.
+    pub script: String,
+    /// Command prefix for invoking the provisioned `stopit` binary inside the
+    /// sandbox, encoded as lowercase hex byte strings.
+    #[serde(with = "crate::control::hex_list")]
+    pub stopit_prefix: Vec<Vec<u8>>,
 }
 
 /// A directory to start the target in, and the identity on the host of
@@ -257,6 +282,7 @@ impl InitSpec {
             proxy_bridge: spec.proxy_domains().is_some(),
             cwd: None,
             skip_shims: false,
+            shell_hook: None,
         }
     }
 }
@@ -510,12 +536,167 @@ pub fn run(args: &[OsString]) -> u8 {
         return EXIT_INIT_FAILED;
     }
 
+    if let Some(hook) = &spec.shell_hook {
+        let wrapper = match build_shell_hook_argv(hook, spec.skip_shims, &args.command) {
+            Ok(wrapper) => wrapper,
+            Err(e) => {
+                report(format_args!("invalid shell_hook: {e}"));
+                return EXIT_INIT_FAILED;
+            }
+        };
+        let error = exec(&wrapper, &env, false);
+        report(format_args!(
+            "{}: {error}",
+            escape_bytes(wrapper[0].as_bytes())
+        ));
+        return error.exit_code();
+    }
+
     let error = exec(&args.command, &env, spec.skip_shims);
     report(format_args!(
         "{}: {error}",
         escape_bytes(args.command[0].as_bytes())
     ));
     error.exit_code()
+}
+
+/// Error parsing `stopit __exec` arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ExecArgsError {
+    /// `--` does not precede the command.
+    #[error("expected -- before command")]
+    MissingSeparator,
+    /// Nothing follows `--`.
+    #[error("no command after --")]
+    MissingCommand,
+}
+
+/// Parsed command-line arguments of `stopit __exec`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecArgs {
+    /// Whether to omit [`crate::shim::SANDBOX_BIN`] when searching `PATH`.
+    pub skip_shims: bool,
+    /// Target argv, with `command[0]` naming the program.
+    pub command: Vec<CString>,
+}
+
+/// Parses the arguments after `__exec`: `[--skip-shims] -- <cmd> [args...]`.
+pub fn parse_exec_args(args: &[OsString]) -> Result<ExecArgs, ExecArgsError> {
+    let (skip_shims, rest) = match args {
+        [opt, rest @ ..] if opt == SKIP_SHIMS_OPTION => (true, rest),
+        _ => (false, args),
+    };
+    let [separator, command @ ..] = rest else {
+        return Err(ExecArgsError::MissingSeparator);
+    };
+    if separator != "--" {
+        return Err(ExecArgsError::MissingSeparator);
+    }
+    if command.is_empty() {
+        return Err(ExecArgsError::MissingCommand);
+    }
+    let command = command
+        .iter()
+        .map(|arg| CString::new(arg.as_os_str().as_bytes()).expect("argv holds no NUL byte"))
+        .collect();
+    Ok(ExecArgs {
+        skip_shims,
+        command,
+    })
+}
+
+/// Runs `stopit __exec` with `args` (the arguments after `__exec`), resolving
+/// and `execve`ing the target command against the post-`shell_hook`
+/// environment. Returns only on failure.
+pub fn run_exec(args: &[OsString]) -> u8 {
+    let parsed = match parse_exec_args(args) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            report(format_args!(
+                "{e} (usage: stopit {EXEC_SUBCOMMAND} [{SKIP_SHIMS_OPTION}] -- <cmd> [args...])"
+            ));
+            return EXIT_INIT_FAILED;
+        }
+    };
+    let mut env = Vec::new();
+    for (key, value) in std::env::vars_os() {
+        let key_bytes = key.as_os_str().as_bytes();
+        let val_bytes = value.as_os_str().as_bytes();
+        let mut entry = Vec::with_capacity(key_bytes.len() + 1 + val_bytes.len());
+        entry.extend_from_slice(key_bytes);
+        entry.push(b'=');
+        entry.extend_from_slice(val_bytes);
+        if let Ok(cstr) = CString::new(entry) {
+            env.push(cstr);
+        }
+    }
+    let error = exec(&parsed.command, &env, parsed.skip_shims);
+    report(format_args!(
+        "{}: {error}",
+        escape_bytes(parsed.command[0].as_bytes())
+    ));
+    error.exit_code()
+}
+
+/// Appends `bytes` wrapped in POSIX single quotes (`'...'`, escaping each `'`
+/// as `'\''`) to `out`.
+pub fn append_posix_single_quoted(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.push(b'\'');
+    for &b in bytes {
+        if b == b'\'' {
+            out.extend_from_slice(b"'\\''");
+        } else {
+            out.push(b);
+        }
+    }
+    out.push(b'\'');
+}
+
+/// Builds `[<hook.shell>, "-c", "<hook.script>\n\n\\exec ..."]` so the shell
+/// runs `hook.script` at top level with `$# == 0` and then replaces itself
+/// with `stopit __exec [--skip-shims] -- <command...>`.
+pub fn build_shell_hook_argv(
+    hook: &ShellHookExec,
+    skip_shims: bool,
+    command: &[CString],
+) -> Result<Vec<CString>, &'static str> {
+    if !hook.shell.starts_with('/') {
+        return Err("shell path must be absolute");
+    }
+    let shell =
+        CString::new(hook.shell.as_bytes()).map_err(|_| "shell path contains a NUL byte")?;
+    if hook.script.as_bytes().contains(&0) {
+        return Err("script contains a NUL byte");
+    }
+    if hook.stopit_prefix.is_empty() || hook.stopit_prefix[0].is_empty() {
+        return Err("stopit_prefix must not be empty");
+    }
+    if hook.stopit_prefix.iter().any(|part| part.contains(&0)) {
+        return Err("stopit_prefix contains a NUL byte");
+    }
+    if command.is_empty() {
+        return Err("target command must not be empty");
+    }
+    let mut body = Vec::with_capacity(hook.script.len() + 128);
+    body.extend_from_slice(hook.script.as_bytes());
+    body.extend_from_slice(b"\n\n\\exec");
+    for part in &hook.stopit_prefix {
+        body.push(b' ');
+        append_posix_single_quoted(&mut body, part);
+    }
+    body.push(b' ');
+    append_posix_single_quoted(&mut body, EXEC_SUBCOMMAND.as_bytes());
+    if skip_shims {
+        body.push(b' ');
+        append_posix_single_quoted(&mut body, SKIP_SHIMS_OPTION.as_bytes());
+    }
+    body.extend_from_slice(b" '--'");
+    for arg in command {
+        body.push(b' ');
+        append_posix_single_quoted(&mut body, arg.as_bytes());
+    }
+    let body = CString::new(body).map_err(|_| "constructed shell script contains a NUL byte")?;
+    Ok(vec![shell, c"-c".to_owned(), body])
 }
 
 fn report(message: std::fmt::Arguments<'_>) {
@@ -1548,5 +1729,41 @@ mod tests {
         let bytes = encode_spec(&spec).unwrap();
         let decoded = decode_spec(&bytes).unwrap();
         assert_eq!(decoded, spec);
+    }
+
+    #[test]
+    fn shell_hook_argv_quotes_odd_bytes_and_handles_trailing_comment_and_backslash() {
+        let hook = ShellHookExec {
+            shell: "/nix/store/abc-bash/bin/bash".into(),
+            script: "export FOO='a b' # trailing comment".into(),
+            stopit_prefix: vec![
+                b"/run/stopit/lib/ld-linux.so.2".to_vec(),
+                b"--library-path".to_vec(),
+                b"/run/stopit/lib".to_vec(),
+                b"/run/stopit/stopit".to_vec(),
+            ],
+        };
+        let cmd = vec![
+            CString::new("sh").unwrap(),
+            CString::new("a'b $HOME `id`\n\\").unwrap(),
+            CString::new(&b"raw\xffbyte"[..]).unwrap(),
+        ];
+        let argv = build_shell_hook_argv(&hook, true, &cmd).unwrap();
+        assert_eq!(argv[0].as_bytes(), b"/nix/store/abc-bash/bin/bash");
+        assert_eq!(argv[1].as_bytes(), b"-c");
+        let expected = b"export FOO='a b' # trailing comment\n\n\\exec '/run/stopit/lib/ld-linux.so.2' '--library-path' '/run/stopit/lib' '/run/stopit/stopit' '__exec' '--skip-shims' '--' 'sh' 'a'\\''b $HOME `id`\n\\' 'raw\xffbyte'";
+        assert_eq!(argv[2].as_bytes(), expected);
+
+        let mut spec = InitSpec::from_sandbox_spec(&SandboxSpec::default());
+        spec.shell_hook = Some(hook);
+        let decoded = decode_spec(&encode_spec(&spec).unwrap()).unwrap();
+        assert_eq!(decoded, spec);
+
+        let parsed = parse_exec_args(&[os("--skip-shims"), os("--"), os("env"), os("-0")]).unwrap();
+        assert!(parsed.skip_shims);
+        assert_eq!(
+            parsed.command,
+            vec![CString::new("env").unwrap(), CString::new("-0").unwrap()]
+        );
     }
 }

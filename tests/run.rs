@@ -6219,7 +6219,8 @@ if [ "$3" = "print-dev-env" ]; then
     "NIX_DEV_VAR": {{"type": "exported", "value": "from-flake"}},
     "HOME": {{"type": "exported", "value": "/homeless-shelter"}},
     "SHELL": {{"type": "exported", "value": "/nix/store/x/bin/bash"}},
-    "shellHook": {{"type": "exported", "value": "echo pwned"}}
+    "shell": {{"type": "exported", "value": "/bin/sh"}},
+    "shellHook": {{"type": "exported", "value": "export HOOK_DYNAMIC=\"hook:$PWD:$#\" # trailing comment"}}
   }}
 }}
 JSON
@@ -6256,9 +6257,14 @@ fi
             .unwrap_or(0)
     };
 
-    // Configure `[[provider]] type = "nix"` in the global config over `DEFAULT_CONFIG_TOML`.
+    // Configure `[[provider]] type = "nix"` in the global config over `DEFAULT_CONFIG_TOML`
+    // (mounting `/usr/bin`, `/usr/lib*`, `/bin`, `/lib*` read-only without `path_prepend` so
+    // `/bin/sh` can run `shellHook` inside the sandbox while keeping `PATH` minimal).
     s.write_global_config(&format!(
-        "{}\n[[provider]]\ntype = \"nix\"\nname = \"nix\"\nprofile = \"main\"\n",
+        "{}\n[[provider]]\ntype = \"config\"\nname = \"host-sh\"\nprofile = \"main\"\n\
+         [provider.sandbox.fs]\nwarn_missing = false\n\
+         ro = [\"/usr/bin\", \"/usr/lib\", \"/usr/lib64\", \"/bin\", \"/lib\", \"/lib64\"]\n\n\
+         [[provider]]\ntype = \"nix\"\nname = \"nix\"\nprofile = \"main\"\n",
         stopit::config::DEFAULT_CONFIG_TOML
     ));
 
@@ -6313,26 +6319,48 @@ fi
         Some("/home/stopit")
     );
     assert!(!env_map.contains_key("SHELL"));
+    assert!(!env_map.contains_key("shell"));
     assert!(!env_map.contains_key("shellHook"));
+    assert_eq!(
+        env_map.get("HOOK_DYNAMIC").map(String::as_str),
+        Some("hook:/workspace:0")
+    );
     assert_eq!(errno(&results[1]), "EROFS");
     assert_eq!(errno(&results[2]), "EROFS");
     assert_eq!(calls(), 2);
 
-    // 3. Second run with unchanged Nix files hits the persistent cache when the store path exists.
+    // 3. Second run with unchanged Nix files hits the persistent cache when the store path exists
+    // and still runs `shellHook` inside `/workspace`.
     if has_real_store_obj {
-        let run2 = output(make_cmd(), b"[]");
-        let _ = probe_results("nix run 2", &run2, &[]);
+        let env_ops = [Op::Env];
+        let env_input = serde_json::to_vec(&env_ops).unwrap();
+        let run2 = output(make_cmd(), &env_input);
+        let r2 = probe_results("nix run 2", &run2, &env_ops);
+        let Data::Env(env2) = ok(&r2[0]) else {
+            panic!("expected env map");
+        };
+        assert_eq!(
+            env2.get("HOOK_DYNAMIC").map(String::as_str),
+            Some("hook:/workspace:0")
+        );
         assert_eq!(stderr(&run2), "");
         assert_eq!(calls(), 2);
     }
 
-    // 4. Overriding `shell = "agent"` in `.stopit.toml` replaces the global `nix` provider cleanly
-    // without any warning and passes `#agent` to `nix print-dev-env`.
+    // 4. Overriding `shell = "agent"` and `shell_hook = false` in `.stopit.toml` replaces the
+    // global `nix` provider cleanly without any warning, passes `#agent` to `nix print-dev-env`,
+    // and skips `shellHook`.
     s.write_raw_config(
-        "[[provider]]\ntype = \"nix\"\nname = \"nix\"\nprofile = \"main\"\nshell = \"agent\"\n",
+        "[[provider]]\ntype = \"nix\"\nname = \"nix\"\nprofile = \"main\"\nshell = \"agent\"\nshell_hook = false\n",
     );
-    let run3 = output(make_cmd(), b"[]");
-    let _ = probe_results("nix run 3", &run3, &[]);
+    let env_ops = [Op::Env];
+    let env_input = serde_json::to_vec(&env_ops).unwrap();
+    let run3 = output(make_cmd(), &env_input);
+    let r3 = probe_results("nix run 3", &run3, &env_ops);
+    let Data::Env(env3) = ok(&r3[0]) else {
+        panic!("expected env map");
+    };
+    assert!(!env3.contains_key("HOOK_DYNAMIC"), "{env3:?}");
     assert!(
         !stderr(&run3).contains("replaces the one of that name"),
         "{}",
@@ -6343,6 +6371,21 @@ fi
         logged.contains(&format!("{}#agent", s.ws().display())),
         "{logged}"
     );
+
+    // 5. `vcs.local` clears inherited `sandbox.shell_hook`, so running in `--profile vcs.local`
+    // does not execute `main`'s `shellHook`.
+    s.write_raw_config(
+        "[[provider]]\ntype = \"nix\"\nname = \"nix\"\nprofile = \"main\"\nshell = \"agent\"\n",
+    );
+    let mut vcs_cmd = s.stopit(&["run", "--quiet", "--profile", "vcs.local", "--"]);
+    vcs_cmd.args(&sandbox_probe_argv);
+    vcs_cmd.env("PATH", &path_with_nix);
+    let run_vcs = output(vcs_cmd, &env_input);
+    let r_vcs = probe_results("nix vcs.local", &run_vcs, &env_ops);
+    let Data::Env(env_vcs) = ok(&r_vcs[0]) else {
+        panic!("expected env map");
+    };
+    assert!(!env_vcs.contains_key("HOOK_DYNAMIC"), "{env_vcs:?}");
 }
 
 #[test]
@@ -6531,5 +6574,61 @@ fn approval_timeout_applies_globally_or_per_project_and_reports_timeout() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "immediate-retry\n");
 
     assert_eq!(server.stop(), 128 + libc::SIGTERM);
+    assert!(s.no_session_left());
+}
+
+#[test]
+fn sandbox_shell_hook_mutates_path_propagates_exit_and_preserves_odd_argv() {
+    let Some(config) = shell_config() else {
+        return;
+    };
+    let s = Setup::new();
+    let custom_bin = s.ws().join("hook-bin");
+    fs::create_dir_all(&custom_bin).unwrap();
+    let custom_tool = custom_bin.join("hook-tool");
+    fs::write(
+        &custom_tool,
+        "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$HOOK_VAR\" \"$1\" \"$2\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&custom_tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+    s.write_global_config(&format!(
+        "{}\n{config}",
+        stopit::config::DEFAULT_CONFIG_TOML
+    ));
+    s.write_raw_config(
+        "[[provider]]\ntype = \"config\"\nname = \"hook\"\nprofile = \"main\"\n\
+         [provider.sandbox.sandbox.shell_hook]\n\
+         shell = \"/bin/sh\"\n\
+         script = '''\n\
+         if [ -n \"${FAIL_HOOK:-}\" ]; then exit 42; fi\n\
+         export HOOK_VAR=\"argc=$#\"\n\
+         export PATH=\"/workspace/hook-bin:$PATH\"\\\n'''\n\
+         [provider.sandbox.env]\npass = [\"FAIL_HOOK\"]\n",
+    );
+
+    // 1. Bare command added to PATH by `shellHook` is resolved by `stopit __exec`,
+    // sees `$# == 0` during the hook, survives a trailing `\` in the script, and
+    // preserves single quotes, `$`, backticks, and newlines in target arguments.
+    let odd1 = "a'b $HOME `id`";
+    let odd2 = "line1\nline2";
+    let out = output(
+        s.stopit(&["run", "--quiet", "--", "hook-tool", odd1, odd2]),
+        b"",
+    );
+    assert_eq!(code(&out), 0, "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("argc=0|{odd1}|{odd2}\n")
+    );
+
+    // 2. Non-zero exit inside `shellHook` aborts before running the target and
+    // propagates the exit code.
+    let mut fail_cmd = s.stopit(&["run", "--quiet", "--", "hook-tool", "x", "y"]);
+    fail_cmd.env("FAIL_HOOK", "1");
+    let fail_out = output(fail_cmd, b"");
+    assert_eq!(code(&fail_out), 42, "{fail_out:?}");
+    assert!(fail_out.stdout.is_empty(), "{fail_out:?}");
     assert!(s.no_session_left());
 }

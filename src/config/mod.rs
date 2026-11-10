@@ -778,6 +778,7 @@ const NIX_COMMENTED_PROVIDERS: &str = "    # --- Host tools (uncomment the recip
     #   name = \"nix\";
     #   type = \"nix\";
     #   profile = \"main\";
+    #   shell_hook = true;
     # }";
 
 /// Renders [`DEFAULT_CONFIG_TOML`] as a Nix attribute set (`stopit default-config --format nix`),

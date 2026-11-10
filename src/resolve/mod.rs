@@ -17,8 +17,9 @@ pub use graph::{
 };
 pub use merge::{
     APPROVALS_PROVIDER_PREFIX, EffectiveEnv, EffectiveGrants, EffectiveNetwork, EffectiveSandbox,
-    EffectiveSystem, EnvSetConflict, FsRule, FsRuleKind, MergeError, MergedProfiles, UserConflict,
-    approvals_provider_name, is_approvals_provider, merge_profiles,
+    EffectiveSystem, EnvSetConflict, FsRule, FsRuleKind, MergeError, MergedProfiles,
+    ShellHookConflict, UserConflict, approvals_provider_name, is_approvals_provider,
+    merge_profiles,
 };
 pub(crate) use paths::hidden_note;
 pub use paths::{

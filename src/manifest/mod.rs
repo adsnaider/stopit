@@ -37,7 +37,7 @@ use crate::serde_util::MapOnly;
 
 pub use env::{EnvGrants, EnvName, EnvPattern, EnvValue, SearchPathEntry};
 pub use network::{Domain, NetworkGrants};
-pub use sandbox::{OptInSyscall, SandboxGrants, ShareableNamespace};
+pub use sandbox::{OptInSyscall, SandboxGrants, ShareableNamespace, ShellHook, ShellHookSetting};
 pub use shim::{
     BinaryName, GRANT_SHIM, ProxyCmd, ProxyProfile, ProxyResponse, ProxySource, ShimAction,
     ShimArg, ShimCmd, ShimKind, ShimMatcher, ShimName, ShimRegex, ShimRule, ShimSpec,
