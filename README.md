@@ -14,7 +14,7 @@ stopit bakes no implicit sandbox rules into its binary. Every profile, mount, en
 
 - your project, read-write, at `/workspace`, which is also the working directory;
 - secrets in the project masked (`fs.warn_missing = false`): `.env`, `.env.*`, `*.pem`, `*.key`, `.npmrc`, `.pypirc`, `.netrc`, SSH keys and others show up empty and unreadable;
-- files that exist when the session starts and would execute on the host made read-only: `.stopit.toml`, `.envrc`, `.vscode`, `.idea`, `.github/workflows`, `.claude`, `.gemini`, `.codex`, `opencode.json`, `.opencode`, `.cursor`, `.mcp.json`, `.zed`, and others in `base`, plus `*.nix` and `flake.lock` in `protect-nix` (DESIGN.md, Appendix A);
+- files that exist when the session starts and would execute on the host made read-only: `.stopit.toml`, `.envrc`, `.vscode`, `.idea`, `.github/workflows`, `.claude`, `.gemini`, `.codex`, `opencode.json`, `.opencode`, `.cursor`, `.mcp.json`, `.zed`, and others in `base`, plus `*.nix`, `flake.lock`, and `.gitignore` in `protect-nix` (DESIGN.md, Appendix A);
 - the repository's `.git` and `.jj` masked when the workspace is a repository, with `git` and `jj` brokered through explicit `[provider.shims.*]` rules (see [Version control](#version-control));
 - an empty home directory at `/home/stopit` and an empty `/tmp`, both deleted when the session ends;
 - its own `/proc`, a minimal `/dev`, and `/var/run` linked to `/run`;
@@ -239,7 +239,7 @@ Each snippet below is a provider of its own. Every `[[provider]]` names `name`, 
 
 ### Edit Nix files in a NixOS or module repository
 
-`stopit default-config` keeps `{workspace}/**/*.nix` and `{workspace}/flake.lock` in a separate `protect-nix` provider so projects that evaluate Nix on the host stay read-only while a NixOS configuration or Nix library repository can turn that off in `.stopit.toml` and edit Nix files directly in `main`:
+`stopit default-config` keeps `{workspace}/**/*.nix`, `{workspace}/flake.lock`, and `{workspace}/**/.gitignore` in a separate `protect-nix` provider so projects that evaluate Nix on the host stay read-only while a NixOS configuration or Nix library repository can turn that off in `.stopit.toml` and edit Nix files directly in `main`:
 
 ```toml
 [[provider]]
@@ -412,9 +412,11 @@ shell = "agent"            # devShells.<system>.agent on flakes, or attribute ag
 # flake = "nix"            # evaluate a flake in another directory
 # cache = true             # cache resolved closures + GC roots in ~/.local/share/stopit/nix
 # shell_hook = true        # run non-empty shellHook inside the sandbox before the command
+# gitignore = true         # filter flake staging and walks via .gitignore (default true)
+# ignore = ["buck-out"]    # additional relative gitignore-style glob patterns
 ```
 
-`flake.lock` is never modified during evaluation, `shellHook` is never run on the host and instead executes inside the sandbox right before the target command via the development shell's `bash` (`shell_hook = false` disables it, and `vcs` profiles clear inherited hooks so brokered `git` and `jj` calls stay fast and clean), exported variables from the shell (other than internal `stdenv`, sandbox identity, and proxy variables) are applied to the profile, and closures containing secret-bearing derivations (`*-etc`, `*-home-manager-files`, `*nix.conf*`) are refused. Set `enabled = false` on `[[provider]] name = "nix"` in `.stopit.toml` for a library or module flake that defines no development shell or default package.
+Flakes are staged into an isolated temporary directory using `.gitignore` filtering (`gitignore = true` by default) and custom `ignore = [...]` glob patterns before evaluation via a `path:` reference, ensuring untracked files and repository metadata (such as Git reftables) never cause evaluation failures or rebuilds. `.gitignore` files consulted during evaluation are automatically protected in every profile. `flake.lock` is never modified during evaluation, `shellHook` is never run on the host and instead executes inside the sandbox right before the target command via the development shell's `bash` (`shell_hook = false` disables it, and `vcs` profiles clear inherited hooks so brokered `git` and `jj` calls stay fast and clean), exported variables from the shell (other than internal `stdenv`, sandbox identity, and proxy variables) are applied to the profile, and closures containing secret-bearing derivations (`*-etc`, `*-home-manager-files`, `*nix.conf*`) are refused. Set `enabled = false` on `[[provider]] name = "nix"` in `.stopit.toml` for a library or module flake that defines no development shell or default package.
 
 ### Generate grants with a script
 
