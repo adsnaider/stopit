@@ -13,7 +13,8 @@
 mod resolve;
 
 pub use resolve::{
-    EntryKind, Resolution, ResolveCache, ResolveWarning, ResolvedPath, resolve, resolve_with_cache,
+    EntryKind, Resolution, ResolveCache, ResolveWarning, ResolvedPath, resolve, resolve_excluding,
+    resolve_excluding_with_cache, resolve_with_cache,
 };
 
 use std::os::unix::ffi::OsStrExt;

@@ -952,4 +952,37 @@ mod tests {
         );
         assert!(msg.contains("duplicate provider name \"x\""), "{msg}");
     }
+
+    #[test]
+    fn config_provider_parses_fs_exclude() {
+        let e = one(r#"
+            [[provider]]
+            name = "protect-nix"
+            type = "config"
+            profile = "main"
+            [provider.sandbox.fs]
+            protected = ["{workspace}/**/*.nix"]
+            exclude = ["{workspace}/buck-out", "{workspace}/**/buck-out"]
+            "#);
+        let ProviderKind::Config { sandbox, .. } = e.kind else {
+            panic!("{:?}", e.kind);
+        };
+        let excludes: Vec<&str> = sandbox
+            .grants
+            .fs
+            .exclude
+            .iter()
+            .map(|p| p.as_str())
+            .collect();
+        assert_eq!(
+            excludes,
+            ["{workspace}/buck-out", "{workspace}/**/buck-out"]
+        );
+
+        let msg = err(
+            "[[provider]]\nname = \"p\"\ntype = \"config\"\nprofile = \"main\"\n\
+             [provider.sandbox.fs]\nexclude = [\"relative/path\"]",
+        );
+        assert!(msg.contains("invalid path pattern"), "{msg}");
+    }
 }

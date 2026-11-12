@@ -58,6 +58,9 @@ pub struct FsRule {
     pub depth: u32,
     /// Whether missing host paths for this rule emit a startup warning.
     pub warn_missing: bool,
+    /// Paths and directory subtrees skipped when resolving a glob rule from
+    /// this `fs` section.
+    pub exclude: Vec<PathPattern>,
 }
 
 /// The effective `system` section.
@@ -765,12 +768,14 @@ fn merge_fs_rules(inherited: &[FsRule], own: &[Contribution]) -> Vec<FsRule> {
         .collect();
     for c in own {
         let warn_missing = c.grants.fs.warn_missing.unwrap_or(true);
+        let exclude = &c.grants.fs.exclude;
         out.extend(fs_rules(&c.grants.fs).map(|kind| FsRule {
             kind,
             provider: c.provider.clone(),
             origin: c.origin,
             depth: 0,
             warn_missing,
+            exclude: exclude.clone(),
         }));
     }
     out
@@ -1474,6 +1479,7 @@ mod tests {
                 origin: ProviderOrigin::Workspace,
                 depth: 0,
                 warn_missing: true,
+                exclude: vec![],
             }],
             env: EffectiveEnv {
                 set: BTreeMap::from([("B".parse().unwrap(), "2".parse().unwrap())]),
@@ -1976,6 +1982,57 @@ mod tests {
         assert_eq!(
             err.to_string(),
             r#"profile "main": conflicting sandbox.shell_hook from provider "a" and provider "b""#
+        );
+    }
+
+    #[test]
+    fn fs_exclude_is_scoped_to_each_fs_block() {
+        let m = merged(&format!(
+            "[profiles.main]\n[profiles.child]\ninherit = \"main\"\n{}{}{}",
+            prov(
+                "base",
+                "main",
+                "fs.rw = [\"{workspace}\"]\nfs.masked = [\"{workspace}/**/.env\"]"
+            ),
+            prov(
+                "protect-nix",
+                "main",
+                "fs.protected = [\"{workspace}/**/*.nix\", \"{workspace}/flake.lock\"]\n\
+                 fs.exclude = [\"{workspace}/buck-out\"]"
+            ),
+            prov("extra", "child", "fs.ro = [\"{workspace}/**/*.md\"]"),
+        ));
+        let excludes = |profile: &str| -> Vec<(String, u32, Vec<String>)> {
+            eff(&m, profile)
+                .fs
+                .iter()
+                .map(|r| {
+                    (
+                        r.provider.to_string(),
+                        r.depth,
+                        r.exclude.iter().map(PathPattern::to_string).collect(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            excludes("main"),
+            [
+                ("base".into(), 0, vec![]),
+                ("base".into(), 0, vec![]),
+                ("protect-nix".into(), 0, vec!["{workspace}/buck-out".into()]),
+                ("protect-nix".into(), 0, vec!["{workspace}/buck-out".into()]),
+            ]
+        );
+        assert_eq!(
+            excludes("child"),
+            [
+                ("base".into(), 1, vec![]),
+                ("base".into(), 1, vec![]),
+                ("protect-nix".into(), 1, vec!["{workspace}/buck-out".into()]),
+                ("protect-nix".into(), 1, vec!["{workspace}/buck-out".into()]),
+                ("extra".into(), 0, vec![]),
+            ]
         );
     }
 }

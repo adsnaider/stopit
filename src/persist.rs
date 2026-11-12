@@ -410,6 +410,7 @@ fn render_approvals_provider(entry: &ProviderEntry) -> Result<String, String> {
         || !fs.masked.is_empty()
         || !fs.protected.is_empty()
         || !fs.ephemeral.is_empty()
+        || !fs.exclude.is_empty()
     {
         out.push_str("\n[provider.sandbox.fs]\n");
         if !fs.ro.is_empty() {
@@ -440,6 +441,12 @@ fn render_approvals_provider(entry: &ProviderEntry) -> Result<String, String> {
             out.push_str(&format!(
                 "ephemeral = {}\n",
                 toml_str_array(fs.ephemeral.iter().map(PathPattern::as_str))
+            ));
+        }
+        if !fs.exclude.is_empty() {
+            out.push_str(&format!(
+                "exclude = {}\n",
+                toml_str_array(fs.exclude.iter().map(PathPattern::as_str))
             ));
         }
     }
@@ -742,5 +749,38 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("approvals-disabled"), "{err}");
+    }
+
+    #[test]
+    fn persist_preserves_hand_edited_fs_exclude_on_approvals_provider() {
+        let existing = format!(
+            "[profiles.main]\n\n{PERSIST_HEADER}\n\
+             [[provider]]\n\
+             name = \"approvals-main\"\n\
+             type = \"config\"\n\
+             profile = \"main\"\n\n\
+             [provider.sandbox.fs]\n\
+             ro = [\"/opt/sdk/**\"]\n\
+             exclude = [\"/opt/sdk/debug\"]\n"
+        );
+        let updated = update_config_toml(
+            &existing,
+            &PersistTarget::Grant {
+                caller_profile: "main".parse().unwrap(),
+                ro: vec!["/opt/extra".to_owned()],
+                rw: Vec::new(),
+                net_domains: Vec::new(),
+                net_full: false,
+            },
+        )
+        .unwrap();
+        let parsed = ConfigLayer::from_toml_str(&updated).unwrap();
+        let ProviderKind::Config { sandbox, .. } = &parsed.providers[0].kind else {
+            panic!("{:?}", parsed.providers[0].kind);
+        };
+        assert_eq!(
+            sandbox.grants.fs.exclude,
+            vec!["/opt/sdk/debug".parse().unwrap()]
+        );
     }
 }

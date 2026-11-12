@@ -122,11 +122,127 @@ pub struct Resolution {
     pub warnings: Vec<ResolveWarning>,
 }
 
+/// Host-side identity of one expanded exclude pattern, used to key
+/// [`ResolveCache`] entries.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum ExcludeKey {
+    Literal(PathBuf),
+    Glob { root: PathBuf, remainder: String },
+}
+
+impl ExcludeKey {
+    fn from_expanded(pattern: &ExpandedPattern) -> Self {
+        if pattern.has_glob() {
+            let split = split_glob(pattern);
+            ExcludeKey::Glob {
+                root: split.root,
+                remainder: split.remainder,
+            }
+        } else {
+            ExcludeKey::Literal(join(pattern.host_anchor(), pattern.rest()))
+        }
+    }
+}
+
+fn exclude_keys(excludes: &[ExpandedPattern]) -> Vec<ExcludeKey> {
+    if excludes.is_empty() {
+        return Vec::new();
+    }
+    let mut keys: Vec<ExcludeKey> = excludes.iter().map(ExcludeKey::from_expanded).collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+enum CompiledExclude {
+    Literal(PathBuf),
+    Glob {
+        root: PathBuf,
+        matcher: globset::GlobMatcher,
+    },
+}
+
+/// Compiled host-side exclude rules used to prune `WalkDir` traversal.
+struct ExcludeSet {
+    rules: Vec<CompiledExclude>,
+}
+
+impl ExcludeSet {
+    fn compile(keys: &[ExcludeKey]) -> Result<Self, ExpandError> {
+        let mut rules = Vec::with_capacity(keys.len());
+        for key in keys {
+            match key {
+                ExcludeKey::Literal(host) => {
+                    rules.push(CompiledExclude::Literal(host.clone()));
+                }
+                ExcludeKey::Glob { root, remainder } => {
+                    let matcher =
+                        compile_glob(remainder).map_err(|error| ExpandError::InvalidGlob {
+                            pattern: join(root, Path::new(remainder)),
+                            error,
+                        })?;
+                    rules.push(CompiledExclude::Glob {
+                        root: root.clone(),
+                        matcher,
+                    });
+                }
+            }
+        }
+        Ok(ExcludeSet { rules })
+    }
+
+    /// Whether `entry_path` (lexical host path reported by `WalkDir`) matches
+    /// an excluded path or lies inside an excluded directory subtree.
+    fn is_excluded(&self, entry_path: &Path) -> bool {
+        self.rules.iter().any(|rule| match rule {
+            CompiledExclude::Literal(x_host) => entry_path.starts_with(x_host),
+            CompiledExclude::Glob { root, matcher } => {
+                let Ok(rel) = entry_path.strip_prefix(root) else {
+                    return false;
+                };
+                rel.ancestors()
+                    .take_while(|a| !a.as_os_str().is_empty())
+                    .any(|a| matcher.is_match(a))
+            }
+        })
+    }
+}
+
+struct SplitGlob {
+    prefix: PathBuf,
+    root: PathBuf,
+    remainder: String,
+    remainder_components: usize,
+}
+
+fn split_glob(pattern: &ExpandedPattern) -> SplitGlob {
+    // `rest` comes from a validated UTF-8 pattern, so this is lossless.
+    let rest = pattern.rest().to_string_lossy();
+    let components: Vec<&str> = rest.split('/').collect();
+    let split = components
+        .iter()
+        .position(|c| has_glob(c))
+        .expect("split_glob is only called for glob patterns");
+    let prefix = PathBuf::from(components[..split].join("/"));
+    let root = join(pattern.host_anchor(), &prefix);
+    debug_assert_eq!(pattern.walk_root().as_ref(), Some(&root));
+    let remainder = components[split..].join("/");
+    SplitGlob {
+        prefix,
+        root,
+        remainder,
+        remainder_components: components.len() - split,
+    }
+}
+
+type WalkCacheKey = (PathBuf, Option<usize>, Vec<ExcludeKey>);
+type ResolutionCacheKey = (ExpandedPattern, Vec<ExcludeKey>);
+
 /// Per-compile cache of glob directory walks and pattern resolutions.
 #[derive(Debug, Default)]
 pub struct ResolveCache {
-    walks: HashMap<(PathBuf, Option<usize>), Arc<CachedWalk>>,
-    resolutions: HashMap<ExpandedPattern, Resolution>,
+    walks: HashMap<WalkCacheKey, Arc<CachedWalk>>,
+    resolutions: HashMap<ResolutionCacheKey, Resolution>,
     symlink_metas: HashMap<PathBuf, Result<EntryKind, io::Error>>,
 }
 
@@ -191,55 +307,74 @@ impl ResolveCache {
         res
     }
 
-    fn walk(&mut self, root: &Path, max_depth: Option<usize>) -> Arc<CachedWalk> {
-        let key = (root.to_owned(), max_depth);
+    fn walk(
+        &mut self,
+        root: &Path,
+        max_depth: Option<usize>,
+        excludes: &[ExcludeKey],
+    ) -> Result<Arc<CachedWalk>, ExpandError> {
+        let key = (root.to_owned(), max_depth, excludes.to_vec());
         if let Some(cached) = self.walks.get(&key) {
-            return cached.clone();
+            return Ok(cached.clone());
         }
-        let built = match root.metadata() {
-            Err(error) => CachedWalk::RootError(error),
-            Ok(_) => {
-                let mut walk = WalkDir::new(root)
-                    .follow_links(false)
-                    // The root is on the way to every match, like the components before
-                    // it, so a link there is followed; links below it never are.
-                    .follow_root_links(true)
-                    .min_depth(1);
-                if let Some(d) = max_depth {
-                    walk = walk.max_depth(d);
-                }
-                let mut steps = Vec::new();
-                for entry in walk {
-                    match entry {
-                        Ok(entry) => {
-                            let relative = entry
-                                .path()
-                                .strip_prefix(root)
-                                .expect("walkdir yields paths below its root")
-                                .to_owned();
-                            let kind = EntryKind::from_file_type(entry.file_type());
-                            let host = entry.into_path();
-                            steps.push(WalkStep::Entry {
-                                host,
-                                relative,
-                                kind,
-                            });
-                        }
-                        Err(err) => {
-                            let path = err.path().unwrap_or(root).to_owned();
-                            steps.push(WalkStep::Error {
-                                path,
-                                error: err.into(),
-                            });
+        let exclude_set = ExcludeSet::compile(excludes)?;
+        let built = if exclude_set.is_excluded(root) {
+            CachedWalk::Steps(Vec::new())
+        } else {
+            match root.metadata() {
+                Err(error) => CachedWalk::RootError(error),
+                Ok(_) => {
+                    let mut walk = WalkDir::new(root)
+                        .follow_links(false)
+                        // The root is on the way to every match, like the components before
+                        // it, so a link there is followed; links below it never are.
+                        .follow_root_links(true)
+                        .min_depth(1);
+                    if let Some(d) = max_depth {
+                        walk = walk.max_depth(d);
+                    }
+                    let mut steps = Vec::new();
+                    let iter = walk
+                        .into_iter()
+                        .filter_entry(|entry| !exclude_set.is_excluded(entry.path()));
+                    for entry in iter {
+                        match entry {
+                            Ok(entry) => {
+                                let relative = entry
+                                    .path()
+                                    .strip_prefix(root)
+                                    .expect("walkdir yields paths below its root")
+                                    .to_owned();
+                                let kind = EntryKind::from_file_type(entry.file_type());
+                                let host = entry.into_path();
+                                steps.push(WalkStep::Entry {
+                                    host,
+                                    relative,
+                                    kind,
+                                });
+                            }
+                            Err(err) => {
+                                // Constructing a `DirEntry` can fail before `filter_entry`
+                                // runs (for example, if `lstat` fails when `readdir` omits
+                                // `d_type` or an entry vanishes concurrently).
+                                if err.path().is_some_and(|path| exclude_set.is_excluded(path)) {
+                                    continue;
+                                }
+                                let path = err.path().unwrap_or(root).to_owned();
+                                steps.push(WalkStep::Error {
+                                    path,
+                                    error: err.into(),
+                                });
+                            }
                         }
                     }
+                    CachedWalk::Steps(steps)
                 }
-                CachedWalk::Steps(steps)
             }
         };
         let arc = Arc::new(built);
         self.walks.insert(key, arc.clone());
-        arc
+        Ok(arc)
     }
 }
 
@@ -297,8 +432,55 @@ impl Resolution {
 /// A validated [`PathPattern`](crate::manifest::PathPattern) never has one,
 /// so this is defensive.
 pub fn resolve(pattern: &ExpandedPattern) -> Result<Resolution, ExpandError> {
+    resolve_excluding(pattern, &[])
+}
+
+/// Resolves `pattern` against the host filesystem, pruning `excludes` during
+/// glob directory traversal.
+///
+/// `excludes` applies only when `pattern` is a glob (`pattern.has_glob()`).
+/// Literal patterns ignore `excludes` so an exact path always beats a glob
+/// exclusion, and missing excluded paths never emit [`ResolveWarning::Missing`].
+///
+/// # Errors
+///
+/// Returns [`ExpandError::InvalidGlob`] if `pattern` or an entry in `excludes`
+/// contains a glob that fails to compile (unreachable for validated
+/// [`PathPattern`](crate::manifest::PathPattern)s).
+///
+/// # Examples
+///
+/// ```
+/// # use std::fs;
+/// # use tempfile::TempDir;
+/// use stopit::expand::{ExpansionContext, expand_pattern, resolve_excluding};
+/// # let tmp = TempDir::new().unwrap();
+/// # let root = tmp.path().canonicalize().unwrap();
+/// # let ws = root.join("ws");
+/// # let home = root.join("home");
+/// # fs::create_dir_all(ws.join("buck-out")).unwrap();
+/// # fs::create_dir_all(&home).unwrap();
+/// # fs::write(ws.join("flake.nix"), "").unwrap();
+/// # fs::write(ws.join("buck-out/gen.nix"), "").unwrap();
+/// # let ctx = ExpansionContext::new(
+/// #     ws.clone(),
+/// #     "/workspace".parse().unwrap(),
+/// #     home,
+/// #     "/home/user".parse().unwrap(),
+/// # ).unwrap();
+///
+/// let pattern = expand_pattern(&"{workspace}/**/*.nix".parse().unwrap(), &ctx);
+/// let exclude = expand_pattern(&"{workspace}/buck-out".parse().unwrap(), &ctx);
+/// let res = resolve_excluding(&pattern, &[exclude]).unwrap();
+/// assert_eq!(res.paths.len(), 1);
+/// assert_eq!(res.paths[0].host, ws.join("flake.nix"));
+/// ```
+pub fn resolve_excluding(
+    pattern: &ExpandedPattern,
+    excludes: &[ExpandedPattern],
+) -> Result<Resolution, ExpandError> {
     let mut cache = ResolveCache::default();
-    resolve_with_cache(pattern, &mut cache)
+    resolve_excluding_with_cache(pattern, excludes, &mut cache)
 }
 
 /// Resolves `pattern` against the host filesystem, reusing walks and
@@ -307,16 +489,72 @@ pub fn resolve_with_cache(
     pattern: &ExpandedPattern,
     cache: &mut ResolveCache,
 ) -> Result<Resolution, ExpandError> {
-    if let Some(cached) = cache.resolutions.get(pattern) {
+    resolve_excluding_with_cache(pattern, &[], cache)
+}
+
+/// Resolves `pattern` against the host filesystem while pruning `excludes`
+/// during glob walks, reusing cached walks and resolutions in `cache`.
+///
+/// Entries in `cache` are keyed by the normalized host-side exclude set so
+/// rules with identical excludes share their pruned walk without colliding
+/// with rules that use different excludes. Literal `pattern`s ignore
+/// `excludes`.
+///
+/// # Errors
+///
+/// Returns [`ExpandError::InvalidGlob`] if `pattern` or an entry in `excludes`
+/// contains a glob that fails to compile (unreachable for validated
+/// [`PathPattern`](crate::manifest::PathPattern)s).
+///
+/// # Examples
+///
+/// ```
+/// # use std::fs;
+/// # use tempfile::TempDir;
+/// use stopit::expand::{
+///     ExpansionContext, ResolveCache, expand_pattern, resolve_excluding_with_cache,
+/// };
+/// # let tmp = TempDir::new().unwrap();
+/// # let root = tmp.path().canonicalize().unwrap();
+/// # let ws = root.join("ws");
+/// # let home = root.join("home");
+/// # fs::create_dir_all(ws.join("buck-out")).unwrap();
+/// # fs::create_dir_all(&home).unwrap();
+/// # fs::write(ws.join("buck-out/.env"), "").unwrap();
+/// # let ctx = ExpansionContext::new(
+/// #     ws.clone(),
+/// #     "/workspace".parse().unwrap(),
+/// #     home,
+/// #     "/home/user".parse().unwrap(),
+/// # ).unwrap();
+///
+/// let mut cache = ResolveCache::default();
+/// let pat = expand_pattern(&"{workspace}/**/.env".parse().unwrap(), &ctx);
+/// let excl = expand_pattern(&"{workspace}/buck-out".parse().unwrap(), &ctx);
+/// assert!(resolve_excluding_with_cache(&pat, &[excl], &mut cache).unwrap().paths.is_empty());
+/// assert_eq!(resolve_excluding_with_cache(&pat, &[], &mut cache).unwrap().paths.len(), 1);
+/// ```
+pub fn resolve_excluding_with_cache(
+    pattern: &ExpandedPattern,
+    excludes: &[ExpandedPattern],
+    cache: &mut ResolveCache,
+) -> Result<Resolution, ExpandError> {
+    let keys = if pattern.has_glob() {
+        exclude_keys(excludes)
+    } else {
+        Vec::new()
+    };
+    let cache_key = (pattern.clone(), keys);
+    if let Some(cached) = cache.resolutions.get(&cache_key) {
         return Ok(cached.clone());
     }
     let res = if pattern.has_glob() {
-        resolve_glob_with_cache(pattern, cache)?
+        resolve_glob_with_cache(pattern, &cache_key.1, cache)?
     } else {
         resolve_literal_with_cache(pattern, cache)
     };
     let finished = res.finish();
-    cache.resolutions.insert(pattern.clone(), finished.clone());
+    cache.resolutions.insert(cache_key, finished.clone());
     Ok(finished)
 }
 
@@ -337,37 +575,28 @@ fn resolve_literal_with_cache(pattern: &ExpandedPattern, cache: &mut ResolveCach
 
 fn resolve_glob_with_cache(
     pattern: &ExpandedPattern,
+    excludes: &[ExcludeKey],
     cache: &mut ResolveCache,
 ) -> Result<Resolution, ExpandError> {
-    // `rest` comes from a validated UTF-8 pattern, so this is lossless.
-    let rest = pattern.rest().to_string_lossy();
-    let components: Vec<&str> = rest.split('/').collect();
-    let split = components
-        .iter()
-        .position(|c| has_glob(c))
-        .expect("resolve_glob is only called for glob patterns");
-    let prefix = PathBuf::from(components[..split].join("/"));
-    let remainder = components[split..].join("/");
+    let split = split_glob(pattern);
 
     // Validated patterns always compile; the error is purely defensive.
-    let matcher = compile_glob(&remainder).map_err(|error| ExpandError::InvalidGlob {
+    let matcher = compile_glob(&split.remainder).map_err(|error| ExpandError::InvalidGlob {
         pattern: join(pattern.host_anchor(), pattern.rest()),
         error,
     })?;
 
     let mut res = Resolution::default();
-    let root = join(pattern.host_anchor(), &prefix);
-    debug_assert_eq!(pattern.walk_root().as_ref(), Some(&root));
-    let sandbox_root = join(pattern.sandbox_anchor(), &prefix);
+    let sandbox_root = join(pattern.sandbox_anchor(), &split.prefix);
     // Without `**` every match has exactly this many components. This is
     // only an optimisation: matching alone is correct.
-    let max_depth = (!remainder.contains("**")).then_some(components.len() - split);
-    let walk = cache.walk(&root, max_depth);
+    let max_depth = (!split.remainder.contains("**")).then_some(split.remainder_components);
+    let walk = cache.walk(&split.root, max_depth, excludes)?;
     match walk.as_ref() {
         CachedWalk::RootError(error) => {
             res.warn_io(
-                join(pattern.host_anchor(), &prefix),
-                root,
+                join(pattern.host_anchor(), &split.prefix),
+                split.root,
                 clone_io_error(error),
             );
         }
@@ -1240,5 +1469,229 @@ mod tests {
         }
         assert_eq!(f.rels("{workspace}/a]"), ["a]"]);
         assert_eq!(f.rels("{workspace}/[ab]?/c"), ["ab/c"]);
+    }
+
+    fn expand_list(ctx: &ExpansionContext, patterns: &[&str]) -> Vec<ExpandedPattern> {
+        patterns
+            .iter()
+            .map(|s| expand_pattern(&s.parse().unwrap(), ctx))
+            .collect()
+    }
+
+    fn rels_excluding(f: &Fixture, pattern: &str, excludes: &[&str]) -> Vec<String> {
+        let pat = expand_pattern(&pattern.parse().unwrap(), &f.ctx);
+        let ex = expand_list(&f.ctx, excludes);
+        let res = resolve_excluding(&pat, &ex).unwrap();
+        assert!(
+            res.warnings.is_empty(),
+            "{pattern} excluding {excludes:?}: {:?}",
+            res.warnings
+        );
+        res.paths
+            .iter()
+            .map(|p| {
+                p.host
+                    .strip_prefix(f.ws())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn exclude_prunes_literal_and_glob_subtrees_and_files() {
+        let f = Fixture::new();
+        f.file("flake.nix");
+        f.file("nix/mod.nix");
+        f.file("nix/generated.gen.nix");
+        f.file("buck-out/v2/gen.nix");
+        f.file("buck-out/.gitignore");
+        f.file("sub/buck-out/nested.nix");
+        f.symlink(Path::new("../flake.nix"), "buck-out/link.nix");
+
+        // Literal directory exclude prunes `buck-out` and its contents.
+        assert_eq!(
+            rels_excluding(&f, "{workspace}/**/*.nix", &["{workspace}/buck-out"]),
+            [
+                "flake.nix",
+                "nix/generated.gen.nix",
+                "nix/mod.nix",
+                "sub/buck-out/nested.nix",
+            ]
+        );
+
+        // Glob excludes: `**/buck-out`, `buck-out/**`, and `**/*.gen.nix`.
+        assert_eq!(
+            rels_excluding(&f, "{workspace}/**/*.nix", &["{workspace}/**/buck-out"]),
+            ["flake.nix", "nix/generated.gen.nix", "nix/mod.nix"]
+        );
+        assert_eq!(
+            rels_excluding(&f, "{workspace}/**/*.nix", &["{workspace}/buck-out/**"]),
+            [
+                "flake.nix",
+                "nix/generated.gen.nix",
+                "nix/mod.nix",
+                "sub/buck-out/nested.nix",
+            ]
+        );
+        assert_eq!(
+            rels_excluding(
+                &f,
+                "{workspace}/**/*.nix",
+                &["{workspace}/**/buck-out", "{workspace}/**/*.gen.nix"]
+            ),
+            ["flake.nix", "nix/mod.nix"]
+        );
+
+        // Walk root itself equal to or strictly inside an excluded tree yields
+        // an empty resolution without walking or warning, even when missing.
+        assert!(
+            rels_excluding(
+                &f,
+                "{workspace}/buck-out/**/*.nix",
+                &["{workspace}/buck-out"]
+            )
+            .is_empty()
+        );
+        assert!(
+            rels_excluding(
+                &f,
+                "{workspace}/buck-out/v2/*.nix",
+                &["{workspace}/buck-out"]
+            )
+            .is_empty()
+        );
+        assert!(
+            rels_excluding(
+                &f,
+                "{workspace}/sub/buck-out/*.nix",
+                &["{workspace}/**/buck-out"]
+            )
+            .is_empty()
+        );
+        assert!(
+            rels_excluding(
+                &f,
+                "{workspace}/buck-out/v2/*.nix",
+                &["{workspace}/buck-out/**"]
+            )
+            .is_empty()
+        );
+        assert!(
+            rels_excluding(
+                &f,
+                "{workspace}/missing-out/**/*.nix",
+                &["{workspace}/missing-out"]
+            )
+            .is_empty()
+        );
+
+        // Non-existent excluded paths emit no `Missing` warning.
+        assert_eq!(
+            rels_excluding(&f, "{workspace}/*.nix", &["{workspace}/does-not-exist"]),
+            ["flake.nix"]
+        );
+
+        // Literal patterns ignore `excludes` ("an exact path beats a glob").
+        let lit = expand_pattern(&"{workspace}/buck-out/.gitignore".parse().unwrap(), &f.ctx);
+        let ex = expand_list(&f.ctx, &["{workspace}/buck-out"]);
+        let lit_res = resolve_excluding(&lit, &ex).unwrap();
+        assert!(lit_res.warnings.is_empty());
+        assert_eq!(lit_res.paths.len(), 1);
+        assert_eq!(lit_res.paths[0].host, f.ws().join("buck-out/.gitignore"));
+    }
+
+    #[test]
+    fn exclude_prunes_unreadable_dirs_and_resists_planted_symlinks() {
+        let f = Fixture::new();
+        f.file("nix/foo.nix");
+
+        // Adversarial symlink: `buck-out -> nix` must not trick lexical exclude
+        // matching into excluding real files under `nix/`.
+        f.symlink(Path::new("nix"), "buck-out");
+        assert_eq!(
+            rels_excluding(&f, "{workspace}/**/*.nix", &["{workspace}/buck-out"]),
+            ["nix/foo.nix"]
+        );
+        fs::remove_file(f.ws().join("buck-out")).unwrap();
+
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipping permission portion: permission checks do not apply to root");
+            return;
+        }
+
+        f.file("buck-out/locked/hidden.nix");
+        f.mkdir("locked-out");
+        let inner_locked = f.ws().join("buck-out/locked");
+        let self_locked = f.ws().join("locked-out");
+        fs::set_permissions(&inner_locked, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::set_permissions(&self_locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let got = rels_excluding(
+            &f,
+            "{workspace}/**/*.nix",
+            &["{workspace}/buck-out", "{workspace}/locked-out"],
+        );
+        let root_inside_locked = rels_excluding(
+            &f,
+            "{workspace}/buck-out/locked/*.nix",
+            &["{workspace}/buck-out"],
+        );
+
+        fs::set_permissions(&inner_locked, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&self_locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(got, ["nix/foo.nix"]);
+        assert!(root_inside_locked.is_empty());
+    }
+
+    #[test]
+    fn resolve_cache_shares_pruned_walks_and_isolates_distinct_excludes() {
+        let f = Fixture::new();
+        f.file("flake.nix");
+        f.file("Cargo.lock");
+        f.file("buck-out/gen.nix");
+        f.file("buck-out/Cargo.lock");
+
+        let nix_pat = expand_pattern(&"{workspace}/**/*.nix".parse().unwrap(), &f.ctx);
+        let lock_pat = expand_pattern(&"{workspace}/**/Cargo.lock".parse().unwrap(), &f.ctx);
+        let excl_buck = expand_list(&f.ctx, &["{workspace}/buck-out"]);
+
+        // Order 1: excluded first, then unexcluded on the same cache.
+        let mut cache = ResolveCache::default();
+        let nix_pruned = resolve_excluding_with_cache(&nix_pat, &excl_buck, &mut cache).unwrap();
+        assert_eq!(cache.walks.len(), 1);
+        assert_eq!(nix_pruned.paths.len(), 1);
+        assert_eq!(nix_pruned.paths[0].host, f.ws().join("flake.nix"));
+
+        // Creating a new Cargo.lock on disk after the first walk proves the
+        // second glob with the identical exclude list reuses the cached walk.
+        f.file("late/Cargo.lock");
+        let lock_pruned = resolve_excluding_with_cache(&lock_pat, &excl_buck, &mut cache).unwrap();
+        assert_eq!(cache.walks.len(), 1);
+        assert_eq!(lock_pruned.paths.len(), 1);
+        assert_eq!(lock_pruned.paths[0].host, f.ws().join("Cargo.lock"));
+
+        // Same glob pattern (`**/*.nix`) with empty excludes does NOT collide
+        // with the pruned resolution or walk.
+        let nix_all = resolve_excluding_with_cache(&nix_pat, &[], &mut cache).unwrap();
+        assert_eq!(cache.walks.len(), 2);
+        assert_eq!(cache.resolutions.len(), 3);
+        assert_eq!(nix_all.paths.len(), 2);
+
+        // Order 2: unexcluded first, then excluded on a fresh cache.
+        let mut cache2 = ResolveCache::default();
+        let nix_all_first = resolve_excluding_with_cache(&nix_pat, &[], &mut cache2).unwrap();
+        let nix_pruned_second =
+            resolve_excluding_with_cache(&nix_pat, &excl_buck, &mut cache2).unwrap();
+        assert_eq!(nix_all_first.paths.len(), 2);
+        assert_eq!(nix_pruned_second.paths.len(), 1);
+        assert_eq!(nix_pruned_second.paths[0].host, f.ws().join("flake.nix"));
+
+        // Invalid unchecked glob in excludes returns `ExpandError::InvalidGlob`.
+        let bad_excl = expand_pattern(&PathPattern::new_unchecked("{workspace}/[bad"), &f.ctx);
+        let err = resolve_excluding_with_cache(&nix_pat, &[bad_excl], &mut cache2).unwrap_err();
+        assert!(matches!(err, ExpandError::InvalidGlob { .. }), "{err:?}");
     }
 }

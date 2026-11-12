@@ -56,7 +56,7 @@ use crate::error::is_missing;
 use crate::escape::shell_quote;
 use crate::expand::{
     EntryKind, ExpandError, ExpandedPattern, ExpansionContext, ResolveCache, ResolveWarning,
-    ResolvedPath, expand_bind, expand_pattern, resolve_with_cache,
+    ResolvedPath, expand_bind, expand_pattern, resolve_excluding_with_cache,
 };
 use crate::manifest::PathPattern;
 use crate::policy::PathMode;
@@ -811,10 +811,20 @@ fn resolve_host(
             }
         };
     }
-    let res = resolve_with_cache(expanded, cache).map_err(|error| PathPlanError::Expand {
-        provider: rule.provider.clone(),
-        pattern: pattern.clone(),
-        error,
+    let excludes: Vec<ExpandedPattern> = if expanded.has_glob() && !rule.exclude.is_empty() {
+        rule.exclude
+            .iter()
+            .map(|ex| expand_pattern(ex, ctx))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let res = resolve_excluding_with_cache(expanded, &excludes, cache).map_err(|error| {
+        PathPlanError::Expand {
+            provider: rule.provider.clone(),
+            pattern: pattern.clone(),
+            error,
+        }
     })?;
     let mut masks = Vec::new();
     // Masks the directory a restrictive rule cannot inspect `path` below,
@@ -1191,6 +1201,7 @@ mod tests {
             origin: crate::config::ProviderOrigin::Workspace,
             depth,
             warn_missing: true,
+            exclude: vec![],
         }
     }
 
@@ -1205,6 +1216,7 @@ mod tests {
             origin: crate::config::ProviderOrigin::Workspace,
             depth,
             warn_missing: true,
+            exclude: vec![],
         }
     }
 
@@ -2736,6 +2748,7 @@ mod tests {
             origin: crate::config::ProviderOrigin::Workspace,
             depth: 0,
             warn_missing: true,
+            exclude: vec![],
         };
         let e = f.plan_err(&[unchecked(Ephemeral, "{workspace}/*.tmp")]);
         assert!(matches!(e, PathPlanError::EphemeralGlob { .. }), "{e:?}");
@@ -2767,5 +2780,184 @@ mod tests {
         assert!(plan.mounts.is_empty());
         assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
         assert_eq!(plan.warnings[0].provider.as_str(), "tools");
+    }
+
+    fn with_exclude(mut r: FsRule, excludes: &[&str]) -> FsRule {
+        r.exclude = excludes.iter().map(|s| s.parse().unwrap()).collect();
+        r
+    }
+
+    #[test]
+    fn exclude_applies_only_to_glob_rules_and_never_warns_when_missing() {
+        let f = Fixture::new();
+        f.file("ws/flake.nix");
+        f.file("ws/buck-out/keep.nix");
+        f.file("ws/buck-out/drop.nix");
+        f.file("ws/buck-out/data");
+
+        let rules = [
+            rule(Rw, "{workspace}", "base", 0),
+            // Literal path rule, `ephemeral`, and `bind` all ignore `exclude`.
+            with_exclude(
+                rule(Protected, "{workspace}/buck-out/keep.nix", "protect", 0),
+                &["{workspace}/buck-out", "{workspace}/missing-cache"],
+            ),
+            with_exclude(
+                rule(Protected, "{workspace}/**/*.nix", "protect", 0),
+                &["{workspace}/buck-out", "{workspace}/missing-cache"],
+            ),
+            with_exclude(
+                rule(Ephemeral, "{workspace}/buck-out/scratch", "protect", 0),
+                &["{workspace}/buck-out"],
+            ),
+            with_exclude(
+                bind(
+                    "{workspace}/buck-out/data",
+                    "/opt/data",
+                    BindMode::Ro,
+                    "protect",
+                    0,
+                ),
+                &["{workspace}/buck-out"],
+            ),
+            // Walk root inside a missing excluded directory emits no Missing warning
+            // even with `warn_missing = true`.
+            with_exclude(
+                rule(
+                    Protected,
+                    "{workspace}/missing-cache/**/*.nix",
+                    "protect",
+                    0,
+                ),
+                &["{workspace}/missing-cache"],
+            ),
+        ];
+        let mounts = f.clean(&rules);
+        assert_eq!(
+            summary(&mounts),
+            [
+                row("/workspace", Rw, "base"),
+                row("/opt/data", Ro, "protect"),
+                row("/workspace/flake.nix", Protected, "protect"),
+                row("/workspace/buck-out/keep.nix", Protected, "protect"),
+                row("/workspace/buck-out/scratch", Ephemeral, "protect"),
+            ]
+        );
+    }
+
+    #[test]
+    fn exclude_is_isolated_per_rule_and_prunes_unreadable_subtrees() {
+        let f = Fixture::new();
+        f.file("ws/.env");
+        f.file("ws/buck-out/.env");
+        f.file("ws/nix/foo.nix");
+        f.file("ws/buck-out/gen.nix");
+
+        if !rustix::process::geteuid().is_root() {
+            use std::os::unix::fs::PermissionsExt;
+            f.mkdir("ws/buck-out/locked");
+            fs::set_permissions(
+                f.ws().join("buck-out/locked"),
+                fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
+        }
+
+        // Pruning skips `buck-out` before descending, so an unreadable child
+        // directory (`0o000`) inside `buck-out` produces neither an
+        // `InaccessibleMasked` warning nor a mask mount.
+        let pruned = f.clean(&[
+            rule(Rw, "{workspace}", "base", 0),
+            with_exclude(
+                rule(Protected, "{workspace}/**/*.nix", "protect-nix", 0),
+                &["{workspace}/buck-out"],
+            ),
+        ]);
+        assert_eq!(
+            summary(&pruned),
+            [
+                row("/workspace", Rw, "base"),
+                row("/workspace/nix/foo.nix", Protected, "protect-nix"),
+            ]
+        );
+
+        if !rustix::process::geteuid().is_root() {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                f.ws().join("buck-out/locked"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            fs::remove_dir(f.ws().join("buck-out/locked")).unwrap();
+        }
+
+        // Provider B's `exclude = ["{workspace}/buck-out"]` on `**/*.nix` must
+        // not punch holes in Provider A's `masked` rules, and identical glob
+        // patterns with different excludes must not collide in `ResolveCache`.
+        let rules_ab = [
+            rule(Rw, "{workspace}", "base", 0),
+            rule(Masked, "{workspace}/**/.env", "base", 0),
+            rule(Ro, "{workspace}/**/*.nix", "reader", 0),
+            with_exclude(
+                rule(Protected, "{workspace}/**/*.nix", "protect-nix", 0),
+                &["{workspace}/buck-out"],
+            ),
+        ];
+        let rules_ba = [
+            rule(Rw, "{workspace}", "base", 0),
+            with_exclude(
+                rule(Protected, "{workspace}/**/*.nix", "protect-nix", 0),
+                &["{workspace}/buck-out"],
+            ),
+            rule(Ro, "{workspace}/**/*.nix", "reader", 0),
+            rule(Masked, "{workspace}/**/.env", "base", 0),
+        ];
+
+        for rules in [&rules_ab, &rules_ba] {
+            let mut cache = ResolveCache::default();
+            let plan = plan_mounts_with_cache(rules, &f.ctx, &mut cache).unwrap();
+            assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+            assert_eq!(
+                summary(&plan.mounts),
+                [
+                    row("/workspace", Rw, "base"),
+                    row("/workspace/.env", Masked, "base"),
+                    row("/workspace/buck-out/.env", Masked, "base"),
+                    row("/workspace/buck-out/gen.nix", Ro, "reader"),
+                    row("/workspace/nix/foo.nix", Protected, "protect-nix"),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn exclude_resists_planted_symlinks_in_workspace() {
+        let f = Fixture::new();
+        f.file("ws/nix/foo.nix");
+        f.symlink("nix", "ws/buck-out");
+
+        // Planting `buck-out -> nix` does not exclude `nix/foo.nix`.
+        let mounts = f.clean(&[
+            rule(Rw, "{workspace}", "base", 0),
+            with_exclude(
+                rule(Protected, "{workspace}/**/*.nix", "protect-nix", 0),
+                &["{workspace}/buck-out"],
+            ),
+        ]);
+        assert_eq!(
+            summary(&mounts),
+            [
+                row("/workspace", Rw, "base"),
+                row("/workspace/nix/foo.nix", Protected, "protect-nix"),
+            ]
+        );
+
+        // And a restrictive glob whose walk root runs through the planted
+        // symlink `buck-out` is still refused by `check_walk_root`.
+        let err = f.plan_err(&[with_exclude(
+            rule(Protected, "{workspace}/buck-out/**/*.nix", "protect-nix", 0),
+            &["{workspace}/buck-out"],
+        )]);
+        assert!(matches!(err, PathPlanError::WalkRootLink(_)), "{err:?}");
     }
 }

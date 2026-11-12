@@ -11225,4 +11225,125 @@ fs.masked = [\"{workspace}/hidden\"]
         );
         assert!(fast.without_profile(&target).get(&target).is_none());
     }
+
+    #[test]
+    fn fs_exclude_prevents_buck_out_glob_link_warnings_pinning_and_cross_provider_leaks() {
+        let f = Fixture::new();
+        f.file("ws/.gitignore");
+        f.file("ws/flake.nix");
+        f.file("ws/nix/mod.nix");
+        f.file("ws/buck-out/.gitignore");
+        f.file("ws/buck-out/v2/gen.nix");
+        symlink("../../flake.nix", f.ws().join("buck-out/v2/link.nix")).unwrap();
+        symlink("../.gitignore", f.ws().join("buck-out/link.gitignore")).unwrap();
+
+        if !rustix::process::geteuid().is_root() {
+            use std::os::unix::fs::PermissionsExt;
+            f.mkdir("ws/buck-out/locked");
+            fs::set_permissions(
+                f.ws().join("buck-out/locked"),
+                fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
+        }
+
+        // 1. `exclude = ["{workspace}/buck-out"]` skips descending into
+        //    `buck-out`, leaving `/workspace/buck-out` completely unpinned
+        //    (zero submounts) and emitting zero `GlobLink`,
+        //    `InaccessibleMasked`, or `Missing` warnings.
+        let cfg_unpinned = format!(
+            "inherit_global = false\n[profiles.main]\n{}{}",
+            prov("base", "main", "fs.rw = [\"{workspace}\"]"),
+            prov(
+                "protect",
+                "main",
+                "fs.protected = [\"{workspace}/**/*.nix\", \"{workspace}/**/.gitignore\"]\n\
+                 fs.exclude = [\"{workspace}/buck-out\", \"{workspace}/not-created-yet\"]\n\
+                 fs.warn_missing = true"
+            ),
+        );
+        let s = f.compile(&cfg_unpinned);
+        let main = get(&s, "main");
+        assert!(main.warnings.is_empty(), "{:?}", main.warnings);
+        assert_eq!(
+            mounts(&main.spec),
+            [
+                row("/workspace", Rw, "base"),
+                row("/workspace/.gitignore", Protected, "protect"),
+                row("/workspace/flake.nix", Protected, "protect"),
+                row("/workspace/nix/mod.nix", Protected, "protect"),
+            ]
+        );
+        assert!(
+            !main
+                .spec
+                .mounts
+                .iter()
+                .any(|m| m.sandbox.starts_with("/workspace/buck-out")),
+            "buck-out must have no submounts pinning it: {:?}",
+            main.spec.mounts
+        );
+
+        if !rustix::process::geteuid().is_root() {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                f.ws().join("buck-out/locked"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            fs::remove_dir(f.ws().join("buck-out/locked")).unwrap();
+        }
+
+        // 2. Provider isolation + literal specificity: `base` (without
+        //    `exclude`) still masks `buck-out/.env`, and a literal `protected`
+        //    rule on `protect` still protects `buck-out/keep.nix`, while
+        //    `protect`'s globs still skip `buck-out` symlinks with no warnings.
+        f.file("ws/buck-out/.env");
+        f.file("ws/buck-out/keep.nix");
+        let cfg_mixed = format!(
+            "inherit_global = false\n[profiles.main]\n{}{}",
+            prov(
+                "base",
+                "main",
+                "fs.rw = [\"{workspace}\"]\nfs.masked = [\"{workspace}/**/.env\"]"
+            ),
+            prov(
+                "protect",
+                "main",
+                "fs.protected = [\"{workspace}/buck-out/keep.nix\", \"{workspace}/**/*.nix\", \"{workspace}/**/.gitignore\"]\n\
+                 fs.exclude = [\"{workspace}/buck-out\"]"
+            ),
+        );
+        let s2 = f.compile(&cfg_mixed);
+        let main2 = get(&s2, "main");
+        assert!(main2.warnings.is_empty(), "{:?}", main2.warnings);
+        assert_eq!(
+            mounts(&main2.spec),
+            [
+                row("/workspace", Rw, "base"),
+                row("/workspace/.gitignore", Protected, "protect"),
+                row("/workspace/flake.nix", Protected, "protect"),
+                row("/workspace/buck-out/.env", Masked, "base"),
+                row("/workspace/buck-out/keep.nix", Protected, "protect"),
+                row("/workspace/nix/mod.nix", Protected, "protect"),
+            ]
+        );
+
+        // 3. Adversarial planted symlink: `buck-out -> nix` cannot bypass
+        //    protection on `nix/mod.nix`.
+        fs::remove_dir_all(f.ws().join("buck-out")).unwrap();
+        symlink("nix", f.ws().join("buck-out")).unwrap();
+        let s3 = f.compile(&cfg_unpinned);
+        let main3 = get(&s3, "main");
+        assert!(main3.warnings.is_empty(), "{:?}", main3.warnings);
+        assert_eq!(
+            mounts(&main3.spec),
+            [
+                row("/workspace", Rw, "base"),
+                row("/workspace/.gitignore", Protected, "protect"),
+                row("/workspace/flake.nix", Protected, "protect"),
+                row("/workspace/nix/mod.nix", Protected, "protect"),
+            ]
+        );
+    }
 }

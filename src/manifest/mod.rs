@@ -268,6 +268,9 @@ pub struct FsGrants {
     pub protected: Vec<PathPattern>,
     /// Writable scratch space, deleted at session end.
     pub ephemeral: Vec<PathPattern>,
+    /// Paths and directory subtrees skipped when resolving glob rules in
+    /// this `fs` section.
+    pub exclude: Vec<PathPattern>,
     /// Explicit host-to-sandbox remappings.
     pub bind: Vec<Bind>,
     /// Mask sockets found in RW grants at startup. `None` means unset, so
@@ -286,6 +289,7 @@ struct RawFsGrants {
     masked: Vec<PathPattern>,
     protected: Vec<PathPattern>,
     ephemeral: Vec<PathPattern>,
+    exclude: Vec<PathPattern>,
     bind: Vec<Bind>,
     mask_sockets: Option<bool>,
     warn_missing: Option<bool>,
@@ -310,6 +314,7 @@ impl TryFrom<MapOnly<RawFsGrants>> for FsGrants {
             masked: raw.masked,
             protected: raw.protected,
             ephemeral: raw.ephemeral,
+            exclude: raw.exclude,
             bind: raw.bind,
             mask_sockets: raw.mask_sockets,
             warn_missing: raw.warn_missing,
@@ -1106,6 +1111,7 @@ mod tests {
                     "{workspace}/.github/workflows",
                 ]),
                 ephemeral: pps(&["/tmp", "~"]),
+                exclude: vec![],
                 bind: vec![],
                 mask_sockets: Some(true),
                 warn_missing: None,
@@ -1124,6 +1130,7 @@ mod tests {
                     masked: vec![],
                     protected: vec![],
                     ephemeral: pps(&["/tmp", "~"]),
+                    exclude: vec![],
                     bind: vec![Bind {
                         host: "/etc/ssl/certs".parse().unwrap(),
                         sandbox: "/etc/ssl/certs".parse().unwrap(),
@@ -1552,7 +1559,7 @@ mod tests {
 
     #[test]
     fn globs_are_still_accepted_in_other_lists() {
-        for list in ["rw", "ro", "masked", "protected"] {
+        for list in ["rw", "ro", "masked", "protected", "exclude"] {
             let m = toml_ok(&format!(
                 "fs.{list} = [\"{{workspace}}/**/*.nix\", \"/a/b?\"]"
             ));
@@ -1560,13 +1567,91 @@ mod tests {
                 "rw" => m.grants.fs.rw,
                 "ro" => m.grants.fs.ro,
                 "masked" => m.grants.fs.masked,
-                _ => m.grants.fs.protected,
+                "protected" => m.grants.fs.protected,
+                _ => m.grants.fs.exclude,
             };
             assert_eq!(got, pps(&["{workspace}/**/*.nix", "/a/b?"]), "{list}");
             jv_ok(&format!(
                 r#""fs": {{"{list}": ["{{workspace}}/**/*.nix", "/a/b[0-9]"]}}"#
             ));
         }
+    }
+
+    #[test]
+    fn fs_exclude_accepts_literals_and_globs_and_validates_patterns() {
+        assert!(toml_ok("").grants.fs.exclude.is_empty());
+        assert!(jv_ok(r#""fs": {}"#).grants.fs.exclude.is_empty());
+
+        let patterns = [
+            "{workspace}/buck-out",
+            "~/.cache/foo",
+            "/opt/sdk/debug",
+            "{workspace}/**/buck-out",
+            "{workspace}/buck-out/**",
+            "{workspace}/**/*.tmp",
+        ];
+        let want = pps(&patterns);
+        let toml = r#"
+            [fs]
+            protected = ["{workspace}/**/*.nix"]
+            exclude = [
+                "{workspace}/buck-out",
+                "~/.cache/foo",
+                "/opt/sdk/debug",
+                "{workspace}/**/buck-out",
+                "{workspace}/buck-out/**",
+                "{workspace}/**/*.tmp",
+            ]
+            [profiles.sub.fs]
+            exclude = ["{workspace}/target"]
+        "#;
+        let json = r#"{
+            "version": 1,
+            "fs": {
+                "protected": ["{workspace}/**/*.nix"],
+                "exclude": [
+                    "{workspace}/buck-out",
+                    "~/.cache/foo",
+                    "/opt/sdk/debug",
+                    "{workspace}/**/buck-out",
+                    "{workspace}/buck-out/**",
+                    "{workspace}/**/*.tmp"
+                ]
+            },
+            "profiles": {
+                "sub": {
+                    "fs": { "exclude": ["{workspace}/target"] }
+                }
+            }
+        }"#;
+        let from_toml = toml_ok(toml);
+        let from_json = Manifest::from_json_str(json).unwrap();
+        assert_eq!(from_toml, from_json);
+        assert_eq!(from_toml.grants.fs.exclude, want);
+        assert_eq!(
+            from_toml.profiles[&"sub".parse().unwrap()]
+                .grants
+                .fs
+                .exclude,
+            pps(&["{workspace}/target"])
+        );
+
+        for bad in [
+            "buck-out",
+            "./buck-out",
+            "/*",
+            "~/*",
+            "{workspace}/../escape",
+            "{workspace}/buck-out/",
+            "{workspace}/[unclosed",
+        ] {
+            let msg = toml_err(&format!("[fs]\nexclude = [{bad:?}]"));
+            assert!(msg.contains("path pattern"), "{bad:?}: {msg}");
+            let msg = jv_err(&format!(r#""fs": {{"exclude": [{bad:?}]}}"#));
+            assert!(msg.contains("path pattern"), "{bad:?}: {msg}");
+        }
+        toml_err("fs.exclude = \"{workspace}/buck-out\"");
+        jv_err(r#""fs": {"exclude": "{workspace}/buck-out"}"#);
     }
 
     #[test]
