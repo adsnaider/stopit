@@ -322,6 +322,7 @@ fs.ephemeral = ["{workspace}/target"]
 - `protected` is read-only for now. A later version will ask you to approve each write.
 - `ephemeral` gives a writable, empty directory that is discarded at the end of the session, here so build output never lands in your project.
 - `fs.warn_missing = false` suppresses startup warnings when rules in a shared provider name files not every project has.
+- `fs.exclude = ["{workspace}/buck-out"]` skips matching files and directory subtrees (literal paths or globs) when resolving globs in that provider's `fs` block. Exact-path rules and other providers' `masked` globs still apply.
 
 The most specific rule wins. An exact path beats a glob, a workspace rule beats a global rule of the same specificity, and within one layer the stricter mode wins.
 
