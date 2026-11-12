@@ -561,21 +561,79 @@ impl Candidate<'_> {
 /// to the first rule's provider.
 pub fn plan_mounts(fs: &[FsRule], ctx: &ExpansionContext) -> Result<MountPlan, PathPlanError> {
     let mut cache = ResolveCache::default();
-    plan_mounts_with_cache(fs, ctx, &mut cache)
+    plan_mounts_with_cache(fs, &[], ctx, &mut cache)
 }
 
-/// [`plan_mounts`] sharing glob directory walks and pattern resolutions via
-/// `cache`.
+/// [`plan_mounts`] pruning `exclude` (as collected in
+/// [`EffectiveGrants::fs_exclude`](super::EffectiveGrants::fs_exclude)) during
+/// glob directory walks and sharing walks and pattern resolutions via `cache`.
+///
+/// Literal path rules, `fs.ephemeral`, and `fs.bind` ignore `exclude`.
+///
+/// # Errors
+///
+/// Returns [`PathPlanError`] under the same conditions as [`plan_mounts`].
+///
+/// # Examples
+///
+/// ```
+/// # use std::fs;
+/// # use std::path::Path;
+/// # use tempfile::TempDir;
+/// use stopit::config::ProviderOrigin;
+/// use stopit::expand::{ExpansionContext, ResolveCache};
+/// use stopit::policy::PathMode;
+/// use stopit::resolve::{FsRule, FsRuleKind, plan_mounts_with_cache};
+/// # let tmp = TempDir::new().unwrap();
+/// # let root = tmp.path().canonicalize().unwrap();
+/// # let ws = root.join("ws");
+/// # let home = root.join("home");
+/// # fs::create_dir_all(ws.join("buck-out")).unwrap();
+/// # fs::create_dir_all(&home).unwrap();
+/// # fs::write(ws.join("flake.nix"), "").unwrap();
+/// # fs::write(ws.join("buck-out/gen.nix"), "").unwrap();
+/// # let ctx = ExpansionContext::new(
+/// #     ws,
+/// #     "/workspace".parse().unwrap(),
+/// #     home,
+/// #     "/home/user".parse().unwrap(),
+/// # ).unwrap();
+///
+/// let rules = [FsRule {
+///     kind: FsRuleKind::Path {
+///         mode: PathMode::Protected,
+///         pattern: "{workspace}/**/*.nix".parse().unwrap(),
+///     },
+///     provider: "protect-nix".parse().unwrap(),
+///     origin: ProviderOrigin::Global,
+///     depth: 0,
+///     warn_missing: false,
+/// }];
+/// let exclude = ["{workspace}/buck-out".parse().unwrap()];
+/// let mut cache = ResolveCache::default();
+/// let plan = plan_mounts_with_cache(&rules, &exclude, &ctx, &mut cache).unwrap();
+/// assert_eq!(plan.mounts.len(), 1);
+/// assert_eq!(plan.mounts[0].sandbox, Path::new("/workspace/flake.nix"));
+/// ```
 pub fn plan_mounts_with_cache(
     fs: &[FsRule],
+    exclude: &[PathPattern],
     ctx: &ExpansionContext,
     cache: &mut ResolveCache,
 ) -> Result<MountPlan, PathPlanError> {
     let mut warnings = Vec::new();
     let mut by_path: BTreeMap<PathBuf, Vec<Candidate<'_>>> = BTreeMap::new();
-    for rule in fs {
-        for c in rule_candidates(rule, ctx, cache, &mut warnings)? {
-            by_path.entry(c.sandbox.clone()).or_default().push(c);
+    {
+        let mut planner = RulePlanner {
+            ctx,
+            expanded_excludes: exclude.iter().map(|ex| expand_pattern(ex, ctx)).collect(),
+            cache,
+            warnings: &mut warnings,
+        };
+        for rule in fs {
+            for c in planner.rule_candidates(rule)? {
+                by_path.entry(c.sandbox.clone()).or_default().push(c);
+            }
         }
     }
     let mut mounts = Vec::with_capacity(by_path.len());
@@ -618,140 +676,280 @@ fn plan_warning(rule: &FsRule, kind: PlanWarningKind) -> PlanWarning {
     }
 }
 
-/// Expands and resolves one rule into its candidates, recording warnings.
-fn rule_candidates<'a>(
-    rule: &'a FsRule,
-    ctx: &ExpansionContext,
-    cache: &mut ResolveCache,
-    warnings: &mut Vec<PlanWarning>,
-) -> Result<Vec<Candidate<'a>>, PathPlanError> {
-    let candidate = |sandbox, source, mode, literal, glob_link| Candidate {
-        sandbox,
-        source,
-        mode,
-        literal,
-        glob_link,
-        synthesized: false,
-        rule,
-    };
-    match &rule.kind {
-        FsRuleKind::Path {
-            mode: PathMode::Ephemeral,
-            pattern,
-        } => {
-            let sandbox = expand_pattern(pattern, ctx).sandbox().ok_or_else(|| {
-                PathPlanError::EphemeralGlob {
-                    provider: rule.provider.clone(),
-                    pattern: pattern.clone(),
-                }
-            })?;
-            Ok(vec![candidate(
-                sandbox,
-                MountSource::Ephemeral {
-                    key: EphemeralKey::new(pattern),
-                },
-                PathMode::Ephemeral,
-                true,
-                false,
-            )])
-        }
-        FsRuleKind::Path { mode, pattern } => {
-            let expanded = expand_pattern(pattern, ctx);
-            let literal = !expanded.has_glob();
-            let refused = unskippable(*mode);
-            let Some(HostResolution { paths, masks }) =
-                resolve_host(rule, pattern, &expanded, refused, ctx, cache, warnings)?
-            else {
-                return Ok(Vec::new());
-            };
-            let mut out = Vec::with_capacity(paths.len() + masks.len());
-            for d in masks {
-                out.push(Candidate {
-                    synthesized: true,
-                    ..candidate(
-                        d.sandbox,
-                        host_source(d.host, d.kind),
-                        PathMode::Masked,
-                        true,
-                        false,
-                    )
-                });
-            }
-            for p in paths {
-                // A matched link is kept as it is, whatever the anchor; the
-                // spec compiler refuses it, or for a glob skips it, if it
-                // lies inside an untrusted root.
-                let glob_link = !literal && p.kind == EntryKind::Symlink;
-                let kind = if *mode == PathMode::Masked && p.kind == EntryKind::Symlink {
-                    match p.host.metadata() {
-                        Ok(meta) => EntryKind::from_file_type(meta.file_type()),
-                        Err(error) if is_missing(error.kind()) => {
-                            warnings.push(plan_warning(
-                                rule,
-                                PlanWarningKind::SymlinkTarget {
-                                    path: p.host,
-                                    error,
-                                },
-                            ));
-                            continue;
-                        }
-                        // A link matched by a glob may have been planted
-                        // inside an untrusted root, where the spec compiler
-                        // skips it without looking at its target (DESIGN.md
-                        // §3.4, Symlinks); only then are the roots known. So
-                        // its own kind stands in for the target's, and the
-                        // spec compiler fails closed if it keeps the mount
-                        // (`SpecError::MaskTargetUninspectable`).
-                        Err(_) if glob_link => EntryKind::Symlink,
-                        Err(error) => {
-                            return Err(PathPlanError::Inaccessible {
-                                provider: rule.provider.clone(),
-                                pattern: rule_pattern(rule),
-                                mode: *mode,
-                                path: p.host,
-                                kind: error.kind(),
-                            });
-                        }
+/// Shared expansion, exclusion, caching, and warning state while planning one
+/// profile's [`FsRule`]s.
+struct RulePlanner<'a> {
+    ctx: &'a ExpansionContext,
+    expanded_excludes: Vec<ExpandedPattern>,
+    cache: &'a mut ResolveCache,
+    warnings: &'a mut Vec<PlanWarning>,
+}
+
+impl RulePlanner<'_> {
+    /// Expands and resolves one rule into its candidates, recording warnings.
+    fn rule_candidates<'r>(
+        &mut self,
+        rule: &'r FsRule,
+    ) -> Result<Vec<Candidate<'r>>, PathPlanError> {
+        let candidate = |sandbox, source, mode, literal, glob_link| Candidate {
+            sandbox,
+            source,
+            mode,
+            literal,
+            glob_link,
+            synthesized: false,
+            rule,
+        };
+        match &rule.kind {
+            FsRuleKind::Path {
+                mode: PathMode::Ephemeral,
+                pattern,
+            } => {
+                let sandbox = expand_pattern(pattern, self.ctx).sandbox().ok_or_else(|| {
+                    PathPlanError::EphemeralGlob {
+                        provider: rule.provider.clone(),
+                        pattern: pattern.clone(),
                     }
-                } else {
-                    p.kind
-                };
-                out.push(candidate(
-                    p.sandbox,
-                    host_source(p.host, kind),
-                    *mode,
-                    literal,
-                    glob_link,
-                ));
-            }
-            Ok(out)
-        }
-        FsRuleKind::Bind(bind) => {
-            let pattern = bind.host.as_pattern();
-            let expanded = expand_pattern(pattern, ctx);
-            let sandbox = expand_bind(bind, ctx).sandbox;
-            // A bind's host side is a grant of host content wherever it is
-            // mounted, so a path that cannot be inspected only skips it. A
-            // final link is kept: the bind follows it, as the spec compiler
-            // does when checking the source.
-            let Some(HostResolution { paths, masks }) =
-                resolve_host(rule, pattern, &expanded, None, ctx, cache, warnings)?
-            else {
-                return Ok(Vec::new());
-            };
-            debug_assert!(masks.is_empty(), "only restrictive rules synthesize masks");
-            let mut out = Vec::with_capacity(paths.len());
-            for p in paths {
-                out.push(candidate(
-                    sandbox.clone(),
-                    host_source(p.host, p.kind),
-                    bind.mode.into(),
+                })?;
+                Ok(vec![candidate(
+                    sandbox,
+                    MountSource::Ephemeral {
+                        key: EphemeralKey::new(pattern),
+                    },
+                    PathMode::Ephemeral,
                     true,
                     false,
-                ));
+                )])
             }
-            Ok(out)
+            FsRuleKind::Path { mode, pattern } => {
+                let expanded = expand_pattern(pattern, self.ctx);
+                let literal = !expanded.has_glob();
+                let refused = unskippable(*mode);
+                let Some(HostResolution { paths, masks }) =
+                    self.resolve_host(rule, pattern, &expanded, refused)?
+                else {
+                    return Ok(Vec::new());
+                };
+                let mut out = Vec::with_capacity(paths.len() + masks.len());
+                for d in masks {
+                    out.push(Candidate {
+                        synthesized: true,
+                        ..candidate(
+                            d.sandbox,
+                            host_source(d.host, d.kind),
+                            PathMode::Masked,
+                            true,
+                            false,
+                        )
+                    });
+                }
+                for p in paths {
+                    // A matched link is kept as it is, whatever the anchor; the
+                    // spec compiler refuses it, or for a glob skips it, if it
+                    // lies inside an untrusted root.
+                    let glob_link = !literal && p.kind == EntryKind::Symlink;
+                    let kind = if *mode == PathMode::Masked && p.kind == EntryKind::Symlink {
+                        match p.host.metadata() {
+                            Ok(meta) => EntryKind::from_file_type(meta.file_type()),
+                            Err(error) if is_missing(error.kind()) => {
+                                self.warnings.push(plan_warning(
+                                    rule,
+                                    PlanWarningKind::SymlinkTarget {
+                                        path: p.host,
+                                        error,
+                                    },
+                                ));
+                                continue;
+                            }
+                            // A link matched by a glob may have been planted
+                            // inside an untrusted root, where the spec compiler
+                            // skips it without looking at its target (DESIGN.md
+                            // §3.4, Symlinks); only then are the roots known. So
+                            // its own kind stands in for the target's, and the
+                            // spec compiler fails closed if it keeps the mount
+                            // (`SpecError::MaskTargetUninspectable`).
+                            Err(_) if glob_link => EntryKind::Symlink,
+                            Err(error) => {
+                                return Err(PathPlanError::Inaccessible {
+                                    provider: rule.provider.clone(),
+                                    pattern: rule_pattern(rule),
+                                    mode: *mode,
+                                    path: p.host,
+                                    kind: error.kind(),
+                                });
+                            }
+                        }
+                    } else {
+                        p.kind
+                    };
+                    out.push(candidate(
+                        p.sandbox,
+                        host_source(p.host, kind),
+                        *mode,
+                        literal,
+                        glob_link,
+                    ));
+                }
+                Ok(out)
+            }
+            FsRuleKind::Bind(bind) => {
+                let pattern = bind.host.as_pattern();
+                let expanded = expand_pattern(pattern, self.ctx);
+                let sandbox = expand_bind(bind, self.ctx).sandbox;
+                // A bind's host side is a grant of host content wherever it is
+                // mounted, so a path that cannot be inspected only skips it. A
+                // final link is kept: the bind follows it, as the spec compiler
+                // does when checking the source.
+                let Some(HostResolution { paths, masks }) =
+                    self.resolve_host(rule, pattern, &expanded, None)?
+                else {
+                    return Ok(Vec::new());
+                };
+                debug_assert!(masks.is_empty(), "only restrictive rules synthesize masks");
+                let mut out = Vec::with_capacity(paths.len());
+                for p in paths {
+                    out.push(candidate(
+                        sandbox.clone(),
+                        host_source(p.host, p.kind),
+                        bind.mode.into(),
+                        true,
+                        false,
+                    ));
+                }
+                Ok(out)
+            }
         }
+    }
+
+    /// Resolves `expanded` (the expansion of `rule`'s `pattern`), recording its
+    /// warnings. A path that cannot be inspected or read for any reason but
+    /// being missing is skipped with a warning, unless `refused` (the rule's
+    /// mode, see [`unskippable`]): then the directory that cannot be searched
+    /// or read is to be masked instead ([`HostResolution::masks`], see
+    /// [`unreadable_dir`]), with a warning.
+    ///
+    /// A glob whose walk root runs through a symlink inside the host workspace
+    /// is not walked (see [`check_walk_root`]): an error if `refused`, and
+    /// otherwise `None` with a warning.
+    fn resolve_host(
+        &mut self,
+        rule: &FsRule,
+        pattern: &PathPattern,
+        expanded: &ExpandedPattern,
+        refused: Option<PathMode>,
+    ) -> Result<Option<HostResolution>, PathPlanError> {
+        if let Some((root, link)) = check_walk_root(expanded, self.ctx) {
+            let workspace = self.ctx.workspace_host().to_owned();
+            return match refused {
+                Some(mode) => Err(PathPlanError::WalkRootLink(Box::new(WalkRootLink {
+                    provider: rule.provider.clone(),
+                    pattern: rule_pattern(rule),
+                    mode,
+                    root,
+                    link,
+                    workspace,
+                }))),
+                None => {
+                    self.warnings.push(plan_warning(
+                        rule,
+                        PlanWarningKind::WalkRootLink {
+                            root,
+                            link,
+                            workspace,
+                        },
+                    ));
+                    Ok(None)
+                }
+            };
+        }
+        let excludes: &[ExpandedPattern] = if expanded.has_glob() {
+            &self.expanded_excludes
+        } else {
+            &[]
+        };
+        let res =
+            resolve_excluding_with_cache(expanded, excludes, self.cache).map_err(|error| {
+                PathPlanError::Expand {
+                    provider: rule.provider.clone(),
+                    pattern: pattern.clone(),
+                    error,
+                }
+            })?;
+        let mut masks = Vec::new();
+        // Masks the directory a restrictive rule cannot inspect `path` below,
+        // once per directory (a directory that can be read but not searched
+        // fails every entry below it), with a warning.
+        let mut mask = |mode, path: PathBuf, error: io::Error, warnings: &mut Vec<PlanWarning>| {
+            let Some(dir) = unreadable_dir(expanded, &path) else {
+                return Err(PathPlanError::Inaccessible {
+                    provider: rule.provider.clone(),
+                    pattern: rule_pattern(rule),
+                    mode,
+                    path,
+                    kind: error.kind(),
+                });
+            };
+            if masks.iter().any(|m: &ResolvedPath| m.host == dir.host) {
+                return Ok(());
+            }
+            warnings.push(plan_warning(
+                rule,
+                PlanWarningKind::InaccessibleMasked {
+                    mode,
+                    path,
+                    error,
+                    dir: dir.host.clone(),
+                    sandbox: dir.sandbox.clone(),
+                },
+            ));
+            masks.push(dir);
+            Ok(())
+        };
+        for w in res.warnings {
+            match w {
+                // The resolver reports a missing path, including an entry that
+                // vanished during a glob walk, as `Missing`, so this is
+                // anything else (e.g. `EACCES`).
+                ResolveWarning::Io { path, error } => match refused {
+                    Some(mode) => mask(mode, path, error, self.warnings)?,
+                    None => self.warnings.push(plan_warning(
+                        rule,
+                        ResolveWarning::Io { path, error }.into(),
+                    )),
+                },
+                other @ ResolveWarning::Missing { .. } => {
+                    if rule.warn_missing {
+                        self.warnings.push(plan_warning(rule, other.into()));
+                    }
+                }
+            }
+        }
+        let mut paths = res.paths;
+        // A glob walk takes its matches' kinds from the directory listing, which
+        // needs read permission only: the entries of a directory that can be
+        // read but not searched (`chmod a-x`) are listed, but cannot be
+        // inspected or mounted. So every match of a restrictive glob is
+        // inspected, and one that cannot be is handled like a directory the
+        // walk cannot read (a literal path has been inspected already).
+        if let (Some(mode), true) = (refused, expanded.has_glob()) {
+            let mut kept = Vec::with_capacity(paths.len());
+            for p in paths {
+                match self.cache.symlink_metadata(&p.host) {
+                    Ok(_) => kept.push(p),
+                    Err(error) if is_missing(error.kind()) => {
+                        if rule.warn_missing {
+                            self.warnings.push(plan_warning(
+                                rule,
+                                ResolveWarning::Missing { path: p.host }.into(),
+                            ));
+                        }
+                    }
+                    Err(error) => mask(mode, p.host, error, self.warnings)?,
+                }
+            }
+            paths = kept;
+        }
+        Ok(Some(HostResolution { paths, masks }))
     }
 }
 
@@ -759,148 +957,13 @@ fn host_source(path: PathBuf, kind: EntryKind) -> MountSource {
     MountSource::Host { path, kind }
 }
 
-/// What [`resolve_host`] found for a rule.
+/// What [`RulePlanner::resolve_host`] found for a rule.
 struct HostResolution {
     /// The matching paths.
     paths: Vec<ResolvedPath>,
     /// The directories to mask because a restrictive rule could not inspect
     /// something on the way or read them (see [`unreadable_dir`]).
     masks: Vec<ResolvedPath>,
-}
-
-/// Resolves `expanded` (the expansion of `rule`'s `pattern`), recording its
-/// warnings. A path that cannot be inspected or read for any reason but
-/// being missing is skipped with a warning, unless `refused` (the rule's
-/// mode, see [`unskippable`]): then the directory that cannot be searched
-/// or read is to be masked instead ([`HostResolution::masks`], see
-/// [`unreadable_dir`]), with a warning.
-///
-/// A glob whose walk root runs through a symlink inside the host workspace
-/// is not walked (see [`check_walk_root`]): an error if `refused`, and
-/// otherwise `None` with a warning.
-fn resolve_host(
-    rule: &FsRule,
-    pattern: &PathPattern,
-    expanded: &ExpandedPattern,
-    refused: Option<PathMode>,
-    ctx: &ExpansionContext,
-    cache: &mut ResolveCache,
-    warnings: &mut Vec<PlanWarning>,
-) -> Result<Option<HostResolution>, PathPlanError> {
-    if let Some((root, link)) = check_walk_root(expanded, ctx) {
-        let workspace = ctx.workspace_host().to_owned();
-        return match refused {
-            Some(mode) => Err(PathPlanError::WalkRootLink(Box::new(WalkRootLink {
-                provider: rule.provider.clone(),
-                pattern: rule_pattern(rule),
-                mode,
-                root,
-                link,
-                workspace,
-            }))),
-            None => {
-                warnings.push(plan_warning(
-                    rule,
-                    PlanWarningKind::WalkRootLink {
-                        root,
-                        link,
-                        workspace,
-                    },
-                ));
-                Ok(None)
-            }
-        };
-    }
-    let excludes: Vec<ExpandedPattern> = if expanded.has_glob() && !rule.exclude.is_empty() {
-        rule.exclude
-            .iter()
-            .map(|ex| expand_pattern(ex, ctx))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let res = resolve_excluding_with_cache(expanded, &excludes, cache).map_err(|error| {
-        PathPlanError::Expand {
-            provider: rule.provider.clone(),
-            pattern: pattern.clone(),
-            error,
-        }
-    })?;
-    let mut masks = Vec::new();
-    // Masks the directory a restrictive rule cannot inspect `path` below,
-    // once per directory (a directory that can be read but not searched
-    // fails every entry below it), with a warning.
-    let mut mask = |mode, path: PathBuf, error: io::Error, warnings: &mut Vec<PlanWarning>| {
-        let Some(dir) = unreadable_dir(expanded, &path) else {
-            return Err(PathPlanError::Inaccessible {
-                provider: rule.provider.clone(),
-                pattern: rule_pattern(rule),
-                mode,
-                path,
-                kind: error.kind(),
-            });
-        };
-        if masks.iter().any(|m: &ResolvedPath| m.host == dir.host) {
-            return Ok(());
-        }
-        warnings.push(plan_warning(
-            rule,
-            PlanWarningKind::InaccessibleMasked {
-                mode,
-                path,
-                error,
-                dir: dir.host.clone(),
-                sandbox: dir.sandbox.clone(),
-            },
-        ));
-        masks.push(dir);
-        Ok(())
-    };
-    for w in res.warnings {
-        match w {
-            // The resolver reports a missing path, including an entry that
-            // vanished during a glob walk, as `Missing`, so this is
-            // anything else (e.g. `EACCES`).
-            ResolveWarning::Io { path, error } => match refused {
-                Some(mode) => mask(mode, path, error, warnings)?,
-                None => warnings.push(plan_warning(
-                    rule,
-                    ResolveWarning::Io { path, error }.into(),
-                )),
-            },
-            other @ ResolveWarning::Missing { .. } => {
-                if rule.warn_missing {
-                    warnings.push(plan_warning(rule, other.into()));
-                }
-            }
-        }
-    }
-    let mut paths = res.paths;
-    // A glob walk takes its matches' kinds from the directory listing, which
-    // needs read permission only: the entries of a directory that can be
-    // read but not searched (`chmod a-x`) are listed, but cannot be
-    // inspected or mounted. So every match of a restrictive glob is
-    // inspected, and one that cannot be is handled like a directory the
-    // walk cannot read (a literal path has been inspected already).
-    if let (Some(mode), true) = (refused, expanded.has_glob()) {
-        let mut kept = Vec::with_capacity(paths.len());
-        for p in paths {
-            match cache.symlink_metadata(&p.host) {
-                Ok(_) => kept.push(p),
-                Err(error) if is_missing(error.kind()) => {
-                    if rule.warn_missing {
-                        warnings.push(plan_warning(
-                            rule,
-                            ResolveWarning::Missing { path: p.host }.into(),
-                        ));
-                    }
-                }
-                Err(error) => mask(mode, p.host, error, warnings)?,
-            }
-        }
-        paths = kept;
-    }
-    Ok(Some(HostResolution { paths, masks }))
 }
 
 /// The directory to mask when a restrictive rule cannot inspect `path`, a
@@ -1168,8 +1231,23 @@ mod tests {
             plan_mounts(rules, &self.ctx).unwrap()
         }
 
+        fn plan_excluding(&self, rules: &[FsRule], excludes: &[&str]) -> MountPlan {
+            let exclude: Vec<PathPattern> = excludes.iter().map(|s| s.parse().unwrap()).collect();
+            let mut cache = ResolveCache::default();
+            plan_mounts_with_cache(rules, &exclude, &self.ctx, &mut cache).unwrap()
+        }
+
         fn plan_err(&self, rules: &[FsRule]) -> PathPlanError {
             match plan_mounts(rules, &self.ctx) {
+                Ok(plan) => panic!("expected an error, got {plan:?}"),
+                Err(e) => e,
+            }
+        }
+
+        fn plan_excluding_err(&self, rules: &[FsRule], excludes: &[&str]) -> PathPlanError {
+            let exclude: Vec<PathPattern> = excludes.iter().map(|s| s.parse().unwrap()).collect();
+            let mut cache = ResolveCache::default();
+            match plan_mounts_with_cache(rules, &exclude, &self.ctx, &mut cache) {
                 Ok(plan) => panic!("expected an error, got {plan:?}"),
                 Err(e) => e,
             }
@@ -1178,6 +1256,13 @@ mod tests {
         /// The plan, asserting that it has no warnings.
         fn clean(&self, rules: &[FsRule]) -> Vec<PlannedMount> {
             let plan = self.plan(rules);
+            assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+            plan.mounts
+        }
+
+        /// The plan with `excludes`, asserting that it has no warnings.
+        fn clean_excluding(&self, rules: &[FsRule], excludes: &[&str]) -> Vec<PlannedMount> {
+            let plan = self.plan_excluding(rules, excludes);
             assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
             plan.mounts
         }
@@ -1201,7 +1286,6 @@ mod tests {
             origin: crate::config::ProviderOrigin::Workspace,
             depth,
             warn_missing: true,
-            exclude: vec![],
         }
     }
 
@@ -1216,7 +1300,6 @@ mod tests {
             origin: crate::config::ProviderOrigin::Workspace,
             depth,
             warn_missing: true,
-            exclude: vec![],
         }
     }
 
@@ -2748,7 +2831,6 @@ mod tests {
             origin: crate::config::ProviderOrigin::Workspace,
             depth: 0,
             warn_missing: true,
-            exclude: vec![],
         };
         let e = f.plan_err(&[unchecked(Ephemeral, "{workspace}/*.tmp")]);
         assert!(matches!(e, PathPlanError::EphemeralGlob { .. }), "{e:?}");
@@ -2782,11 +2864,6 @@ mod tests {
         assert_eq!(plan.warnings[0].provider.as_str(), "tools");
     }
 
-    fn with_exclude(mut r: FsRule, excludes: &[&str]) -> FsRule {
-        r.exclude = excludes.iter().map(|s| s.parse().unwrap()).collect();
-        r
-    }
-
     #[test]
     fn exclude_applies_only_to_glob_rules_and_never_warns_when_missing() {
         let f = Fixture::new();
@@ -2798,41 +2875,29 @@ mod tests {
         let rules = [
             rule(Rw, "{workspace}", "base", 0),
             // Literal path rule, `ephemeral`, and `bind` all ignore `exclude`.
-            with_exclude(
-                rule(Protected, "{workspace}/buck-out/keep.nix", "protect", 0),
-                &["{workspace}/buck-out", "{workspace}/missing-cache"],
-            ),
-            with_exclude(
-                rule(Protected, "{workspace}/**/*.nix", "protect", 0),
-                &["{workspace}/buck-out", "{workspace}/missing-cache"],
-            ),
-            with_exclude(
-                rule(Ephemeral, "{workspace}/buck-out/scratch", "protect", 0),
-                &["{workspace}/buck-out"],
-            ),
-            with_exclude(
-                bind(
-                    "{workspace}/buck-out/data",
-                    "/opt/data",
-                    BindMode::Ro,
-                    "protect",
-                    0,
-                ),
-                &["{workspace}/buck-out"],
+            rule(Protected, "{workspace}/buck-out/keep.nix", "protect", 0),
+            rule(Protected, "{workspace}/**/*.nix", "protect", 0),
+            rule(Ephemeral, "{workspace}/buck-out/scratch", "protect", 0),
+            bind(
+                "{workspace}/buck-out/data",
+                "/opt/data",
+                BindMode::Ro,
+                "protect",
+                0,
             ),
             // Walk root inside a missing excluded directory emits no Missing warning
             // even with `warn_missing = true`.
-            with_exclude(
-                rule(
-                    Protected,
-                    "{workspace}/missing-cache/**/*.nix",
-                    "protect",
-                    0,
-                ),
-                &["{workspace}/missing-cache"],
+            rule(
+                Protected,
+                "{workspace}/missing-cache/**/*.nix",
+                "protect",
+                0,
             ),
         ];
-        let mounts = f.clean(&rules);
+        let mounts = f.clean_excluding(
+            &rules,
+            &["{workspace}/buck-out", "{workspace}/missing-cache"],
+        );
         assert_eq!(
             summary(&mounts),
             [
@@ -2846,7 +2911,7 @@ mod tests {
     }
 
     #[test]
-    fn exclude_is_isolated_per_rule_and_prunes_unreadable_subtrees() {
+    fn exclude_prunes_unreadable_subtrees_and_caches_per_exclude_set() {
         let f = Fixture::new();
         f.file("ws/.env");
         f.file("ws/buck-out/.env");
@@ -2866,17 +2931,19 @@ mod tests {
         // Pruning skips `buck-out` before descending, so an unreadable child
         // directory (`0o000`) inside `buck-out` produces neither an
         // `InaccessibleMasked` warning nor a mask mount.
-        let pruned = f.clean(&[
-            rule(Rw, "{workspace}", "base", 0),
-            with_exclude(
+        let pruned = f.clean_excluding(
+            &[
+                rule(Rw, "{workspace}", "base", 0),
+                rule(Masked, "{workspace}/**/.env", "base", 0),
                 rule(Protected, "{workspace}/**/*.nix", "protect-nix", 0),
-                &["{workspace}/buck-out"],
-            ),
-        ]);
+            ],
+            &["{workspace}/buck-out"],
+        );
         assert_eq!(
             summary(&pruned),
             [
                 row("/workspace", Rw, "base"),
+                row("/workspace/.env", Masked, "base"),
                 row("/workspace/nix/foo.nix", Protected, "protect-nix"),
             ]
         );
@@ -2891,43 +2958,44 @@ mod tests {
             fs::remove_dir(f.ws().join("buck-out/locked")).unwrap();
         }
 
-        // Provider B's `exclude = ["{workspace}/buck-out"]` on `**/*.nix` must
-        // not punch holes in Provider A's `masked` rules, and identical glob
-        // patterns with different excludes must not collide in `ResolveCache`.
-        let rules_ab = [
+        // Sharing one `ResolveCache` across profiles with different `exclude`
+        // lists (such as `main` vs an `inherit = "none"` profile) keeps their
+        // cached walks and glob resolutions isolated.
+        let rules = [
             rule(Rw, "{workspace}", "base", 0),
             rule(Masked, "{workspace}/**/.env", "base", 0),
-            rule(Ro, "{workspace}/**/*.nix", "reader", 0),
-            with_exclude(
-                rule(Protected, "{workspace}/**/*.nix", "protect-nix", 0),
-                &["{workspace}/buck-out"],
-            ),
+            rule(Protected, "{workspace}/**/*.nix", "protect-nix", 0),
         ];
-        let rules_ba = [
-            rule(Rw, "{workspace}", "base", 0),
-            with_exclude(
-                rule(Protected, "{workspace}/**/*.nix", "protect-nix", 0),
-                &["{workspace}/buck-out"],
-            ),
-            rule(Ro, "{workspace}/**/*.nix", "reader", 0),
-            rule(Masked, "{workspace}/**/.env", "base", 0),
-        ];
-
-        for rules in [&rules_ab, &rules_ba] {
-            let mut cache = ResolveCache::default();
-            let plan = plan_mounts_with_cache(rules, &f.ctx, &mut cache).unwrap();
-            assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
-            assert_eq!(
-                summary(&plan.mounts),
-                [
-                    row("/workspace", Rw, "base"),
-                    row("/workspace/.env", Masked, "base"),
-                    row("/workspace/buck-out/.env", Masked, "base"),
-                    row("/workspace/buck-out/gen.nix", Ro, "reader"),
-                    row("/workspace/nix/foo.nix", Protected, "protect-nix"),
-                ]
-            );
-        }
+        let excl: Vec<PathPattern> = vec!["{workspace}/buck-out".parse().unwrap()];
+        let mut cache = ResolveCache::default();
+        let with_excl = plan_mounts_with_cache(&rules, &excl, &f.ctx, &mut cache).unwrap();
+        let without_excl = plan_mounts_with_cache(&rules, &[], &f.ctx, &mut cache).unwrap();
+        let with_excl_again = plan_mounts_with_cache(&rules, &excl, &f.ctx, &mut cache).unwrap();
+        assert!(with_excl.warnings.is_empty(), "{:?}", with_excl.warnings);
+        assert!(
+            without_excl.warnings.is_empty(),
+            "{:?}",
+            without_excl.warnings
+        );
+        assert_eq!(
+            summary(&with_excl.mounts),
+            [
+                row("/workspace", Rw, "base"),
+                row("/workspace/.env", Masked, "base"),
+                row("/workspace/nix/foo.nix", Protected, "protect-nix"),
+            ]
+        );
+        assert_eq!(
+            summary(&without_excl.mounts),
+            [
+                row("/workspace", Rw, "base"),
+                row("/workspace/.env", Masked, "base"),
+                row("/workspace/buck-out/.env", Masked, "base"),
+                row("/workspace/buck-out/gen.nix", Protected, "protect-nix"),
+                row("/workspace/nix/foo.nix", Protected, "protect-nix"),
+            ]
+        );
+        assert_eq!(summary(&with_excl_again.mounts), summary(&with_excl.mounts));
     }
 
     #[test]
@@ -2937,13 +3005,13 @@ mod tests {
         f.symlink("nix", "ws/buck-out");
 
         // Planting `buck-out -> nix` does not exclude `nix/foo.nix`.
-        let mounts = f.clean(&[
-            rule(Rw, "{workspace}", "base", 0),
-            with_exclude(
+        let mounts = f.clean_excluding(
+            &[
+                rule(Rw, "{workspace}", "base", 0),
                 rule(Protected, "{workspace}/**/*.nix", "protect-nix", 0),
-                &["{workspace}/buck-out"],
-            ),
-        ]);
+            ],
+            &["{workspace}/buck-out"],
+        );
         assert_eq!(
             summary(&mounts),
             [
@@ -2954,10 +3022,15 @@ mod tests {
 
         // And a restrictive glob whose walk root runs through the planted
         // symlink `buck-out` is still refused by `check_walk_root`.
-        let err = f.plan_err(&[with_exclude(
-            rule(Protected, "{workspace}/buck-out/**/*.nix", "protect-nix", 0),
+        let err = f.plan_excluding_err(
+            &[rule(
+                Protected,
+                "{workspace}/buck-out/**/*.nix",
+                "protect-nix",
+                0,
+            )],
             &["{workspace}/buck-out"],
-        )]);
+        );
         assert!(matches!(err, PathPlanError::WalkRootLink(_)), "{err:?}");
     }
 }

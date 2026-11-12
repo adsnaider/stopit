@@ -3835,7 +3835,12 @@ fn plan_profile(
         .clone()
         .unwrap_or_else(|| SandboxHome::for_user(&user));
     check_reserved_paths(ctx.workspace_sandbox(), Path::new(home.as_str()))?;
-    let plan = plan_mounts_with_cache(&grants.fs, &ctx.with_sandbox_home(&home), cache)?;
+    let plan = plan_mounts_with_cache(
+        &grants.fs,
+        &grants.fs_exclude,
+        &ctx.with_sandbox_home(&home),
+        cache,
+    )?;
     check_mount_destinations(&plan.mounts, synthesizes_resolv_conf(grants))?;
     Ok(PlannedProfile { user, home, plan })
 }
@@ -11227,51 +11232,54 @@ fs.masked = [\"{workspace}/hidden\"]
     }
 
     #[test]
-    fn fs_exclude_prevents_buck_out_glob_link_warnings_pinning_and_cross_provider_leaks() {
+    fn fs_exclude_unions_across_layers_and_profiles_preventing_buck_out_warnings_and_pinning() {
         let f = Fixture::new();
         f.file("ws/.gitignore");
         f.file("ws/flake.nix");
         f.file("ws/nix/mod.nix");
+        f.file("ws/.env");
+        f.file("ws/cert.pem");
+        f.file("ws/extra-out/skip.nix");
         f.file("ws/buck-out/.gitignore");
+        f.file("ws/buck-out/.env");
         f.file("ws/buck-out/v2/gen.nix");
         symlink("../../flake.nix", f.ws().join("buck-out/v2/link.nix")).unwrap();
         symlink("../.gitignore", f.ws().join("buck-out/link.gitignore")).unwrap();
+        symlink("../cert.pem", f.ws().join("buck-out/link.pem")).unwrap();
 
-        if !rustix::process::geteuid().is_root() {
-            use std::os::unix::fs::PermissionsExt;
-            f.mkdir("ws/buck-out/locked");
-            fs::set_permissions(
-                f.ws().join("buck-out/locked"),
-                fs::Permissions::from_mode(0o000),
-            )
-            .unwrap();
-        }
-
-        // 1. `exclude = ["{workspace}/buck-out"]` skips descending into
-        //    `buck-out`, leaving `/workspace/buck-out` completely unpinned
-        //    (zero submounts) and emitting zero `GlobLink`,
-        //    `InaccessibleMasked`, or `Missing` warnings.
-        let cfg_unpinned = format!(
-            "inherit_global = false\n[profiles.main]\n{}{}",
-            prov("base", "main", "fs.rw = [\"{workspace}\"]"),
+        // 1. A local repo `.stopit.toml` layered over `DEFAULT_CONFIG_TOML`
+        //    adds `fs.exclude = ["{workspace}/buck-out", ...]` on a local
+        //    provider on `main`, pruning global `base` and `protect-nix`
+        //    globs without redefining them. `child` inherits `main`'s
+        //    exclusions and unions its own `extra-out` exclusion.
+        let cfg_layered = format!(
+            "[profiles.child]\ninherit = \"main\"\n{}{}",
             prov(
-                "protect",
+                "qurios",
                 "main",
-                "fs.protected = [\"{workspace}/**/*.nix\", \"{workspace}/**/.gitignore\"]\n\
-                 fs.exclude = [\"{workspace}/buck-out\", \"{workspace}/not-created-yet\"]\n\
-                 fs.warn_missing = true"
+                "fs.exclude = [\"{workspace}/buck-out\", \"{workspace}/not-created-yet\"]"
+            ),
+            prov(
+                "child-rules",
+                "child",
+                "fs.exclude = [\"{workspace}/extra-out\"]"
             ),
         );
-        let s = f.compile(&cfg_unpinned);
+        let s = f.compile(&cfg_layered);
         let main = get(&s, "main");
         assert!(main.warnings.is_empty(), "{:?}", main.warnings);
         assert_eq!(
             mounts(&main.spec),
             [
+                row("/tmp", Ephemeral, "base"),
                 row("/workspace", Rw, "base"),
-                row("/workspace/.gitignore", Protected, "protect"),
-                row("/workspace/flake.nix", Protected, "protect"),
-                row("/workspace/nix/mod.nix", Protected, "protect"),
+                row("/home/stopit", Ephemeral, "base"),
+                row("/workspace/.env", Masked, "base"),
+                row("/workspace/.gitignore", Protected, "protect-nix"),
+                row("/workspace/cert.pem", Masked, "base"),
+                row("/workspace/flake.nix", Protected, "protect-nix"),
+                row("/workspace/extra-out/skip.nix", Protected, "protect-nix"),
+                row("/workspace/nix/mod.nix", Protected, "protect-nix"),
             ]
         );
         assert!(
@@ -11284,8 +11292,68 @@ fs.masked = [\"{workspace}/hidden\"]
             main.spec.mounts
         );
 
+        let child = get(&s, "child");
+        assert!(child.warnings.is_empty(), "{:?}", child.warnings);
+        assert_eq!(
+            mounts(&child.spec),
+            [
+                row("/tmp", Ephemeral, "base"),
+                row("/workspace", Rw, "base"),
+                row("/home/stopit", Ephemeral, "base"),
+                row("/workspace/.env", Masked, "base"),
+                row("/workspace/.gitignore", Protected, "protect-nix"),
+                row("/workspace/cert.pem", Masked, "base"),
+                row("/workspace/flake.nix", Protected, "protect-nix"),
+                row("/workspace/nix/mod.nix", Protected, "protect-nix"),
+            ]
+        );
+
+        // 2. With `mask_sockets = false` and `warn_missing = true`, unioned
+        //    `fs.exclude` skips descending into `buck-out` so an unreadable
+        //    (`0o000`) directory inside `buck-out` emits no
+        //    `InaccessibleMasked` warning or mount, and a missing excluded
+        //    path emits no `Missing` warning.
         if !rustix::process::geteuid().is_root() {
             use std::os::unix::fs::PermissionsExt;
+            f.mkdir("ws/buck-out/locked");
+            fs::set_permissions(
+                f.ws().join("buck-out/locked"),
+                fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
+            let cfg_unreadable = format!(
+                "inherit_global = false\n[profiles.main]\n{}{}",
+                prov(
+                    "rules",
+                    "main",
+                    "fs.mask_sockets = false\n\
+                     fs.warn_missing = true\n\
+                     fs.rw = [\"{workspace}\"]\n\
+                     fs.protected = [\"{workspace}/**/*.nix\", \"{workspace}/**/.gitignore\"]"
+                ),
+                prov(
+                    "qurios",
+                    "main",
+                    "fs.warn_missing = true\n\
+                     fs.exclude = [\"{workspace}/buck-out\", \"{workspace}/not-created-yet\"]"
+                ),
+            );
+            let s_locked = f.compile(&cfg_unreadable);
+            let main_locked = get(&s_locked, "main");
+            assert!(
+                main_locked.warnings.is_empty(),
+                "{:?}",
+                main_locked.warnings
+            );
+            assert!(
+                !main_locked
+                    .spec
+                    .mounts
+                    .iter()
+                    .any(|m| m.sandbox.starts_with("/workspace/buck-out")),
+                "{:?}",
+                main_locked.spec.mounts
+            );
             fs::set_permissions(
                 f.ws().join("buck-out/locked"),
                 fs::Permissions::from_mode(0o755),
@@ -11294,24 +11362,25 @@ fs.masked = [\"{workspace}/hidden\"]
             fs::remove_dir(f.ws().join("buck-out/locked")).unwrap();
         }
 
-        // 2. Provider isolation + literal specificity: `base` (without
-        //    `exclude`) still masks `buck-out/.env`, and a literal `protected`
-        //    rule on `protect` still protects `buck-out/keep.nix`, while
-        //    `protect`'s globs still skip `buck-out` symlinks with no warnings.
-        f.file("ws/buck-out/.env");
+        // 3. `inherit = "none"` does not inherit `main`'s `fs.exclude`, and
+        //    exact literal rules beat `fs.exclude` while globs still skip the
+        //    rest of `buck-out`.
         f.file("ws/buck-out/keep.nix");
+        f.file("ws/buck-out/secret.env");
         let cfg_mixed = format!(
-            "inherit_global = false\n[profiles.main]\n{}{}",
+            "[profiles.isolated]\ninherit = \"none\"\n{}{}",
             prov(
-                "base",
+                "qurios",
                 "main",
-                "fs.rw = [\"{workspace}\"]\nfs.masked = [\"{workspace}/**/.env\"]"
+                "fs.exclude = [\"{workspace}/buck-out\"]\n\
+                 fs.protected = [\"{workspace}/buck-out/keep.nix\"]\n\
+                 fs.masked = [\"{workspace}/buck-out/secret.env\"]"
             ),
             prov(
-                "protect",
-                "main",
-                "fs.protected = [\"{workspace}/buck-out/keep.nix\", \"{workspace}/**/*.nix\", \"{workspace}/**/.gitignore\"]\n\
-                 fs.exclude = [\"{workspace}/buck-out\"]"
+                "iso-rules",
+                "isolated",
+                "fs.rw = [\"{workspace}\"]\n\
+                 fs.protected = [\"{workspace}/**/*.nix\"]"
             ),
         );
         let s2 = f.compile(&cfg_mixed);
@@ -11320,29 +11389,51 @@ fs.masked = [\"{workspace}/hidden\"]
         assert_eq!(
             mounts(&main2.spec),
             [
+                row("/tmp", Ephemeral, "base"),
                 row("/workspace", Rw, "base"),
-                row("/workspace/.gitignore", Protected, "protect"),
-                row("/workspace/flake.nix", Protected, "protect"),
-                row("/workspace/buck-out/.env", Masked, "base"),
-                row("/workspace/buck-out/keep.nix", Protected, "protect"),
-                row("/workspace/nix/mod.nix", Protected, "protect"),
+                row("/home/stopit", Ephemeral, "base"),
+                row("/workspace/.env", Masked, "base"),
+                row("/workspace/.gitignore", Protected, "protect-nix"),
+                row("/workspace/cert.pem", Masked, "base"),
+                row("/workspace/flake.nix", Protected, "protect-nix"),
+                row("/workspace/buck-out/keep.nix", Protected, "qurios"),
+                row("/workspace/buck-out/secret.env", Masked, "qurios"),
+                row("/workspace/extra-out/skip.nix", Protected, "protect-nix"),
+                row("/workspace/nix/mod.nix", Protected, "protect-nix"),
             ]
         );
+        let isolated = get(&s2, "isolated");
+        assert!(
+            isolated
+                .spec
+                .mounts
+                .iter()
+                .any(|m| m.sandbox == Path::new("/workspace/buck-out/v2/gen.nix")
+                    && m.mode == PathMode::Protected),
+            "inherit = \"none\" must not inherit main's fs.exclude: {:?}",
+            mounts(&isolated.spec)
+        );
 
-        // 3. Adversarial planted symlink: `buck-out -> nix` cannot bypass
+        // 4. Adversarial planted symlink: `buck-out -> nix` cannot bypass
         //    protection on `nix/mod.nix`.
         fs::remove_dir_all(f.ws().join("buck-out")).unwrap();
         symlink("nix", f.ws().join("buck-out")).unwrap();
-        let s3 = f.compile(&cfg_unpinned);
+        let cfg_symlink = prov("qurios", "main", "fs.exclude = [\"{workspace}/buck-out\"]");
+        let s3 = f.compile(&cfg_symlink);
         let main3 = get(&s3, "main");
         assert!(main3.warnings.is_empty(), "{:?}", main3.warnings);
         assert_eq!(
             mounts(&main3.spec),
             [
+                row("/tmp", Ephemeral, "base"),
                 row("/workspace", Rw, "base"),
-                row("/workspace/.gitignore", Protected, "protect"),
-                row("/workspace/flake.nix", Protected, "protect"),
-                row("/workspace/nix/mod.nix", Protected, "protect"),
+                row("/home/stopit", Ephemeral, "base"),
+                row("/workspace/.env", Masked, "base"),
+                row("/workspace/.gitignore", Protected, "protect-nix"),
+                row("/workspace/cert.pem", Masked, "base"),
+                row("/workspace/flake.nix", Protected, "protect-nix"),
+                row("/workspace/extra-out/skip.nix", Protected, "protect-nix"),
+                row("/workspace/nix/mod.nix", Protected, "protect-nix"),
             ]
         );
     }

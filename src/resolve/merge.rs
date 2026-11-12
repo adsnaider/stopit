@@ -58,9 +58,6 @@ pub struct FsRule {
     pub depth: u32,
     /// Whether missing host paths for this rule emit a startup warning.
     pub warn_missing: bool,
-    /// Paths and directory subtrees skipped when resolving a glob rule from
-    /// this `fs` section.
-    pub exclude: Vec<PathPattern>,
 }
 
 /// The effective `system` section.
@@ -137,6 +134,9 @@ pub struct EffectiveGrants {
     /// rules first (outermost ancestor first), each list in contribution
     /// order. Path precedence is not applied yet.
     pub fs: Vec<FsRule>,
+    /// Paths and directory subtrees skipped when resolving glob path rules
+    /// of this profile, inherited patterns first, without duplicates.
+    pub fs_exclude: Vec<PathPattern>,
     /// Mask sockets found in RW grants at startup.
     pub mask_sockets: bool,
     /// System mounts and synthesized files.
@@ -350,6 +350,10 @@ fn merge_profile(
 ) -> Result<EffectiveGrants, MergeError> {
     Ok(EffectiveGrants {
         fs: merge_fs_rules(&inherited.fs, own),
+        fs_exclude: union_ordered(
+            &inherited.fs_exclude,
+            own.iter().map(|c| &c.grants.fs.exclude),
+        ),
         mask_sockets: merge_mask_sockets(inherited.mask_sockets, own),
         system: EffectiveSystem {
             proc: merge_proc(inherited.system.proc, own),
@@ -768,14 +772,12 @@ fn merge_fs_rules(inherited: &[FsRule], own: &[Contribution]) -> Vec<FsRule> {
         .collect();
     for c in own {
         let warn_missing = c.grants.fs.warn_missing.unwrap_or(true);
-        let exclude = &c.grants.fs.exclude;
         out.extend(fs_rules(&c.grants.fs).map(|kind| FsRule {
             kind,
             provider: c.provider.clone(),
             origin: c.origin,
             depth: 0,
             warn_missing,
-            exclude: exclude.clone(),
         }));
     }
     out
@@ -1479,7 +1481,6 @@ mod tests {
                 origin: ProviderOrigin::Workspace,
                 depth: 0,
                 warn_missing: true,
-                exclude: vec![],
             }],
             env: EffectiveEnv {
                 set: BTreeMap::from([("B".parse().unwrap(), "2".parse().unwrap())]),
@@ -1986,53 +1987,67 @@ mod tests {
     }
 
     #[test]
-    fn fs_exclude_is_scoped_to_each_fs_block() {
+    fn fs_exclude_unions_across_providers_layers_and_inheritance() {
         let m = merged(&format!(
-            "[profiles.main]\n[profiles.child]\ninherit = \"main\"\n{}{}{}",
+            "[profiles.main]\n[profiles.child]\ninherit = \"main\"\n[profiles.isolated]\n\
+             inherit = \"none\"\n{}{}{}{}",
             prov(
                 "base",
                 "main",
-                "fs.rw = [\"{workspace}\"]\nfs.masked = [\"{workspace}/**/.env\"]"
+                "fs.rw = [\"{workspace}\"]\n\
+                 fs.masked = [\"{workspace}/**/.env\"]\n\
+                 fs.exclude = [\"{workspace}/dist\"]"
             ),
             prov(
-                "protect-nix",
+                "local-excl",
                 "main",
-                "fs.protected = [\"{workspace}/**/*.nix\", \"{workspace}/flake.lock\"]\n\
-                 fs.exclude = [\"{workspace}/buck-out\"]"
+                "fs.exclude = [\"{workspace}/buck-out\", \"{workspace}/dist\"]"
             ),
-            prov("extra", "child", "fs.ro = [\"{workspace}/**/*.md\"]"),
+            prov(
+                "child-excl",
+                "child",
+                "fs.exclude = [\"{workspace}/target\", \"{workspace}/buck-out\"]"
+            ),
+            prov("iso-excl", "isolated", "fs.ro = [\"{workspace}\"]"),
         ));
-        let excludes = |profile: &str| -> Vec<(String, u32, Vec<String>)> {
-            eff(&m, profile)
-                .fs
+        let excludes = |m: &MergedProfiles, profile: &str| -> Vec<String> {
+            eff(m, profile)
+                .fs_exclude
                 .iter()
-                .map(|r| {
-                    (
-                        r.provider.to_string(),
-                        r.depth,
-                        r.exclude.iter().map(PathPattern::to_string).collect(),
-                    )
-                })
+                .map(PathPattern::to_string)
                 .collect()
         };
         assert_eq!(
-            excludes("main"),
-            [
-                ("base".into(), 0, vec![]),
-                ("base".into(), 0, vec![]),
-                ("protect-nix".into(), 0, vec!["{workspace}/buck-out".into()]),
-                ("protect-nix".into(), 0, vec!["{workspace}/buck-out".into()]),
-            ]
+            excludes(&m, "main"),
+            ["{workspace}/dist", "{workspace}/buck-out"]
         );
         assert_eq!(
-            excludes("child"),
+            excludes(&m, "child"),
             [
-                ("base".into(), 1, vec![]),
-                ("base".into(), 1, vec![]),
-                ("protect-nix".into(), 1, vec!["{workspace}/buck-out".into()]),
-                ("protect-nix".into(), 1, vec!["{workspace}/buck-out".into()]),
-                ("extra".into(), 0, vec![]),
+                "{workspace}/dist",
+                "{workspace}/buck-out",
+                "{workspace}/target"
             ]
+        );
+        assert!(excludes(&m, "isolated").is_empty());
+
+        let layered_merged = layered(
+            &prov(
+                "protect-nix",
+                "main",
+                "fs.protected = [\"{workspace}/**/*.nix\"]\n\
+                 fs.exclude = [\"{workspace}/buck-out\"]",
+            ),
+            &prov(
+                "repo-excl",
+                "main",
+                "fs.exclude = [\"{workspace}/bazel-out\", \"{workspace}/buck-out\"]",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            excludes(&layered_merged, "main"),
+            ["{workspace}/buck-out", "{workspace}/bazel-out"]
         );
     }
 }

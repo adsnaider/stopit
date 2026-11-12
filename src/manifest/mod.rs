@@ -268,8 +268,7 @@ pub struct FsGrants {
     pub protected: Vec<PathPattern>,
     /// Writable scratch space, deleted at session end.
     pub ephemeral: Vec<PathPattern>,
-    /// Paths and directory subtrees skipped when resolving glob rules in
-    /// this `fs` section.
+    /// Paths and directory subtrees skipped when resolving glob path rules.
     pub exclude: Vec<PathPattern>,
     /// Explicit host-to-sandbox remappings.
     pub bind: Vec<Bind>,
